@@ -83572,6 +83572,118 @@
         "version": "version:2.1.0"
       },
       "version": "version:2.1.0"
+    },
+    {
+      "alias_copies": [
+        {
+          "bytes": 22105504,
+          "kind": "symlink",
+          "linkname": "llvm-objdump",
+          "output_mode": 448,
+          "path": "bin/llvm-otool",
+          "sha256": "8fdf9c3071f468e37821462654282c5198e7c6c8069b3a181317755053dd50b5",
+          "source": "bin/llvm-objdump"
+        }
+      ],
+      "bytes": 5350540,
+      "extraction": "tree",
+      "format": "tar.xz",
+      "members": [
+        {
+          "bytes": 0,
+          "kind": "directory",
+          "mode": 493,
+          "path": "bin",
+          "pax_headers": {
+            "mtime": "1763722818.4602358"
+          }
+        },
+        {
+          "bytes": 416272,
+          "kind": "regular",
+          "mode": 493,
+          "output_mode": 448,
+          "path": "bin/llvm-bcanalyzer",
+          "pax_headers": {
+            "mtime": "1763722818.460085"
+          },
+          "sha256": "968d2a93d5e86da0c6e76a687617878ae61ab22bf1c1e6869ac4f85e3790a4f9"
+        },
+        {
+          "bytes": 346432,
+          "kind": "regular",
+          "mode": 493,
+          "output_mode": 448,
+          "path": "bin/llvm-cxxfilt",
+          "pax_headers": {
+            "mtime": "1763722818.4294329"
+          },
+          "sha256": "3cee5d844519d3222e2ec3c603a3b135ba4bcc303df59aebeab87b6c316ac0a6"
+        },
+        {
+          "bytes": 16652768,
+          "kind": "regular",
+          "mode": 493,
+          "output_mode": 448,
+          "path": "bin/llvm-dwarfdump",
+          "pax_headers": {
+            "mtime": "1763722818.4479432"
+          },
+          "sha256": "4d081656809a5f880a670890e53246724e3e8e7690c1a8bf0791df8563718cb6"
+        },
+        {
+          "bytes": 20450184,
+          "kind": "regular",
+          "mode": 493,
+          "output_mode": 448,
+          "path": "bin/llvm-nm",
+          "pax_headers": {
+            "mtime": "1763722818.4174182"
+          },
+          "sha256": "6a779a83f9e3396d5c1c305441ec4617dec4b0ee004904d3f7938774c1dcdd85"
+        },
+        {
+          "bytes": 22105504,
+          "kind": "regular",
+          "mode": 493,
+          "output_mode": 448,
+          "path": "bin/llvm-objdump",
+          "pax_headers": {
+            "mtime": "1763722818.3949602"
+          },
+          "sha256": "8fdf9c3071f468e37821462654282c5198e7c6c8069b3a181317755053dd50b5"
+        },
+        {
+          "bytes": 0,
+          "kind": "symlink",
+          "linkname": "llvm-objdump",
+          "mode": 493,
+          "path": "bin/llvm-otool",
+          "pax_headers": {
+            "mtime": "1763722818.3715603"
+          }
+        },
+        {
+          "bytes": 34,
+          "kind": "regular",
+          "mode": 420,
+          "output_mode": 384,
+          "path": "llvmobjdump_build_revision",
+          "pax_headers": {
+            "mtime": "1763722818.3715172"
+          },
+          "sha256": "bc083637b187e75d27477b130c1f9187f109783809789addcd39b56aee5783e5"
+        }
+      ],
+      "name": "llvmobjdump",
+      "seed_cache": false,
+      "sha256": "cace63bdf68ff4be9680c497a9d15482f52fe01ebeb0de65dce1828e5628df12",
+      "source": {
+        "bucket": "chromium-browser-clang",
+        "generation": 1763731858865476,
+        "kind": "gcs",
+        "object": "Mac_arm64/llvmobjdump-llvmorg-22-init-14273-gea10026b-2.tar.xz"
+      }
     }
   ],
   "roles": {
@@ -83596,7 +83708,7 @@
       "sha256": "49166ff4203702b4f460df0dfae3d6500cd450e86a4ece643499323d992da248"
     }
   },
-  "schema": "morpheus-native-macos-materials-v1",
+  "schema": "morpheus-native-macos-materials-v2",
   "specs": [
     {
       "bytes": 3128,

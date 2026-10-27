@@ -86,9 +86,9 @@
       "sha256": "103f389a79acabe6714cdfcc0d91e9dbf64188b077e07131824393f88a44a633"
     },
     {
-      "bytes": 5081,
+      "bytes": 6608,
       "path": "native/webrtc/macos/mac-x64/dependency-decisions.json",
-      "sha256": "864836bf91a4fca5d7f9a30fd9614718a547eb44f00294527b576820736c652b"
+      "sha256": "7e50e029c379810d2a712a41cea71fcf468e477e79dbd249940ef7758f861057"
     },
     {
       "bytes": 17692,
@@ -96,14 +96,29 @@
       "sha256": "b2ca5cb477a68c18f273b66ea310b387976a85305f667bc531ccb35a0950ed79"
     },
     {
-      "bytes": 3066223,
+      "bytes": 3069519,
       "path": "native/webrtc/macos/mac-x64/selected-mac-materials.json",
-      "sha256": "64f88aeb7dde4306ff37ee723bf979dcc12c4d08362a1195a73210a974be76c9"
+      "sha256": "af706e4aa330dc274bfbbf5cc3206357a79c5a443a317f16b763996e2a62da94"
     },
     {
       "bytes": 2428,
       "path": "native/webrtc/linux/reference/producer-interface.json",
       "sha256": "ebfdd22dd8eaa6ee893adbdc9fe904f5e859d33b7353b067a66c32df526508bf"
+    },
+    {
+      "bytes": 13424,
+      "path": "native/webrtc/macos/evidence/dependency-caller-proof.json",
+      "sha256": "93a9903eaf8ab6fd76f8975b161fd5e709a30ee375895a4cfbdde065ed56b227"
+    },
+    {
+      "bytes": 15141,
+      "path": "native/webrtc/macos/evidence/LLVM-LICENSE.TXT",
+      "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+    },
+    {
+      "bytes": 707,
+      "path": "native/webrtc/macos/evidence/llvm-source-license-binding.json",
+      "sha256": "b147ec4c840ee038c51ab8952c1ff8850ef53581daba4faad94478aea1751049"
     }
   ],
   "cache_handoff_authorized": false,
@@ -117,7 +132,7 @@
   },
   "dependency_decisions": {
     "path": "native/webrtc/macos/mac-x64/dependency-decisions.json",
-    "sha256": "864836bf91a4fca5d7f9a30fd9614718a547eb44f00294527b576820736c652b"
+    "sha256": "7e50e029c379810d2a712a41cea71fcf468e477e79dbd249940ef7758f861057"
   },
   "host_git": {
     "bytes": null,
@@ -137,7 +152,7 @@
   },
   "mac_material_plan": {
     "path": "native/webrtc/macos/mac-x64/selected-mac-materials.json",
-    "sha256": "64f88aeb7dde4306ff37ee723bf979dcc12c4d08362a1195a73210a974be76c9"
+    "sha256": "af706e4aa330dc274bfbbf5cc3206357a79c5a443a317f16b763996e2a62da94"
   },
   "minimum_free_bytes": 12884901888,
   "native_test_count": 12,
@@ -145,7 +160,7 @@
     "path": "native/webrtc/macos/patch-manifest.json",
     "sha256": "b2ca5cb477a68c18f273b66ea310b387976a85305f667bc531ccb35a0950ed79"
   },
-  "pipeline_sha256": "eba900194949283c6f7955efedc636bcdf0f972df20fc95d40b825b6c5276c55",
+  "pipeline_sha256": "2ab327789d280e0f8a0f67f28f35ba680091ccbd09bb97853f8f11cc085a6539",
   "production_targets": [
     ":default",
     "api/audio_codecs:builtin_audio_decoder_factory",
@@ -158,7 +173,7 @@
     "desktop_capture_objc",
     "modules/audio_device:audio_device"
   ],
-  "recipe_sha256": "e845aeaa16dd270d1c9e319feeecbe18be1d77677646e83d460bc1605f267bb7",
+  "recipe_sha256": "e664095571eb5239fecdc9410b77f2e34fc7907da9ae67d399ba53206547b1fb",
   "schema": "morpheus-native-macos-pipeline-v1",
   "security_patch_count": 8,
   "security_plan": {

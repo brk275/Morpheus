@@ -1,0 +1,12 @@
+{
+  "binary_reproducibility_claim": false,
+  "commit": "ea10026b64f66b3b69c0545db20f9daa8579f5cb",
+  "commit_api": "https://api.github.com/repos/llvm/llvm-project/commits/ea10026b",
+  "commit_response_sha256": "9af45d97b0a7c4c25e462465bccf283b9f62db38ab885d82db7fb9e56617cd15",
+  "full_preferred_source_downloaded": false,
+  "license_bytes": 15141,
+  "license_sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee",
+  "license_url": "https://raw.githubusercontent.com/llvm/llvm-project/ea10026b64f66b3b69c0545db20f9daa8579f5cb/llvm/LICENSE.TXT",
+  "preferred_source_url": "https://github.com/llvm/llvm-project/tree/ea10026b64f66b3b69c0545db20f9daa8579f5cb",
+  "tools_executed": false
+}

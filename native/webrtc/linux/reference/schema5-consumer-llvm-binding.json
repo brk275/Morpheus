@@ -1,6 +1,6 @@
 {
   "build_ready": false,
-  "change_kind": "exact_source_alias_normalization_validation_at_existing_marker_checkpoints",
+  "change_kind": "exact_Mac_v2_llvm_addon_material_projection; unchanged_Linux_validation",
   "compiler_cipd_runtime_closure": false,
   "distribution_ready": false,
   "execution_admitted": false,
@@ -17,6 +17,13 @@
     "path": "native/webrtc/linux/selected-linux-build-inputs.json",
     "sha256": "f75cf14baaec10fdc9203626737808d3987cc734923b0bb55eae6218234489a5"
   },
+  "mac_material_contract": {
+    "consumer_schema": "morpheus-macos-material-consumer-v2",
+    "helper_sha256": "3c526b2fe1b1618b212f0b37ee060d191912f1a0f5e784a18dc3c513d2c1457f",
+    "native_security_or_runtime_admission": false,
+    "plan_schema": "morpheus-native-macos-materials-v2",
+    "staged_schema": "morpheus-native-macos-data-staged-v2"
+  },
   "native_sources_complete": false,
   "parent_consumer_binding_path": "reference/schema5-consumer-privacy-binding.json",
   "parent_consumer_binding_sha256": "088e25fef10412a68d8cc97cbeb6d815d34985d3a61cca1a82a0509b4f8d3fb2",
@@ -24,7 +31,7 @@
   "receipt_semantics": "New consumer declaration for a genuine validator extension; not an equivalence-only rebind or execution approval.",
   "recipe": {
     "path": "scripts/build_native_webrtc_unix.py",
-    "sha256": "e845aeaa16dd270d1c9e319feeecbe18be1d77677646e83d460bc1605f267bb7"
+    "sha256": "e664095571eb5239fecdc9410b77f2e34fc7907da9ae67d399ba53206547b1fb"
   },
   "same_twelve_external_gates_and_twelve_native_cases": true,
   "schema": "morpheus-native-schema5-consumer-llvm-extension-v1",

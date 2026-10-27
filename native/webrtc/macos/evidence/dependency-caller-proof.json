@@ -1,0 +1,263 @@
+{
+  "GN_graph_executed": false,
+  "all_original_security_ABI_license_runtime_gates_preserved": true,
+  "build_ready": false,
+  "build_with_chromium": false,
+  "direct_native_test_count": 12,
+  "distribution_ready": false,
+  "invalidation": "Any changed target/args/import/action/formatter/infra/generated-wrapper execution or selected package source invalidates this scope proof. Original declarations stay retained and selected; these are exact fixed-route decisions, never repository-complete or general absence claims.",
+  "mac_material_helper_sha256": "3c526b2fe1b1618b212f0b37ee060d191912f1a0f5e784a18dc3c513d2c1457f",
+  "material_closure": {
+    "addons": [
+      {
+        "bytes": 5611140,
+        "generation": 1763731833330327,
+        "object": "Mac/llvmobjdump-llvmorg-22-init-14273-gea10026b-2.tar.xz",
+        "sha256": "65c229f8ac773e258bcf4ba67038d8db9f9100fea063c60263d7d37a8cee2374"
+      },
+      {
+        "bytes": 5350540,
+        "generation": 1763731858865476,
+        "object": "Mac_arm64/llvmobjdump-llvmorg-22-init-14273-gea10026b-2.tar.xz",
+        "sha256": "cace63bdf68ff4be9680c497a9d15482f52fe01ebeb0de65dce1828e5628df12"
+      }
+    ],
+    "license": {
+      "full_preferred_source_retained": false,
+      "gate_approval": false,
+      "path": "native/webrtc/macos/evidence/LLVM-LICENSE.TXT",
+      "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee",
+      "source_binding_path": "native/webrtc/macos/evidence/llvm-source-license-binding.json",
+      "source_binding_sha256": "b147ec4c840ee038c51ab8952c1ff8850ef53581daba4faad94478aea1751049"
+    },
+    "llvm_declaration": "Exact host Mac Clang main archive remains the original core profile. Exact second original default llvmobjdump GCS object perhost is now fully inventoried and staged/projected; disabled clang-tidy/clangd/coverage/Linux/Windows/cross-Mac-runtime objects remain conditionally unselected. No guessed file substitution.",
+    "normalization": "Only original bin/llvm-otool -> llvm-objdump is projected as regular byte-identical COPY; both full archive member tables and raw links are retained. No overlap with original main Clang regular/alias outputs on either Mac target."
+  },
+  "native_test_target": "//:rtc_unittests",
+  "production_targets": [
+    ":default",
+    "api/audio_codecs:builtin_audio_decoder_factory",
+    "api/task_queue:default_task_queue_factory",
+    "sdk:native_api",
+    "sdk:default_codec_factory_objc",
+    "pc:peer_connection",
+    "sdk:videocapture_objc",
+    "sdk:mac_framework_objc",
+    "desktop_capture_objc",
+    "modules/audio_device:audio_device"
+  ],
+  "proven_inactive_reasons": {
+    "fonts": "Complete original native source contains no test_fonts caller beyond DEPS and no Skia/test-font GN/C++ target. In pinned testing/test.gni, mac follows the non-Android/non-Fuchsia/non-ChromeOS-device/non-iOS branch; the Fuchsia component test_fonts shard is not selected. Mac rtc_test delegates ordinary test(), generated wrapper only writes checked-in script text, and direct native12 filters do not invoke a font-data route.",
+    "format": "Original buildtools DEPS Mac/mac_arm64 formatting object is selected, but complete pinned buildtools and native/build/testing GN/action sources contain no clang-format execution target. The fixed recipe runs direct GN/Ninja, native12, archives and license generation; no format/presubmit/sync/hooks command.",
+    "luci": "Selected packages are CAS/isolate/swarming. Complete native/build/testing GN has no action consuming tools/luci-go. The concrete base_test_triggerer.py path is an infra/Swarming entry, outside fixed production targets and ordinary Mac rtc_test generated wrapper DATA. Fixed native12 and license commands do not invoke it.",
+    "reclient": "Pinned build/toolchain/rbe.gni declares use_remoteexec=false and use_reclient=use_remoteexec && !use_siso. Fixed args preserve build_with_chromium=false and use_siso=false and do not override remoteexec. Actual Mac toolchain supplies only current_cpu and no true remoteexec/reclient override. apple/toolchain.gni prepends rewrapper only when toolchain_uses_reclient. No reclient client/config execution is selected.",
+    "resultdb": "Selected package is result_adapter. Ordinary Mac rtc_test wrapper/test_scripts_shared includes checked-in build/util proto/test_results Python DATA, not this binary. Wrapper generation writes text; fixed builder directly lists/runs rtc_unittests with exact filter/XML, never bot/ResultDB adapter/infra runner. No native/build/testing GN action executes this package.",
+    "siso": "Native .gn defaults use_siso=true, but the unchanged fixed args explicitly override use_siso=false in both GN outputs. Pinned build/toolchain/siso.gni documents this variable as autoninja dispatch/reclient default. The recipe invokes the genuine pinned Ninja directly, never autoninja/siso; no Siso runtime or remote backend selected."
+  },
+  "recipe_sha256": "e664095571eb5239fecdc9410b77f2e34fc7907da9ae67d399ba53206547b1fb",
+  "schema": "morpheus-native-macos-dependency-caller-proof-v1",
+  "source_bindings": [
+    {
+      "bytes": 3620,
+      "path": "native/.gn",
+      "repository_path": ".gn",
+      "repository_url": "https://github.com/webrtc-sdk/webrtc.git",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "sha256": "e5b01e0fe1b9a8733577dc4357f8b2c220a7849bb43a6dc83bbb382d083fd345",
+      "tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
+    },
+    {
+      "bytes": 24959,
+      "path": "native/BUILD.gn",
+      "repository_path": "BUILD.gn",
+      "repository_url": "https://github.com/webrtc-sdk/webrtc.git",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "sha256": "28de900976df3f8d54285575a29fe5e0ca53632a464a6cdebd051d1ef1e26ec9",
+      "tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
+    },
+    {
+      "bytes": 44070,
+      "path": "native/webrtc.gni",
+      "repository_path": "webrtc.gni",
+      "repository_url": "https://github.com/webrtc-sdk/webrtc.git",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "sha256": "df86c65b417b7185c21d49144bd02845d47f768493763a1b4791c5c12f1d4b73",
+      "tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
+    },
+    {
+      "bytes": 42071,
+      "path": "native/test/BUILD.gn",
+      "repository_path": "test/BUILD.gn",
+      "repository_url": "https://github.com/webrtc-sdk/webrtc.git",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "sha256": "34d066661818cfb90f9d4c9840e5c542b29de6ec9ab8bbf513ae5fbd869ece13",
+      "tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
+    },
+    {
+      "bytes": 2468,
+      "path": "native/test/test_main.cc",
+      "repository_path": "test/test_main.cc",
+      "repository_url": "https://github.com/webrtc-sdk/webrtc.git",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "sha256": "d30705b761031f9ca9175fc5f19e01cb2ea92f94a0869f873cebf0d8e8bc8e7f",
+      "tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
+    },
+    {
+      "bytes": 11311,
+      "path": "native/test/test_main_lib.cc",
+      "repository_path": "test/test_main_lib.cc",
+      "repository_url": "https://github.com/webrtc-sdk/webrtc.git",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "sha256": "f32ebe98ea6b63c2174b6f9aa32a706178c50e4b1ffb8b6d3f24c9a932cb59dc",
+      "tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
+    },
+    {
+      "bytes": 11440,
+      "path": "native/tools_webrtc/libs/generate_licenses.py",
+      "repository_path": "tools_webrtc/libs/generate_licenses.py",
+      "repository_url": "https://github.com/webrtc-sdk/webrtc.git",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "sha256": "e6b5c94a8138e62c9d16beec64741d3e081ccc1ced59e983b818cef6a96a916e",
+      "tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
+    },
+    {
+      "bytes": 46825,
+      "path": "testing/test.gni",
+      "repository_path": "test.gni",
+      "repository_url": "https://chromium.googlesource.com/chromium/src/testing",
+      "revision": "9b3d3d6543ec7bd1d15fbb60da594103d2720ac7",
+      "sha256": "913394c2eb534b34a068819f6a3e494b85a9cd70604cd1ffd5bf7a90cdde5f47",
+      "tree": "84ac15456637eecdd3dd5f3ea559a9a7ab760c42"
+    },
+    {
+      "bytes": 3202,
+      "path": "testing/BUILD.gn",
+      "repository_path": "BUILD.gn",
+      "repository_url": "https://chromium.googlesource.com/chromium/src/testing",
+      "revision": "9b3d3d6543ec7bd1d15fbb60da594103d2720ac7",
+      "sha256": "807686b3ae7ce79af0f501b1c5ec0a3b9b7b86a8a900c67ea80d49fbe6581ac4",
+      "tree": "84ac15456637eecdd3dd5f3ea559a9a7ab760c42"
+    },
+    {
+      "bytes": 16303,
+      "path": "testing/trigger_scripts/base_test_triggerer.py",
+      "repository_path": "trigger_scripts/base_test_triggerer.py",
+      "repository_url": "https://chromium.googlesource.com/chromium/src/testing",
+      "revision": "9b3d3d6543ec7bd1d15fbb60da594103d2720ac7",
+      "sha256": "2946d953828e514442e42729f079f87ae076389eb5bcd30c4279cabf4c066511",
+      "tree": "84ac15456637eecdd3dd5f3ea559a9a7ab760c42"
+    },
+    {
+      "bytes": 813,
+      "path": "build/toolchain/siso.gni",
+      "repository_path": "toolchain/siso.gni",
+      "repository_url": "https://github.com/webrtc-sdk/build",
+      "revision": "be1a8f6dcd7df7e46320192c5e2f364e50d79bbf",
+      "sha256": "51d55e8f7d8ca3252d60a92ab215609f893efdeacb2d84b25a7a25a73a26d5ef",
+      "tree": "3ad20ff19575b750dc27b73f852aa960d7e8bcd2"
+    },
+    {
+      "bytes": 5479,
+      "path": "build/toolchain/rbe.gni",
+      "repository_path": "toolchain/rbe.gni",
+      "repository_url": "https://github.com/webrtc-sdk/build",
+      "revision": "be1a8f6dcd7df7e46320192c5e2f364e50d79bbf",
+      "sha256": "8cec2ca088ce1ffe46a19baedc091a1e13a4021fe04769ec3fbd44b68957dc1e",
+      "tree": "3ad20ff19575b750dc27b73f852aa960d7e8bcd2"
+    },
+    {
+      "bytes": 39028,
+      "path": "build/toolchain/apple/toolchain.gni",
+      "repository_path": "toolchain/apple/toolchain.gni",
+      "repository_url": "https://github.com/webrtc-sdk/build",
+      "revision": "be1a8f6dcd7df7e46320192c5e2f364e50d79bbf",
+      "sha256": "6861b83d2b45dfa91eb8d92f44c9341b34e7f158c530b3d3b8331ae3a67c469e",
+      "tree": "3ad20ff19575b750dc27b73f852aa960d7e8bcd2"
+    },
+    {
+      "bytes": 2527,
+      "path": "build/toolchain/mac/BUILD.gn",
+      "repository_path": "toolchain/mac/BUILD.gn",
+      "repository_url": "https://github.com/webrtc-sdk/build",
+      "revision": "be1a8f6dcd7df7e46320192c5e2f364e50d79bbf",
+      "sha256": "72620e9f399c270ffcc1ebdf1f520a1ed5b625a29c039b2ba2d18337112981c2",
+      "tree": "3ad20ff19575b750dc27b73f852aa960d7e8bcd2"
+    },
+    {
+      "bytes": 1255,
+      "path": "build/toolchain/cc_wrapper.gni",
+      "repository_path": "toolchain/cc_wrapper.gni",
+      "repository_url": "https://github.com/webrtc-sdk/build",
+      "revision": "be1a8f6dcd7df7e46320192c5e2f364e50d79bbf",
+      "sha256": "abd28fc373976b31d63003cdc4495570aacc89f8080cd836d2a2a4bd016a0242",
+      "tree": "3ad20ff19575b750dc27b73f852aa960d7e8bcd2"
+    },
+    {
+      "bytes": 1171,
+      "path": "build/util/BUILD.gn",
+      "repository_path": "util/BUILD.gn",
+      "repository_url": "https://github.com/webrtc-sdk/build",
+      "revision": "be1a8f6dcd7df7e46320192c5e2f364e50d79bbf",
+      "sha256": "65cce5c8a3a138da9b7f2883b1988b60fb59ae1ad438de1c5ece0d21cdd15cd7",
+      "tree": "3ad20ff19575b750dc27b73f852aa960d7e8bcd2"
+    },
+    {
+      "bytes": 3245,
+      "path": "build/util/generate_wrapper.gni",
+      "repository_path": "util/generate_wrapper.gni",
+      "repository_url": "https://github.com/webrtc-sdk/build",
+      "revision": "be1a8f6dcd7df7e46320192c5e2f364e50d79bbf",
+      "sha256": "108f64b85cb63bb9a0c27607ea6b31db6452c0a0f93a765110e30ac410925248",
+      "tree": "3ad20ff19575b750dc27b73f852aa960d7e8bcd2"
+    },
+    {
+      "bytes": 8373,
+      "path": "build/util/generate_wrapper.py",
+      "repository_path": "util/generate_wrapper.py",
+      "repository_url": "https://github.com/webrtc-sdk/build",
+      "revision": "be1a8f6dcd7df7e46320192c5e2f364e50d79bbf",
+      "sha256": "3c0c06c039874c8b99af3d85b5e20d41cf12ce84f09b32d19e0af79260e60973",
+      "tree": "3ad20ff19575b750dc27b73f852aa960d7e8bcd2"
+    },
+    {
+      "bytes": 2000,
+      "path": "buildtools/DEPS",
+      "repository_path": "DEPS",
+      "repository_url": "https://chromium.googlesource.com/chromium/src/buildtools",
+      "revision": "aec4f3c79e5af648386819cbe7f6e67206385ece",
+      "sha256": "72317f8d247e4a40a8629efaf0d267302258715ddc38b4d28448f1fecb4bb9b4",
+      "tree": "a3e6af02b8c81472c67d47bce22caa1f87a83889"
+    }
+  ],
+  "source_coverage": [
+    {
+      "archive_sha256": "bfcfd0a02d6d31aeeeddcba69782e2b8f07131ee32357eec94b51debc45d81a3",
+      "files": 7499,
+      "mount": "src"
+    },
+    {
+      "leaves": 1436,
+      "mount": "src/build",
+      "tree": "3ad20ff19575b750dc27b73f852aa960d7e8bcd2"
+    },
+    {
+      "leaves": 78,
+      "mount": "src/buildtools",
+      "tree": "a3e6af02b8c81472c67d47bce22caa1f87a83889"
+    },
+    {
+      "leaves": 789,
+      "mount": "src/testing",
+      "tree": "84ac15456637eecdd3dd5f3ea559a9a7ab760c42"
+    }
+  ],
+  "source_revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+  "source_tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5",
+  "target_os": "mac",
+  "targets": [
+    "mac-arm64",
+    "mac-x64"
+  ],
+  "use_remoteexec_default": false,
+  "use_siso": false
+}

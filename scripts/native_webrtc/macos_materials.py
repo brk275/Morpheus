@@ -25,6 +25,11 @@ RUST = {
  "mac-x64": ("Mac", "bb8be97e327b72f03f9caadae5557c7ce0ddac66e6dcc37cd3b8e65fca074e4b", 134345832, 1762971369029231),
 }
 RUST_ARCHIVE = "rust-toolchain-11339a0ef5ed586bb7ea4f85a9b7287880caac3a-1-llvmorg-22-init-14273-gea10026b.tar.xz"
+LLVM_OBJDUMP_ARCHIVE = "llvmobjdump-llvmorg-22-init-14273-gea10026b-2.tar.xz"
+LLVM_OBJDUMP = {
+ "mac-arm64": ("Mac_arm64", "cace63bdf68ff4be9680c497a9d15482f52fe01ebeb0de65dce1828e5628df12", 5350540, 1763731858865476),
+ "mac-x64": ("Mac", "65c229f8ac773e258bcf4ba67038d8db9f9100fea063c60263d7d37a8cee2374", 5611140, 1763731833330327),
+}
 TARGETS = {"mac-arm64": ("MacARM", "mac-arm64", "arm64", "mac"),
            "mac-x64": ("MacIntel", "mac-amd64", "x86_64", "mac")}
 SPEC_HASHES = {"native": "101dc83d0e719b51d84d9c42719a78ec4dd873e9ee82a5e9c83485b8c6ccf600",
@@ -42,7 +47,7 @@ def need(ok):
         raise Refused()
 
 def pax_metadata(member):
-    # Only authenticated Rust archive metadata. A directory's original PAX
+    # Only authenticated Rust/LLVM archive metadata. A directory's original PAX
     # path may retain one terminal slash; the canonical inventory does not.
     # Preserve the exact metadata bytes without redirecting a path or type.
     fields = member.get("pax_headers", {})
@@ -112,7 +117,7 @@ def paths(row, material):
 def validate(plan, target, material, python):
     need(set(plan) == {"schema", "target", "baseline", "tree", "core_manifest_sha256", "materials", "specs", "roles",
         "environment_complete", "build_ready", "distribution_ready", "genuine_tag_cache_created", "vpython_derivations_created"})
-    need(target in TARGETS and plan["schema"] == "morpheus-native-macos-materials-v1"
+    need(target in TARGETS and plan["schema"] == "morpheus-native-macos-materials-v2"
          and plan["target"] == target and plan["baseline"] == BASELINE and plan["tree"] == TREE
          and plan["core_manifest_sha256"] == CORE_PLAN)
     need(all(plan[key] is False for key in ("environment_complete", "build_ready", "distribution_ready",
@@ -120,21 +125,23 @@ def validate(plan, target, material, python):
     rows = plan["materials"]
     need(type(rows) is list and 4 <= len(rows) <= 128)
     names = {row["name"] for row in rows}
-    required = {"rust", "vpython", "cipd-client", "cpython-bootstrap", "virtualenv"}
+    required = {"rust", "llvmobjdump", "vpython", "cipd-client", "cpython-bootstrap", "virtualenv"}
     need(len(names) == len(rows) and required <= names)
     need(all(name in required or re.fullmatch(r"wheel-[0-9a-f]{16}", name) for name in names))
     expanded_total = 0
     seen_cache = set()
     for row in rows:
         fields = {"name", "format", "source", "sha256", "bytes", "seed_cache", "extraction", "members", "alias_copies"}
-        need(set(row) == fields | (set() if row["name"] == "rust" else {"package", "version", "instance", "instance_id"}))
+        need(set(row) == fields | (set() if row["name"] in ("rust", "llvmobjdump") else {"package", "version", "instance", "instance_id"}))
         need(type(row["name"]) is str and re.fullmatch(r"[a-z0-9-]{1,64}", row["name"])
              and row["format"] in ("zip", "tar.xz") and HEX.fullmatch(row["sha256"])
              and type(row["bytes"]) is int and 0 < row["bytes"] <= MAX_ARCHIVE
              and type(row["seed_cache"]) is bool)
-        if row["name"] == "rust":
-            prefix, sha, size, generation = RUST[target]
-            need(row["source"] == {"kind": "gcs", "bucket": "chromium-browser-clang", "object": prefix + "/" + RUST_ARCHIVE,
+        if row["name"] in ("rust", "llvmobjdump"):
+            pins = RUST if row["name"] == "rust" else LLVM_OBJDUMP
+            archive = RUST_ARCHIVE if row["name"] == "rust" else LLVM_OBJDUMP_ARCHIVE
+            prefix, sha, size, generation = pins[target]
+            need(row["source"] == {"kind": "gcs", "bucket": "chromium-browser-clang", "object": prefix + "/" + archive,
                                    "generation": generation}
                  and (row["sha256"], row["bytes"], row["format"]) == (sha, size, "tar.xz")
                  and row["seed_cache"] is False and row["extraction"] == "tree")
@@ -299,7 +306,7 @@ def stage_data(plan, raw_plan, root, material, transport):
         for row in plan["materials"]:
             suffix = ".zip" if row["format"] == "zip" else ".tar.xz"
             archive = root / "archives" / (row["name"] + suffix)
-            if row["name"] == "rust":
+            if row["name"] in ("rust", "llvmobjdump"):
                 transport.download(stage, row, archive)
             else:
                 payload = json.dumps({"package": row["package"], "instance": row["instance"]}, separators=(",", ":")).encode()
@@ -332,7 +339,7 @@ def stage_data(plan, raw_plan, root, material, transport):
             path = root / material.relative(role["path"])
             need(material.file_fact(path)["sha256"] == role["sha256"] and os.access(path, os.X_OK))
         stage.bytes(root / "material-plan.json", raw_plan)
-        material.write_json(root / "tool-materials.json", {"schema": "morpheus-native-macos-data-staged-v1",
+        material.write_json(root / "tool-materials.json", {"schema": "morpheus-native-macos-data-staged-v2",
             "target": plan["target"], "plan_sha256": hashlib.sha256(raw_plan).hexdigest(),
             "original_archives_retained": True, "executed_tools": [], "environment_complete": False,
             "native_sources_complete": False, "build_ready": False, "distribution_ready": False})
@@ -343,7 +350,7 @@ def profile(root, plan_sha, target, material, python):
     plan = material.read_json(root / "material-plan.json", plan_sha)
     validate(plan, target, material, python)
     receipt = material.read_json(root / "tool-materials.json", material.file_fact(root / "tool-materials.json")["sha256"])
-    need(receipt == {"schema": "morpheus-native-macos-data-staged-v1", "target": target,
+    need(receipt == {"schema": "morpheus-native-macos-data-staged-v2", "target": target,
         "plan_sha256": plan_sha, "original_archives_retained": True, "executed_tools": [],
         "environment_complete": False, "native_sources_complete": False, "build_ready": False,
         "distribution_ready": False})
@@ -401,7 +408,8 @@ def project(base, files, directories, markers, core, runtime, target, material):
     roots = [(core, "tools/gn/", "buildtools/mac/"),
              (core, "tools/ninja/", "third_party/ninja/"),
              (core, "tools/clang/", "third_party/llvm-build/Release+Asserts/"),
-             (runtime, "runtime/rust/", "third_party/rust-toolchain/")]
+             (runtime, "runtime/rust/", "third_party/rust-toolchain/"),
+             (runtime, "runtime/llvmobjdump/", "third_party/llvm-build/Release+Asserts/")]
     markers = {"checkout/" + material.relative(name) for name in markers}
     overlay = []
     for root_spec, prefix, mount in roots:

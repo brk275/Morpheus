@@ -17,34 +17,50 @@
       "path": "src/buildtools/mac"
     },
     {
-      "decision": "unresolved",
+      "decision": "proven-inactive",
       "declaration_sha256": "abdb306a0bfa60b71e898c77e28aeccef265cd89cea33df77f3d40625a2cf5f8",
       "evidence": [
         {
           "path": "native/webrtc/macos/mac-x64/declaration-ledger.json",
           "sha256": "103f389a79acabe6714cdfcc0d91e9dbf64188b077e07131824393f88a44a633"
+        },
+        {
+          "path": "native/webrtc/macos/evidence/dependency-caller-proof.json",
+          "sha256": "93a9903eaf8ab6fd76f8975b161fd5e709a30ee375895a4cfbdde065ed56b227"
         }
       ],
       "path": "src/buildtools/mac-format"
     },
     {
-      "decision": "unresolved",
+      "decision": "proven-inactive",
       "declaration_sha256": "2c49d85553fc73d22c06dac2f5a3bc4905dfaf51b15b7811573b67fc004df093",
       "evidence": [
         {
           "path": "native/webrtc/macos/mac-x64/declaration-ledger.json",
           "sha256": "103f389a79acabe6714cdfcc0d91e9dbf64188b077e07131824393f88a44a633"
+        },
+        {
+          "path": "native/webrtc/macos/evidence/dependency-caller-proof.json",
+          "sha256": "93a9903eaf8ab6fd76f8975b161fd5e709a30ee375895a4cfbdde065ed56b227"
         }
       ],
       "path": "src/buildtools/reclient"
     },
     {
-      "decision": "unresolved",
+      "decision": "real-material",
       "declaration_sha256": "630afb11f8eb0e3d31c592710ecc627cc30aaeccdc75fedfc573403e66150ad9",
       "evidence": [
         {
           "path": "native/webrtc/macos/mac-x64/declaration-ledger.json",
           "sha256": "103f389a79acabe6714cdfcc0d91e9dbf64188b077e07131824393f88a44a633"
+        },
+        {
+          "path": "native/webrtc/macos/evidence/dependency-caller-proof.json",
+          "sha256": "93a9903eaf8ab6fd76f8975b161fd5e709a30ee375895a4cfbdde065ed56b227"
+        },
+        {
+          "path": "native/webrtc/macos/mac-x64/selected-mac-materials.json",
+          "sha256": "af706e4aa330dc274bfbbf5cc3206357a79c5a443a317f16b763996e2a62da94"
         }
       ],
       "path": "src/third_party/llvm-build/Release+Asserts"
@@ -74,51 +90,67 @@
         },
         {
           "path": "native/webrtc/macos/mac-x64/selected-mac-materials.json",
-          "sha256": "64f88aeb7dde4306ff37ee723bf979dcc12c4d08362a1195a73210a974be76c9"
+          "sha256": "af706e4aa330dc274bfbbf5cc3206357a79c5a443a317f16b763996e2a62da94"
         }
       ],
       "path": "src/third_party/rust-toolchain"
     },
     {
-      "decision": "unresolved",
+      "decision": "proven-inactive",
       "declaration_sha256": "9231bc0a00e91cd836362ce8afbf7bb4b97824d1d786dad03400f55fca48253b",
       "evidence": [
         {
           "path": "native/webrtc/macos/mac-x64/declaration-ledger.json",
           "sha256": "103f389a79acabe6714cdfcc0d91e9dbf64188b077e07131824393f88a44a633"
+        },
+        {
+          "path": "native/webrtc/macos/evidence/dependency-caller-proof.json",
+          "sha256": "93a9903eaf8ab6fd76f8975b161fd5e709a30ee375895a4cfbdde065ed56b227"
         }
       ],
       "path": "src/third_party/siso/cipd"
     },
     {
-      "decision": "unresolved",
+      "decision": "proven-inactive",
       "declaration_sha256": "3e154637b3b53dba38291534a34c82122c0a9b2e1d5f09e12cf0b22f24738207",
       "evidence": [
         {
           "path": "native/webrtc/macos/mac-x64/declaration-ledger.json",
           "sha256": "103f389a79acabe6714cdfcc0d91e9dbf64188b077e07131824393f88a44a633"
+        },
+        {
+          "path": "native/webrtc/macos/evidence/dependency-caller-proof.json",
+          "sha256": "93a9903eaf8ab6fd76f8975b161fd5e709a30ee375895a4cfbdde065ed56b227"
         }
       ],
       "path": "src/third_party/test_fonts/test_fonts"
     },
     {
-      "decision": "unresolved",
+      "decision": "proven-inactive",
       "declaration_sha256": "11a8c5b21479f8313e27189db28532aed3ee4c3f0291390c25a78f6a8fef0e3e",
       "evidence": [
         {
           "path": "native/webrtc/macos/mac-x64/declaration-ledger.json",
           "sha256": "103f389a79acabe6714cdfcc0d91e9dbf64188b077e07131824393f88a44a633"
+        },
+        {
+          "path": "native/webrtc/macos/evidence/dependency-caller-proof.json",
+          "sha256": "93a9903eaf8ab6fd76f8975b161fd5e709a30ee375895a4cfbdde065ed56b227"
         }
       ],
       "path": "src/tools/luci-go"
     },
     {
-      "decision": "unresolved",
+      "decision": "proven-inactive",
       "declaration_sha256": "62b7186108c104253eeca040ea1d6a8e27d885bf9f266790dcf928d834e8928b",
       "evidence": [
         {
           "path": "native/webrtc/macos/mac-x64/declaration-ledger.json",
           "sha256": "103f389a79acabe6714cdfcc0d91e9dbf64188b077e07131824393f88a44a633"
+        },
+        {
+          "path": "native/webrtc/macos/evidence/dependency-caller-proof.json",
+          "sha256": "93a9903eaf8ab6fd76f8975b161fd5e709a30ee375895a4cfbdde065ed56b227"
         }
       ],
       "path": "src/tools/resultdb"

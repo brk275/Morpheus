@@ -276,9 +276,9 @@
       "sha256": "ebfdd22dd8eaa6ee893adbdc9fe904f5e859d33b7353b067a66c32df526508bf"
     },
     {
-      "bytes": 2688,
+      "bytes": 3038,
       "path": "reference/schema5-consumer-llvm-binding.json",
-      "sha256": "da892a568e43b7adb94bc1da31b5794cf16f8fe91f99c0fdf2e4d83a8c999d84"
+      "sha256": "1c72f514a7e385294aebbc55be2c72aad95bfb53135a1abc26ce3bd7c3314e6e"
     },
     {
       "bytes": 858,
@@ -434,7 +434,7 @@
     "path": "patch-manifest.json",
     "sha256": "e97be792680220ec3d21f39a0a950599a3266fd3041e2a8d5027df36d946b714"
   },
-  "pipeline_sha256": "ca6f9444ad76f850691de724b9153cac65dffc9ae57bf4c42bf94a16fd16ae9c",
+  "pipeline_sha256": "8f7d05207e7587300c1fbc5bfa73883ff45fe8eee594d6192d24b16cd3c8e2f3",
   "python_plan": {
     "path": "selected-python-inputs.json",
     "sha256": "b3cd3a5066338da7fa450fe48580d987dbb88f90d9497dc2106802ab989c0aea"

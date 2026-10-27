@@ -124,7 +124,7 @@ GATES = {"source", "deps-hooks", "toolchain-rust", "patches", "native-test-sourc
          "license-material", "license-gn-resolution", "wrapper-abi", "symbol-prefix",
          "generated-metadata"}
 HEX = re.compile(r"[0-9a-f]{64}\Z")
-MAC_MATERIAL_HELPER_SHA = "87e087e6f47f10134f04f119e8523d03d4ad67ed0f3971546d9c0edd7a713334"
+MAC_MATERIAL_HELPER_SHA = "3c526b2fe1b1618b212f0b37ee060d191912f1a0f5e784a18dc3c513d2c1457f"
 COMMAND_PROCESS_HELPER_SHA = "e99c8aadd7db5e53229ad836b2bba115bfc0a11d9cda6b00d9166759ba6a0211"
 MAX_LOG = 256 * 1024 * 1024
 MAX_INVENTORY = 128 * 1024 * 1024
@@ -616,7 +616,7 @@ class Build:
     def validate_mac_materials(self):
         data = self.m["mac_materials"]
         require(set(data) == {"schema", "plan", "materials", "overlay"}
-                and data["schema"] == "morpheus-macos-material-consumer-v1"
+                and data["schema"] == "morpheus-macos-material-consumer-v2"
                 and all(data[key]["root"] == "mac-data" for key in ("plan", "materials"))
                 and data["plan"]["path"] == "material-plan.json"
                 and data["materials"]["path"] == "tool-materials.json")
@@ -640,7 +640,8 @@ class Build:
         for rows, prefix, mount in ((core_rows, "tools/gn/", "buildtools/mac/"),
                 (core_rows, "tools/ninja/", "third_party/ninja/"),
                 (core_rows, "tools/clang/", "third_party/llvm-build/Release+Asserts/"),
-                (expected, "runtime/rust/", "third_party/rust-toolchain/")):
+                (expected, "runtime/rust/", "third_party/rust-toolchain/"),
+                (expected, "runtime/llvmobjdump/", "third_party/llvm-build/Release+Asserts/")):
             for name, row in rows.items():
                 if name.startswith(prefix):
                     projected.append({"path": mount + name[len(prefix):], "type": "file",

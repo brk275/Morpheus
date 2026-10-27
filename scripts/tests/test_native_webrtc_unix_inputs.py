@@ -488,7 +488,7 @@ class NativeMacMaterialBoundaryTests(unittest.TestCase):
                 path = _SCRIPT.parents[1] / "native/webrtc/macos" / target / "selected-mac-materials.json"
                 plan = json.loads(path.read_bytes())
                 self.assertIs(_MAC.validate(plan, target, _MATERIAL, python), plan)
-                self.assertEqual(len(plan["materials"]), 34)
+                self.assertEqual(len(plan["materials"]), 35)
                 self.assertEqual(sum(row["seed_cache"] for row in plan["materials"]), 30)
                 self.assertEqual(plan["roles"]["vpython3"]["path"],
                     "runtime/vpython/vpython3.app/Contents/MacOS/vpython3")
@@ -508,6 +508,66 @@ class NativeMacMaterialBoundaryTests(unittest.TestCase):
                 plan["roles"]["vpython3"]["path"] = "runtime/vpython/vpython3"
                 with self.assertRaises(_MAC.Refused):
                     _MAC.validate(plan, target, _MATERIAL, python)
+
+    def test_real_mac_llvm_addon_pins_and_original_regular_copy_are_required(self):
+        python = _PIPELINE.module("python_stager.py")
+        pins = {
+            "mac-arm64": ("Mac_arm64", "cace63bdf68ff4be9680c497a9d15482f52fe01ebeb0de65dce1828e5628df12", 5350540, 1763731858865476),
+            "mac-x64": ("Mac", "65c229f8ac773e258bcf4ba67038d8db9f9100fea063c60263d7d37a8cee2374", 5611140, 1763731833330327),
+        }
+        for target, (prefix, digest, size, generation) in pins.items():
+            with self.subTest(target=target):
+                path = _SCRIPT.parents[1] / "native/webrtc/macos" / target / "selected-mac-materials.json"
+                plan = json.loads(path.read_bytes())
+                _MAC.validate(plan, target, _MATERIAL, python)
+                row = next(r for r in plan["materials"] if r["name"] == "llvmobjdump")
+                self.assertEqual(plan["schema"], "morpheus-native-macos-materials-v2")
+                self.assertEqual((row["sha256"], row["bytes"], row["source"]["generation"]), (digest, size, generation))
+                self.assertEqual(row["source"], {"kind": "gcs", "bucket": "chromium-browser-clang",
+                    "object": prefix + "/llvmobjdump-llvmorg-22-init-14273-gea10026b-2.tar.xz", "generation": generation})
+                self.assertEqual(len(row["members"]), 8)
+                self.assertEqual(len(row["alias_copies"]), 1)
+                copy = row["alias_copies"][0]
+                regular = next(m for m in row["members"] if m["path"] == "bin/llvm-objdump")
+                self.assertEqual((copy["path"], copy["source"], copy["linkname"]),
+                                 ("bin/llvm-otool", "bin/llvm-objdump", "llvm-objdump"))
+                self.assertEqual((copy["bytes"], copy["sha256"], copy["output_mode"]),
+                                 (regular["bytes"], regular["sha256"], regular["output_mode"]))
+                for field in ("missing", "platform", "generation", "alias"):
+                    changed = json.loads(json.dumps(plan))
+                    addon = next(r for r in changed["materials"] if r["name"] == "llvmobjdump")
+                    if field == "missing": changed["materials"].remove(addon)
+                    elif field == "platform": addon["source"]["object"] = "Linux_x64/" + addon["source"]["object"].split("/", 1)[1]
+                    elif field == "generation": addon["source"]["generation"] += 1
+                    else: addon["alias_copies"][0]["linkname"] = "../../outside"
+                    with self.subTest(refusal=field), self.assertRaises(_MAC.Refused):
+                        _MAC.validate(changed, target, _MATERIAL, python)
+
+
+    def test_llvm_addon_projects_real_bytes_without_overwrite_or_marker_crossing(self):
+        payload = b"synthetic original addon"
+        digest = hashlib.sha256(payload).hexdigest()
+        name = "runtime/llvmobjdump/bin/llvm-objdump"
+        row = {"path": name, "bytes": len(payload), "sha256": digest, "mode": 0o700}
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / "source"; source.mkdir(mode=0o700)
+            runtime = root / "runtime-data"
+            original = runtime / name; original.parent.mkdir(mode=0o700, parents=True)
+            original.write_bytes(payload); original.chmod(0o700)
+            overlay = _MAC.project(source, {}, {"."}, [], (runtime, {}), (runtime, {name: row}), "mac-arm64", _MATERIAL)
+            output = "third_party/llvm-build/Release+Asserts/bin/llvm-objdump"
+            self.assertEqual(overlay, [{"path": output, "type": "file", "mode": "100755", "bytes": len(payload), "sha256": digest}])
+            self.assertEqual((source / "checkout/src" / output).read_bytes(), payload)
+            self.assertFalse((source / "checkout/src" / output).is_symlink())
+            for marker in ("src/third_party/llvm-build/Release+Asserts", "src/third_party/llvm-build/Release+Asserts/bin/llvm-objdump"):
+                with self.subTest(marker=marker), mock.patch.object(_MATERIAL, "file_fact", side_effect=AssertionError("copy before marker check")):
+                    with self.assertRaises(_MAC.Refused):
+                        _MAC.project(source, {}, {"."}, [marker], (runtime, {}), (runtime, {name: row}), "mac-arm64", _MATERIAL)
+            with mock.patch.object(_MATERIAL, "file_fact", side_effect=AssertionError("copy before original collision check")):
+                with self.assertRaises(_MAC.Refused):
+                    _MAC.project(source, {"checkout/src/" + output: row}, {"."}, [], (runtime, {}), (runtime, {name: row}), "mac-arm64", _MATERIAL)
+
 
     def test_zip_implicit_parents_are_derived_without_accepting_aliases_or_file_parents(self):
         member = {"path": "app/Contents/bin/tool", "kind": "regular", "mode": 0o100755,

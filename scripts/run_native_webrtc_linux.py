@@ -42,13 +42,13 @@ PYTHON_PLAN = "b3cd3a5066338da7fa450fe48580d987dbb88f90d9497dc2106802ab989c0aea"
 INSTRUMENTED_PLAN = "927a95029b9ddc8f4b4cce20f07975505b343260d913b9c3488bc6f6182ad0f9"
 HELPERS = {
     "git_source_stager.py": "e99c8aadd7db5e53229ad836b2bba115bfc0a11d9cda6b00d9166759ba6a0211",
-    "source_importer.py": "c74bdee7672625427f584769d2401fd9e8cbe1d59187d42086c07b48372c5833",
+    "source_importer.py": "1eb339a7fe46382443bd8bfcab85d8e69bf75039d8e310c4d501cdcbe9cc769e",
     "linux_stager.py": "f3a908bc20170ee01f2643169ce60397627981d86de11ffaedf03dd8ea9e1c8c",
     "python_stager.py": "4de9a016a988535b7576f2e0d7561afa290529dae7b1eb267bb8382956d49d02",
     "instrumented_stager.py": "8903aef2de2ea5a7778ad4ba21047909ad7595d3e1359f151829e489910fc84f",
     "linux_materials.py": "acca8d027e3e2f1ce3a38181345b522a2906e5eeb1a1fc39cd3c1d2ff3bf0b51",
 }
-BUILD_RECIPE = "e845aeaa16dd270d1c9e319feeecbe18be1d77677646e83d460bc1605f267bb7"
+BUILD_RECIPE = "e664095571eb5239fecdc9410b77f2e34fc7907da9ae67d399ba53206547b1fb"
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 # Last-entered fixed operation only, never a claimed unique failure cause.
