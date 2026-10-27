@@ -8,6 +8,7 @@
 //! pure; `super` drives the window.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use morpheus_config::{AccountOverrides, Config};
 use serde_json::{Map, Value};
@@ -338,6 +339,9 @@ pub(crate) enum Resolution {
 
 #[derive(Default)]
 pub(crate) struct Draft {
+    // A pending Apply retains this exact token. Every draft mutation gets
+    // a new one, so returning to identical values cannot revive that Apply.
+    revision: Arc<()>,
     edits: Edits,
     undo: VecDeque<Edits>,
     redo: VecDeque<Edits>,
@@ -351,6 +355,14 @@ fn push_bounded(stack: &mut VecDeque<Edits>, edits: Edits) {
 }
 
 impl Draft {
+    pub(crate) fn revision(&self) -> &Arc<()> {
+        &self.revision
+    }
+
+    fn changed(&mut self) {
+        self.revision = Arc::new(());
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.edits.is_empty()
     }
@@ -402,6 +414,7 @@ impl Draft {
         let previous = std::mem::replace(&mut self.edits, next);
         push_bounded(&mut self.undo, previous);
         self.redo.clear();
+        self.changed();
         true
     }
 
@@ -411,6 +424,7 @@ impl Draft {
         };
         let current = std::mem::replace(&mut self.edits, previous);
         push_bounded(&mut self.redo, current);
+        self.changed();
         true
     }
 
@@ -420,10 +434,13 @@ impl Draft {
         };
         let current = std::mem::replace(&mut self.edits, next);
         push_bounded(&mut self.undo, current);
+        self.changed();
         true
     }
 
     pub(crate) fn discard(&mut self) {
+        // Default allocates a new token; an old retry still owns its old
+        // allocation, so even discard-and-recreate cannot restore it.
         *self = Self::default();
     }
 
@@ -463,6 +480,8 @@ impl Draft {
         keep(&mut self.edits);
         self.undo.iter_mut().for_each(keep);
         self.redo.iter_mut().for_each(keep);
+        // The account transition also invalidates history-only changes.
+        self.changed();
         before - self.edits.len()
     }
 }

@@ -14896,6 +14896,47 @@ async fn assert_theme_studio_publish_race(ui: &AppWindow, directory: &std::path:
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
     assert_eq!(store.load().unwrap().geometry.corner_radius, 8);
     assert_eq!(ui.get_studio_pending(), 1);
+
+    // Returning to the same drafted values is still a new intent. An old
+    // Apply must not become authorized again after Undo/Redo, an edit round
+    // trip, or Discard followed by recreating that draft.
+    for action in 0..3 {
+        let before = on_disk();
+        holder.lock().unwrap();
+        ui.invoke_studio_apply();
+        match action {
+            0 => {
+                ui.invoke_studio_undo();
+                ui.invoke_studio_redo();
+            }
+            1 => {
+                crate::save_config_change(ui, &store, |config| {
+                    config.geometry.corner_radius = 11;
+                })
+                .unwrap();
+                crate::save_config_change(ui, &store, |config| {
+                    config.geometry.corner_radius = 10;
+                })
+                .unwrap();
+            }
+            _ => {
+                ui.invoke_studio_discard();
+                crate::save_config_change(ui, &store, |config| {
+                    config.geometry.corner_radius = 10;
+                })
+                .unwrap();
+            }
+        }
+        assert_eq!(ui.get_studio_pending(), 1);
+        holder.unlock().unwrap();
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+        assert_eq!(on_disk(), before, "an intervening action cancels Apply");
+        assert_eq!(ui.get_studio_pending(), 1);
+    }
+    // A fresh explicit Apply still saves the current draft normally.
+    ui.invoke_studio_apply();
+    assert_eq!(store.load().unwrap().geometry.corner_radius, 10);
+    assert_eq!(ui.get_studio_pending(), 0);
     drop(holder);
 
     ui.invoke_studio_discard();

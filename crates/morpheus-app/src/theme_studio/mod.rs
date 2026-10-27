@@ -37,6 +37,7 @@ pub(crate) mod scope;
 mod session;
 
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::time::Duration;
 
 use morpheus_config::{CommitError, Config, ConfigRevision, ConfigStore, ThemePack};
@@ -62,6 +63,7 @@ const APPLY_RETRY_DELAY: Duration = Duration::from_millis(150);
 struct PendingApply {
     attempt: u8,
     edits: Edits,
+    revision: Arc<()>,
     scope: scope::Scope,
     resolution: Option<Resolution>,
 }
@@ -712,6 +714,7 @@ fn retry_later(ui: &AppWindow, resolution: Option<Resolution>, attempt: u8) {
         studio.retry = Some(PendingApply {
             attempt,
             edits: studio.draft.edits().clone(),
+            revision: studio.draft.revision().clone(),
             scope: captured,
             resolution,
         });
@@ -735,13 +738,16 @@ fn retry_later(ui: &AppWindow, resolution: Option<Resolution>, attempt: u8) {
 
 /// Try a waiting Apply again, only for the same draft, account and choice.
 /// Anything the person did meanwhile (an edit, Undo, Discard, an account
-/// switch) owns the draft now, so the old Apply is dropped.
+/// switch) owns the draft now, so the old Apply is dropped. Returning to the
+/// same values does not restore that earlier Apply's change identity.
 fn retry_apply(ui: &AppWindow) {
     let Some(pending) = with(|studio| studio.retry.take()) else {
         return;
     };
-    let same =
-        with(|studio| *studio.draft.edits() == pending.edits) && scope::current(ui, &pending.scope);
+    let same = with(|studio| {
+        Arc::ptr_eq(studio.draft.revision(), &pending.revision)
+            && *studio.draft.edits() == pending.edits
+    }) && scope::current(ui, &pending.scope);
     if !same {
         if drafting() {
             notify(
