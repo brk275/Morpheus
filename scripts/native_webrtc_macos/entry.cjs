@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 // Only source-fixed categories may cross the failed-entry boundary.
-const ENTRY_FAILURES = Object.freeze(["entry", "host_guard", "workspace", "plan_read", "plan_parse", "plan_identity", "preflight_input", "preflight_tools", "preflight_xcode_listing", "preflight_xcode_root", "preflight_xcode_version", "preflight_sdk_listing", "preflight_sdk_metadata", "preflight_sdk_inventory", "preflight_python_listing", "preflight_zstd_candidates", "preflight_emit", "producer_input", "python_admission", "producer_source", "exec_support", "producer_args", "exec_handover"]);
+const ENTRY_FAILURES = Object.freeze(["entry", "host_guard", "workspace", "plan_read", "plan_parse", "plan_identity", "preflight_input", "preflight_tools", "preflight_xcode_listing", "preflight_xcode_root", "preflight_xcode_version", "preflight_sdk_listing", "preflight_sdk_metadata", "preflight_sdk_inventory", "preflight_sdk_intake", "preflight_python_listing", "preflight_zstd_candidates", "preflight_emit", "producer_input", "python_admission", "producer_source", "exec_support", "producer_args", "exec_handover"]);
 let entryFailure = 'entry';
 function need(ok) { if (!ok) throw new Error(); }
 function fact(name, cap = 128 * 1024 * 1024) {
@@ -69,6 +69,151 @@ function sdkInventory(root) {
     directory_topology_sha256: crypto.createHash('sha256').update(dirBytes).digest('hex'), files: files.length,
     directories: directories.length, original_file_bytes: total, sdk_bytes_copied: false };
 }
+// Read-only material observation only. This does not admit an SDK, its owners,
+// aliases or permissions for stage/build. The original strict fact() and
+// sdkInventory() execution inputs remain separate and unchanged.
+function sdkIntake(app) {
+  need(typeof app === 'string' && app.length <= 255 && /^Xcode(?:_[A-Za-z0-9_.-]+)?\.app$/.test(app));
+  const root = fs.realpathSync(path.join('/Applications', app));
+  need(path.dirname(root) === '/Applications' && /^Xcode(?:_[A-Za-z0-9_.-]+)?\.app$/.test(path.basename(root)));
+  const started = process.hrtime.bigint(), buffer = Buffer.alloc(1024 * 1024);
+  const limits = {entries: 1000000, depth: 64, file_bytes: 2 * 1024 ** 3,
+    total_bytes: 64 * 1024 ** 3, metadata_bytes: 128 * 1024 ** 2, seconds: 240};
+  const files = [], directories = [], metadata = [], snapshots = [], anchors = [];
+  const seen = new Set(), owners = new Set();
+  // Two bytes reserve the array/newline envelope beyond per-row '+ 1'.
+  let total = 0, entries = 0, metadataBytes = 2, live = 0, strictPolicy = true;
+  function budget() { need(process.hrtime.bigint() - started <= BigInt(limits.seconds) * 1000000000n
+    && entries <= limits.entries && total <= limits.total_bytes && metadataBytes <= limits.metadata_bytes && live <= 66); }
+  const inside = value => value === root || value.startsWith(root + path.sep);
+  function relative(value) {
+    need(inside(value));
+    const name = path.relative(root, value).split(path.sep).join('/') || '.';
+    need(name.length <= 4096 && !/[\\\x00-\x1f\x7f\ufffd]/.test(name)
+      && (name === '.' || !name.split('/').some(x => !x || ['.', '..', '.git'].includes(x))));
+    return name;
+  }
+  const stat = name => fs.lstatSync(name, {bigint: true});
+  const same = (a, b) => ['dev','ino','mode','uid','gid','nlink','size','mtimeNs','ctimeNs'].every(k => a[k] === b[k]);
+  function row(name, info, type) {
+    owners.add(info.uid.toString()); need(owners.size <= 64);
+    if (type !== 'symlink' && (info.uid !== 0n || (info.mode & 0o022n) !== 0n)) strictPolicy = false;
+    const value = {path: name, type, dev: info.dev.toString(), ino: info.ino.toString(),
+      mode: Number(info.mode), uid: info.uid.toString(), gid: info.gid.toString(),
+      links: info.nlink.toString(), bytes: info.size.toString(),
+      mtime_ns: info.mtimeNs.toString(), ctime_ns: info.ctimeNs.toString()};
+    // Reserve the complete digest field before any file open/read or row retention.
+    if (type === 'file') value.sha256 = '0'.repeat(64);
+    metadataBytes += Buffer.byteLength(JSON.stringify(value), 'utf8') + 1; budget(); return value;
+  }
+  function names(directory) {
+    const result = [], exact = new Set(); const stream = fs.opendirSync(directory);
+    try { for (;;) { budget(); const entry = stream.readSync(); if (!entry) break;
+      need(typeof entry.name === 'string' && entry.name.length > 0 && entry.name.length <= 255
+        && !/[\\/\x00-\x1f\x7f\ufffd]/.test(entry.name) && !['.', '..', '.git'].includes(entry.name)
+        && !exact.has(entry.name)); exact.add(entry.name);
+      relative(path.join(directory, entry.name)); result.push(entry.name); need(result.length <= limits.entries); }
+    } finally { stream.closeSync(); }
+    result.sort((a,b) => Buffer.compare(Buffer.from(a), Buffer.from(b))); return result;
+  }
+  function resolveAlias(file) {
+    let todo = relative(file).split('/'), done = [], links = 0; const visited = new Set();
+    while (todo.length) {
+      budget(); const part = todo.shift();
+      if (part === '' || part === '.') continue;
+      if (part === '..') { need(done.length > 0); done.pop(); continue; }
+      const current = path.join(root, ...done, part);
+      need(inside(current)); const info = stat(current);
+      if (info.isSymbolicLink()) {
+        need(++links <= 64 && !visited.has(current)); visited.add(current);
+        const target = fs.readlinkSync(current); need(typeof target === 'string' && target.length <= 4096
+          && !/[\x00-\x1f\x7f\ufffd]/.test(target) && !target.includes('\\'));
+        need(same(info, stat(current)) && fs.readlinkSync(current) === target);
+        // Resolve each original component before '..'; lexical path.resolve()
+        // would incorrectly erase a preceding symlink component.
+        if (path.isAbsolute(target)) {
+          need(target === root || target.startsWith(root + path.sep));
+          todo = (target === root ? [] : target.slice(root.length + 1).split('/')).concat(todo); done = [];
+        } else todo = target.split('/').concat(todo);
+      } else { need(todo.length ? info.isDirectory() : info.isDirectory() || info.isFile()); done.push(part); }
+      need(done.length + todo.length <= limits.depth);
+    }
+    return relative(path.join(root, ...done));
+  }
+  function checkAnchors() { for (const value of anchors) need(same(value.info, fs.fstatSync(value.fd, {bigint: true}))
+    && same(value.info, stat(value.path))); }
+  function walk(directory, depth) {
+    budget(); need(depth <= limits.depth); checkAnchors();
+    const before = stat(directory); need(before.isDirectory() && !before.isSymbolicLink());
+    const fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    live++; const anchor = {path: directory, info: before, fd}; anchors.push(anchor);
+    try {
+      need(same(before, fs.fstatSync(fd, {bigint: true}))); const name = relative(directory);
+      directories.push(name); metadata.push(row(name, before, 'directory'));
+      const original = names(directory); snapshots.push({path: directory, info: before, names: original});
+      for (const child of original) {
+        budget(); checkAnchors(); need(++entries <= limits.entries);
+        const file = path.join(directory, child), name = relative(file); need(!seen.has(name)); seen.add(name);
+        const info = stat(file);
+        if (info.isSymbolicLink()) {
+          const target = fs.readlinkSync(file); const resolved = resolveAlias(file);
+          need(same(info, stat(file)) && fs.readlinkSync(file) === target);
+          const value = row(name, info, 'symlink'); value.target = target; value.resolved_path = resolved;
+          metadataBytes += 64 + Buffer.byteLength(JSON.stringify(target), 'utf8') + Buffer.byteLength(JSON.stringify(resolved), 'utf8'); budget(); metadata.push(value);
+          files.push({path: name, target, type: 'symlink'});
+        } else if (info.isDirectory()) walk(file, depth + 1);
+        else {
+          need(info.isFile() && info.size >= 0n && info.size <= BigInt(limits.file_bytes)
+            && info.size <= BigInt(limits.total_bytes - total));
+          const value = row(name, info, 'file'); const expected = Number(info.size);
+          const input = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+          live++;
+          try {
+            need(same(info, fs.fstatSync(input, {bigint: true}))); const hash = crypto.createHash('sha256'); let count = 0;
+            for (;;) { budget(); const size = Math.min(buffer.length, expected - count + 1);
+              const got = fs.readSync(input, buffer, 0, size, null); if (!got) break;
+              count += got; total += got; need(count <= expected); budget(); hash.update(buffer.subarray(0, got)); }
+            need(count === expected && same(info, fs.fstatSync(input, {bigint: true})) && same(info, stat(file)));
+            value.sha256 = hash.digest('hex'); metadata.push(value);
+            files.push({bytes: count, path: name, sha256: value.sha256, type: 'file'});
+          } finally { fs.closeSync(input); live--; }
+        }
+      }
+      need(JSON.stringify(names(directory)) === JSON.stringify(original)); checkAnchors();
+    } finally { anchors.pop(); fs.closeSync(fd); live--; }
+  }
+  walk(root, 0);
+  // Recheck original directory topology and each named identity after the full
+  // read. This is a bounded host material snapshot, not an atomic OS lock.
+  for (const value of snapshots) { budget(); need(same(value.info, stat(value.path))
+    && JSON.stringify(names(value.path)) === JSON.stringify(value.names)); }
+  for (const value of metadata) { budget(); const info = stat(path.join(root, value.path));
+    need(info.dev.toString() === value.dev && info.ino.toString() === value.ino && Number(info.mode) === value.mode
+      && info.uid.toString() === value.uid && info.gid.toString() === value.gid && info.nlink.toString() === value.links
+      && info.size.toString() === value.bytes && info.mtimeNs.toString() === value.mtime_ns && info.ctimeNs.toString() === value.ctime_ns);
+    if (value.type === 'symlink') need(fs.readlinkSync(path.join(root, value.path)) === value.target
+      && resolveAlias(path.join(root, value.path)) === value.resolved_path); }
+  const compare = (a,b) => Buffer.compare(Buffer.from(a,'utf8'), Buffer.from(b,'utf8'));
+  files.sort((a,b) => compare(a.path,b.path)); directories.sort(compare); metadata.sort((a,b) => compare(a.path,b.path));
+  function canonical(value) { if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(k => [k, canonical(value[k])])); return value; }
+  function digest(value) { const bytes = Buffer.from(JSON.stringify(canonical(value)) + '\n');
+    need(bytes.length <= limits.metadata_bytes); return {bytes: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex')}; }
+  const versions = files.filter(r => r.type === 'file' && (r.path === 'Contents/version.plist'
+    || /^Contents\/Developer\/Platforms\/MacOSX\.platform\/Developer\/SDKs\/MacOSX(?:\d+\.\d+)?\.sdk\/(?:SDKSettings\.(?:plist|json)|System\/Library\/CoreServices\/SystemVersion\.plist)$/.test(r.path)));
+  const sdkPattern = /^Contents\/Developer\/Platforms\/MacOSX\.platform\/Developer\/SDKs\/MacOSX(?:\d+\.\d+)?\.sdk$/;
+  const sdks = metadata.filter(r => sdkPattern.test(r.path)).map(r => ({path: r.path, type: r.type,
+    ...(r.type === 'symlink' ? {target: r.target, resolved_path: r.resolved_path} : {})}));
+  need(versions.length <= 128 && sdks.length <= 32 && live === 0);
+  return {schema: 'morpheus-native-macos-sdk-intake-v1', app: path.basename(root), requested_app: app,
+    file_inventory: digest(files), directory_topology: digest(directories), metadata_inventory: digest(metadata),
+    files: files.length, directories: directories.length, original_file_bytes: total, owner_uids: [...owners].sort(),
+    original_root_owned_nonwritable_policy_observed: strictPolicy, metadata_roles: versions, sdk_candidates: sdks,
+    developer_directory_observed: directories.includes('Contents/Developer'), snapshot_complete: true,
+    provenance: 'UNBOUND', host_approval_granted: false, build_admission_granted: false,
+    sdk_bytes_copied: false, sdk_redistributed: false, build_ready: false, distribution_ready: false};
+}
+
 // Optional discovery never promotes a refused identity into an admitted SDK.
 // Only fixed categories and already-filtered app/SDK basenames leave this path.
 function preflightXcodes() {
@@ -142,6 +287,18 @@ try {
     entryFailure = 'preflight_tools';
     const tools = {};
     for (const role of ['git', 'xcodebuild', 'xcrun', 'xcode-select', 'sw_vers']) tools[role] = fact('/usr/bin/' + role);
+    const detail = input('preflight_detail') || 'basic';
+    need(['basic', 'host-sdk'].includes(detail));
+    if (detail === 'host-sdk') {
+      entryFailure = 'preflight_sdk_intake';
+      need(input('xcode_app') !== '');
+      const intake = sdkIntake(input('xcode_app'));
+      console.log('MORPHEUS_NATIVE_MAC_SDK_INTAKE ' + JSON.stringify({schema: 1, target,
+        source_commit: process.env.GITHUB_SHA, run_id: process.env.GITHUB_RUN_ID, run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+        image_os: process.env.ImageOS || null, image_version: process.env.ImageVersion || null, plan_sha256: planSha,
+        tools, intake, sdk_full_inventory: 'UNBOUND', sdk_redistributed: false, cache_write: false, staged: false,
+        build_admission_granted: false, native_sources_complete: false, build_ready: false, distribution_ready: false}));
+    } else {
     const {xcodes, sdk, xcodeCandidates, sdkCandidates} = preflightXcodes();
     let fullSdk = 'UNBOUND';
     if (input('xcode_app')) {
@@ -182,9 +339,10 @@ try {
       python_candidates: pythonCandidates, zstd_candidates: zstdCandidates, sdk_full_inventory: fullSdk,
       sdk_redistributed: false, cache_write: false, staged: false, build_admission_granted: false,
       native_sources_complete: false, build_ready: false, distribution_ready: false }));
+    }
   } else {
     entryFailure = 'producer_input';
-    need(input('xcode_app') === '');
+    need(input('xcode_app') === '' && ['','basic'].includes(input('preflight_detail')));
     need(['stage', 'build', 'cache-receipt'].includes(phase) && /^[0-9a-f]{64}$/.test(input('plan_sha256')) && planSha === input('plan_sha256'));
     entryFailure = 'python_admission';
     const python = plan.host_python;

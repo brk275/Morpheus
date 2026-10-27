@@ -6,6 +6,11 @@ on:
         type: choice
         options: [mac-arm64, mac-x64]
         required: true
+      preflight_detail:
+        description: Basic host discovery or selected read-only SDK material intake (no admission)
+        type: choice
+        options: [basic, host-sdk]
+        default: basic
       xcode_app:
         description: Optional exact /Applications Xcode app basename for read-only full host inventory
         type: string
@@ -62,6 +67,7 @@ jobs:
         with:
           target: ${{ inputs.target }}
           phase: ${{ inputs.phase }}
+          preflight_detail: ${{ inputs.preflight_detail }}
           xcode_app: ${{ inputs.xcode_app }}
           plan_sha256: ${{ inputs.plan_sha256 }}
           publish_handoff: ${{ inputs.publish_handoff && 'true' || 'false' }}

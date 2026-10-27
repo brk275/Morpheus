@@ -831,3 +831,186 @@ console.log(JSON.stringify({output, errors, exitCode: processFixture.exitCode ||
 
 if __name__ == "__main__":
     unittest.main()
+class NativeMacSdkIntakeTests(unittest.TestCase):
+    def intake_result(self, scenario, target="mac-arm64"):
+        # Source-reviewed real entry against complete synthetic host DATA. No
+        # native tool, installed SDK, network or owner filesystem is accessed.
+        script = r"""
+const fs = require('node:fs'), path = require('node:path').posix, crypto = require('node:crypto');
+const vm = require('node:vm'), assert = require('node:assert/strict');
+let source = fs.readFileSync(process.argv[1], 'utf8');
+const scenario = process.argv[2], target = process.argv[3];
+if (scenario === 'metadata_limit') {
+  const fixed = 'metadata_bytes: 128 * 1024 ** 2'; assert.equal(source.split(fixed).length, 2);
+  source = source.replace(fixed, 'metadata_bytes: 500');
+}
+const root = '/Applications/Xcode_fixture.app', planPath = '/synthetic/native/webrtc/macos/' + target + '/pipeline-plan.json';
+const tree = new Map(); let inode = 1, outsideReads = 0, walks = 0, payloadReads = 0, calls = 0;
+function add(name, type, bytes = '') { tree.set(name, {type, data: Buffer.from(bytes), ino: inode++}); }
+add(root, 'directory');
+function file(name, bytes) {
+  let here = path.dirname(name); const parents = [];
+  while (here !== root && here.startsWith(root + '/')) { parents.push(here); here = path.dirname(here); }
+  for (const parent of parents.reverse()) if (!tree.has(parent)) add(parent, 'directory');
+  add(name, 'file', bytes);
+}
+file(root + '/Contents/version.plist', 'version');
+const sdkBase = root + '/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/';
+const sdkName = scenario === 'plain' ? 'MacOSX.sdk' : 'MacOSX15.1.sdk';
+file(sdkBase + sdkName + '/SDKSettings.plist', 'settings');
+if (scenario === 'plain') { add(sdkBase + 'MacOSX15.1.sdk', 'symlink'); tree.get(sdkBase + 'MacOSX15.1.sdk').target = 'MacOSX.sdk'; }
+if (scenario === 'component_local') {
+  file(sdkBase + 'nested/MacOSX15.1.sdk/SDKSettings.plist', 'nested-settings');
+  add(sdkBase + 'nested/directory', 'directory');
+  add(sdkBase + 'pivot', 'symlink'); tree.get(sdkBase + 'pivot').target = 'nested/directory';
+  add(sdkBase + 'MacOSX15.2.sdk', 'symlink'); tree.get(sdkBase + 'MacOSX15.2.sdk').target = 'pivot/../MacOSX15.1.sdk';
+}
+file(root + '/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang', 'binary');
+add(root + '/Contents/link', 'symlink'); tree.get(root + '/Contents/link').target =
+  scenario === 'escape' ? '/private/never-read' : scenario === 'cycle' ? 'link' :
+    scenario === 'component_escape' ? 'pivot/../version.plist' : 'version.plist';
+if (scenario === 'component_escape') { add(root + '/Contents/pivot', 'symlink'); tree.get(root + '/Contents/pivot').target = '/private/never-read'; }
+if (scenario === 'metadata_limit') {
+  for (const name of [...tree.keys()]) if (![root, root + '/Contents', root + '/Contents/version.plist'].includes(name)) tree.delete(name);
+}
+if (scenario === 'fifo') add(root + '/AAA_fifo', 'fifo');
+if (scenario === 'oversize') { add(root + '/AAA_large', 'file'); tree.get(root + '/AAA_large').size = 2 * 1024 ** 3 + 1; }
+const bytes = new Map([[planPath, Buffer.from(JSON.stringify({schema: 'morpheus-native-macos-pipeline-v1', target}))]]);
+for (const role of ['git','xcodebuild','xcrun','xcode-select','sw_vers']) bytes.set('/usr/bin/' + role, Buffer.from('tool'));
+const descriptors = new Map(), opened = []; let next = 10;
+function info(name, big = false, changed = false) {
+  if (name.startsWith('/private/')) { outsideReads++; throw new Error('opaque'); }
+  const node = tree.get(name); assert.ok(node || bytes.has(name), 'unknown synthetic node');
+  const type = node ? node.type : 'file', uid = node && scenario === 'owner' ? 501 : 0;
+  const mode = type === 'directory' ? 0o40755 : type === 'symlink' ? 0o120777 :
+    type === 'fifo' ? 0o10600 : scenario === 'mode' && node ? 0o100666 : 0o100644;
+  const n = value => big ? BigInt(value) : value;
+  return {isFile: () => type === 'file', isDirectory: () => type === 'directory', isSymbolicLink: () => type === 'symlink',
+    dev: n(1), ino: n((node ? node.ino : 2000) + (changed ? 1000 : 0)), mode: n(mode), uid: n(uid), gid: n(0),
+    nlink: n(1), size: n(node ? node.size || (type === 'file' ? node.data.length : 0) : bytes.get(name).length),
+    mtimeNs: n(10), ctimeNs: n(20), mtimeMs: 1, ctimeMs: 1};
+}
+function names(name) {
+  const prefix = name + '/', result = [];
+  for (const key of tree.keys()) if (key.startsWith(prefix) && !key.slice(prefix.length).includes('/')) result.push(path.basename(key));
+  if (scenario === 'directory_change' && name === root && payloadReads) result.push('added');
+  return result;
+}
+const fake = {constants: fs.constants,
+  realpathSync(name) { if (name === '/synthetic' || name === root) return name; throw new Error('opaque'); },
+  openSync(name, flags) { assert.ok(flags & fs.constants.O_NOFOLLOW); const node = tree.get(name);
+    assert.ok(node || bytes.has(name)); assert.ok(!node || ['file','directory'].includes(node.type));
+    const fd = next++; descriptors.set(fd, {name, position: 0}); opened.push(name); return fd; },
+  closeSync(fd) { assert.ok(descriptors.delete(fd)); },
+  fstatSync(fd, options) { const owner = descriptors.get(fd); assert.ok(owner);
+    return info(owner.name, !!(options && options.bigint), scenario === 'identity' && owner.name === root + '/Contents/version.plist' && owner.position > 0); },
+  lstatSync(name, options) { return info(name, !!(options && options.bigint)); },
+  statSync(name) { return info(name); },
+  readFileSync(fd) { const owner = descriptors.get(fd); return Buffer.from(bytes.get(owner.name)); },
+  readSync(fd, buffer, offset = 0, length = buffer.length) {
+    const owner = descriptors.get(fd), value = bytes.get(owner.name) || tree.get(owner.name).data;
+    const count = Math.min(length, value.length - owner.position); value.copy(buffer, offset, owner.position, owner.position + count);
+    owner.position += count; if (count && owner.name.startsWith(root)) payloadReads++; return count; },
+  readlinkSync(name) { assert.equal(tree.get(name).type, 'symlink'); return tree.get(name).target; },
+  opendirSync(name) { assert.equal(tree.get(name).type, 'directory'); const rows = names(name); walks++; let i = 0, closed = false;
+    return {readSync() { assert.ok(!closed); return i < rows.length ? {name: rows[i++]} : null; },
+      closeSync() { assert.ok(!closed); closed = true; walks--; }}; },
+};
+const output = [], errors = [];
+const env = {INPUT_TARGET: target, INPUT_PHASE: scenario === 'stage_detail' ? 'stage' : 'preflight',
+  INPUT_PREFLIGHT_DETAIL: 'host-sdk', INPUT_XCODE_APP: scenario === 'empty' || scenario === 'stage_detail' ? '' :
+    scenario === 'traversal' ? '../private.app' : 'Xcode_fixture.app', INPUT_PUBLISH_HANDOFF: 'false',
+  GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'github-hosted', GITHUB_REPOSITORY: 'brk275/Morpheus',
+  GITHUB_REF: 'refs/heads/main', GITHUB_ACTOR: 'brk275', GITHUB_TRIGGERING_ACTOR: 'brk275',
+  GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_WORKSPACE: '/synthetic'};
+const proc = {platform: 'darwin', arch: target === 'mac-arm64' ? 'arm64' : 'x64', env,
+  hrtime: {bigint: () => BigInt(calls++)}, stderr: {write: value => errors.push(value)},
+  execve() { throw new Error('unexpected-native-execution'); }};
+vm.runInNewContext(source, {Buffer, process: proc, console: {log: value => output.push(value)},
+  require(name) { if (name === 'node:fs') return fake; if (name === 'node:path') return path;
+    if (name === 'node:crypto') return crypto; throw new Error('unexpected-module'); }}, {timeout: 2000});
+assert.equal(descriptors.size, 0); assert.equal(walks, 0); assert.equal(outsideReads, 0);
+assert.ok(!JSON.stringify({output, errors}).includes('/private/never-read'));
+console.log(JSON.stringify({output, errors, exitCode: proc.exitCode || 0,
+  selected_file_opened: opened.includes(root + '/Contents/version.plist'),
+  oversized_payload_opened: opened.includes(root + '/AAA_large'), fifo_opened: opened.includes(root + '/AAA_fifo')}));
+"""
+        import subprocess
+        entry = _SCRIPT.parent / "native_webrtc_macos/entry.cjs"
+        environment = {key: value for key, value in os.environ.items()
+                       if key in ("PATH", "SystemRoot", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")}
+        result = subprocess.run(["node", "-e", script, str(entry), scenario, target],
+                                capture_output=True, text=True, timeout=10, env=environment)
+        self.assertEqual(result.returncode, 0, "controlled SDK intake regression failed")
+        self.assertTrue(result.stderr == "", "controlled SDK intake child stderr withheld")
+        self.assertLess(len(result.stdout), 65536)
+        return json.loads(result.stdout)
+
+    def test_selected_sdk_intake_hashes_real_synthetic_material_without_admission(self):
+        files = {"Contents/version.plist": b"version",
+                 "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.1.sdk/SDKSettings.plist": b"settings",
+                 "Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang": b"binary"}
+        for target in ("mac-arm64", "mac-x64"):
+            for scenario in ("valid", "owner", "mode", "plain", "component_local"):
+                with self.subTest(target=target, scenario=scenario):
+                    inventory = [{"path": name.replace("MacOSX15.1.sdk/", "MacOSX.sdk/") if scenario == "plain" else name,
+                                  "type": "file", "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+                                 for name, raw in files.items()]
+                    inventory.append({"path": "Contents/link", "type": "symlink", "target": "version.plist"})
+                    if scenario == "plain":
+                        inventory.append({"path": "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.1.sdk",
+                                          "type": "symlink", "target": "MacOSX.sdk"})
+                    if scenario == "component_local":
+                        nested = "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/"
+                        inventory.extend([
+                            {"path": nested + "nested/MacOSX15.1.sdk/SDKSettings.plist", "type": "file", "bytes": 15,
+                             "sha256": hashlib.sha256(b"nested-settings").hexdigest()},
+                            {"path": nested + "pivot", "type": "symlink", "target": "nested/directory"},
+                            {"path": nested + "MacOSX15.2.sdk", "type": "symlink", "target": "pivot/../MacOSX15.1.sdk"}])
+                    inventory.sort(key=lambda row: row["path"].encode("utf-8"))
+                    expected = hashlib.sha256((json.dumps(inventory, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest()
+                    result = self.intake_result(scenario, target)
+                    self.assertEqual((result["exitCode"], result["errors"]), (0, []))
+                    self.assertEqual(len(result["output"]), 1)
+                    prefix = "MORPHEUS_NATIVE_MAC_SDK_INTAKE "
+                    self.assertTrue(result["output"][0].startswith(prefix))
+                    value = json.loads(result["output"][0][len(prefix):])
+                    self.assertEqual(value["target"], target)
+                    intake = value["intake"]
+                    self.assertEqual(intake["file_inventory"]["sha256"], expected)
+                    self.assertEqual(intake["files"], 5 if scenario == "plain" else 7 if scenario == "component_local" else 4)
+                    self.assertEqual(intake["original_file_bytes"], sum(map(len, files.values())) + (15 if scenario == "component_local" else 0))
+                    self.assertIs(intake["snapshot_complete"], True)
+                    self.assertIs(intake["original_root_owned_nonwritable_policy_observed"], scenario in ("valid", "plain", "component_local"))
+                    self.assertEqual(intake["owner_uids"], ["501"] if scenario == "owner" else ["0"])
+                    self.assertEqual(intake["provenance"], "UNBOUND")
+                    self.assertIs(intake["developer_directory_observed"], True)
+                    self.assertEqual(len(intake["sdk_candidates"]), 2 if scenario in ("plain", "component_local") else 1)
+                    if scenario == "component_local":
+                        candidate = next(row for row in intake["sdk_candidates"] if row["path"].endswith("/MacOSX15.2.sdk"))
+                        self.assertEqual(candidate["resolved_path"],
+                                         "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/nested/MacOSX15.1.sdk")
+                    self.assertEqual(len(intake["metadata_roles"]), 2)
+                    self.assertTrue(any(row["path"].endswith(("MacOSX.sdk/SDKSettings.plist" if scenario == "plain" else
+                                                             "MacOSX15.1.sdk/SDKSettings.plist"))
+                                        for row in intake["metadata_roles"]))
+                    for row in (value, intake):
+                        for flag in ("build_admission_granted", "build_ready", "distribution_ready", "sdk_redistributed"):
+                            self.assertIs(row[flag], False)
+                    self.assertIs(value["cache_write"], False)
+                    self.assertIs(intake["sdk_bytes_copied"], False)
+                    self.assertEqual(value["sdk_full_inventory"], "UNBOUND")
+
+    def test_intake_refuses_escape_cycles_mutations_specials_caps_and_execution_mode(self):
+        for scenario in ("escape", "component_escape", "cycle", "identity", "directory_change", "fifo", "oversize", "metadata_limit", "empty", "traversal", "stage_detail"):
+            with self.subTest(scenario=scenario):
+                result = self.intake_result(scenario)
+                self.assertEqual((result["exitCode"], result["output"]), (1, []))
+                category = "producer_input" if scenario == "stage_detail" else "preflight_sdk_intake"
+                self.assertEqual(result["errors"], ["MORPHEUS_NATIVE_MAC_PRODUCER_ENTRY failed category=" + category + "\n"])
+                self.assertIs(result["oversized_payload_opened"], False)
+                self.assertIs(result["fifo_opened"], False)
+                if scenario == "metadata_limit":
+                    self.assertIs(result["selected_file_opened"], False)
+
+

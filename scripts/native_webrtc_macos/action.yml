@@ -3,6 +3,8 @@ description: Read-only host discovery or explicitly admitted Mac DATA/native pro
 inputs:
   target:
     required: true
+  preflight_detail:
+    default: basic
   xcode_app:
     default: ''
   phase:
