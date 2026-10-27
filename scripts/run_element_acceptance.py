@@ -49,6 +49,10 @@ STAGES = frozenset((
 FAILURES = frozenset(("fixture_operation", "browser_acceptance", "native_acceptance", "deadline", "evidence", "log_scan"))
 NATIVE_STAGES = ("microphone_cryptor", "late_login", "late_sync", "late_bootstrap", "late_join", "group_roster")
 NATIVE_STAGE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_STAGE "
+NATIVE_KEY_PREFIX = "MORPHEUS_ELEMENT_NATIVE_KEY_CONTEXT "
+NATIVE_KEY_PATTERN = re.compile(
+    r"import=(observed|unknown) original=(decrypted|unknown) continuity=(same_identity|changed|unknown)"
+)
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILES = 128
 MAX_LOG_ENTRIES = 65_536
@@ -86,6 +90,26 @@ def native_stages(output: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def native_key_context(output: str) -> dict[str, str]:
+    """One bounded fixed failure context; never raw metadata or a pass fact."""
+    found = None
+    cursor = 0
+    while (start := output.find(NATIVE_KEY_PREFIX.rstrip(), cursor)) >= 0:
+        cursor = start + len(NATIVE_KEY_PREFIX)
+        if start and output[start - 1] != "\n":
+            continue
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        if found is not None or end - start > 160:
+            return {"room_key_context": "invalid"}
+        line = output[start:end]
+        match = NATIVE_KEY_PATTERN.fullmatch(line[len(NATIVE_KEY_PREFIX):]) if line.startswith(NATIVE_KEY_PREFIX) else None
+        if match is None:
+            return {"room_key_context": "invalid"}
+        found = dict(zip(("room_key_import", "original_membership", "membership_continuity"), match.groups()))
+    return found or {}
+
+
 def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
@@ -94,8 +118,10 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
         result["stage"] = stages[-1]
     if failures:
         result["failure"] = failures[-1]
-    if include_native and (native := native_stages(output)):
-        result["native_stage"] = native[-1]
+    if include_native:
+        if native := native_stages(output):
+            result["native_stage"] = native[-1]
+        result.update(native_key_context(output))
     return result
 
 
@@ -471,6 +497,11 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     if children_joined and cleanup_failure is None:
         for value in native_stages(native_output):
             print(NATIVE_STAGE_PREFIX + value, flush=True)
+        context = native_key_context(native_output)
+        if set(context) == {"room_key_import", "original_membership", "membership_continuity"}:
+            print(NATIVE_KEY_PREFIX + "import=" + context["room_key_import"]
+                  + " original=" + context["original_membership"]
+                  + " continuity=" + context["membership_continuity"], flush=True)
     # Cleanup is required but must not erase the last useful failure stage.
     diagnostic_output = output.replace("MORPHEUS_ELEMENT_STAGE element_cleanup\n", "")
     if found := diagnostics(diagnostic_output, include_native=False):

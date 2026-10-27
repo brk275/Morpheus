@@ -80,6 +80,22 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(target.native_stages(output), ("invalid",))
                 self.assertEqual(target.diagnostics(output), {"native_stage": "invalid"})
 
+    def test_room_key_context_is_fixed_bounded_and_never_acceptance(self):
+        line = target.NATIVE_KEY_PREFIX + "import=observed original=unknown continuity=same_identity"
+        expected = {"room_key_import": "observed", "original_membership": "unknown", "membership_continuity": "same_identity"}
+        self.assertEqual(target.native_key_context(line), expected)
+        self.assertEqual(target.diagnostics(line), expected)
+        self.assertEqual(target.diagnostics(line, include_native=False), {})
+        self.assertEqual(target.evidence(line), {})
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(line, complete=True)
+        self.assertEqual(target.native_key_context("private prefix " + line), {})
+        for bad in (line + "\n" + line, line + " opaque-private", line.replace("observed", "opaque_private"),
+                    target.NATIVE_KEY_PREFIX + "x" * 161, target.NATIVE_KEY_PREFIX.rstrip() + "bad"):
+            with self.subTest(shape=bad):
+                self.assertEqual(target.native_key_context(bad), {"room_key_context": "invalid"})
+                self.assertNotIn("opaque", json.dumps(target.diagnostics(bad)))
+
     def test_native_failure_facts_follow_owned_cleanup_and_successful_scan(self):
         for scanner_status, join_failure, service_failure in ((0, False, False), (1, False, False),
                                                             (0, True, False), (0, False, True)):
@@ -94,7 +110,8 @@ class EvidenceTests(unittest.TestCase):
                 native = self.anchored_log(runner, "native.log", (
                     "opaque-fixture-panic\nMORPHEUS_ELEMENT_CHECK native_audio=true\n"
                     + target.NATIVE_STAGE_PREFIX + "microphone_cryptor\n"
-                    + target.NATIVE_STAGE_PREFIX + "late_login\n").encode())
+                    + target.NATIVE_STAGE_PREFIX + "late_login\n"
+                    + target.NATIVE_KEY_PREFIX + "import=observed original=unknown continuity=same_identity\n").encode())
                 browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
                 native.joined = browser.joined = False
                 native.status = mock.Mock(return_value=1)
@@ -144,6 +161,8 @@ class EvidenceTests(unittest.TestCase):
                                  {"native_audio": True, "official_image": True} if scanner_status == 0 and not join_failure and not service_failure else {})
                 self.assertEqual(target.diagnostics(output).get("native_stage"),
                                  "late_login" if scanner_status == 0 and not join_failure and not service_failure else None)
+                self.assertEqual(target.diagnostics(output).get("room_key_import"),
+                                 "observed" if scanner_status == 0 and not join_failure and not service_failure else None)
 
     @staticmethod
     def anchored_log(runner, name, data):
