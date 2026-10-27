@@ -70,7 +70,10 @@ impl RemoteTrackAdmissions {
         if state.closed {
             return false;
         }
-        let ours = state.tracks.get(&key).is_some_and(|current| Arc::ptr_eq(current, instance));
+        let ours = state
+            .tracks
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, instance));
         if required && !ours {
             return false;
         }
@@ -102,13 +105,20 @@ mod tests {
 
     #[test]
     fn configured_e2ee_refuses_clear_tracks_before_prepare_or_export() {
-        for encryption in [EncryptionType::None, EncryptionType::Gcm, EncryptionType::Custom] {
+        for encryption in [
+            EncryptionType::None,
+            EncryptionType::Gcm,
+            EncryptionType::Custom,
+        ] {
             let admissions = RemoteTrackAdmissions::default();
             let instance = Arc::new(());
             let prepared = Cell::new(false);
             let exported = Cell::new(false);
             let admitted = admissions.admit(
-                true, encryption, key(), instance.clone(),
+                true,
+                encryption,
+                key(),
+                instance.clone(),
                 |required| {
                     assert!(required);
                     prepared.set(true);
@@ -119,20 +129,30 @@ mod tests {
             assert_eq!(admitted, encrypted);
             assert_eq!(prepared.get(), encrypted);
             assert_eq!(exported.get(), encrypted);
-            assert_eq!(admissions.retire(true, key(), &instance, || {}, || {}), encrypted);
+            assert_eq!(
+                admissions.retire(true, key(), &instance, || {}, || {}),
+                encrypted
+            );
             assert!(!admissions.retire(true, key(), &instance, || {}, || {}));
         }
     }
 
     #[test]
     fn non_e2ee_rooms_keep_preparation_and_export_without_cryptor_setup() {
-        for encryption in [EncryptionType::None, EncryptionType::Gcm, EncryptionType::Custom] {
+        for encryption in [
+            EncryptionType::None,
+            EncryptionType::Gcm,
+            EncryptionType::Custom,
+        ] {
             let admissions = RemoteTrackAdmissions::default();
             let instance = Arc::new(());
             let prepared = Cell::new(false);
             let exported = Cell::new(false);
             assert!(admissions.admit(
-                false, encryption, key(), instance.clone(),
+                false,
+                encryption,
+                key(),
+                instance.clone(),
                 |required| {
                     assert!(!required);
                     prepared.set(true);
@@ -151,7 +171,10 @@ mod tests {
         let exported = Cell::new(false);
         let result = catch_unwind(AssertUnwindSafe(|| {
             admissions.admit(
-                true, EncryptionType::Gcm, key(), Arc::new(()),
+                true,
+                EncryptionType::Gcm,
+                key(),
+                Arc::new(()),
                 |_| panic!("receiver installation failed"),
                 || exported.set(true),
             );
@@ -160,8 +183,12 @@ mod tests {
         assert!(!exported.get());
         admissions.close();
         assert!(!admissions.admit(
-            true, EncryptionType::Gcm, key(), Arc::new(()),
-            |_| panic!("closed preparation"), || panic!("closed export"),
+            true,
+            EncryptionType::Gcm,
+            key(),
+            Arc::new(()),
+            |_| panic!("closed preparation"),
+            || panic!("closed export"),
         ));
         assert!(admissions.lock().tracks.is_empty());
     }
@@ -174,23 +201,50 @@ mod tests {
         let refused = Arc::new(());
         let removed = Cell::new(0);
         let exported = Cell::new(0);
-        assert!(admissions.admit(true, EncryptionType::Gcm, key(), older.clone(), |_| {}, || {}));
+        assert!(admissions.admit(
+            true,
+            EncryptionType::Gcm,
+            key(),
+            older.clone(),
+            |_| {},
+            || {}
+        ));
         assert!(!admissions.admit(
-            true, EncryptionType::None, key(), refused.clone(), |_| panic!("clear setup"),
+            true,
+            EncryptionType::None,
+            key(),
+            refused.clone(),
+            |_| panic!("clear setup"),
             || panic!("clear export"),
         ));
         assert!(!admissions.retire(
-            true, key(), &refused, || removed.set(removed.get() + 1),
+            true,
+            key(),
+            &refused,
+            || removed.set(removed.get() + 1),
             || exported.set(exported.get() + 1),
         ));
-        assert!(admissions.admit(true, EncryptionType::Gcm, key(), newer.clone(), |_| {}, || {}));
+        assert!(admissions.admit(
+            true,
+            EncryptionType::Gcm,
+            key(),
+            newer.clone(),
+            |_| {},
+            || {}
+        ));
         assert!(!admissions.retire(
-            true, key(), &older, || removed.set(removed.get() + 1),
+            true,
+            key(),
+            &older,
+            || removed.set(removed.get() + 1),
             || exported.set(exported.get() + 1),
         ));
         assert_eq!((removed.get(), exported.get()), (0, 0));
         assert!(admissions.retire(
-            true, key(), &newer, || removed.set(removed.get() + 1),
+            true,
+            key(),
+            &newer,
+            || removed.set(removed.get() + 1),
             || exported.set(exported.get() + 1),
         ));
         assert_eq!((removed.get(), exported.get()), (1, 1));
@@ -208,7 +262,10 @@ mod tests {
         let install_gate = admissions.clone();
         let installer = std::thread::spawn(move || {
             assert!(install_gate.admit(
-                true, EncryptionType::Gcm, key(), Arc::new(()),
+                true,
+                EncryptionType::Gcm,
+                key(),
+                Arc::new(()),
                 |_| {
                     entered_tx.send(()).unwrap();
                     release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -224,18 +281,29 @@ mod tests {
             closed_tx.send(()).unwrap();
         });
         closing_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(closed_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            closed_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         release_tx.send(()).unwrap();
         installer.join().unwrap();
         closer.join().unwrap();
         exported_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         closed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(!admissions.admit(
-            true, EncryptionType::Gcm, key(), Arc::new(()),
-            |_| panic!("late setup"), || panic!("late export"),
+            true,
+            EncryptionType::Gcm,
+            key(),
+            Arc::new(()),
+            |_| panic!("late setup"),
+            || panic!("late export"),
         ));
         assert!(!admissions.retire(
-            true, key(), &Arc::new(()), || panic!("late removal"), || panic!("late export"),
+            true,
+            key(),
+            &Arc::new(()),
+            || panic!("late removal"),
+            || panic!("late export"),
         ));
         assert!(admissions.lock().tracks.is_empty());
     }
