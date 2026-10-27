@@ -49,8 +49,8 @@ jobs:
           $checks = @(
             @($python, '4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a', 104952),
             @('.github/workflows/native-webrtc-windows-source.yml', '1b9d6cb231face182efd178ce482084900795965613e31a4bfe625c2f04fe0ef', 4969),
-            @('scripts/native_webrtc/windows_preflight.ps1', '3a63353d4f6aef5a3f1517207997c11c511fbb3b48d0c7a75a312b1dbf7440ef', 21456),
-            @('scripts/tests/test_native_webrtc_windows_inputs.py', '658744c19914a901d69ac08672d50c4c236a60e4d265e6abeefba447288c84fa', 61156),
+            @('scripts/native_webrtc/windows_preflight.ps1', 'e67de788e688904c8ecba81c3284cd77ca92966a9c64fec65a46d440ea5de1b1', 22498),
+            @('scripts/tests/test_native_webrtc_windows_inputs.py', '0f9eab2291c48363f089b2ad1f72a2e7ffe23b3d4e4f501c2af121823e738f8a', 61798),
             @('scripts/run_native_webrtc_windows.py', 'f9cfa589dc267bdccb9c4422ec0445098895b90f42db025a42f2e7196157acd6', 47087)
           )
           foreach ($check in $checks) {

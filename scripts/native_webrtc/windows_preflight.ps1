@@ -46,13 +46,31 @@ function Assert-HostBudget {
 function Get-CanonicalHostPath([string] $Value) {
     if ([string]::IsNullOrEmpty($Value) -or $Value.Length -gt 1024 -or
         $Value -notmatch '^[A-Za-z]:\\' -or $Value.Substring(2).Contains(':') -or
-        $Value.Contains('/') -or $Value -match '[\x00-\x1f*?"<>|]') { throw 'path' }
+        $Value.Contains('/') -or $Value -match '[\x00-\x1f*?"<>|]') {
+        # Classify only an already-refused immutable string, in the exact
+        # original short-circuit order. These labels grant no path allowance.
+        if ([string]::IsNullOrEmpty($Value)) { throw 'path_empty' }
+        if ($Value.Length -gt 1024) { throw 'path_length' }
+        if ($Value -notmatch '^[A-Za-z]:\\') { throw 'path_drive' }
+        if ($Value.Substring(2).Contains(':')) { throw 'path_colon' }
+        if ($Value.Contains('/')) { throw 'path_slash' }
+        if ($Value -match '[\x00-\x1f*?"<>|]') { throw 'path_chars' }
+        throw 'path_input'
+    }
     $full = [IO.Path]::GetFullPath($Value)
-    if ($full.TrimEnd('\') -cne $Value.TrimEnd('\')) { throw 'path' }
+    if ($full.TrimEnd('\') -cne $Value.TrimEnd('\')) { throw 'path_normalized' }
     foreach ($part in $Value.Substring(3).Split('\')) {
         if ($part -eq '' -and $Value.Length -eq 3) { continue }
         if ($part -eq '' -or $part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ') -or
-            $part -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)' -or $part -ieq '.git') { throw 'path' }
+            $part -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)' -or $part -ieq '.git') {
+            if ($part -eq '') { throw 'path_part_empty' }
+            if ($part -in @('.', '..')) { throw 'path_part_dot' }
+            if ($part.EndsWith('.')) { throw 'path_part_trailingdot' }
+            if ($part.EndsWith(' ')) { throw 'path_part_trailingspace' }
+            if ($part -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') { throw 'path_part_device' }
+            if ($part -ieq '.git') { throw 'path_part_git' }
+            throw 'path_component'
+        }
     }
     return $full
 }
