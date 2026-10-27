@@ -27,6 +27,12 @@ use libwebrtc::{
 use livekit_protocol::PacketTrailerFeature;
 use parking_lot::Mutex;
 
+// Morpheus modification: fence exact-instance receiver admission and Room export.
+// See MORPHEUS_PATCH.md.
+#[path = "remote_track_admission.rs"]
+mod remote_track_admission;
+use remote_track_admission::RemoteTrackAdmissions;
+
 use super::{key_provider::KeyProvider, EncryptionType};
 use crate::{
     e2ee::E2eeOptions,
@@ -62,6 +68,7 @@ struct ManagerInner {
 pub struct E2eeManager {
     inner: Arc<Mutex<ManagerInner>>,
     state_changed: Arc<Mutex<Option<StateChangedHandler>>>,
+    remote_track_admissions: Arc<RemoteTrackAdmissions>,
 }
 
 impl E2eeManager {
@@ -83,10 +90,14 @@ impl E2eeManager {
                 data_packet_cryptor,
             })),
             state_changed: Default::default(),
+            remote_track_admissions: Arc::new(RemoteTrackAdmissions::default()),
         }
     }
 
     pub(crate) fn cleanup(&self) {
+        // Detached subscription tasks need not have ended. Closing the gate
+        // waits out entered preparation/export, then refuses all later work.
+        self.remote_track_admissions.close();
         let mut inner = self.inner.lock();
         for cryptor in inner.frame_cryptors.values() {
             cryptor.set_enabled(false);
@@ -112,49 +123,50 @@ impl E2eeManager {
         track: RemoteTrack,
         publication: RemoteTrackPublication,
         participant: RemoteParticipant,
-    ) {
+        export: impl FnOnce(),
+    ) -> bool {
         let identity = participant.identity();
-        let receiver = track.transceiver().unwrap().receiver();
-        let mut packet_trailer_handler = None;
-
-        let needs_packet_trailer_handler = needs_video_receiver_packet_trailer_handler(
-            &publication.proto_info().packet_trailer_features,
-        );
-
-        if let RemoteTrack::Video(video_track) = &track {
-            if needs_packet_trailer_handler {
-                let handler = packet_trailer::create_receiver_handler(
-                    LkRuntime::instance().pc_factory(),
-                    &receiver,
+        let sid = track.sid();
+        let required = self.initialized();
+        self.remote_track_admissions.admit(
+            required, publication.encryption_type(), (identity.to_string(), sid.to_string()),
+            track.instance_token(),
+            |required| {
+                let receiver = track.transceiver().unwrap().receiver();
+                let mut packet_trailer_handler = None;
+                let needs_packet_trailer_handler = needs_video_receiver_packet_trailer_handler(
+                    &publication.proto_info().packet_trailer_features,
                 );
-                video_track.set_packet_trailer_handler(handler.clone());
-                packet_trailer_handler = Some(handler);
-                log::info!(
-                    "attached packet_trailer handler for subscribed track {} from {}",
-                    publication.sid(),
-                    identity,
-                );
-            } else {
-                log::debug!(
-                    "skipping packet_trailer handler for subscribed track {} from {} without advertised packet trailer support",
-                    publication.sid(),
-                    identity,
-                );
-            }
-        }
-
-        if !self.initialized() || publication.encryption_type() == EncryptionType::None {
-            return;
-        }
-
-        let frame_cryptor = self.setup_rtp_receiver(&identity, receiver);
-        if let Some(handler) = packet_trailer_handler.as_ref() {
-            frame_cryptor.set_packet_trailer_handler(handler);
-        }
-        self.setup_cryptor(&frame_cryptor);
-
-        let mut inner = self.inner.lock();
-        inner.frame_cryptors.insert((identity, publication.sid()), frame_cryptor.clone());
+                if let RemoteTrack::Video(video_track) = &track {
+                    if needs_packet_trailer_handler {
+                        let handler = packet_trailer::create_receiver_handler(
+                            LkRuntime::instance().pc_factory(), &receiver,
+                        );
+                        video_track.set_packet_trailer_handler(handler.clone());
+                        packet_trailer_handler = Some(handler);
+                        log::info!(
+                            "attached packet_trailer handler for subscribed track {} from {}",
+                            publication.sid(), identity,
+                        );
+                    } else {
+                        log::debug!(
+                            "skipping packet_trailer handler for subscribed track {} from {} without advertised packet trailer support",
+                            publication.sid(), identity,
+                        );
+                    }
+                }
+                if !required {
+                    return;
+                }
+                let frame_cryptor = self.setup_rtp_receiver(&identity, receiver);
+                if let Some(handler) = packet_trailer_handler.as_ref() {
+                    frame_cryptor.set_packet_trailer_handler(handler);
+                }
+                self.setup_cryptor(&frame_cryptor);
+                self.inner.lock().frame_cryptors.insert((identity, sid), frame_cryptor);
+            },
+            export,
+        )
     }
 
     pub(crate) fn on_local_track_published(
@@ -221,11 +233,21 @@ impl E2eeManager {
     /// Called by the room
     pub(crate) fn on_track_unsubscribed(
         &self,
-        _: RemoteTrack,
-        publication: RemoteTrackPublication,
+        track: RemoteTrack,
+        _publication: RemoteTrackPublication,
         participant: RemoteParticipant,
+        export: impl FnOnce(),
     ) {
-        self.remove_frame_cryptor(participant.identity(), publication.sid());
+        let identity = participant.identity();
+        let sid = track.sid();
+        let required = self.initialized();
+        self.remote_track_admissions.retire(
+            required, (identity.to_string(), sid.to_string()), &track.instance_token(),
+            || {
+                self.inner.lock().frame_cryptors.remove(&(identity, sid));
+            },
+            export,
+        );
     }
 
     pub fn frame_cryptors(&self) -> HashMap<(ParticipantIdentity, TrackSid), FrameCryptor> {

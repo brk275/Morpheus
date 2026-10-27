@@ -340,6 +340,88 @@ def qualified_apply_main_reuse(paths, event, event_name, force_all=False):
         return False
 
 
+# No vendor execution is qualified yet. Maintainer activation must bind the
+# exact tested commit/tree/workflow, receipt, four jobs and complete reviewed
+# changed-input tuple. Source review and a separate helper run precede merge;
+# no candidate data or event can populate this trusted literal.
+VENDOR_REUSE_QUALIFICATION = None
+
+
+def qualified_vendor_main_reuse(paths, event, event_name, force_all=False):
+    qualified = VENDOR_REUSE_QUALIFICATION
+    if (force_all or event_name != "push" or type(qualified) is not dict
+            or set(qualified) != {"source", "tree", "workflow_sha256", "receipt_sha256", "route", "jobs", "inputs"}
+            or any(type(qualified[name]) is not str or re.fullmatch(r"[0-9a-f]{40}", qualified[name]) is None
+                   for name in ("source", "tree"))
+            or qualified["workflow_sha256"] != REVIEWED_CONTROL_WORKFLOW_SHA256 or qualified["route"] != "vendor"
+            or type(qualified["receipt_sha256"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", qualified["receipt_sha256"]) is None):
+        return False
+    jobs, inputs = qualified["jobs"], qualified["inputs"]
+    if (type(jobs) is not tuple or len(jobs) != len(PLATFORMS)
+            or any(type(job) is not tuple or len(job) != 3 or job[0] not in PLATFORMS
+                   or type(job[1]) is not int or job[1] <= 0 or type(job[2]) is not int or job[2] <= 0 for job in jobs)
+            or {job[0] for job in jobs} != set(PLATFORMS)
+            or len({job[2] for job in jobs}) != len(jobs)):
+        return False
+    if (type(inputs) is not tuple or not inputs
+            or any(type(path) is not str or not path or str(PurePosixPath(path)) != path
+                   or PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts
+                   or ".git" in PurePosixPath(path).parts or "\\" in path
+                   or any(ord(char) < 32 or ord(char) == 127 for char in path)
+                   or path in NATIVE_REUSE_SELECTORS for path in inputs)
+            or len(set(inputs)) != len(inputs)):
+        return False
+    if (type(paths) not in (list, tuple) or not paths or any(type(path) is not str for path in paths)
+            or not set(paths) <= set(inputs) | set(NATIVE_REUSE_SELECTORS)
+            or not set(paths) & set(inputs) or type(event) is not dict):
+        return False
+    repository, sender = event.get("repository"), event.get("sender")
+    if (type(repository) is not dict or type(sender) is not dict
+            or repository.get("full_name") != "brk275/Morpheus" or repository.get("private") is not False
+            or type(repository.get("owner")) is not dict or repository["owner"].get("login") != "brk275"
+            or sender.get("login") != "brk275" or event.get("ref") != "refs/heads/main"
+            or event.get("forced") is not False or event.get("deleted") is not False
+            or os.environ.get("GITHUB_ACTOR") != "brk275" or os.environ.get("GITHUB_TRIGGERING_ACTOR") != "brk275"):
+        return False
+    after = event.get("after")
+    if type(after) is not str or re.fullmatch(r"[0-9a-f]{40}", after) is None:
+        return False
+    if not reviewed_workflow_layout(event, event_name):
+        return False
+    command = ["git", "--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+               "-c", "core.fsmonitor=false"]
+    environment = {key: value for key, value in os.environ.items() if not key.startswith(("GIT_", "SSH_"))}
+    environment.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", GIT_NO_REPLACE_OBJECTS="1",
+                       GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1")
+    options = {"stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL, "timeout": 10, "env": environment}
+    try:
+        # Verify the recorded immutable source is a commit with the exact tree;
+        # missing/promisor objects fail rather than triggering a network fetch.
+        kind = subprocess.run(command + ["cat-file", "-t", qualified["source"]], check=True, **options).stdout
+        if kind != b"commit\n":
+            return False
+        tree = subprocess.run(command + ["rev-parse", "--verify", qualified["source"] + "^{tree}"],
+                              check=True, **options).stdout
+        if tree != qualified["tree"].encode() + b"\n":
+            return False
+        # Exclude only these two regular files, never directories/symlinks or
+        # submodules. No path prefix, binary artifact or cached job is reused.
+        selectors = subprocess.run(command + ["ls-tree", "--full-tree", "-z", after, "--", *NATIVE_REUSE_SELECTORS],
+                                   check=True, **options).stdout
+        pattern = (rb"100644 blob [0-9a-f]{40}\tscripts/ci_scope\.py\x00"
+                   rb"100644 blob [0-9a-f]{40}\tscripts/tests/test_ci_scope\.py\x00")
+        if type(selectors) is not bytes or re.fullmatch(pattern, selectors) is None:
+            return False
+        compared = subprocess.run(command + ["diff-tree", "--quiet", "--exit-code", "--no-ext-diff",
+            "--no-textconv", "--no-renames", "--ignore-submodules=none", "-r", qualified["source"], after, "--", ".",
+            ":(top,exclude)scripts/ci_scope.py", ":(top,exclude)scripts/tests/test_ci_scope.py"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, env=environment)
+        return type(compared.returncode) is int and compared.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def event_selection(event, event_name):
     if event_name != "workflow_dispatch":
         paths, force_all = changed_paths(event, event_name)
@@ -348,6 +430,8 @@ def event_selection(event, event_name):
         if route == "all" and reviewed_control_only(paths, event, event_name, force_all):
             route = "helpers"
         if qualified_apply_main_reuse(paths, event, event_name, force_all):
+            route = "helpers"
+        if qualified_vendor_main_reuse(paths, event, event_name, force_all):
             route = "helpers"
         if route == "desktop":
             selected = {"native": True, "native_matrix": {"os": list(PLATFORMS)},

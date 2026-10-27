@@ -1047,3 +1047,11 @@ mod encoding_tests {
         }
     }
 }
+
+// Exercise the exact private SDK admission source without selecting its upstream
+// dev-dependency graph or exposing native test constructors.
+#[cfg(test)]
+use livekit::e2ee::EncryptionType;
+#[cfg(test)]
+#[path = "../../livekit/src/room/e2ee/remote_track_admission.rs"]
+mod remote_track_admission_tests;

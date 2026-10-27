@@ -656,6 +656,118 @@ class ScopeTests(unittest.TestCase):
                 self.assertFalse(selected["native"] or selected["config"] or selected["wayland"])
                 self.assertFalse(selected["manual"])
 
+    @patch("scripts.ci_scope.reviewed_workflow_layout", return_value=True)
+    @patch("scripts.ci_scope.subprocess.run")
+    def test_vendor_native_reuse_is_disabled_until_exact_four_job_qualification(self, run, workflow):
+        inputs = ("vendor/controlled-native/source.rs", "crates/controlled-native/src/lib.rs")
+        event = {"after": "a" * 40, "ref": "refs/heads/main", "forced": False, "deleted": False,
+                 "repository": {"full_name": "brk275/Morpheus", "private": False, "owner": {"login": "brk275"}},
+                 "sender": {"login": "brk275"}}
+        qualification = {"source": "e" * 40, "tree": "f" * 40,
+                         "workflow_sha256": ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
+                         "receipt_sha256": "b" * 64, "route": "vendor", "inputs": inputs,
+                         "jobs": tuple((platform, 42, i + 10) for i, platform in enumerate(PLATFORMS))}
+        selectors = (b"100644 blob " + b"c" * 40 + b"\tscripts/ci_scope.py\x00"
+                     b"100644 blob " + b"d" * 40 + b"\tscripts/tests/test_ci_scope.py\x00")
+        # Fixture IDs/receipts are controlled test DATA, never production qualification.
+        with patch.object(ci_scope, "VENDOR_REUSE_QUALIFICATION", None):
+            self.assertFalse(ci_scope.qualified_vendor_main_reuse(list(inputs), event, "push"))
+            with patch("scripts.ci_scope.changed_paths", return_value=(list(inputs), False)):
+                disabled = event_selection(event, "push")
+                self.assertEqual(disabled["check_route"], "all")
+                self.assertTrue(disabled["native"])
+                self.assertEqual(disabled["native_matrix"]["os"], list(PLATFORMS))
+        run.assert_not_called(); workflow.assert_not_called()
+        with (patch.object(ci_scope, "VENDOR_REUSE_QUALIFICATION", qualification),
+              patch.dict(ci_scope.os.environ, {"GITHUB_ACTOR": "brk275", "GITHUB_TRIGGERING_ACTOR": "brk275",
+                    "GIT_DIR": "untrusted", "GIT_CONFIG_GLOBAL": "untrusted", "SSH_ASKPASS": "untrusted"})):
+            def compare(paths=list(inputs), changed_event=event, name="push", force=False, *,
+                        kind=b"commit\n", tree=b"f" * 40 + b"\n", listing=selectors, result=0):
+                run.reset_mock(); workflow.reset_mock()
+                run.side_effect = [SimpleNamespace(stdout=kind), SimpleNamespace(stdout=tree),
+                                   SimpleNamespace(stdout=listing), SimpleNamespace(returncode=result)]
+                return ci_scope.qualified_vendor_main_reuse(paths, changed_event, name, force)
+            # One real all-platform vendor workflow has one run and four jobs.
+            self.assertTrue(compare())
+            self.assertEqual(run.call_count, 4)
+            calls = run.call_args_list
+            self.assertEqual(calls[0].args[0][-3:], ["cat-file", "-t", "e" * 40])
+            self.assertEqual(calls[1].args[0][-3:], ["rev-parse", "--verify", "e" * 40 + "^{tree}"])
+            self.assertEqual(calls[2].args[0][-7:], ["ls-tree", "--full-tree", "-z", "a" * 40, "--", *ci_scope.NATIVE_REUSE_SELECTORS])
+            arguments = calls[-1].args[0]
+            self.assertEqual(arguments[-6:], ["e" * 40, "a" * 40, "--", ".",
+                ":(top,exclude)scripts/ci_scope.py", ":(top,exclude)scripts/tests/test_ci_scope.py"])
+            for option in ("--no-replace-objects", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-r"):
+                self.assertIn(option, arguments)
+            for call in calls:
+                self.assertEqual(call.kwargs["timeout"], 10)
+                self.assertEqual(call.kwargs["stderr"], subprocess.DEVNULL)
+                environment = call.kwargs["env"]
+                self.assertNotIn("GIT_DIR", environment); self.assertNotIn("SSH_ASKPASS", environment)
+                self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+                self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
+            self.assertEqual(calls[-1].kwargs["stdout"], subprocess.DEVNULL)
+            for paths in ([inputs[0]], list(inputs) + list(ci_scope.NATIVE_REUSE_SELECTORS)):
+                self.assertTrue(compare(paths))
+            # Separate genuinely qualified runs remain valid as well.
+            distinct_runs = qualification | {"jobs": tuple((platform, i + 1, i + 10)
+                                                        for i, platform in enumerate(PLATFORMS))}
+            with patch.object(ci_scope, "VENDOR_REUSE_QUALIFICATION", distinct_runs):
+                self.assertTrue(compare())
+            for paths in ([], None, [None], list(ci_scope.NATIVE_REUSE_SELECTORS),
+                          list(inputs) + ["Cargo.lock"], list(inputs) + [".github/workflows/ci.yml"],
+                          list(inputs) + ["rust-toolchain.toml"], list(inputs) + ["scripts/scan_history.py"],
+                          list(inputs) + ["vendor/unrecorded.rs"], list(inputs) + ["unknown"], ["./" + inputs[0]]):
+                self.assertFalse(compare(paths)); run.assert_not_called(); workflow.assert_not_called()
+            for changed_event in (event | {"ref": "refs/heads/topic"}, event | {"forced": True},
+                                  event | {"deleted": True}, event | {"after": "--help"}, event | {"after": None},
+                                  event | {"sender": {"login": "other"}}, event | {"repository": {}}, {}):
+                self.assertFalse(compare(changed_event=changed_event)); run.assert_not_called()
+            for name in ("pull_request", "workflow_dispatch", "workflow_run", "release"):
+                self.assertFalse(compare(name=name)); run.assert_not_called()
+            self.assertFalse(compare(force=True)); run.assert_not_called()
+            for actor in ("GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR"):
+                with patch.dict(ci_scope.os.environ, {actor: "other"}):
+                    self.assertFalse(compare()); run.assert_not_called()
+            for field, values in (("kind", (b"tree\n", b"tag\n", b"", "commit\n")),
+                                  ("tree", (b"d" * 40 + b"\n", b"", "f" * 40 + "\n"))):
+                for value in values:
+                    self.assertFalse(compare(**{field: value}))
+                    self.assertEqual(run.call_count, 1 if field == "kind" else 2)
+            for listing in (b"", selectors.replace(b"100644 blob", b"040000 tree", 1),
+                            selectors.replace(b"blob", b"tree", 1), selectors.replace(b"100644", b"120000", 1),
+                            selectors.replace(b"100644 blob", b"160000 commit", 1), selectors.replace(b"100644", b"100755", 1),
+                            selectors + b"foreign\x00", "not-bytes"):
+                self.assertFalse(compare(listing=listing)); self.assertEqual(run.call_count, 3)
+            for result in (1, 2, -9, None, "0", False):
+                self.assertFalse(compare(result=result))
+            workflow.return_value = False
+            self.assertFalse(compare()); run.assert_not_called()
+            workflow.return_value = True
+            for bad in (None, {}, qualification | {"source": "--help"}, qualification | {"tree": "F" * 40},
+                        qualification | {"workflow_sha256": "b" * 64}, qualification | {"receipt_sha256": ""},
+                        qualification | {"route": "desktop"}, qualification | {"jobs": qualification["jobs"][:3]},
+                        qualification | {"jobs": (qualification["jobs"][0],) * 4},
+                        qualification | {"jobs": tuple((platform, 42, 10) for platform in PLATFORMS)},
+                        qualification | {"jobs": ((PLATFORMS[0], True, 10),) + qualification["jobs"][1:]},
+                        qualification | {"inputs": ()}, qualification | {"inputs": (inputs[0], inputs[0])},
+                        qualification | {"inputs": ([],)}, qualification | {"inputs": ("../outside",)},
+                        qualification | {"inputs": ("/absolute",)}, qualification | {"inputs": ("a/.git/b",)},
+                        qualification | {"inputs": ("a\\b",)}, qualification | {"inputs": ("a\nb",)},
+                        qualification | {"inputs": ci_scope.NATIVE_REUSE_SELECTORS}):
+                with patch.object(ci_scope, "VENDOR_REUSE_QUALIFICATION", bad):
+                    self.assertFalse(compare()); run.assert_not_called(); workflow.assert_not_called()
+            for error in (OSError("opaque"), subprocess.CalledProcessError(1, "git"), subprocess.TimeoutExpired("git", 10)):
+                run.reset_mock(); run.side_effect = error
+                self.assertFalse(ci_scope.qualified_vendor_main_reuse(list(inputs), event, "push"))
+            with patch("scripts.ci_scope.changed_paths", return_value=(list(inputs), False)):
+                run.side_effect = [SimpleNamespace(stdout=b"commit\n"), SimpleNamespace(stdout=b"f" * 40 + b"\n"),
+                                   SimpleNamespace(stdout=selectors), SimpleNamespace(returncode=0)]
+                selected = event_selection(event, "push")
+                self.assertEqual(selected["check_route"], "helpers")
+                self.assertFalse(selected["native"] or selected["config"] or selected["wayland"])
+                self.assertFalse(selected["manual"])
+
     def test_initial_push_selects_all(self):
         self.assertEqual(changed_paths({"before": "0" * 40, "after": "a" * 40}, "push"), ([], True))
 

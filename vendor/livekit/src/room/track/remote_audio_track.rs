@@ -23,6 +23,7 @@ use crate::prelude::*;
 #[derive(Clone)]
 pub struct RemoteAudioTrack {
     inner: Arc<TrackInner>,
+    instance: Arc<()>,
 }
 
 impl Debug for RemoteAudioTrack {
@@ -36,8 +37,15 @@ impl Debug for RemoteAudioTrack {
 }
 
 impl RemoteAudioTrack {
+    // Morpheus modification: stable private identity for this receiver instance.
+    // See MORPHEUS_PATCH.md. Clones retain it; metadata updates never replace it.
+    pub(crate) fn instance_token(&self) -> Arc<()> {
+        self.instance.clone()
+    }
+
     pub(crate) fn new(sid: TrackSid, name: String, rtc_track: RtcAudioTrack) -> Self {
         Self {
+            instance: Arc::new(()),
             inner: Arc::new(super::new_inner(
                 sid,
                 name,

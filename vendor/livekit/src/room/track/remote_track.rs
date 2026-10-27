@@ -28,6 +28,15 @@ pub enum RemoteTrack {
 }
 
 impl RemoteTrack {
+    // Morpheus modification: preserve exact receiver ownership across same-SID events.
+    // See MORPHEUS_PATCH.md.
+    pub(crate) fn instance_token(&self) -> Arc<()> {
+        match self {
+            Self::Audio(track) => track.instance_token(),
+            Self::Video(track) => track.instance_token(),
+        }
+    }
+
     track_dispatch!([Audio, Video]);
 
     #[inline]

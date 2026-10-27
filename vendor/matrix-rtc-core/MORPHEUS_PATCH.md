@@ -96,3 +96,18 @@ production collector and real backend-free core slot resolution. They cover
 original authority, both type precedences, malformed state, refresh/removal,
 custom IDs, room/format separation and the stock per-member encryption spelling.
 They do not prove native/stock runtime interoperability or historical-key recovery.
+
+## rc.7 predecessor media-key denial
+
+Backport the public rc.7 fix from MatrixRTC revision
+`5b8e73539878e40fa5bd88d637eb8eb2b6b2f0d0` without changing the rc.2 pin or
+dependencies. During a delayed key switch, an arrival now receives only the
+current outbound key, never the predecessor minted before that arrival. The
+predecessor is retained locally for the existing overlap deadline; members
+already holding it keep their original bounded continuity. The existing
+actual-manager regression now requires the new key and refuses the predecessor.
+
+This changes media-key distribution, not Megolm membership decryption, room
+history, Matrix recipient policy or stock-peer behavior. It does not establish
+a cause or cure for the fresh-device stock Bob membership failure. Source-only
+review does not establish native execution or acceptance.

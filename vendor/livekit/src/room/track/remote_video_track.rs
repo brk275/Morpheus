@@ -39,6 +39,7 @@ const SUBSCRIBE_TIMING_BUFFER: usize = 256;
 #[derive(Clone)]
 pub struct RemoteVideoTrack {
     inner: Arc<TrackInner>,
+    instance: Arc<()>,
     subscribe_timing_tx: Arc<Mutex<Option<broadcast::Sender<SubscribeTimingEvent>>>>,
 }
 
@@ -74,8 +75,15 @@ impl Stream for SubscribeTimingEventStream {
 }
 
 impl RemoteVideoTrack {
+    // Morpheus modification: stable private identity for this receiver instance.
+    // See MORPHEUS_PATCH.md. Clones retain it; metadata updates never replace it.
+    pub(crate) fn instance_token(&self) -> Arc<()> {
+        self.instance.clone()
+    }
+
     pub(crate) fn new(sid: TrackSid, name: String, rtc_track: RtcVideoTrack) -> Self {
         Self {
+            instance: Arc::new(()),
             inner: Arc::new(super::new_inner(
                 sid,
                 name,

@@ -15,6 +15,8 @@
 pub use crate::utils::take_cell::TakeCell;
 use bmrng::unbounded::UnboundedRequestReceiver;
 use futures_util::{Stream, StreamExt};
+// Morpheus modification: export protected receiver instances under admission; see MORPHEUS_PATCH.md.
+
 use libwebrtc::{
     native::frame_cryptor::EncryptionState,
     prelude::{
@@ -2040,8 +2042,13 @@ impl RoomSession {
                     track: track.clone(),
                     publication: publication.clone(),
                 };
-                e2ee_manager.on_track_subscribed(track, publication, participant);
-                dispatcher.dispatch(&event);
+                if !e2ee_manager.on_track_subscribed(
+                    track.clone(), publication, participant, || dispatcher.dispatch(&event),
+                ) {
+                    // Disable this exact rejected receiver only. Publication-wide
+                    // unsubscribe could clear an overlapping accepted receiver.
+                    track.disable();
+                }
             }
         });
 
@@ -2054,8 +2061,9 @@ impl RoomSession {
                     track: track.clone(),
                     publication: publication.clone(),
                 };
-                e2ee_manager.on_track_unsubscribed(track, publication, participant);
-                dispatcher.dispatch(&event);
+                e2ee_manager.on_track_unsubscribed(
+                    track, publication, participant, || dispatcher.dispatch(&event),
+                );
             }
         });
 
