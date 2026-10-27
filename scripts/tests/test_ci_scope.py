@@ -582,6 +582,80 @@ class ScopeTests(unittest.TestCase):
                            SimpleNamespace(stdout=b"x" * 64005)]
         self.assertFalse(ci_scope.reviewed_control_only(sorted(control), {"after": "a" * 40}, "push"))
 
+
+    @patch("scripts.ci_scope.reviewed_workflow_layout", return_value=True)
+    @patch("scripts.ci_scope.subprocess.run")
+    def test_apply_native_reuse_requires_qualified_exact_inputs_and_owner_main_push(self, run, workflow):
+        app = sorted(ci_scope.AUTOMATIC_DESKTOP_INPUTS)
+        event = {"after": "a" * 40, "ref": "refs/heads/main", "forced": False, "deleted": False,
+                 "repository": {"full_name": "brk275/Morpheus", "private": False, "owner": {"login": "brk275"}},
+                 "sender": {"login": "brk275"}}
+        qualification = {"source": "ee1bfdf1eff5c234a413c1f147b9ac6dd19f07fa",
+                         "tree": "9e81e57e38c37881ff45ae798bdd15dc7ca80bfd",
+                         "workflow_sha256": ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
+                         "receipt_sha256": "b" * 64, "route": "desktop",
+                         "jobs": tuple((platform, i + 1, i + 10) for i, platform in enumerate(PLATFORMS))}
+        selectors = (b"100644 blob " + b"c" * 40 + b"\tscripts/ci_scope.py\x00"
+                     b"100644 blob " + b"d" * 40 + b"\tscripts/tests/test_ci_scope.py\x00")
+        # The disabled state always fails closed; maintainer activation with
+        # actual independently qualified jobs is a separate source receipt.
+        with patch.object(ci_scope, "NATIVE_REUSE_QUALIFICATION", None):
+            self.assertFalse(ci_scope.qualified_apply_main_reuse(app, event, "push"))
+        run.assert_not_called(); workflow.assert_not_called()
+        with (patch.object(ci_scope, "NATIVE_REUSE_QUALIFICATION", qualification),
+              patch.dict(ci_scope.os.environ, {"GITHUB_ACTOR": "brk275", "GITHUB_TRIGGERING_ACTOR": "brk275"})):
+            def compare(paths=app, changed_event=event, name="push", force=False, *, listing=selectors, result=0):
+                run.reset_mock(); workflow.reset_mock()
+                run.side_effect = [SimpleNamespace(stdout=listing), SimpleNamespace(returncode=result)]
+                return ci_scope.qualified_apply_main_reuse(paths, changed_event, name, force)
+            self.assertTrue(compare())
+            arguments = run.call_args.args[0]
+            self.assertEqual(arguments[-6:], [ci_scope.NATIVE_REUSE_SOURCE, "a" * 40, "--", ".",
+                                            ":(top,exclude)scripts/ci_scope.py", ":(top,exclude)scripts/tests/test_ci_scope.py"])
+            self.assertEqual(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
+            self.assertEqual(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
+            self.assertEqual(run.call_args.kwargs["timeout"], 10)
+            self.assertIn("--no-ext-diff", arguments); self.assertIn("--no-textconv", arguments)
+            self.assertIn("--ignore-submodules=none", arguments); self.assertIn("-r", arguments)
+            for paths in (app + list(ci_scope.NATIVE_REUSE_SELECTORS), [app[0]]):
+                self.assertTrue(compare(paths))
+            for changed_event in (event | {"ref": "refs/heads/topic"}, event | {"forced": True}, event | {"deleted": True},
+                                  event | {"after": "--help"}, event | {"after": None},
+                                  event | {"sender": {"login": "other"}}, event | {"repository": {}}, {}):
+                self.assertFalse(compare(changed_event=changed_event)); run.assert_not_called()
+            for name in ("pull_request", "workflow_dispatch", "workflow_run"):
+                self.assertFalse(compare(name=name)); run.assert_not_called()
+            self.assertFalse(compare(force=True)); run.assert_not_called()
+            for paths in ([], list(ci_scope.NATIVE_REUSE_SELECTORS), app + ["Cargo.lock"],
+                          app + ["scripts/run_native_webrtc_linux.py"], app + ["scripts/tests/test_ci_acceptance.py"],
+                          app + [".github/workflows/ci.yml"], app + ["scripts/scan_history.py"], app + ["unknown"]):
+                self.assertFalse(compare(paths)); run.assert_not_called()
+            for actor in ("GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR"):
+                with patch.dict(ci_scope.os.environ, {actor: "other"}):
+                    self.assertFalse(compare()); run.assert_not_called()
+            workflow.return_value = False
+            self.assertFalse(compare()); run.assert_not_called()
+            workflow.return_value = True
+            for listing in (b"", selectors.replace(b"100644", b"040000", 1), selectors.replace(b"blob", b"tree", 1),
+                            selectors.replace(b"100644", b"120000", 1), selectors + b"foreign\x00", "not-bytes"):
+                self.assertFalse(compare(listing=listing)); self.assertEqual(run.call_count, 1)
+            for result in (1, 2, -9, None, "0", False):
+                self.assertFalse(compare(result=result))
+            run.reset_mock(); run.side_effect = OSError("opaque")
+            self.assertFalse(ci_scope.qualified_apply_main_reuse(app, event, "push"))
+            for bad in (None, {}, qualification | {"source": "e" * 40}, qualification | {"tree": "e" * 40},
+                        qualification | {"receipt_sha256": ""}, qualification | {"route": "all"},
+                        qualification | {"jobs": qualification["jobs"][:3]},
+                        qualification | {"jobs": (qualification["jobs"][0],) * 4}):
+                with patch.object(ci_scope, "NATIVE_REUSE_QUALIFICATION", bad):
+                    self.assertFalse(compare()); run.assert_not_called()
+            with patch("scripts.ci_scope.changed_paths", return_value=(app, False)):
+                run.side_effect = [SimpleNamespace(stdout=selectors), SimpleNamespace(returncode=0)]
+                selected = event_selection(event, "push")
+                self.assertEqual(selected["check_route"], "helpers")
+                self.assertFalse(selected["native"] or selected["config"] or selected["wayland"])
+                self.assertFalse(selected["manual"])
+
     def test_initial_push_selects_all(self):
         self.assertEqual(changed_paths({"before": "0" * 40, "after": "a" * 40}, "push"), ([], True))
 

@@ -242,6 +242,10 @@ def reviewed_control_only(paths, event, event_name, force_all=False):
     if (force_all or not paths or any(type(path) is not str for path in paths)
             or not set(paths) <= AUTOMATIC_CONTROL_INPUTS or type(event) is not dict):
         return False
+    return reviewed_workflow_layout(event, event_name)
+
+
+def reviewed_workflow_layout(event, event_name):
     if event_name == "push":
         after = event.get("after")
     elif event_name == "pull_request":
@@ -271,12 +275,79 @@ def reviewed_control_only(paths, event, event_name, force_all=False):
         return False
 
 
+# The maintainer qualified all four native desktop jobs for this exact source.
+# The digest binds the immutable source/run/job receipt. Helpers/history still
+# run, and no binary, cache artifact or active run is treated as qualification.
+NATIVE_REUSE_SOURCE = "ee1bfdf1eff5c234a413c1f147b9ac6dd19f07fa"
+NATIVE_REUSE_TREE = "9e81e57e38c37881ff45ae798bdd15dc7ca80bfd"
+NATIVE_REUSE_QUALIFICATION = {'source': 'ee1bfdf1eff5c234a413c1f147b9ac6dd19f07fa', 'tree': '9e81e57e38c37881ff45ae798bdd15dc7ca80bfd', 'workflow_sha256': '9d557eeb730a8785aaf2d3eb9fbd5224ab202fdc2f2f384a60c73a87b61c9aa0', 'receipt_sha256': 'f994e9dfc5fb136ce6e6c2ffa3dfb06b8da2be8ffa13b14edfccf66cbcab927e', 'route': 'desktop', 'jobs': (('macos-15', 40453533115, 122021806445), ('macos-15-intel', 40455765740, 122028913464), ('ubuntu-24.04', 40453536502, 122021792596), ('windows-2025', 40453247821, 122020886627))}
+NATIVE_REUSE_SELECTORS = ("scripts/ci_scope.py", "scripts/tests/test_ci_scope.py")
+
+
+def qualified_apply_main_reuse(paths, event, event_name, force_all=False):
+    qualified = NATIVE_REUSE_QUALIFICATION
+    if (force_all or event_name != "push" or type(qualified) is not dict
+            or set(qualified) != {"source", "tree", "workflow_sha256", "receipt_sha256", "route", "jobs"}
+            or qualified["source"] != NATIVE_REUSE_SOURCE or qualified["tree"] != NATIVE_REUSE_TREE
+            or qualified["workflow_sha256"] != REVIEWED_CONTROL_WORKFLOW_SHA256 or qualified["route"] != "desktop"
+            or type(qualified["receipt_sha256"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", qualified["receipt_sha256"]) is None):
+        return False
+    jobs = qualified["jobs"]
+    if (type(jobs) is not tuple or len(jobs) != len(PLATFORMS)
+            or any(type(job) is not tuple or len(job) != 3 or job[0] not in PLATFORMS
+                   or type(job[1]) is not int or job[1] <= 0 or type(job[2]) is not int or job[2] <= 0 for job in jobs)
+            or {job[0] for job in jobs} != set(PLATFORMS)
+            or len({job[1] for job in jobs}) != len(jobs) or len({job[2] for job in jobs}) != len(jobs)):
+        return False
+    if (not paths or any(type(path) is not str for path in paths)
+            or not set(paths) <= AUTOMATIC_DESKTOP_INPUTS | set(NATIVE_REUSE_SELECTORS)
+            or not set(paths) & AUTOMATIC_DESKTOP_INPUTS or type(event) is not dict):
+        return False
+    repository, sender = event.get("repository"), event.get("sender")
+    if (type(repository) is not dict or type(sender) is not dict
+            or repository.get("full_name") != "brk275/Morpheus" or repository.get("private") is not False
+            or type(repository.get("owner")) is not dict or repository["owner"].get("login") != "brk275"
+            or sender.get("login") != "brk275" or event.get("ref") != "refs/heads/main"
+            or event.get("forced") is not False or event.get("deleted") is not False
+            or os.environ.get("GITHUB_ACTOR") != "brk275" or os.environ.get("GITHUB_TRIGGERING_ACTOR") != "brk275"):
+        return False
+    after = event.get("after")
+    if type(after) is not str or re.fullmatch(r"[0-9a-f]{40}", after) is None:
+        return False
+    if not reviewed_workflow_layout(event, event_name):
+        return False
+    command = ["git", "--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+               "-c", "core.fsmonitor=false"]
+    try:
+        # Exclude only two regular selector FILES, never a replacement directory
+        # or symlink whose descendants a pathspec could otherwise also exclude.
+        selectors = subprocess.run(command + ["ls-tree", "--full-tree", "-z", after, "--", *NATIVE_REUSE_SELECTORS],
+                                   check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10).stdout
+        pattern = (rb"100644 blob [0-9a-f]{40}\tscripts/ci_scope\.py\x00"
+                   rb"100644 blob [0-9a-f]{40}\tscripts/tests/test_ci_scope\.py\x00")
+        if type(selectors) is not bytes or re.fullmatch(pattern, selectors) is None:
+            return False
+        # Quiet object/mode comparison covers the ENTIRE remaining tree,
+        # including locks, toolchains, build configuration and all other tests.
+        # No recursive output allocation, candidate imports or external diff.
+        compared = subprocess.run(command + ["diff-tree", "--quiet", "--exit-code", "--no-ext-diff",
+            "--no-textconv", "--no-renames", "--ignore-submodules=none", "-r", NATIVE_REUSE_SOURCE, after, "--", ".",
+            ":(top,exclude)scripts/ci_scope.py", ":(top,exclude)scripts/tests/test_ci_scope.py"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        return type(compared.returncode) is int and compared.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def event_selection(event, event_name):
     if event_name != "workflow_dispatch":
         paths, force_all = changed_paths(event, event_name)
         selected = classify(paths, force_all)
         route = automatic_route(paths, force_all)
         if route == "all" and reviewed_control_only(paths, event, event_name, force_all):
+            route = "helpers"
+        if qualified_apply_main_reuse(paths, event, event_name, force_all):
             route = "helpers"
         if route == "desktop":
             selected = {"native": True, "native_matrix": {"os": list(PLATFORMS)},
