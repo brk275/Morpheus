@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
+//
+// Morpheus modification: rc.7 predecessor-key denial scenarios and bounded
+// switch assertions. Original retained in key_rotation.rs.upstream; see MORPHEUS_PATCH.md.
 
 //! Key rotation as timed multi-party scenarios.
 //!
@@ -22,9 +25,9 @@
 //!   cost. This is what "over-rotating" means, and the ideal is known exactly:
 //!   in a call of `n` where nobody rotates, every ordered pair exchanges one
 //!   key, so `n * (n - 1)` sends and one key each.
-//! - **Correctness** — at every point, whatever a member is *encrypting with*
-//!   must be a key every other member present holds. A cheap policy that leaves
-//!   somebody unable to decrypt is not cheaper, it is broken.
+//! - **Correctness** — established members keep decrypting through a key switch.
+//!   Outside key freshness, newcomers receive only pending keys and decrypt at
+//!   the original bounded `delayBeforeUse`; the predecessor is never handed over.
 //!
 //! # No real time passes
 //!
@@ -900,7 +903,8 @@ async fn arrivals_outside_the_grace_period_rotate_the_whole_call() {
         call.join(name).await;
     }
 
-    call.assert_media_flows("four spaced-out arrivals");
+    call.assert_media_flows_once_settled("four spaced-out arrivals")
+        .await;
     assert_eq!(
         call.total_rotations(),
         6,
@@ -909,9 +913,10 @@ async fn arrivals_outside_the_grace_period_rotate_the_whole_call() {
     );
     assert_eq!(
         call.key_sends(),
-        25,
-        "against a floor of {} for a call of four: 13 of the extra sends are the re-keying, \
-         and 5 are outgoing keys handed to arrivals so a delayed switch does not blind them — {}",
+        // With k existing members, each sends a fresh key to k peers, and the
+        // entrant sends its own key to those k: sum(k * (k + 1), k = 1..3) = 20.
+        20,
+        "against a floor of {} for a call of four: the extra sends are the re-keying — {}",
         ideal_sends(4),
         call.cost(),
     );
@@ -1096,25 +1101,52 @@ async fn a_departed_member_is_locked_out_when_the_delay_expires() {
     }
 }
 
-/// Somebody joins an established call.
+/// Somebody joins an established call whose keys are no longer fresh.
 ///
-/// They are handed a key and can decrypt from their first frame. Today a
-/// rotation on their arrival keeps every *existing* member decrypting through
-/// `delayBeforeUse` — by continuing to encrypt with a key the newcomer was
-/// never sent, so it is the newcomer who goes blind, for the whole delay, on
-/// every join.
+/// Existing members continue with their predecessor until the original delayed
+/// switch. The newcomer must never receive that prejoin key, and must decrypt
+/// as soon as the fresh keys come into use, exactly `delayBeforeUse` later.
 #[tokio::test]
-async fn a_new_arrival_can_decrypt_immediately() {
+async fn a_new_arrival_decrypts_once_the_switch_happens() {
+    let delay = EncryptionConfig::default().delay_before_use_ms;
+    assert!(delay > 0);
     let mut call = Call::with_defaults();
 
     call.join("alice").await;
     call.join("bob").await;
-    // Long enough that alice and bob will rotate for the next arrival.
     call.advance(30_000).await;
+    let predecessors: Vec<_> = ["alice", "bob"]
+        .into_iter()
+        .map(|name| {
+            let (index, key) = call
+                .peer(name)
+                .media
+                .sending_key(call.clock.now())
+                .expect("an established member is sending");
+            (name, index, key)
+        })
+        .collect();
 
     call.join("carol").await;
-
-    call.assert_media_flows("carol has just joined an established call");
+    let expected_gaps: Vec<_> = predecessors
+        .iter()
+        .map(|(name, index, _)| format!("carol cannot decrypt {name} (index {index})"))
+        .collect();
+    // These exact gaps also require every other ordered pair to keep decrypting.
+    assert_eq!(call.undecryptable_pairs(), expected_gaps);
+    call.advance(delay - 1).await;
+    assert_eq!(call.undecryptable_pairs(), expected_gaps);
+    call.advance(1).await;
+    call.assert_media_flows("the newcomer's original switch deadline");
+    for (name, index, key) in &predecessors {
+        assert!(
+            !call
+                .peer("carol")
+                .media
+                .can_decrypt(&call.peer(name).identity(), *index, key),
+            "carol received {name}'s prejoin predecessor",
+        );
+    }
 }
 
 /// The grace period's edge, from both sides.
@@ -1151,25 +1183,54 @@ async fn the_grace_period_decides_whether_an_arrival_rotates() {
 
 /// Somebody joins while a rotation is still propagating.
 ///
-/// The trap: the key in `outbound_key` is the pending one, but what is on the wire
-/// is the key it replaced, and only the pending one would be handed to an arrival
-/// by default. They would hold a key nobody is using and wait out the rest of a
-/// window they had nothing to do with.
+/// Only the pending key is handed over. The remaining switch interval is bounded
+/// by the original rotation deadline; no prejoin predecessor buys immediate media.
 #[tokio::test]
-async fn an_arrival_during_a_switch_window_can_decrypt_immediately() {
+async fn an_arrival_during_a_switch_window_is_not_handed_the_old_key() {
+    let delay = EncryptionConfig::default().delay_before_use_ms;
+    assert!(delay > 1_000);
     let mut call = Call::with_defaults();
 
     call.join("alice").await;
     call.join("bob").await;
-    // Long enough that carol's arrival rotates, opening a switch window.
     call.advance(30_000).await;
+    let predecessors: Vec<_> = ["alice", "bob"]
+        .into_iter()
+        .map(|name| {
+            let (index, key) = call
+                .peer(name)
+                .media
+                .sending_key(call.clock.now())
+                .expect("an established member is sending");
+            (name, index, key)
+        })
+        .collect();
     call.join("carol").await;
 
-    // Dave arrives while that rotation is still waiting to come into use.
     call.advance(1_000).await;
     call.join("dave").await;
-
-    call.assert_media_flows("dave joined mid-rotation");
+    let mut expected_gaps = Vec::new();
+    for (name, index, _) in &predecessors {
+        for newcomer in ["carol", "dave"] {
+            expected_gaps.push(format!("{newcomer} cannot decrypt {name} (index {index})"));
+        }
+    }
+    assert_eq!(call.undecryptable_pairs(), expected_gaps);
+    call.advance(delay - 1_000 - 1).await;
+    assert_eq!(call.undecryptable_pairs(), expected_gaps);
+    call.advance(1).await;
+    call.assert_media_flows("the original rotation deadline, without restarting for dave");
+    for (name, index, key) in &predecessors {
+        for newcomer in ["carol", "dave"] {
+            assert!(
+                !call
+                    .peer(newcomer)
+                    .media
+                    .can_decrypt(&call.peer(name).identity(), *index, key),
+                "{newcomer} received {name}'s prejoin predecessor",
+            );
+        }
+    }
 }
 
 /// A long, quiet call still replaces its key.
@@ -1270,41 +1331,45 @@ async fn churn_costs_one_rotation_per_grace_period() {
     }
 }
 
-/// An arrival inside a switch window is served from the key in flight, and no
-/// rotation is left owed for them once the window closes.
-///
-/// The alternative would be to rotate again at the end of the window purely
-/// because they arrived — denying them a key this rollout deliberately handed over
-/// so they would not sit blind. This pins the choice: an arrival mid-window can
-/// read from `delay_before_use_ms` before they joined, the same bargain the grace
-/// period strikes over a longer span.
+/// An arrival inside a switch window receives only the fresh pending key.
+/// Once the original window closes, that key serves them without an extra rotation.
 #[tokio::test]
 async fn an_arrival_inside_a_window_leaves_no_rotation_owed() {
     let delay = EncryptionConfig::default().delay_before_use_ms;
+    assert!(delay > 1_000);
     let mut call = Call::with_defaults();
 
     call.join("alice").await;
     call.join("bob").await;
     call.advance(30_000).await;
-    // Carol's arrival rotates and opens a window.
     call.join("carol").await;
     let after_carol = call.rotations("alice");
 
-    // Dave arrives inside it, and is served the key in flight.
     call.advance(1_000).await;
     call.join("dave").await;
-    call.assert_media_flows("dave joined mid-window");
-
-    // The window closes. Dave holds what the call is using, so nothing is owed.
-    call.advance(delay).await;
+    // Only carol and dave lack the two established senders' current predecessors.
+    // No existing member loses media, and the pending rotation is not restarted.
+    let mut expected_gaps = Vec::new();
+    for name in ["alice", "bob"] {
+        let (index, _) = call
+            .peer(name)
+            .media
+            .sending_key(call.clock.now())
+            .expect("an established member is sending");
+        for newcomer in ["carol", "dave"] {
+            expected_gaps.push(format!("{newcomer} cannot decrypt {name} (index {index})"));
+        }
+    }
+    assert_eq!(call.undecryptable_pairs(), expected_gaps);
+    call.advance(delay - 1_000).await;
     assert_eq!(
         call.rotations("alice"),
         after_carol,
-        "an arrival already served from the key in flight must not cost a further rotation \
-         when the window closes — {}",
+        "an arrival handed the pending key must not cost a further rotation when the \
+         window closes — {}",
         call.cost(),
     );
-    call.assert_media_flows("the window closed with dave in the call");
+    call.assert_media_flows("the original window closed with dave in the call");
 }
 
 /// A key message the homeserver refuses is retried — with the same key.
@@ -1432,7 +1497,8 @@ async fn a_reconnecting_member_costs_one_rotation() {
 /// The shape of the "over-rotating" reports, and the reason the grace period is
 /// the dial that matters: nothing unusual happens, everybody is well-behaved and
 /// well-connected, every arrival is spaced far enough apart to miss the grace
-/// period, and the call still spends 28 keys and triple the necessary traffic.
+/// period, and the call still spends 28 rotations and three times the floor
+/// in key-message deliveries.
 ///
 /// Scaling is the point — the same policy over a longer meeting with more
 /// arrivals costs proportionally more, so this is the number to watch if the
@@ -1450,7 +1516,8 @@ async fn a_long_call_with_a_steady_trickle_of_arrivals() {
         call.join(name).await;
     }
 
-    call.assert_media_flows("eight arrivals over four minutes");
+    call.assert_media_flows_once_settled("eight arrivals over four minutes")
+        .await;
     assert_eq!(
         call.total_rotations(),
         28,
@@ -1459,7 +1526,9 @@ async fn a_long_call_with_a_steady_trickle_of_arrivals() {
     );
     assert_eq!(
         call.key_sends(),
-        195,
+        // sum(k * (k + 1), k = 1..7) = 2 + 6 + 12 + 20 + 30 + 42 + 56.
+        // Predecessors are retained locally, never an additional newcomer send.
+        168,
         "against a floor of {} for a call of eight — {}",
         ideal_sends(8),
         call.cost(),
@@ -1528,7 +1597,10 @@ async fn documented_costs() {
             call.total_rotations(),
             call.key_sends()
         ),
-        (36, 28, 195)
+        // 8 initial keys plus 1 + ... + 7 rotations; k established senders
+        // each send their new key to k peers, and the entrant sends to k:
+        // 2 + 6 + 12 + 20 + 30 + 42 + 56 = 168 deliveries.
+        (36, 28, 168)
     );
 
     // -- 3 leave in one membership change ---------------------------------------

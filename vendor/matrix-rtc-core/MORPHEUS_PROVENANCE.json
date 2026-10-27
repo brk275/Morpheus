@@ -10,8 +10,14 @@
     "LICENSE-COMMERCIAL": "8f4b65d16f5ae2810f08a57430d2672e82bd06ddd1762f68dafdeb9f1f151896"
   },
   "changed_source_files": [
+    "src/client/tests.rs",
+    "src/compat/ingest.rs",
+    "src/encryption/mod.rs",
+    "src/feeder/dialect.rs",
+    "src/feeder/mod.rs",
     "src/own_membership.rs",
-    "src/session.rs"
+    "src/session.rs",
+    "tests/key_rotation.rs"
   ],
   "new_lock_identities": [],
   "lock_change": {

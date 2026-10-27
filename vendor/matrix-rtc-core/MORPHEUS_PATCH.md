@@ -111,3 +111,25 @@ This changes media-key distribution, not Megolm membership decryption, room
 history, Matrix recipient policy or stock-peer behavior. It does not establish
 a cause or cure for the fresh-device stock Bob membership failure. Source-only
 review does not establish native execution or acceptance.
+
+## rc.7 multi-party predecessor-key integration scenarios
+
+`tests/key_rotation.rs` now uses the rc.7 no-predecessor contract from
+`5b8e73539878e40fa5bd88d637eb8eb2b6b2f0d0`. The existing real-manager,
+to-device bus and controlled-clock scenarios remain in place. Newcomers cannot
+decrypt prejoin predecessor media during a pending switch; all other ordered
+member pairs keep decrypting. The original switch deadline admits newcomer
+media, without restarting the deadline for an arrival inside the window or
+sending that arrival any predecessor. Captured prejoin keys remain unavailable
+after switching. Existing departure, retry, rotation and coalescing checks remain.
+
+For an arrival to k established members, each existing sender distributes its
+fresh key to k peers and the newcomer distributes to k: k*(k+1) deliveries.
+Thus four spaced arrivals cost 2+6+12=20, and eight cost
+2+6+12+20+30+42+56=168; key creation remains 36 total/28 rotations for eight.
+These derive from recipient counts, not acceptance of observed totals.
+
+The original test bytes are retained in `tests/key_rotation.rs.upstream` and
+still match `UPSTREAM_FILES.sha256`. No production, dependency, encryption,
+trust, grace, delay or workflow setting changes. This is a source correction to
+obsolete integration expectations; affected hosted checks remain required.
