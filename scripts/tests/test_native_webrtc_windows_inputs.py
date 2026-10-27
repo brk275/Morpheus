@@ -798,9 +798,12 @@ try {
             script = r"""
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$caseStage = 'source_parse'
+try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw 'source_parse' }
+$caseStage = 'source_functions'
 $definitions = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)
 # Function declarations must remain in this scope for the actual calls below.
 . ([ScriptBlock]::Create(($definitions | ForEach-Object { $_.Extent.Text }) -join "`n"))
@@ -809,6 +812,7 @@ function Must-Refuse([ScriptBlock] $Action) {
     try { & $Action | Out-Null } catch { $refused = $true }
     if (-not $refused) { throw 'accepted' }
 }
+$caseStage = 'metadata'
 $metadata = @{ run_id = '1'; run_attempt = '1'; source_commit = ('a' * 40);
     image_os = 'win25'; image_version = '20261026.1.0'; powershell_version = '7.5.3' }
 if ((Get-HostReceiptMetadata $metadata).run_id -cne '1') { throw 'metadata' }
@@ -818,25 +822,32 @@ foreach ($bad in @('private value', ('x' * 65), "line`nbreak")) {
 }
 $changed = $metadata.Clone(); $changed.extra = 'unrequested'
 Must-Refuse { Get-HostReceiptMetadata $changed }
+$caseStage = 'path_refusals'
 $root = $env:MORPHEUS_HOST_TEST_ROOT
 foreach ($bad in @('relative', '\\server\share\x', 'C:\x:stream', 'C:\x\..\other', 'C:\x\bad.', 'C:\x\bad ', 'C:\x\CON.txt')) {
     Must-Refuse { Get-CanonicalHostPath $bad }
 }
+$caseStage = 'synthetic_setup'
 $good = Join-Path $root 'good'
 [IO.Directory]::CreateDirectory((Join-Path $good 'include')) | Out-Null
 [IO.File]::WriteAllBytes((Join-Path $good 'tool.bin'), [byte[]]@(1,2,3,4))
 [IO.File]::WriteAllBytes((Join-Path $good 'include\header.h'), [byte[]]@(5))
+$caseStage = 'reader_initialize'
 Initialize-HostReader
 try {
+    $caseStage = 'inventory'
     $result = Get-HostRootInventory $good
     if ($result.files.Count -ne 2 -or $script:HostBytes -ne 5) { throw 'inventory' }
+    $caseStage = 'digest_assertion'
     $tool = @($result.files | Where-Object { $_.path -eq 'tool.bin' })
     if ($tool.Count -ne 1 -or $tool[0].bytes -ne 4 -or
         $tool[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
     # Actual retained READ-sharing owner denies a new writer, not a mock lock.
+    $caseStage = 'write_exclusion'
     Must-Refuse { [IO.File]::WriteAllBytes((Join-Path $good 'tool.bin'), [byte[]]@(9)) }
 } finally { Close-HostReader }
 foreach ($boundary in @('bytes', 'entries', 'deadline', 'metadata')) {
+    $caseStage = 'limit_' + $boundary
     Initialize-HostReader
     try {
         switch ($boundary) {
@@ -850,9 +861,11 @@ foreach ($boundary in @('bytes', 'entries', 'deadline', 'metadata')) {
 }
 # The aggregate boundary is checked against the opened size before the
 # first payload Read argument is evaluated, not only after a completed hash.
+$caseStage = 'aggregate_setup'
 $budgetRoot = Join-Path $root 'aggregate-budget'
 [IO.Directory]::CreateDirectory($budgetRoot) | Out-Null
 [IO.File]::WriteAllBytes((Join-Path $budgetRoot 'next.bin'), [byte[]]@(1,2,3,4))
+$caseStage = 'aggregate_before_read'
 Initialize-HostReader
 try {
     $script:HostLimits.TotalBytes = 6; $script:HostBytes = [uint64]3
@@ -869,6 +882,7 @@ try {
 } finally { Close-HostReader }
 # A file that exactly consumes the remaining bytes still uses the actual
 # reader/hash and is admitted; the production 64GiB cap is unchanged.
+$caseStage = 'aggregate_exact_fit'
 Initialize-HostReader
 try {
     $script:HostLimits.TotalBytes = 7; $script:HostBytes = [uint64]3
@@ -878,12 +892,43 @@ try {
         throw 'aggregate_exact_fit'
     }
 } finally { Close-HostReader }
+$caseStage = 'junction_setup'
 $junctionRoot = Join-Path $root 'junction-root'
 [IO.Directory]::CreateDirectory($junctionRoot) | Out-Null
 New-Item -ItemType Junction -Path (Join-Path $junctionRoot 'alias') -Target $good | Out-Null
+$caseStage = 'junction_refusal'
 Initialize-HostReader
 try { Must-Refuse { Get-HostRootInventory $junctionRoot } } finally { Close-HostReader }
 Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
+} catch {
+    # Output only source-fixed labels. No ErrorRecord/string rendering, native
+    # error text, path, argument, environment value or child stderr is emitted.
+    $category = 'unexpected'
+    $closed = @('source_parse', 'metadata', 'accepted', 'path', 'host', 'type',
+        'identity', 'reparse', 'open', 'changed', 'limit', 'file_size', 'text_size',
+        'depth', 'entries', 'alias', 'handle_cleanup', 'inventory', 'hash',
+        'aggregate_before_read', 'aggregate_exact_fit')
+    if ($closed -ccontains $_.Exception.Message) { $category = 'check_' + $_.Exception.Message }
+    else {
+        # PowerShell wraps .NET invocation errors. Inspect at most eight links,
+        # mapping only known runtime types to fixed categories, never printing them.
+        $problem = $_.Exception
+        for ($i = 0; $i -lt 8 -and $null -ne $problem; $i++) {
+            if ($problem -is [UnauthorizedAccessException]) { $category = 'access'; break }
+            if ($problem -is [IO.IOException]) { $category = 'io'; break }
+            if ($problem -is [ArgumentException]) { $category = 'argument'; break }
+            if ($problem -is [InvalidCastException]) { $category = 'cast'; break }
+            if ($problem -is [MissingMemberException]) { $category = 'member'; break }
+            if ($problem -is [Management.Automation.MethodInvocationException]) { $category = 'invocation' }
+            elseif ($category -eq 'unexpected' -and $problem -is [Management.Automation.RuntimeException]) {
+                $category = 'powershell_runtime'
+            }
+            $problem = $problem.InnerException
+        }
+    }
+    Write-Output ('MORPHEUS_HOST_READER_BOUNDARY_FAILED stage=' + $caseStage + ' category=' + $category)
+    exit 1
+}
 """
             source = PATH.parent / "native_webrtc/windows_preflight.ps1"
             pwsh = Path(os.environ["ProgramFiles"]) / "PowerShell/7/pwsh.exe"
@@ -893,8 +938,31 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
                 env["MORPHEUS_HOST_TEST_ROOT"] = temporary
                 result = subprocess.run([str(pwsh), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
                     text=True, encoding="utf-8", capture_output=True, timeout=45, env=env)
-            self.assertEqual(result.returncode, 0, "fixed Windows host reader boundary case failed")
-            self.assertEqual(result.stdout.strip(), "MORPHEUS_HOST_READER_BOUNDARIES_OK")
+            # The only forwarded child output is one exact finite diagnostic.
+            # Unknown/multiple/raw lines and all child stderr stay withheld.
+            stages = ("source_parse", "source_functions", "metadata", "path_refusals",
+                      "synthetic_setup", "reader_initialize", "inventory", "digest_assertion",
+                      "write_exclusion", "limit_bytes", "limit_entries", "limit_deadline",
+                      "limit_metadata", "aggregate_setup", "aggregate_before_read",
+                      "aggregate_exact_fit", "junction_setup", "junction_refusal")
+            checks = ("source_parse", "metadata", "accepted", "path", "host", "type",
+                      "identity", "reparse", "open", "changed", "limit", "file_size", "text_size",
+                      "depth", "entries", "alias", "handle_cleanup", "inventory", "hash",
+                      "aggregate_before_read", "aggregate_exact_fit")
+            categories = ("unexpected", "access", "io", "argument", "cast", "member",
+                          "invocation", "powershell_runtime") + tuple("check_" + item for item in checks)
+            diagnostic = "stage=unknown category=unexpected"
+            if len(result.stdout) <= 160:
+                for stage in stages:
+                    for category in categories:
+                        expected = ("MORPHEUS_HOST_READER_BOUNDARY_FAILED stage=" + stage
+                                    + " category=" + category)
+                        if result.stdout.strip() == expected:
+                            diagnostic = "stage=" + stage + " category=" + category
+            self.assertEqual(result.returncode, 0,
+                             "fixed Windows host reader boundary case failed " + diagnostic)
+            self.assertTrue(result.stdout.strip() == "MORPHEUS_HOST_READER_BOUNDARIES_OK",
+                            "fixed Windows host reader success marker mismatch")
 
 
 if __name__ == "__main__":
