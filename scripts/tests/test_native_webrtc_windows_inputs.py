@@ -1157,6 +1157,22 @@ function Must-Refuse([ScriptBlock] $Action) {
     try { & $Action | Out-Null } catch { $refused = $true }
     if (-not $refused) { throw 'accepted' }
 }
+$caseStage = 'failure_context'
+foreach ($phase in @('initialization', 'bootstrap', 'vs_inventory', 'sdk_inventory',
+    'role_binding', 'final_identity', 'serialization')) {
+    $message = @(Get-HostPreflightFailureMessage $phase)
+    if ($message.Count -ne 1 -or $message[0] -cne ('MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=' + $phase)) {
+        throw 'failure_context'
+    }
+}
+foreach ($value in @($null, '', 'BOOTSTRAP', "private`npath token payload", ('private' * 1000),
+    ('boot' + [char]0 + 'strap'), ('boot' + [char]0x200b + 'strap'),
+    @{ path = 'private'; error = 'private' }, [pscustomobject]@{ value = 'private' })) {
+    $message = @(Get-HostPreflightFailureMessage $value)
+    if ($message.Count -ne 1 -or $message[0] -cne 'MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=unknown') {
+        throw 'failure_context'
+    }
+}
 $caseStage = 'metadata'
 $metadata = @{ run_id = '1'; run_attempt = '1'; source_commit = ('a' * 40);
     image_os = 'win25'; image_version = '20261026.1.0'; powershell_version = '7.5.3' }
@@ -1259,7 +1275,7 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
         'host', 'type',
         'identity', 'reparse', 'open', 'changed', 'limit', 'file_size', 'text_size',
         'depth', 'entries', 'alias', 'handle_cleanup', 'inventory', 'hash',
-        'aggregate_before_read', 'aggregate_exact_fit')
+        'aggregate_before_read', 'aggregate_exact_fit', 'failure_context')
     if ($closed -ccontains $_.Exception.Message) { $category = 'check_' + $_.Exception.Message }
     else {
         # PowerShell wraps .NET invocation errors. Inspect at most eight links,
@@ -1292,7 +1308,7 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
                     text=True, encoding="utf-8", capture_output=True, timeout=45, env=env)
             # The only forwarded child output is one exact finite diagnostic.
             # Unknown/multiple/raw lines and all child stderr stay withheld.
-            stages = ("source_parse", "source_functions", "metadata", "path_refusals",
+            stages = ("source_parse", "source_functions", "failure_context", "metadata", "path_refusals",
                       "synthetic_setup", "reader_initialize", "inventory", "digest_assertion",
                       "write_exclusion", "limit_bytes", "limit_entries", "limit_deadline",
                       "limit_metadata", "aggregate_setup", "aggregate_before_read",
@@ -1304,7 +1320,7 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
                       "host", "type",
                       "identity", "reparse", "open", "changed", "limit", "file_size", "text_size",
                       "depth", "entries", "alias", "handle_cleanup", "inventory", "hash",
-                      "aggregate_before_read", "aggregate_exact_fit")
+                      "aggregate_before_read", "aggregate_exact_fit", "failure_context")
             categories = ("unexpected", "access", "io", "argument", "cast", "member",
                           "invocation", "powershell_runtime") + tuple("check_" + item for item in checks)
             diagnostic = "stage=unknown category=unexpected"
@@ -1319,6 +1335,20 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
                              "fixed Windows host reader boundary case failed " + diagnostic)
             self.assertTrue(result.stdout.strip() == "MORPHEUS_HOST_READER_BOUNDARIES_OK",
                             "fixed Windows host reader success marker mismatch")
+
+            # Exercise the actual entry/catch/exit with a refused synthetic
+            # caller. The first guard fails before bootstrap tool discovery or
+            # installed SDK selection; no child stderr/raw text is forwarded.
+            env = os.environ.copy()
+            env["GITHUB_ACTIONS"] = "false"
+            result = subprocess.run([str(pwsh), "-NoLogo", "-NoProfile", "-NonInteractive",
+                "-File", str(source), "-Mode", "host-toolchain"],
+                text=True, encoding="utf-8", capture_output=True, timeout=45, env=env)
+            self.assertEqual(result.returncode, 1, "fixed preflight failure must remain fatal")
+            self.assertTrue(result.stdout.strip() ==
+                            "MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=bootstrap",
+                            "fixed preflight failure context mismatch")
+            self.assertTrue(not result.stderr, "preflight failure emitted unexpected stderr")
 
 
 if __name__ == "__main__":

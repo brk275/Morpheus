@@ -245,9 +245,25 @@ function Get-HostReceiptMetadata([hashtable] $Values) {
     return $Values
 }
 
+function Get-HostPreflightFailureMessage($Stage) {
+    # Only source-fixed phases can reach the log. Never inspect the exception,
+    # a path, environment value or another object's string representation.
+    if ($Stage -is [string]) {
+        foreach ($phase in @('initialization', 'bootstrap', 'vs_inventory',
+            'sdk_inventory', 'role_binding', 'final_identity', 'serialization')) {
+            if ([string]::Equals($Stage, $phase, [StringComparison]::Ordinal)) {
+                return 'MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=' + $phase
+            }
+        }
+    }
+    return 'MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=unknown'
+}
+
 function Get-HostToolchainInventory {
+    $script:HostPreflightStage = 'initialization'
     Initialize-HostReader
     try {
+        $script:HostPreflightStage = 'role_binding'
         $drive = $env:SystemRoot.Substring(0, 2)
         $vsBase = $drive + '\Program Files\Microsoft Visual Studio\2022'
         $candidates = @('Enterprise', 'Professional', 'Community', 'Preview', 'BuildTools') |
@@ -280,7 +296,12 @@ function Get-HostToolchainInventory {
             if ($fact.bytes -le 0) { throw 'role' }
             $roleFacts[$name] = @{ path = $roles[$name]; fact = $fact }
         }
-        $roots = @((Get-HostRootInventory $vs), (Get-HostRootInventory $sdk))
+        $script:HostPreflightStage = 'vs_inventory'
+        $vsInventory = Get-HostRootInventory $vs
+        $script:HostPreflightStage = 'sdk_inventory'
+        $sdkInventory = Get-HostRootInventory $sdk
+        $roots = @($vsInventory, $sdkInventory)
+        $script:HostPreflightStage = 'final_identity'
         foreach ($record in $script:HostDirectories.Values) { Assert-HostIdentity $record $false }
         foreach ($record in $script:HostFileRecords) { Assert-HostBudget; Assert-HostIdentity $record $true }
         Assert-HostBudget
@@ -300,6 +321,7 @@ function Get-HostToolchainInventory {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$script:HostPreflightStage = 'bootstrap'
 try {
     if ($Mode -cnotin @('basic', 'host-toolchain')) { throw 'mode' }
     if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or
@@ -342,10 +364,12 @@ try {
         else { $facts[$name] = $null }
     }
     if ($Mode -eq 'host-toolchain') {
+        $script:HostPreflightStage = 'initialization'
         $metadata = Get-HostReceiptMetadata @{ run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT;
             source_commit = $env:GITHUB_SHA; image_os = $env:ImageOS; image_version = $env:ImageVersion;
             powershell_version = $PSVersionTable.PSVersion.ToString() }
         $inventory = Get-HostToolchainInventory
+        $script:HostPreflightStage = 'serialization'
         foreach ($key in $metadata.Keys) { $inventory[$key] = $metadata[$key] }
         $inventory.bootstrap_tools = $facts
         # Only filenames, sizes and hashes of fixed host roots leave the reader.
@@ -355,6 +379,7 @@ try {
         Write-Output $json
         return
     }
+    $script:HostPreflightStage = 'serialization'
     [ordered]@{
         schema = 'morpheus-native-windows-host-preflight-v1'
         run_id = $env:GITHUB_RUN_ID
@@ -373,6 +398,6 @@ try {
         build_admission_granted = $false
     } | ConvertTo-Json -Depth 5 -Compress | Write-Output
 } catch {
-    Write-Output 'MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed'
+    Write-Output (Get-HostPreflightFailureMessage $script:HostPreflightStage)
     exit 1
 }
