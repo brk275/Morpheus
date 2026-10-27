@@ -3279,9 +3279,9 @@ async fn assert_appearance_workspace_and_search(
         external.window.opacity_percent = reloaded;
         store.save(&external).unwrap();
         let accepted = std::fs::read(store.path()).unwrap();
-        apply_loaded_config(
+        crate::apply_loaded_config(
             ui,
-            &LoadedConfig {
+            &morpheus_config::LoadedConfig {
                 config: external,
                 theme: None,
             },
