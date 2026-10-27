@@ -181,10 +181,7 @@ fn avatar_slots_inherit_by_account_and_room_and_round_trip() {
             config.colors_for_room(Some("local-b"), Some(ROOM))[id],
             "#111111"
         );
-        assert_eq!(
-            config.colors_for_room(None, Some(ROOM))[id],
-            "#111111"
-        );
+        assert_eq!(config.colors_for_room(None, Some(ROOM))[id], "#111111");
         assert_eq!(
             parse(&toml::to_string_pretty(&config).unwrap()).unwrap(),
             config

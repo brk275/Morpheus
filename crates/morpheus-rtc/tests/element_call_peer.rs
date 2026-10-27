@@ -412,7 +412,10 @@ fn roster_discriminator(rtc: &RtcService, room: &str, users: [&str; 3]) -> &'sta
     }
     let mut counts = [0_usize; 3];
     for member in members {
-        let Some(index) = users.iter().position(|user| member.user_id.as_str() == *user) else {
+        let Some(index) = users
+            .iter()
+            .position(|user| member.user_id.as_str() == *user)
+        else {
             return "unexpected_or_duplicate";
         };
         counts[index] += 1;
