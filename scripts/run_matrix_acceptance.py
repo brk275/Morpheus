@@ -1406,6 +1406,22 @@ class Acceptance:
         if pid_namespace and "Element process containment failed; raw diagnostics withheld" in output:
             raise RuntimeError("Acceptance process containment failed")
         if element_checks and re.search(r"^MORPHEUS_ELEMENT_FAILURE (?:log_scan|fixture_operation)$", output, re.MULTILINE):
+            # The full outer scan and fatal predicate above stay authoritative.
+            # Only bounded complete lines reach the existing script-only reducer;
+            # a suffix of an oversized line must not forge a fresh stage marker.
+            tail = output[-4096:]
+            if len(output) > len(tail) and output[-len(tail) - 1] != "\n":
+                _, separator, tail = tail.partition("\n")
+                if not separator:
+                    tail = ""
+            diagnostics = element_diagnostics(tail, include_native=False)
+            fatal_scan = re.search(r"^MORPHEUS_ELEMENT_FAILURE log_scan$", output, re.MULTILINE) is not None
+            fatal_fixture = re.search(r"^MORPHEUS_ELEMENT_FAILURE fixture_operation$", output, re.MULTILINE) is not None
+            diagnostics["failure"] = ("ambiguous" if fatal_scan and fatal_fixture else
+                                      "log_scan" if fatal_scan else "fixture_operation")
+            # Fixed categories only: no native context or acceptance facts.
+            print(json.dumps({"check": ELEMENT_LABEL, "status": "failed",
+                              "element_diagnostics": diagnostics}, sort_keys=True), flush=True)
             raise RuntimeError("Element acceptance infrastructure or cleanup failed")
         if ring_case is not None and (ring_evidence(output).get("cleanup") is False
                                      or ring_diagnostics(output).get("failure") == "cleanup"

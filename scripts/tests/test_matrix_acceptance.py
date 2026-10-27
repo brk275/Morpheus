@@ -3564,14 +3564,66 @@ class ScopedContinuationTests(unittest.TestCase):
             self.assertTrue(run.call_args.kwargs["cleanup"])
 
     def test_inner_scan_and_ring_cleanup_failure_never_become_collectible(self):
-        for output, extra in (("MORPHEUS_ELEMENT_STAGE native_test\nMORPHEUS_ELEMENT_FAILURE log_scan\n", {"element_checks": True}),
-                              ("running 1 test\nMORPHEUS_RING_CHECK cleanup=false\n", {"ring_case": ("current", "dm")})):
-            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as folder:
-                runner = Acceptance(Path(folder), "scanner")
-                label = acceptance_module.ELEMENT_LABEL if "element_checks" in extra else "outgoing-ring-current-dm"
-                with self.contained_child(runner, output), self.assertRaises(RuntimeError) as caught:
-                    runner.run(label, ["test"], pid_namespace=True, **extra)
-                self.assertNotIsInstance(caught.exception, acceptance_module.CheckFailure)
+        cases = (
+            ("MORPHEUS_ELEMENT_STAGE native_test\nMORPHEUS_ELEMENT_FAILURE log_scan\n",
+             {"element_checks": True}, {"stage": "native_test", "failure": "log_scan"}),
+            ("MORPHEUS_ELEMENT_STAGE element_cleanup\nMORPHEUS_ELEMENT_FAILURE fixture_operation\n"
+             "MORPHEUS_ELEMENT_NATIVE_STAGE group_roster\n"
+             "MORPHEUS_ELEMENT_NATIVE_KEY_CONTEXT import=observed original=decrypted continuity=changed\n"
+             "opaque_private_token_and_url\n",
+             {"element_checks": True}, {"stage": "element_cleanup", "failure": "fixture_operation"}),
+            ("MORPHEUS_ELEMENT_STAGE opaque_private_stage\nMORPHEUS_ELEMENT_FAILURE log_scan\n"
+             "MORPHEUS_ELEMENT_NATIVE_KEY_CONTEXT opaque_private_value\n",
+             {"element_checks": True}, {"failure": "log_scan"}),
+            # A later different failure category never clears the earlier
+            # fatal infrastructure predicate; only fixed context is shown.
+            ("MORPHEUS_ELEMENT_FAILURE fixture_operation\nMORPHEUS_ELEMENT_FAILURE native_acceptance\n",
+             {"element_checks": True}, {"failure": "fixture_operation"}),
+            ("MORPHEUS_ELEMENT_FAILURE log_scan\nMORPHEUS_ELEMENT_FAILURE fixture_operation\n",
+             {"element_checks": True}, {"failure": "ambiguous"}),
+            # Keep a genuine final stage after a large untrusted prefix, but
+            # never copy the prefix or parse more than the bounded tail.
+            ("opaque_private" * 4096 + "\nMORPHEUS_ELEMENT_STAGE native_test\n"
+             "MORPHEUS_ELEMENT_FAILURE log_scan\n",
+             {"element_checks": True}, {"stage": "native_test", "failure": "log_scan"}),
+            # Fatality is matched against the full log even when the bounded
+            # diagnostic tail contains no complete useful line.
+            ("MORPHEUS_ELEMENT_FAILURE fixture_operation\n" + "opaque_private" * 4096,
+             {"element_checks": True}, {"failure": "fixture_operation"}),
+            # The final4096 characters start with a valid-looking marker, but
+            # its preceding character is not a newline: drop that partial line.
+            ("MORPHEUS_ELEMENT_FAILURE fixture_operation\nopaque_private" +
+             "MORPHEUS_ELEMENT_STAGE native_test\n" + "x" * (4096 - len("MORPHEUS_ELEMENT_STAGE native_test\n")),
+             {"element_checks": True}, {"failure": "fixture_operation"}),
+            ("running 1 test\nMORPHEUS_RING_CHECK cleanup=false\n",
+             {"ring_case": ("current", "dm")}, None),
+        )
+        for output, extra, diagnostics in cases:
+            for scanner_code in (0, 1):
+                with self.subTest(extra=extra, scanner=scanner_code), tempfile.TemporaryDirectory() as folder:
+                    runner = Acceptance(Path(folder), "scanner")
+                    label = acceptance_module.ELEMENT_LABEL if "element_checks" in extra else "outgoing-ring-current-dm"
+                    with (patch.object(acceptance_module, "element_diagnostics",
+                                       wraps=acceptance_module.element_diagnostics) as reduced,
+                          self.contained_child(runner, output, scanner_code=scanner_code) as (
+                              visible, _, _, _, _, scan,
+                          ), self.assertRaises(RuntimeError) as caught):
+                        runner.run(label, ["test"], pid_namespace=True, **extra)
+                    self.assertNotIsInstance(caught.exception, acceptance_module.CheckFailure)
+                    scan.assert_called_once()
+                    self.assertEqual(runner.results, [])
+                    self.assertTrue("opaque_private" not in visible.getvalue(), "closed failure summary reflected input")
+                    records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+                    expected = ([{"check": acceptance_module.ELEMENT_LABEL, "status": "failed",
+                                  "element_diagnostics": diagnostics}]
+                                if scanner_code == 0 and diagnostics is not None else [])
+                    self.assertTrue(records == expected, "fatal failure summary was missing or outside its fixed schema")
+                    if expected:
+                        reduced.assert_called_once()
+                        self.assertLessEqual(len(reduced.call_args.args[0]), 4096)
+                        self.assertEqual(reduced.call_args.kwargs, {"include_native": False})
+                    else:
+                        reduced.assert_not_called()
 
     def test_element_setup_deadline_is_fatal_and_only_actual_peer_stages_are_collectible(self):
         from run_element_acceptance import STAGES
