@@ -1064,6 +1064,8 @@ class WindowsNativeInputsTests(unittest.TestCase):
     def test_workflow_supplies_fixed_absolute_plan_and_entry_keeps_path_policy(self):
         workflow = PATH.parents[1] / ".github/workflows/native-webrtc-windows-source.yml"
         source = workflow.read_text()
+        self.assertEqual([line.strip() for line in source.splitlines()
+                          if line.lstrip().startswith("runs-on:")], ["runs-on: windows-2022"])
         self.assertIn("$plan = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath "
                       "'native/webrtc/windows/pipeline-plan.json'", source)
         self.assertIn("--plan $plan --plan-sha256", source)
