@@ -52,31 +52,30 @@ The pending-removal row is a fixture. [Account controls](../ACCOUNT_ACCESS.md).
 <details>
 <summary>Source revision, capture run and image checksums</summary>
 
-Captured on October 17, 2026, from the tested
-[PR 9](https://github.com/brk275/Morpheus/pull/9) merge snapshot
-`78f6f46d401d0dd091eedae1278c015c459760c9`, on the standard Ubuntu runner in
-[CI run 39074067812](https://github.com/brk275/Morpheus/actions/runs/39074067812),
-attempt 1. The pixels are unchanged and the files contain no embedded metadata.
+Captured from source `2b4f276379692e3e3e50b48bb80e5ade9e3f345d` on the standard Ubuntu runner in
+[CI run 40543416624](https://github.com/brk275/Morpheus/actions/runs/40543416624),
+attempt 1. This capture does not imply that the complete CI run or beta release gates passed.
+The pixels are unchanged and the files contain no embedded metadata.
 
 The native capture command is `--morpheus-capture-preview`; CI converts its RGB
 snapshots to PNG with `scripts/encode_preview_pngs.py`. The source artifact was
-`native-preview-78f6f46d401d0dd091eedae1278c015c459760c9-1`, ID `12116672244`.
+`native-preview-2b4f276379692e3e3e50b48bb80e5ade9e3f345d-1`, ID `12752219176`.
 Its archive SHA-256 is
-`e2cb955703f14afe8c82e4638918ed9087f32dc5338abda8d39eec548f86ce28`.
+`3a95b49e569ba2e266c78dc6f52bcd61829daf27ddc0f815695d344ef5fa4a2f`.
 `desktop-preview.png` was copied here as `desktop.png`, and `paper-preview.png`
 as `paper.png`. Every image was copied byte for byte after privacy and visual
 review. All eight images below came from the same native executable, SHA-256
-`828516c07b29468eff912666c41a8c1370854bb105e773875c9f84ecd7a33918`.
+`e304274e18697584879c8c4723ffde3b7bf7fb207bb18ae7413e5dc5b7d4d592`.
 
 | File | SHA-256 |
 | --- | --- |
-| `desktop.png` | `e46322d8ba1ef3c285df62a7fb2f9cbd9a5c7ee7809b1d0f7797088f38ef4051` |
-| `account-switcher.png` | `c131e5238c5323ae5a27180be943f6832c6837c559ba7a9ec06e44e0935b5a55` |
-| `paper.png` | `14df8b7d3b9266633c08a83f36c31c6ca7431ab1aa22ff4d0d964e482ea5576e` |
-| `manage-accounts.png` | `422081010f89253a4d97eaacf086e987da81ba26e89fdf005025fdd22044b305` |
-| `account-password.png` | `7d4c7ac0fb304f82fd9ab80371d092b2ee6893472cbfc78bbcf083730b0b4a21` |
-| `sign-in.png` | `efcf41e65b1ca636511c612f2fbb56a024ba9b1f32c1ef906766e10a9d6ef367` |
-| `terminal-sidebar.png` | `113c69a3ef7fd607c884a6973424766969b706721098c424116ab4fb47770766` |
-| `terminal-space-labels.png` | `4250c62a176e235b6877cc02d63bbe1ec93a9049a818527b2fac9b92a1af8781` |
+| `desktop.png` | `1239b00823817939e08a6f9a9fa72802a65ed5d98c5ece360401c5681bac70cd` |
+| `paper.png` | `e42272abbc885a58648b0a964638c62ebb8c4bcc24f6712bba8a291aa5c9427f` |
+| `account-switcher.png` | `7201f0b8be3fc6b95eb09f2ef85623bce27d7aff999c2f97d4f56ad5bdb9bd7d` |
+| `manage-accounts.png` | `e6ff8713d1fd5476dd9c191e332bcbcf79e7adc749ed0f013c1f55c98f7e6766` |
+| `account-password.png` | `9a110a2dcf2469e37de52874da350ce2d64044fc4da46b990d19712ef277f755` |
+| `sign-in.png` | `cb82a16035ee1318923d9e4463396995b12337bb609066ba7b5f2f10444672a4` |
+| `terminal-sidebar.png` | `bab46d740a4da7946276d2ceb0f04bcac3cb8567fd948ab32d4f2f9b871e4b5f` |
+| `terminal-space-labels.png` | `721c39fad97b7f11f556923095485f27b149c169a881c8b1e82ced3e47ff1ec2` |
 
 </details>
