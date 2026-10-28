@@ -115,6 +115,116 @@ function New-HostComparisonInvoker([Delegate] $TypeCall, [Delegate] $InfoCall) {
     return $method.CreateDelegate([Func[Delegate, Delegate, IntPtr, IntPtr, byte[], object, bool, int]])
 }
 
+# Compile only fixed source expressions in the existing managed runtime. No
+# compiler executable, native export, file fact, or caller-supplied expression
+# is used. Unicode inputs return -1 for the unchanged PowerShell validator:
+# this preserves its Regex cache/culture and PowerShell comparison semantics.
+function New-HostCanonicalInvoker {
+    $e = [Linq.Expressions.Expression]
+    # Select exact public signatures once. PowerShell must not choose among
+    # collection/params overloads or Return's Type/Expression alternatives.
+    # These delegates build only the fixed graph below; no input is compiled.
+    $expressions = [Collections.Generic.IEnumerable[Linq.Expressions.Expression]]
+    $parameters = [Collections.Generic.IEnumerable[Linq.Expressions.ParameterExpression]]
+    $new = $e.GetMethod('New', [Type[]]@([Reflection.ConstructorInfo], $expressions)).CreateDelegate(
+        [Func[Reflection.ConstructorInfo, Collections.Generic.IEnumerable[Linq.Expressions.Expression], Linq.Expressions.NewExpression]])
+    $returnValue = $e.GetMethod('Return', [Type[]]@([Linq.Expressions.LabelTarget], [Linq.Expressions.Expression])).CreateDelegate(
+        [Func[Linq.Expressions.LabelTarget, Linq.Expressions.Expression, Linq.Expressions.GotoExpression]])
+    $staticCall = $e.GetMethod('Call', [Type[]]@([Reflection.MethodInfo], $expressions)).CreateDelegate(
+        [Func[Reflection.MethodInfo, Collections.Generic.IEnumerable[Linq.Expressions.Expression], Linq.Expressions.MethodCallExpression]])
+    $instanceCall = $e.GetMethod('Call', [Type[]]@([Linq.Expressions.Expression], [Reflection.MethodInfo], $expressions)).CreateDelegate(
+        [Func[Linq.Expressions.Expression, Reflection.MethodInfo, Collections.Generic.IEnumerable[Linq.Expressions.Expression], Linq.Expressions.MethodCallExpression]])
+    $block = $e.GetMethod('Block', [Type[]]@($expressions)).CreateDelegate(
+        [Func[Collections.Generic.IEnumerable[Linq.Expressions.Expression], Linq.Expressions.BlockExpression]])
+    $variableBlock = $e.GetMethod('Block', [Type[]]@($parameters, $expressions)).CreateDelegate(
+        [Func[Collections.Generic.IEnumerable[Linq.Expressions.ParameterExpression], Collections.Generic.IEnumerable[Linq.Expressions.Expression], Linq.Expressions.BlockExpression]])
+    $lambda = $e.GetMethod('Lambda', [Type[]]@([Type], [Linq.Expressions.Expression], $parameters)).CreateDelegate(
+        [Func[Type, Linq.Expressions.Expression, Collections.Generic.IEnumerable[Linq.Expressions.ParameterExpression], Linq.Expressions.LambdaExpression]])
+    $resultType = [ValueTuple[string, int]]
+    $resultCtor = $resultType.GetConstructor([Type[]]@([string], [int]))
+    $value = $e::Parameter([string], 'value')
+    $full = $e::Variable([string], 'full')
+    $parts = $e::Variable([string[]], 'parts')
+    $part = $e::Variable([string], 'part')
+    $index = $e::Variable([int], 'index')
+    $finish = $e::Label($resultType, 'finish')
+    $asciiDone = $e::Label('ascii_done'); $partsDone = $e::Label('parts_done')
+    $zero = $e::Constant([int]0)
+    $nullString = $e::Constant($null, [string])
+    $refused = @{}
+    foreach ($code in @(-1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)) {
+        $refused[$code] = $returnValue.Invoke($finish,
+            $new.Invoke($resultCtor, [Linq.Expressions.Expression[]]@($nullString, $e::Constant([int]$code))))
+    }
+    $empty = [string].GetMethod('IsNullOrEmpty', [Type[]]@([string]))
+    $charAt = [string].GetMethod('get_Chars', [Type[]]@([int]))
+    $substring = [string].GetMethod('Substring', [Type[]]@([int]))
+    $contains = [string].GetMethod('Contains', [Type[]]@([string]))
+    $endsWith = [string].GetMethod('EndsWith', [Type[]]@([string]))
+    $trimEnd = [string].GetMethod('TrimEnd', [Type[]]@([char[]]))
+    $split = [string].GetMethod('Split', [Type[]]@([char[]], [StringSplitOptions]))
+    $getFullPath = [IO.Path].GetMethod('GetFullPath', [Type[]]@([string]))
+    # These are the public PowerShell equality semantics, not ordinal equality.
+    $psEquals = [Management.Automation.LanguagePrimitives].GetMethod('Equals',
+        [Type[]]@([object], [object], [bool]))
+    $slash = $e::Constant([char[]]@([char]92), [char[]])
+    $ignoreCase = $e::Constant($true); $caseSensitive = $e::Constant($false)
+    $regexOptions = [Text.RegularExpressions.RegexOptions]::IgnoreCase
+    $drive = [Text.RegularExpressions.Regex]::new('^[A-Za-z]:\\', $regexOptions)
+    $invalid = [Text.RegularExpressions.Regex]::new('[\x00-\x1f*?"<>|]', $regexOptions)
+    $device = [Text.RegularExpressions.Regex]::new('^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)', $regexOptions)
+    $isMatch = [Text.RegularExpressions.Regex].GetMethod('IsMatch', [Type[]]@([string]))
+    $length = $e::Property($value, 'Length')
+    $partObject = $e::Convert($part, [object])
+    $partEmpty = $staticCall.Invoke($psEquals, [Linq.Expressions.Expression[]]@(
+        $partObject, $e::Constant('', [object]), $ignoreCase))
+    $dot = $staticCall.Invoke($psEquals, [Linq.Expressions.Expression[]]@(
+        $partObject, $e::Constant('.', [object]), $ignoreCase))
+    $dotDot = $staticCall.Invoke($psEquals, [Linq.Expressions.Expression[]]@(
+        $partObject, $e::Constant('..', [object]), $ignoreCase))
+    $git = $staticCall.Invoke($psEquals, [Linq.Expressions.Expression[]]@(
+        $partObject, $e::Constant('.git', [object]), $ignoreCase))
+    $trimmedFull = $instanceCall.Invoke($full, $trimEnd, [Linq.Expressions.Expression[]]@($slash))
+    $trimmedValue = $instanceCall.Invoke($value, $trimEnd, [Linq.Expressions.Expression[]]@($slash))
+    $normalized = $staticCall.Invoke($psEquals, [Linq.Expressions.Expression[]]@(
+        $e::Convert($trimmedFull, [object]), $e::Convert($trimmedValue, [object]), $caseSensitive))
+    $componentChecks = $block.Invoke([Linq.Expressions.Expression[]]@(
+        $e::IfThen($partEmpty, $refused[8]),
+        $e::IfThen($e::OrElse($dot, $dotDot), $refused[9]),
+        $e::IfThen($instanceCall.Invoke($part, $endsWith, [Linq.Expressions.Expression[]]@($e::Constant('.'))), $refused[10]),
+        $e::IfThen($instanceCall.Invoke($part, $endsWith, [Linq.Expressions.Expression[]]@($e::Constant(' '))), $refused[11]),
+        $e::IfThen($instanceCall.Invoke($e::Constant($device), $isMatch, [Linq.Expressions.Expression[]]@($part)), $refused[12]),
+        $e::IfThen($git, $refused[13]), $e::Empty()))
+    $asciiLoop = $e::Loop($e::IfThenElse($e::LessThan($index, $length),
+        $block.Invoke([Linq.Expressions.Expression[]]@(
+            $e::IfThen($e::GreaterThan($e::Convert(
+                $instanceCall.Invoke($value, $charAt, [Linq.Expressions.Expression[]]@($index)), [int]), $e::Constant([int]127)), $refused[-1]),
+            $e::PostIncrementAssign($index), $e::Empty())), $e::Break($asciiDone)), $asciiDone)
+    $componentLoop = $e::Loop($e::IfThenElse($e::LessThan($index, $e::ArrayLength($parts)),
+        $block.Invoke([Linq.Expressions.Expression[]]@(
+            $e::Assign($part, $e::ArrayIndex($parts, $index)),
+            $e::IfThen($e::Not($e::AndAlso($partEmpty, $e::Equal($length, $e::Constant([int]3)))), $componentChecks),
+            $e::PostIncrementAssign($index), $e::Empty())), $e::Break($partsDone)), $partsDone)
+    $body = $variableBlock.Invoke([Linq.Expressions.ParameterExpression[]]@($full, $parts, $part, $index),
+        [Linq.Expressions.Expression[]]@(
+            $e::IfThen($staticCall.Invoke($empty, [Linq.Expressions.Expression[]]@($value)), $refused[1]),
+            $e::IfThen($e::GreaterThan($length, $e::Constant([int]1024)), $refused[2]),
+            $e::Assign($index, $zero), $asciiLoop,
+            $e::IfThen($e::Not($instanceCall.Invoke($e::Constant($drive), $isMatch, [Linq.Expressions.Expression[]]@($value))), $refused[3]),
+            $e::IfThen($instanceCall.Invoke($instanceCall.Invoke($value, $substring, [Linq.Expressions.Expression[]]@($e::Constant([int]2))),
+                $contains, [Linq.Expressions.Expression[]]@($e::Constant(':'))), $refused[4]),
+            $e::IfThen($instanceCall.Invoke($value, $contains, [Linq.Expressions.Expression[]]@($e::Constant('/'))), $refused[5]),
+            $e::IfThen($instanceCall.Invoke($e::Constant($invalid), $isMatch, [Linq.Expressions.Expression[]]@($value)), $refused[6]),
+            $e::Assign($full, $staticCall.Invoke($getFullPath, [Linq.Expressions.Expression[]]@($value))),
+            $e::IfThen($e::Not($normalized), $refused[7]),
+            $e::Assign($parts, $instanceCall.Invoke($instanceCall.Invoke($value, $substring, [Linq.Expressions.Expression[]]@($e::Constant([int]3))),
+                $split, [Linq.Expressions.Expression[]]@($slash, $e::Constant([StringSplitOptions]::None)))),
+            $e::Assign($index, $zero), $componentLoop,
+            $e::Label($finish, $new.Invoke($resultCtor, [Linq.Expressions.Expression[]]@($full, $zero)))))
+    return $lambda.Invoke([Func[string, ValueTuple[string, int]]], $body,
+        [Linq.Expressions.ParameterExpression[]]@($value)).Compile()
+}
+
 function Initialize-HostReader {
     # One sequential reader owns its metadata scratch until Close-HostReader.
     # Refuse an overlapping initialization rather than lose live owned storage.
@@ -131,6 +241,7 @@ function Initialize-HostReader {
     $script:HostComparisonInfo = $null
     $script:HostHandles = [Collections.Generic.List[IntPtr]]::new()
     $script:HostCanonicalPaths = $null
+    $script:HostCanonicalInvoker = $null
     $script:HostCanonicalUnits = 0
     # Only immutable lexical results are memoized. Count and UTF-16 code-unit
     # limits bound this reader-owned cache separately from receipt limits.
@@ -150,6 +261,8 @@ function Initialize-HostReader {
     $script:HostLastDirectoryPath = $null
     $script:HostLastDirectoryChain = $null
     $script:HostDirectoryChainLimit = 512
+    # Pure lexical work is compiled before acquiring any unmanaged ownership.
+    $script:HostCanonicalInvoker = New-HostCanonicalInvoker
     $system = Get-HostCanonicalPath $env:SystemRoot
     if ($system -cnotmatch '^[A-Za-z]:\\Windows$') { throw 'host' }
     $script:HostKernel = [Runtime.InteropServices.NativeLibrary]::Load([IO.Path]::Combine($system, 'System32', 'kernel32.dll'))
@@ -226,7 +339,28 @@ function Get-HostCanonicalPath([string] $Value) {
     [string] $full = ''
     if ($null -ne $memo -and -not [string]::IsNullOrEmpty($Value) -and
         $memo.TryGetValue($Value, [ref]$full)) { return $full }
-    $full = Get-CanonicalHostPath $Value
+    if ($null -eq $script:HostCanonicalInvoker) { $full = Get-CanonicalHostPath $Value }
+    else {
+        $validated = $script:HostCanonicalInvoker.Invoke($Value)
+        switch ($validated.Item2) {
+            0 { $full = $validated.Item1; break }
+            -1 { $full = Get-CanonicalHostPath $Value; break }
+            1 { throw 'path_empty' }
+            2 { throw 'path_length' }
+            3 { throw 'path_drive' }
+            4 { throw 'path_colon' }
+            5 { throw 'path_slash' }
+            6 { throw 'path_chars' }
+            7 { throw 'path_normalized' }
+            8 { throw 'path_part_empty' }
+            9 { throw 'path_part_dot' }
+            10 { throw 'path_part_trailingdot' }
+            11 { throw 'path_part_trailingspace' }
+            12 { throw 'path_part_device' }
+            13 { throw 'path_part_git' }
+            default { throw 'path_input' }
+        }
+    }
     if ($null -ne $memo) {
         $units = $Value.Length + $full.Length
         if ($memo.Count -lt $script:HostCanonicalEntryLimit -and
@@ -487,6 +621,7 @@ function Close-HostReader {
             if ($null -ne $chain) { [Array]::Clear($chain, 0, $chain.Length) }
             $memo = $script:HostCanonicalPaths
             $script:HostCanonicalPaths = $null
+            $script:HostCanonicalInvoker = $null
             $script:HostCanonicalUnits = 0
             if ($null -ne $memo) { $memo.Clear() }
         }
