@@ -189,9 +189,13 @@ MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-re
 # four app targets. The standalone protocol/device/vendor/interop binaries do
 # not consume these draft/controller inputs. Keep auth/account scope, pack/font
 # I/O, shared main/config/RTC source and dependency/workflow changes conservative.
+# app-window.slint is compiled by the app and its compiler-only UI check,
+# not standalone protocol/device/config binaries. All four desktop targets
+# retain their runtime account/security UI guards. No Slint-prefix exemption.
 # Maintainer source review may always require wider checks for semantic impact.
 AUTOMATIC_DESKTOP_INPUTS = frozenset((
                 'crates/morpheus-app/src/account_access_ui_tests.rs',
+                'crates/morpheus-app/ui/app-window.slint',
                 'crates/morpheus-app/src/theme_studio/mod.rs',
                 'crates/morpheus-app/src/theme_studio/session.rs',
             ))

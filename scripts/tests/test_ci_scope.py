@@ -447,6 +447,7 @@ class ScopeTests(unittest.TestCase):
     def test_exact_automatic_appearance_and_producer_batches_select_existing_routes(self, changed):
         app = set((
                 'crates/morpheus-app/src/account_access_ui_tests.rs',
+                'crates/morpheus-app/ui/app-window.slint',
                 'crates/morpheus-app/src/theme_studio/mod.rs',
                 'crates/morpheus-app/src/theme_studio/session.rs',
             ))
@@ -476,6 +477,10 @@ class ScopeTests(unittest.TestCase):
                 "scripts/run_native_webrtc_macos.py", "scripts/tests/test_native_webrtc_unix_inputs.py"}
         batches = [(set(), "all"), (app, "desktop"), (app | pack, "desktop"),
                    (app | producer, "desktop"), (producer, "helpers")]
+        # The generated-UI regression and exact markup change retain the
+        # complete desktop matrix without unrelated protocol/device binaries.
+        batches += [({"crates/morpheus-app/ui/app-window.slint",
+                      "crates/morpheus-app/src/account_access_ui_tests.rs"}, "desktop")]
         batches += [({path}, "desktop") for path in app]
         batches += [({path}, "helpers") for path in producer]
         for paths, route in batches:
@@ -492,6 +497,9 @@ class ScopeTests(unittest.TestCase):
         for dependency in ("Cargo.lock", "Cargo.toml", "crates/morpheus-app/Cargo.toml",
                            "crates/morpheus-app/src/main.rs", "crates/morpheus-app/src/live.rs",
                            "crates/morpheus-app/src/appearance_editor.rs", "crates/morpheus-config/src/lib.rs",
+                           "crates/morpheus-app/src/settings_search.rs", "crates/morpheus-app/src/account_access.rs",
+                           "crates/morpheus-app/ui/unknown.slint", "crates/morpheus-app/ui/call-bar.slint",
+                           "crates/morpheus-app/build.rs", "crates/morpheus-ui-check/build.rs",
                            "crates/morpheus-app/src/theme_studio/scope.rs", "crates/morpheus-app/src/theme_studio/fonts.rs",
                            "crates/morpheus-app/src/theme_studio/packs.rs", "crates/morpheus-rtc/src/media.rs",
                            "vendor/libwebrtc/src/lib.rs", ".github/workflows/ci.yml", "scripts/ci_scope.py",
