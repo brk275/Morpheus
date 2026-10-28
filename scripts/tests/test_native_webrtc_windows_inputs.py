@@ -1151,7 +1151,9 @@ if ($errors.Count -ne 0) { throw 'source_parse' }
 $caseStage = 'source_functions'
 $definitions = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)
 # Function declarations must remain in this scope for the actual calls below.
-. ([ScriptBlock]::Create(($definitions | ForEach-Object { $_.Extent.Text }) -join "`n"))
+$definitionText = ($definitions | ForEach-Object { $_.Extent.Text }) -join "`n"
+$definitionLineLimit = $definitionText.Split([char]10).Length
+. ([ScriptBlock]::Create($definitionText))
 function Must-Refuse([ScriptBlock] $Action) {
     $refused = $false
     try { & $Action | Out-Null } catch { $refused = $true }
@@ -1830,7 +1832,32 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
             $problem = $problem.InnerException
         }
     }
-    Write-Output ('MORPHEUS_HOST_READER_BOUNDARY_FAILED stage=' + $caseStage + ' category=' + $category)
+    $construction = ''
+    if ($caseStage -ceq 'reader_initialize') {
+        $failure = $_
+        # Closed runtime kind and a line in our joined, reviewed function text.
+        # Never render InvocationInfo, exception text, a path, or unknown types.
+        $kind = switch -CaseSensitive ($failure.Exception.GetType().FullName) {
+            'System.Management.Automation.MethodException' { 'binding'; break }
+            'System.Management.Automation.MethodInvocationException' { 'invocation'; break }
+            'System.Management.Automation.RuntimeException' { 'runtime'; break }
+            'System.Management.Automation.PSInvalidCastException' { 'cast'; break }
+            'System.ArgumentException' { 'argument'; break }
+            'System.ArgumentNullException' { 'argument_null'; break }
+            'System.InvalidOperationException' { 'invalid_operation'; break }
+            'System.TypeLoadException' { 'type_load'; break }
+            'System.Reflection.AmbiguousMatchException' { 'ambiguous'; break }
+            default { 'unknown' }
+        }
+        $line = 0
+        $invocation = $failure.InvocationInfo
+        if ($null -ne $invocation -and [string]::IsNullOrEmpty($invocation.ScriptName) -and
+            $invocation.ScriptLineNumber -gt 0 -and $invocation.ScriptLineNumber -le $definitionLineLimit) {
+            $line = [int]$invocation.ScriptLineNumber
+        }
+        $construction = ' line=' + $line.ToString([Globalization.CultureInfo]::InvariantCulture) + ' kind=' + $kind
+    }
+    Write-Output ('MORPHEUS_HOST_READER_BOUNDARY_FAILED stage=' + $caseStage + ' category=' + $category + $construction)
     exit 1
 }
 """
@@ -1865,12 +1892,25 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
                           "invocation", "powershell_runtime") + tuple("check_" + item for item in checks)
             diagnostic = "stage=unknown category=unexpected"
             if len(result.stdout) <= 160:
+                observed = result.stdout.strip()
+                kinds = ("binding", "invocation", "runtime", "cast", "argument", "argument_null",
+                         "invalid_operation", "type_load", "ambiguous", "unknown")
+                # Joined non-nested function extents cannot exceed the source's
+                # line count. PowerShell additionally requires an empty filename.
+                line_limit = len(source.read_text(encoding="utf-8").splitlines())
                 for stage in stages:
                     for category in categories:
                         expected = ("MORPHEUS_HOST_READER_BOUNDARY_FAILED stage=" + stage
                                     + " category=" + category)
-                        if result.stdout.strip() == expected:
+                        if observed == expected:
                             diagnostic = "stage=" + stage + " category=" + category
+                        elif stage == "reader_initialize" and observed.startswith(expected + " line="):
+                            suffix = observed[len(expected + " line="):]
+                            line, separator, kind = suffix.partition(" kind=")
+                            if (separator and 0 < len(line) <= 4 and line.isascii() and line.isdecimal()
+                                    and int(line) <= line_limit and kind in kinds):
+                                diagnostic = ("stage=" + stage + " category=" + category
+                                              + " line=" + line + " kind=" + kind)
             self.assertEqual(result.returncode, 0,
                              "fixed Windows host reader boundary case failed " + diagnostic)
             self.assertTrue(result.stdout.strip() == "MORPHEUS_HOST_READER_BOUNDARIES_OK",
