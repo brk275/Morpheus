@@ -1,5 +1,5 @@
 # TEMPORARY BRIDGE ONLY. NEVER MERGE THIS REPLACEMENT WORKFLOW.
-name: Windows canonical path contract (temporary)
+name: Windows owned directory-chain contract (temporary)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-identity-dispatch-contract-codex-windows-managed-comparison-contract-20261028-32c77a434a1704c0431bd96734bb9a494d95d1dd
+  group: windows-identity-dispatch-contract-codex-windows-managed-comparison-contract-20261028-db5b95ddc048c70ee53ed620f3c428255feb33e1
   cancel-in-progress: false
 
 jobs:
@@ -30,14 +30,14 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 32c77a434a1704c0431bd96734bb9a494d95d1dd
+          ref: db5b95ddc048c70ee53ed620f3c428255feb33e1
           persist-credentials: false
       - name: Require the exact independently reviewed source
         shell: pwsh
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-          $expected = '32c77a434a1704c0431bd96734bb9a494d95d1dd'
+          $expected = 'db5b95ddc048c70ee53ed620f3c428255feb33e1'
           if ($expected -cnotmatch '^[0-9a-f]{40}$') { throw 'reviewed source is not bound' }
           $actual = @(& git -c core.hooksPath=NUL -c core.fsmonitor=false rev-parse --verify HEAD)
           if ($LASTEXITCODE -ne 0 -or $actual.Count -ne 1 -or $actual[0] -cne $expected) {
