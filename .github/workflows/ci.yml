@@ -186,10 +186,13 @@ jobs:
                       $assembly = [ordered]@{ name = $name.Name; version = $name.Version.ToString(); public_key_token = $tokenHex }
                   } catch {
                       $problem = $_.Exception
-                      for ($depth = 0; $depth -lt 8 -and $null -ne $problem.InnerException; $depth++) {
+                      # Preserve the documented bad-image category even when .NET wraps
+                      # its native/no-metadata InvalidOperationException as the inner cause.
+                      for ($depth = 0; $depth -lt 8 -and $problem -isnot [BadImageFormatException] -and
+                          $null -ne $problem.InnerException; $depth++) {
                           $problem = $problem.InnerException
                       }
-                      if ($null -ne $problem.InnerException -or $problem -isnot [BadImageFormatException]) {
+                      if ($problem -isnot [BadImageFormatException]) {
                           Save-Failure $_; throw 'metadata'
                       }
                   }
