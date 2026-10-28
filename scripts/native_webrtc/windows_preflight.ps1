@@ -232,6 +232,130 @@ function New-HostChainInvoker([Delegate] $ComparisonCall) {
     return $method.CreateDelegate([Func[object[], Delegate, Delegate, Delegate, IntPtr, byte[], int]])
 }
 
+# Own the complete synchronous 1MiB payload-read/hash loop in managed code.
+# 0=complete, 1..5=deadline/entries/bytes/handles/metadata, 6=changed, 7=adaptation.
+# Native open/ancestor/final identity checks remain at their original callers.
+function New-HostHashInvoker {
+    $method = [Reflection.Emit.DynamicMethod]::new('ReadAndHashHostFile', [int],
+        [Type[]]@([IO.Stream], [Security.Cryptography.HashAlgorithm], [byte[]], [IO.MemoryStream],
+            [uint64], [Diagnostics.Stopwatch], [long[]], [uint64], [uint64]))
+    $il = $method.GetILGenerator()
+    $size = $il.DeclareLocal([uint64]); $count = $il.DeclareLocal([int])
+    $elapsed = $il.DeclareLocal([TimeSpan])
+    $read = $il.DefineLabel(); $body = $il.DefineLabel()
+    $changed = $il.DefineLabel(); $afterText = $il.DefineLabel(); $adapted = $il.DefineLabel()
+    $refused = @{}
+    foreach ($code in @(1, 2, 3, 4, 5)) { $refused[$code] = $il.DefineLabel() }
+    $streamRead = [IO.Stream].GetMethod('Read', [Type[]]@([byte[]], [int], [int]))
+    $transform = [Security.Cryptography.HashAlgorithm].GetMethod('TransformBlock',
+        [Type[]]@([byte[]], [int], [int], [byte[]], [int]))
+    $finalize = [Security.Cryptography.HashAlgorithm].GetMethod('TransformFinalBlock',
+        [Type[]]@([byte[]], [int], [int]))
+    $write = [IO.MemoryStream].GetMethod('Write', [Type[]]@([byte[]], [int], [int]))
+    $getElapsed = [Diagnostics.Stopwatch].GetMethod('get_Elapsed', [Type[]]@())
+    $seconds = [TimeSpan].GetMethod('get_TotalSeconds', [Type[]]@())
+    $getType = [object].GetMethod('GetType', [Type[]]@())
+    $typeFromHandle = [Type].GetMethod('GetTypeFromHandle', [Type[]]@([RuntimeTypeHandle]))
+    # Fixed CLR type inspection cannot execute a PowerShell GetType shadow.
+    # A derived/adapted clock resumes the old loop before any Read/hash call.
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]5)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getType)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldtoken, [Diagnostics.Stopwatch])
+    $il.Emit([Reflection.Emit.OpCodes]::Call, $typeFromHandle)
+    $il.Emit([Reflection.Emit.OpCodes]::Bne_Un, $adapted)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Conv_U8)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $size)
+    $il.Emit([Reflection.Emit.OpCodes]::Br, $read)
+    $il.MarkLabel($body)
+    # Exact Assert-HostBudget predicate order after each positive Read.
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]5)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getElapsed)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $elapsed)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloca, $elapsed)
+    $il.Emit([Reflection.Emit.OpCodes]::Call, $seconds)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]6)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldelem_I8)
+    $il.Emit([Reflection.Emit.OpCodes]::Conv_R8)
+    $il.Emit([Reflection.Emit.OpCodes]::Bgt, $refused[1])
+    # State: seconds,current/max entries,current/max handles,current/max metadata.
+    foreach ($check in @(@(1, 2, 2), @(3, 4, 4), @(5, 6, 5))) {
+        if ($check[2] -eq 4) {
+            $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]7)
+            $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]8)
+            $il.Emit([Reflection.Emit.OpCodes]::Bgt_Un, $refused[3])
+        }
+        foreach ($offset in @($check[0], $check[1])) {
+            $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]6)
+            $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]$offset)
+            $il.Emit([Reflection.Emit.OpCodes]::Ldelem_I8)
+        }
+        $il.Emit([Reflection.Emit.OpCodes]::Bgt, $refused[[int]$check[2]])
+    }
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $size)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $count)
+    $il.Emit([Reflection.Emit.OpCodes]::Conv_U8)
+    $il.Emit([Reflection.Emit.OpCodes]::Add)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $size)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $size)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+    $il.Emit([Reflection.Emit.OpCodes]::Bgt_Un, $changed)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_1)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $count)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldnull)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $transform)
+    $il.Emit([Reflection.Emit.OpCodes]::Pop)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_3)
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $afterText)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_3)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $count)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $write)
+    $il.MarkLabel($afterText)
+    $il.MarkLabel($read)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldlen)
+    $il.Emit([Reflection.Emit.OpCodes]::Conv_I4)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $streamRead)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $count)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $count)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Bgt, $body)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_1)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Newarr, [byte])
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $finalize)
+    $il.Emit([Reflection.Emit.OpCodes]::Pop)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $size)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+    $il.Emit([Reflection.Emit.OpCodes]::Bne_Un, $changed)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    foreach ($code in @(1, 2, 3, 4, 5)) {
+        $il.MarkLabel($refused[$code])
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]$code)
+        $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    }
+    $il.MarkLabel($changed)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_6)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($adapted)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_7)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    return $method.CreateDelegate([Func[IO.Stream, Security.Cryptography.HashAlgorithm, byte[], IO.MemoryStream,
+        uint64, Diagnostics.Stopwatch, long[], uint64, uint64, int]])
+}
+
 # Compile only fixed source expressions in the existing managed runtime. No
 # compiler executable, native export, file fact, or caller-supplied expression
 # is used. Unicode inputs return -1 for the unchanged PowerShell validator:
@@ -350,6 +474,8 @@ function Initialize-HostReader {
     if (($null -ne $previous -and $previous.Value -ne [IntPtr]::Zero) -or
         ($null -ne $previousHandles -and $previousHandles.Value.Count -ne 0)) { throw 'identity' }
     $script:HostPreflightBudgetCause = 'unknown'
+    $script:HostPreflightWork = 'idle'
+    $script:HostManagedHashes = 0
     $script:HostInfoMemory = [IntPtr]::Zero
     $script:HostInfoScratch = $null
     $script:HostInfoBusy = $false
@@ -359,6 +485,11 @@ function Initialize-HostReader {
     $script:HostChainInvoker = $null
     $script:HostChainInvokerOwner = $null
     $script:HostChainComparison = $null
+    $script:HostHashInvoker = $null
+    $script:HostHashInvokerOwner = $null
+    $script:HostHashBudgetOwner = $null
+    $script:HostHashLimitsOwner = $null
+    $script:HostHashHandlesOwner = $null
     $script:HostHandles = [Collections.Generic.List[IntPtr]]::new()
     $script:HostCanonicalPaths = $null
     $script:HostCanonicalInvoker = $null
@@ -381,6 +512,11 @@ function Initialize-HostReader {
     $script:HostLastDirectoryPath = $null
     $script:HostLastDirectoryChain = $null
     $script:HostDirectoryChainLimit = 512
+    $script:HostHashInvoker = New-HostHashInvoker
+    $script:HostHashInvokerOwner = $script:HostHashInvoker
+    $script:HostHashBudgetOwner = ${function:Assert-HostBudget}
+    $script:HostHashLimitsOwner = $script:HostLimits
+    $script:HostHashHandlesOwner = $script:HostHandles
     # Pure lexical work is compiled before acquiring any unmanaged ownership.
     $script:HostCanonicalInvoker = New-HostCanonicalInvoker
     $system = Get-HostCanonicalPath $env:SystemRoot
@@ -642,6 +778,7 @@ function Open-HostDirectoryChain([string] $LiteralPath) {
 }
 
 function Get-HostFileFact([string] $LiteralPath, [int] $TextLimit = 0, [uint64] $RemainingBytes = [uint64]::MaxValue) {
+    $script:HostPreflightWork = 'file_open'
     $full = Get-HostCanonicalPath $LiteralPath
     $null = Open-HostDirectoryChain ([IO.Path]::GetDirectoryName($full))
     $record = Open-HostReadHandle $full $false
@@ -665,15 +802,80 @@ function Get-HostFileFact([string] $LiteralPath, [int] $TextLimit = 0, [uint64] 
     $digest = [Security.Cryptography.SHA256]::Create(); $buffer = $script:HostBuffer
     $text = if ($TextLimit -gt 0) { [IO.MemoryStream]::new() } else { $null }
     try {
-        $size = [uint64]0
-        while (($count = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            Assert-HostBudget; $size += $count
-            if ($size -gt $record.initial.bytes) { throw 'changed' }
-            $null = $digest.TransformBlock($buffer, 0, $count, $null, 0)
-            if ($null -ne $text) { $text.Write($buffer, 0, $count) }
+        $script:HostPreflightWork = 'file_hash'
+        $limits = $script:HostLimits
+        $managed = $script:HostHashInvoker -is [Delegate] -and
+            [object]::ReferenceEquals($script:HostHashInvoker, $script:HostHashInvokerOwner) -and
+            [object]::ReferenceEquals(${function:Assert-HostBudget}, $script:HostHashBudgetOwner) -and
+            [object]::ReferenceEquals($limits, $script:HostHashLimitsOwner) -and
+            [object]::ReferenceEquals($script:HostHandles, $script:HostHashHandlesOwner) -and
+            $script:HostWatch -is [Diagnostics.Stopwatch] -and
+            $buffer -is [byte[]] -and $script:HostHandles -is [Collections.Generic.List[IntPtr]] -and
+            $script:HostCount -is [int] -and $script:HostBytes -is [uint64] -and
+            $script:HostMetadataBytes -is [int]
+        # A fixed owner has plain numeric limits. ETS shadows or a probe's
+        # alternative number/clock semantics retain the original loop below.
+        if ($managed) {
+            $limitMembers = [Management.Automation.PSObject]::AsPSObject($limits).Members
+            foreach ($key in @('Seconds', 'Entries', 'TotalBytes', 'Handles', 'MetadataBytes')) {
+                if ($null -ne $limitMembers[$key]) { $managed = $false; break }
+            }
+            $clockMember = [Management.Automation.PSObject]::AsPSObject($script:HostWatch).Members['Elapsed']
+            $secondsMember = [Management.Automation.PSObject]::AsPSObject([TimeSpan]::Zero).Members['TotalSeconds']
+            $bufferMember = [Management.Automation.PSObject]::AsPSObject($buffer).Members['Length']
+            $handlesMember = [Management.Automation.PSObject]::AsPSObject($script:HostHandles).Members['Count']
+            $readMember = [Management.Automation.PSObject]::AsPSObject($stream).Members['Read']
+            $digestMembers = [Management.Automation.PSObject]::AsPSObject($digest).Members
+            $blockMember = $digestMembers['TransformBlock']; $finalMember = $digestMembers['TransformFinalBlock']
+            $writeOrdinary = $null -eq $text -or
+                [Management.Automation.PSObject]::AsPSObject($text).Members['Write'] -is [Management.Automation.PSMethod]
+            if ($readMember -isnot [Management.Automation.PSMethod] -or
+                $blockMember -isnot [Management.Automation.PSMethod] -or
+                $finalMember -isnot [Management.Automation.PSMethod] -or -not $writeOrdinary -or
+                $clockMember -isnot [Management.Automation.PSProperty] -or
+                $secondsMember -isnot [Management.Automation.PSProperty] -or
+                $bufferMember -isnot [Management.Automation.PSProperty] -or
+                $handlesMember -isnot [Management.Automation.PSProperty] -or
+                $limits['Seconds'] -isnot [int] -or $limits['Entries'] -isnot [int] -or
+                $limits['TotalBytes'] -isnot [long] -or $limits['TotalBytes'] -lt 0 -or
+                $limits['Handles'] -isnot [int] -or $limits['MetadataBytes'] -isnot [int]) { $managed = $false }
         }
-        $null = $digest.TransformFinalBlock([byte[]]::new(0), 0, 0)
-        if ($size -ne $record.initial.bytes) { throw 'changed' }
+        $size = [uint64]0
+        if ($managed) {
+            # No callbacks occur in this owned FileStream/SHA256 loop. These
+            # counters cannot change until the same synchronous file completes.
+            $budget = [long[]]@($limits['Seconds'], $script:HostCount, $limits['Entries'],
+                $script:HostHandles.Count, $limits['Handles'], $script:HostMetadataBytes, $limits['MetadataBytes'])
+            $status = $script:HostHashInvoker.Invoke($stream, $digest, $buffer, $text,
+                [uint64]$record.initial.bytes, $script:HostWatch, $budget,
+                $script:HostBytes, [uint64]$limits['TotalBytes'])
+            switch ($status) {
+                0 {
+                    $size = [uint64]$record.initial.bytes
+                    if ($script:HostManagedHashes -lt 200000) { $script:HostManagedHashes++ }
+                    break
+                }
+                1 { if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = 'deadline' }; throw 'limit' }
+                2 { if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = 'entries' }; throw 'limit' }
+                3 { if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = 'bytes' }; throw 'limit' }
+                4 { if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = 'handles' }; throw 'limit' }
+                5 { if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = 'metadata' }; throw 'limit' }
+                6 { throw 'changed' }
+                7 { $managed = $false; break }
+                default { throw 'identity' }
+            }
+        }
+        if (-not $managed) {
+            while (($count = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                Assert-HostBudget; $size += $count
+                if ($size -gt $record.initial.bytes) { throw 'changed' }
+                $null = $digest.TransformBlock($buffer, 0, $count, $null, 0)
+                if ($null -ne $text) { $text.Write($buffer, 0, $count) }
+            }
+            $null = $digest.TransformFinalBlock([byte[]]::new(0), 0, 0)
+            if ($size -ne $record.initial.bytes) { throw 'changed' }
+        }
+        $script:HostPreflightWork = 'file_identity'
         Get-HostHandleInfo $record.handle $record.comparison $true
         $fact = @{ bytes = $size; sha256 = [Convert]::ToHexString($digest.Hash).ToLowerInvariant() }
         if ($null -ne $text) { $fact.text = [Text.UTF8Encoding]::new($false, $true).GetString($text.ToArray()) }
@@ -704,13 +906,16 @@ function Get-HostDirectoryNames([string] $Directory) {
 
 function Get-HostRootInventory([string] $LiteralRoot) {
     $root = Get-HostCanonicalPath $LiteralRoot
+    $script:HostPreflightWork = 'directory_open'
     $null = Open-HostDirectoryChain $root
     $pending = [Collections.Generic.Stack[object]]::new(); $pending.Push(@{ path = $root; depth = 0 })
     $snapshots = [Collections.Generic.List[object]]::new(); $files = [Collections.Generic.List[object]]::new()
     while ($pending.Count -gt 0) {
         Assert-HostBudget; $next = $pending.Pop()
         if ($next.depth -gt $script:HostLimits.Depth) { throw 'depth' }
+        $script:HostPreflightWork = 'directory_open'
         $directory = Open-HostDirectoryChain $next.path
+        $script:HostPreflightWork = 'enumeration'
         $names = Get-HostDirectoryNames $next.path
         $snapshots.Add(@{ directory = $directory; names = $names })
         foreach ($name in $names) {
@@ -718,13 +923,16 @@ function Get-HostRootInventory([string] $LiteralRoot) {
             $path = [IO.Path]::Combine($next.path, $name)
             # Attributes only select the read-open kind. The final no-follow
             # handle supplies the authoritative type before any payload read.
+            $script:HostPreflightWork = 'entry_type'
             $attributes = [IO.File]::GetAttributes($path)
             if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse' }
             if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+                $script:HostPreflightWork = 'directory_open'
                 $null = Open-HostDirectoryChain $path
                 $pending.Push(@{ path = $path; depth = $next.depth + 1 })
             } else {
                 $fact = Get-HostFileFact $path 0 ([uint64]($script:HostLimits.TotalBytes - $script:HostBytes))
+                $script:HostPreflightWork = 'receipt_row'
                 $script:HostBytes += $fact.bytes; Assert-HostBudget
                 $relative = [IO.Path]::GetRelativePath($root, $path).Replace('\', '/')
                 # JSON upper bound before adding a row, including worst-case
@@ -736,7 +944,9 @@ function Get-HostRootInventory([string] $LiteralRoot) {
         }
     }
     foreach ($snapshot in $snapshots) {
+        $script:HostPreflightWork = 'snapshot_identity'
         Assert-HostBudget; Get-HostHandleInfo $snapshot.directory.handle $snapshot.directory.comparison $true
+        $script:HostPreflightWork = 'snapshot_names'
         $again = Get-HostDirectoryNames $snapshot.directory.path
         if ($again.Count -ne $snapshot.names.Count) { throw 'changed' }
         for ($i = 0; $i -lt $again.Count; $i++) { if ($again[$i] -cne $snapshot.names[$i]) { throw 'changed' } }
@@ -770,6 +980,11 @@ function Close-HostReader {
             $script:HostChainInvoker = $null
             $script:HostChainInvokerOwner = $null
             $script:HostChainComparison = $null
+            $script:HostHashInvoker = $null
+            $script:HostHashInvokerOwner = $null
+            $script:HostHashBudgetOwner = $null
+            $script:HostHashLimitsOwner = $null
+            $script:HostHashHandlesOwner = $null
             if ($memory -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory) }
         } finally {
             # Retire lexical ownership even if native cleanup throws. No result
@@ -830,6 +1045,27 @@ function Get-HostPreflightFailureMessage($Stage, $BudgetCause) {
     return 'MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=unknown' + $budgetSuffix
 }
 
+# Export only fixed work labels and bounded integers after an actual inventory
+# refusal. No path, payload, exception, arbitrary object or elapsed time escapes.
+function Get-HostPreflightProgressMessage($Work, $Entries, $Bytes, $ManagedHashes) {
+    $phase = 'unknown'
+    if ($Work -is [string]) {
+        foreach ($known in @('idle', 'directory_open', 'enumeration', 'entry_type',
+            'file_open', 'file_hash', 'file_identity', 'receipt_row', 'snapshot_identity',
+            'snapshot_names', 'final_directory', 'final_file', 'json')) {
+            if ([string]::Equals($Work, $known, [StringComparison]::Ordinal)) { $phase = $known; break }
+        }
+    }
+    $count = 0; $size = [uint64]0; $hashes = 0
+    # Include the first over-limit entry only, never arbitrary counter values.
+    if ($Entries -is [int] -and $Entries -ge 0 -and $Entries -le 200001) { $count = $Entries }
+    if ($Bytes -is [uint64] -and $Bytes -le [uint64]68719476736) { $size = $Bytes }
+    if ($ManagedHashes -is [int] -and $ManagedHashes -ge 0 -and $ManagedHashes -le 200000) { $hashes = $ManagedHashes }
+    return ' work=' + $phase + ' entries=' + [Convert]::ToString([int]$count, [Globalization.CultureInfo]::InvariantCulture) +
+        ' bytes=' + [Convert]::ToString([uint64]$size, [Globalization.CultureInfo]::InvariantCulture) +
+        ' managed_hashes=' + [Convert]::ToString([int]$hashes, [Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Get-HostToolchainInventory {
     $script:HostPreflightStage = 'initialization'
     Initialize-HostReader
@@ -873,7 +1109,9 @@ function Get-HostToolchainInventory {
         $sdkInventory = Get-HostRootInventory $sdk
         $roots = @($vsInventory, $sdkInventory)
         $script:HostPreflightStage = 'final_identity'
+        $script:HostPreflightWork = 'final_directory'
         foreach ($record in $script:HostDirectories.Values) { Get-HostHandleInfo $record.handle $record.comparison $false }
+        $script:HostPreflightWork = 'final_file'
         foreach ($record in $script:HostFileRecords) { Assert-HostBudget; Get-HostHandleInfo $record.handle $record.comparison $true }
         Assert-HostBudget
         return [ordered]@{ schema = 'morpheus-native-windows-host-toolchain-inventory-v1';
@@ -946,6 +1184,7 @@ try {
         $inventory.bootstrap_tools = $facts
         # Only filenames, sizes and hashes of fixed host roots leave the reader.
         # Never print SDK/tool bytes, ambient environment or native error text.
+        $script:HostPreflightWork = 'json'
         $json = $inventory | ConvertTo-Json -Depth 10 -Compress
         if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 33554432) {
             if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = 'metadata' }
@@ -973,6 +1212,11 @@ try {
         build_admission_granted = $false
     } | ConvertTo-Json -Depth 5 -Compress | Write-Output
 } catch {
-    Write-Output (Get-HostPreflightFailureMessage $script:HostPreflightStage $script:HostPreflightBudgetCause)
+    $message = Get-HostPreflightFailureMessage $script:HostPreflightStage $script:HostPreflightBudgetCause
+    if ($Mode -ceq 'host-toolchain' -and $script:HostPreflightStage -cin
+        @('role_binding', 'vs_inventory', 'sdk_inventory', 'final_identity', 'serialization')) {
+        $message += Get-HostPreflightProgressMessage $script:HostPreflightWork $script:HostCount $script:HostBytes $script:HostManagedHashes
+    }
+    Write-Output $message
     exit 1
 }
