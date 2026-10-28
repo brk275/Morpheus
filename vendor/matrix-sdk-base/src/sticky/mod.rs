@@ -222,8 +222,12 @@ impl PendingStickyEventState {
     ) -> Self {
         use matrix_sdk_common::deserialized_responses::UnableToDecryptReason;
         match reason {
-            UnableToDecryptReason::MissingMegolmSession { withheld_code: None } => Self::PendingMissingKey,
-            UnableToDecryptReason::MissingMegolmSession { withheld_code: Some(_) } => Self::PendingWithheldKey,
+            UnableToDecryptReason::MissingMegolmSession { withheld_code: None } => {
+                Self::PendingMissingKey
+            }
+            UnableToDecryptReason::MissingMegolmSession { withheld_code: Some(_) } => {
+                Self::PendingWithheldKey
+            }
             UnableToDecryptReason::UnknownMegolmMessageIndex => Self::PendingUnknownIndex,
             UnableToDecryptReason::SenderIdentityNotTrusted(_) => Self::PendingUntrustedSender,
             UnableToDecryptReason::MalformedEncryptedEvent
@@ -768,9 +772,17 @@ mod tests {
         // retry lock above remain the authority for whether it is pending.
         use matrix_sdk_common::deserialized_responses::{UnableToDecryptReason, VerificationLevel};
         for (reason, expected) in [
-            (UnableToDecryptReason::MissingMegolmSession { withheld_code: None }, "pending_missing_key"),
+            (
+                UnableToDecryptReason::MissingMegolmSession { withheld_code: None },
+                "pending_missing_key",
+            ),
             (UnableToDecryptReason::UnknownMegolmMessageIndex, "pending_unknown_index"),
-            (UnableToDecryptReason::SenderIdentityNotTrusted(VerificationLevel::UnverifiedIdentity), "pending_untrusted_sender"),
+            (
+                UnableToDecryptReason::SenderIdentityNotTrusted(
+                    VerificationLevel::UnverifiedIdentity,
+                ),
+                "pending_untrusted_sender",
+            ),
             (UnableToDecryptReason::MalformedEncryptedEvent, "pending_malformed"),
             (UnableToDecryptReason::PayloadDeserializationFailure, "pending_malformed"),
             (UnableToDecryptReason::MegolmDecryptionFailure, "pending_megolm_failure"),

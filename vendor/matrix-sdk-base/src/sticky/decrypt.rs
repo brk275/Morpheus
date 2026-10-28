@@ -73,9 +73,10 @@ pub(crate) async fn decrypt(
         // ordinary decrypt. Do not retry, query keys or log raw crypto data.
         Ok(Some(decrypted)) => {
             pending.pending_diagnostic = match &decrypted.kind {
-                matrix_sdk_common::deserialized_responses::TimelineEventKind::UnableToDecrypt { utd_info, .. } => {
-                    super::PendingStickyEventState::from_reason(&utd_info.reason)
-                }
+                matrix_sdk_common::deserialized_responses::TimelineEventKind::UnableToDecrypt {
+                    utd_info,
+                    ..
+                } => super::PendingStickyEventState::from_reason(&utd_info.reason),
                 _ => super::PendingStickyEventState::PendingOther,
             };
             Decryption::Pending(pending)
