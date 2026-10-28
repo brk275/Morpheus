@@ -115,6 +115,123 @@ function New-HostComparisonInvoker([Delegate] $TypeCall, [Delegate] $InfoCall) {
     return $method.CreateDelegate([Func[Delegate, Delegate, IntPtr, IntPtr, byte[], object, bool, int]])
 }
 
+# Collapse the cached root-to-leaf comparison loop into the managed runtime.
+# Each entry is read live, never a retained native fact or handle/Expected copy.
+# 0=all checked; 1..4=the existing comparison status; -(index+1)=resume the
+# original PowerShell path at this entry, with no completed check repeated.
+function New-HostChainInvoker([Delegate] $ComparisonCall) {
+    $comparisonMethod = $ComparisonCall.GetType().GetMethod('Invoke')
+    $method = [Reflection.Emit.DynamicMethod]::new('CheckHostDirectoryChain', [int],
+        [Type[]]@([object[]], [Delegate], [Delegate], [Delegate], [IntPtr], [byte[]]))
+    $il = $method.GetILGenerator()
+    $index = $il.DeclareLocal([int])
+    $record = $il.DeclareLocal([Collections.Hashtable])
+    $handle = $il.DeclareLocal([object])
+    $expected = $il.DeclareLocal([object])
+    $membersType = [Management.Automation.PSMemberInfoCollection[Management.Automation.PSMemberInfo]]
+    $members = $il.DeclareLocal($membersType)
+    $status = $il.DeclareLocal([int])
+    $test = $il.DefineLabel(); $next = $il.DefineLabel(); $advance = $il.DefineLabel(); $fallback = $il.DefineLabel()
+    $getType = [object].GetMethod('GetType', [Type[]]@())
+    $typeFromHandle = [Type].GetMethod('GetTypeFromHandle', [Type[]]@([RuntimeTypeHandle]))
+    $contains = [Collections.Hashtable].GetMethod('ContainsKey', [Type[]]@([object]))
+    $item = [Collections.Hashtable].GetMethod('get_Item', [Type[]]@([object]))
+    $asPSObject = [Management.Automation.PSObject].GetMethod('AsPSObject', [Type[]]@([object]))
+    $getMembers = [Management.Automation.PSObject].GetMethod('get_Members', [Type[]]@())
+    $getMember = $membersType.GetMethod('get_Item', [Type[]]@([string]))
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $index)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldlen)
+    $il.Emit([Reflection.Emit.OpCodes]::Conv_I4)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]512)
+    $il.Emit([Reflection.Emit.OpCodes]::Bgt, $fallback)
+    $il.Emit([Reflection.Emit.OpCodes]::Br, $test)
+    $il.MarkLabel($next)
+    # Only the exact internally-created Hashtable shape bypasses adaptation.
+    # Subclasses, missing members and convertible/non-IntPtr handles resume
+    # original property access and parameter binding before any native read.
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $index)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldelem_Ref)
+    $il.Emit([Reflection.Emit.OpCodes]::Isinst, [Collections.Hashtable])
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $record)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $record)
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $fallback)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $record)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getType)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldtoken, [Collections.Hashtable])
+    $il.Emit([Reflection.Emit.OpCodes]::Call, $typeFromHandle)
+    $il.Emit([Reflection.Emit.OpCodes]::Bne_Un, $fallback)
+    # ETS instance members precede dictionary keys in PowerShell. Inspect
+    # public member metadata only, never Value/getters. Any shadow resumes
+    # original adaptation before this entry's property evaluation/native read.
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $record)
+    $il.Emit([Reflection.Emit.OpCodes]::Call, $asPSObject)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMembers)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $members)
+    foreach ($key in @('handle', 'comparison')) {
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $members)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldstr, $key)
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMember)
+        $il.Emit([Reflection.Emit.OpCodes]::Brtrue, $fallback)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $record)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldstr, $key)
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $contains)
+        $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $fallback)
+    }
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $record)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldstr, 'handle')
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $item)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $handle)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $handle)
+    $il.Emit([Reflection.Emit.OpCodes]::Isinst, [IntPtr])
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $fallback)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $record)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldstr, 'comparison')
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $item)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $expected)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $expected)
+    $il.Emit([Reflection.Emit.OpCodes]::Isinst, [byte[]])
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $fallback)
+    # Invoke the exact owned comparison: Type -> Info -> scratch Copy ->
+    # reparse -> current Expected shape -> identity fields, Content=false.
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_1)
+    $il.Emit([Reflection.Emit.OpCodes]::Castclass, $ComparisonCall.GetType())
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_3)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $handle)
+    $il.Emit([Reflection.Emit.OpCodes]::Unbox_Any, [IntPtr])
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]5)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $expected)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $comparisonMethod)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $status)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $status)
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $advance)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $status)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($advance)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $index)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_1)
+    $il.Emit([Reflection.Emit.OpCodes]::Add)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $index)
+    $il.MarkLabel($test)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $index)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldlen)
+    $il.Emit([Reflection.Emit.OpCodes]::Conv_I4)
+    $il.Emit([Reflection.Emit.OpCodes]::Blt, $next)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($fallback)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $index)
+    $il.Emit([Reflection.Emit.OpCodes]::Not)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    return $method.CreateDelegate([Func[object[], Delegate, Delegate, Delegate, IntPtr, byte[], int]])
+}
+
 # Compile only fixed source expressions in the existing managed runtime. No
 # compiler executable, native export, file fact, or caller-supplied expression
 # is used. Unicode inputs return -1 for the unchanged PowerShell validator:
@@ -239,6 +356,9 @@ function Initialize-HostReader {
     $script:HostComparisonInvoker = $null
     $script:HostComparisonType = $null
     $script:HostComparisonInfo = $null
+    $script:HostChainInvoker = $null
+    $script:HostChainInvokerOwner = $null
+    $script:HostChainComparison = $null
     $script:HostHandles = [Collections.Generic.List[IntPtr]]::new()
     $script:HostCanonicalPaths = $null
     $script:HostCanonicalInvoker = $null
@@ -275,6 +395,9 @@ function Initialize-HostReader {
     $script:HostComparisonInvoker = New-HostComparisonInvoker $script:HostType $script:HostInfo
     $script:HostComparisonType = $script:HostType
     $script:HostComparisonInfo = $script:HostInfo
+    $script:HostChainInvoker = New-HostChainInvoker $script:HostComparisonInvoker
+    $script:HostChainInvokerOwner = $script:HostChainInvoker
+    $script:HostChainComparison = $script:HostComparisonInvoker
     # Allocate last: no further initialization can fail after unmanaged ownership
     # is acquired. The 52-byte Win32 record and ABI are unchanged.
     $script:HostInfoScratch = [byte[]]::new(52)
@@ -453,7 +576,40 @@ function Open-HostDirectoryChain([string] $LiteralPath) {
         # Same records, ROOT to LEAF, with every original native type/identity
         # read. Only prefix splitting, path allocation and dictionary probes
         # are avoided; no filesystem fact or successful check is reused.
-        foreach ($record in $cached) { Get-HostHandleInfo $record.handle $record.comparison $false }
+        $resume = 0
+        if ($cached.Length -gt 0 -and $cached.Length -le 512 -and
+            $script:HostChainInvoker -is [Delegate] -and
+            [object]::ReferenceEquals($script:HostChainInvoker, $script:HostChainInvokerOwner) -and
+            [object]::ReferenceEquals($script:HostComparisonInvoker, $script:HostChainComparison) -and
+            [object]::ReferenceEquals($script:HostType, $script:HostComparisonType) -and
+            [object]::ReferenceEquals($script:HostInfo, $script:HostComparisonInfo) -and
+            -not $script:HostInfoBusy -and $script:HostInfoMemory -ne [IntPtr]::Zero) {
+            # The exact native calls have no callbacks, so this one sequential
+            # scratch ownership covers the whole loop. Probes and unavailable
+            # scratch use the original per-entry guard and adaptation below.
+            $script:HostInfoBusy = $true
+            try {
+                $status = $script:HostChainInvoker.Invoke($cached, $script:HostComparisonInvoker,
+                    $script:HostType, $script:HostInfo, $script:HostInfoMemory, $script:HostInfoScratch)
+                switch ($status) {
+                    0 { $resume = $cached.Length; break }
+                    1 { throw 'type' }
+                    2 { throw 'identity' }
+                    3 { throw 'reparse' }
+                    4 { throw 'changed' }
+                    default {
+                        if ($status -ge 0) { throw 'identity' }
+                        $resume = -1 - $status
+                    }
+                }
+            } finally { $script:HostInfoBusy = $false }
+        }
+        # A record needing PowerShell adaptation resumes at its first unread
+        # entry. Earlier real native reads are never skipped or repeated.
+        for ($i = $resume; $i -lt $cached.Length; $i++) {
+            $record = $cached[$i]
+            Get-HostHandleInfo $record.handle $record.comparison $false
+        }
         return $cached[$cached.Length - 1]
     }
     # Never publish an incomplete chain after a failed miss. A full cache is
@@ -611,6 +767,9 @@ function Close-HostReader {
             $script:HostComparisonInvoker = $null
             $script:HostComparisonType = $null
             $script:HostComparisonInfo = $null
+            $script:HostChainInvoker = $null
+            $script:HostChainInvokerOwner = $null
+            $script:HostChainComparison = $null
             if ($memory -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory) }
         } finally {
             # Retire lexical ownership even if native cleanup throws. No result
