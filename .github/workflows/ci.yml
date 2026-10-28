@@ -30,6 +30,40 @@ jobs:
           $memory = [IntPtr]::Zero
           $output = $null
           $good = $false
+          $firstFailure = $null
+          $fileSubstage = 'open'
+          $fileOrdinal = 0
+          
+          function Save-Failure([Management.Automation.ErrorRecord] $Failure) {
+              if ($null -ne $script:firstFailure) { return }
+              $kind = 'other'
+              $problem = $Failure.Exception
+              for ($depth = 0; $depth -lt 8 -and $null -ne $problem.InnerException; $depth++) {
+                  $problem = $problem.InnerException
+              }
+              if ($problem -is [Management.Automation.MethodException]) { $kind = 'binding' }
+              elseif ($problem -is [BadImageFormatException]) { $kind = 'bad_image' }
+              elseif ($problem -is [UnauthorizedAccessException]) { $kind = 'access' }
+              elseif ($problem -is [IO.IOException]) { $kind = 'io' }
+              elseif ($problem -is [ArgumentException]) { $kind = 'argument' }
+              elseif ($problem -is [InvalidOperationException]) { $kind = 'operation' }
+              elseif ($problem -is [NotSupportedException]) { $kind = 'unsupported' }
+              elseif ($problem -is [Security.Cryptography.CryptographicException]) { $kind = 'crypto' }
+              elseif ($problem -is [Management.Automation.RuntimeException]) { $kind = 'runtime' }
+              $line = 0
+              if ($null -ne $Failure.InvocationInfo) {
+                  $candidateLine = $Failure.InvocationInfo.ScriptLineNumber
+                  if ($candidateLine -is [int] -and $candidateLine -ge 1 -and $candidateLine -le 600) { $line = $candidateLine }
+              }
+              $script:firstFailure = [ordered]@{ compiler_metadata_failure = 'closed-diagnostic-v1';
+                  substage = $script:fileSubstage; ordinal = $script:fileOrdinal; category = $kind; line = $line }
+          }
+          function Emit-Failure {
+              if ($null -ne $script:firstFailure) {
+                  Write-Output ($script:firstFailure | ConvertTo-Json -Compress)
+              }
+              Write-Output 'MORPHEUS_COMPILER_METADATA failed'
+          }
           
           function Need($Value) { if (-not $Value) { throw 'refused' } }
           function Budget {
@@ -110,6 +144,8 @@ jobs:
               return $Value
           }
           function File-Fact([string] $Relative) {
+              $script:fileSubstage = 'open'
+              if ($script:fileOrdinal -lt 1040) { $script:fileOrdinal++ }
               Need ($Relative -cmatch '^[A-Za-z0-9._/-]{1,200}$' -and -not $Relative.Contains('..'))
               $path = [IO.Path]::GetFullPath([IO.Path]::Combine($root, $Relative.Replace('/', '\')))
               Need ($path.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase))
@@ -119,6 +155,7 @@ jobs:
               $size = [uint64][BitConverter]::ToUInt32($before, 32) * 4294967296 + [uint64][BitConverter]::ToUInt32($before, 36)
               Need ($size -gt 0 -and $size -le 268435456 -and $size -le 1073741824 - $script:total)
               $records.Add($record)
+              $script:fileSubstage = 'hash'
               $safe = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($record.handle, $false)
               $stream = [IO.FileStream]::new($safe, [IO.FileAccess]::Read, 1048576, $false)
               $hash = [Security.Cryptography.SHA256]::Create()
@@ -131,9 +168,12 @@ jobs:
                   $null = $hash.TransformFinalBlock([byte[]]::new(0), 0, 0)
                   Need ($read -eq $size)
                   $digest = [Convert]::ToHexString($hash.Hash).ToLowerInvariant()
-              } finally { $stream.Dispose(); $safe.Dispose(); $hash.Dispose() }
+              } catch { Save-Failure $_; throw }
+              finally { $stream.Dispose(); $safe.Dispose(); $hash.Dispose() }
+              $script:fileSubstage = 'identity'
               Same-Identity $record.handle $before
               $script:total += $size
+              $script:fileSubstage = 'assembly_metadata'
               $assembly = $null
               if ($Relative.EndsWith('.dll', [StringComparison]::OrdinalIgnoreCase)) {
                   try {
@@ -146,12 +186,19 @@ jobs:
                       $assembly = [ordered]@{ name = $name.Name; version = $name.Version.ToString(); public_key_token = $tokenHex }
                   } catch {
                       $problem = $_.Exception
-                      while ($null -ne $problem.InnerException) { $problem = $problem.InnerException }
-                      if ($problem -isnot [BadImageFormatException]) { throw 'metadata' }
+                      for ($depth = 0; $depth -lt 8 -and $null -ne $problem.InnerException; $depth++) {
+                          $problem = $problem.InnerException
+                      }
+                      if ($null -ne $problem.InnerException -or $problem -isnot [BadImageFormatException]) {
+                          Save-Failure $_; throw 'metadata'
+                      }
                   }
               }
+              $script:fileSubstage = 'file_version'
               $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($path)
+              $script:fileSubstage = 'identity'
               Same-Identity $record.handle $before
+              $script:fileSubstage = 'file_version'
               return [ordered]@{ path = $Relative; bytes = $size; sha256 = $digest; managed_assembly = $assembly;
                   file_version = (Optional-Version $version.FileVersion); product_version = (Optional-Version $version.ProductVersion) }
           }
@@ -192,18 +239,6 @@ jobs:
                   'Microsoft.CodeAnalysis.dll', 'Microsoft.CodeAnalysis.CSharp.dll', 'System.Private.CoreLib.dll',
                   'System.Collections.Immutable.dll', 'System.Reflection.Metadata.dll')) { Need ($rootNames -ccontains $required) }
               $files = [Collections.Generic.List[object]]::new()
-              Write-Output '{"compiler_metadata_phase":"bundle_hashes","status":"started"}'
-              foreach ($name in $rootNames) { $files.Add((File-Fact $name)) }
-              Write-Output '{"compiler_metadata_phase":"ref_hashes","status":"started"}'
-              foreach ($name in $refNames) { $files.Add((File-Fact ('ref/' + $name))) }
-              Write-Output '{"compiler_metadata_phase":"fixed_files","status":"started"}'
-              foreach ($name in @('pwsh.exe', 'pwsh.deps.json', 'pwsh.runtimeconfig.json',
-                  'Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1')) { $files.Add((File-Fact $name)) }
-              $licenses = [Collections.Generic.List[object]]::new()
-              foreach ($name in @('LICENSE.txt', 'ThirdPartyNotices.txt')) {
-                  if ([IO.File]::Exists([IO.Path]::Combine($root, $name))) { $licenses.Add((File-Fact $name)) }
-                  else { $licenses.Add([ordered]@{ path = $name; present = $false }) }
-              }
               Write-Output '{"compiler_metadata_phase":"version_checks","status":"started"}'
               Need ([string]::Equals([Environment]::ProcessPath, [IO.Path]::Combine($root, 'pwsh.exe'), [StringComparison]::OrdinalIgnoreCase))
               Need ([string]::Equals([Reflection.Assembly]::GetEntryAssembly().Location,
@@ -216,6 +251,24 @@ jobs:
               Need ($psVersion -cmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]{1,64})?$' -and $PSVersionTable.PSEdition -ceq 'Core')
               $framework = [Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
               Need ($framework.Length -le 128 -and $framework -cmatch '^[A-Za-z0-9 .+_-]+$')
+              # Identity header is explicitly incomplete: no bundle/ref verification or admission.
+              Write-Output (([ordered]@{ schema = 'morpheus-powershell-compiler-metadata-unverified-header-v1';
+                  verification = 'UNVERIFIED'; powershell_version = $psVersion; powershell_edition = 'Core';
+                  architecture = 'X64'; framework = $framework; core_runtime_in_fixed_root = $coreInRoot;
+                  process_and_sma_fixed_root_checks = $true; compiler_admission_granted = $false;
+                  build_ready = $false }) | ConvertTo-Json -Compress)
+              Write-Output '{"compiler_metadata_phase":"bundle_hashes","status":"started"}'
+              foreach ($name in $rootNames) { $files.Add((File-Fact $name)) }
+              Write-Output '{"compiler_metadata_phase":"ref_hashes","status":"started"}'
+              foreach ($name in $refNames) { $files.Add((File-Fact ('ref/' + $name))) }
+              Write-Output '{"compiler_metadata_phase":"fixed_files","status":"started"}'
+              foreach ($name in @('pwsh.exe', 'pwsh.deps.json', 'pwsh.runtimeconfig.json',
+                  'Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1')) { $files.Add((File-Fact $name)) }
+              $licenses = [Collections.Generic.List[object]]::new()
+              foreach ($name in @('LICENSE.txt', 'ThirdPartyNotices.txt')) {
+                  if ([IO.File]::Exists([IO.Path]::Combine($root, $name))) { $licenses.Add((File-Fact $name)) }
+                  else { $licenses.Add([ordered]@{ path = $name; present = $false }) }
+              }
               Write-Output '{"compiler_metadata_phase":"snapshot_and_close","status":"started"}'
               $againRoot = Dll-Names $root; $againRef = Dll-Names $refRoot
               Need ($againRoot.Count -eq $rootNames.Count -and $againRef.Count -eq $refNames.Count)
@@ -230,17 +283,24 @@ jobs:
                   add_type_invoked = $false; roslyn_compilation_invoked = $false; candidate_code_imported = $false;
                   sdk_tool_executed = $false; compiler_admission_granted = $false; build_ready = $false }
               $good = $true
-          } catch { $good = $false }
+          } catch { Save-Failure $_; $good = $false }
           finally {
-              for ($i = $handles.Count - 1; $i -ge 0; $i--) {
-                  $handle = $handles[$i]; $handles[$i] = [IntPtr]::Zero
-                  if ($handle -ne [IntPtr]::Zero -and $close.Invoke($handle) -eq 0) { $good = $false }
+              try {
+                  for ($i = $handles.Count - 1; $i -ge 0; $i--) {
+                      $handle = $handles[$i]; $handles[$i] = [IntPtr]::Zero
+                      try {
+                          if ($handle -ne [IntPtr]::Zero -and $close.Invoke($handle) -eq 0) { $good = $false }
+                      } catch { Save-Failure $_; $good = $false }
+                  }
+              } finally {
+                  try {
+                      if ($memory -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory); $memory = [IntPtr]::Zero }
+                  } catch { Save-Failure $_; $good = $false }
               }
-              if ($memory -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory); $memory = [IntPtr]::Zero }
           }
-          if (-not $good) { Write-Output 'MORPHEUS_COMPILER_METADATA failed'; exit 1 }
+          if (-not $good) { Emit-Failure; exit 1 }
           try {
               $json = $output | ConvertTo-Json -Depth 7 -Compress
               Need ([Text.Encoding]::UTF8.GetByteCount($json) -le 2097152)
               Write-Output $json
-          } catch { Write-Output 'MORPHEUS_COMPILER_METADATA failed'; exit 1 }
+          } catch { Save-Failure $_; Emit-Failure; exit 1 }
