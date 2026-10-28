@@ -58,6 +58,46 @@ STAGE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_STAGE ([a-z_]+)$", re.MULTILINE)
 FAILURE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_FAILURE ([a-z_]+)$", re.MULTILINE)
 
 
+GROUP_PREFIX = "MORPHEUS_ELEMENT_GROUP "
+GROUP_FIELDS = ("original_roster", "late_roster", "continuity_detail", "late_current_bob", "late_bob_pending")
+GROUP_ROSTERS = frozenset(("exact", "missing_alice", "missing_bob", "missing_carol", "missing_multiple",
+                           "unexpected_or_duplicate", "unavailable", "unknown"))
+GROUP_VALUES = (GROUP_ROSTERS, GROUP_ROSTERS,
+                frozenset(("same_live_event", "changed_live_event", "not_unique", "unknown")),
+                frozenset(("present", "missing", "ambiguous", "unknown")),
+                frozenset(("pending", "absent", "retrying", "unknown")))
+GROUP_MAX_LINE = len(GROUP_PREFIX) + len(GROUP_FIELDS) - 1 + sum(
+    len(key) + 1 + max(map(len, values)) for key, values in zip(GROUP_FIELDS, GROUP_VALUES))
+
+
+def group_discriminator(output: str) -> dict[str, str]:
+    """One bounded complete fixed-label line; never copy an unbounded token."""
+    result = None
+    cursor = 0
+    while (start := output.find("MORPHEUS_ELEMENT_GROUP", cursor)) >= 0:
+        cursor = start + len("MORPHEUS_ELEMENT_GROUP")
+        if start and output[start - 1] != "\n":
+            continue
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        unknown = dict.fromkeys(GROUP_FIELDS, "unknown")
+        if result is not None or end - start > GROUP_MAX_LINE:
+            return unknown
+        line = output[start:end]
+        if not line.startswith(GROUP_PREFIX):
+            return unknown
+        fields = line[len(GROUP_PREFIX):].split(" ")
+        if len(fields) != len(GROUP_FIELDS):
+            return unknown
+        result = {}
+        for field, key, values in zip(fields, GROUP_FIELDS, GROUP_VALUES):
+            name, sep, value = field.partition("=")
+            if not sep or name != key or value not in values:
+                return unknown
+            result[key] = value
+    return result or {}
+
+
 def evidence(output: str, *, complete=False) -> dict[str, bool]:
     result = {}
     for key, value in CHECK_PATTERN.findall(output):
@@ -96,6 +136,9 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
         result["failure"] = failures[-1]
     if include_native and (native := native_stages(output)):
         result["native_stage"] = native[-1]
+    if (include_native and result.get("native_stage") == "group_roster"
+            and result.get("failure") == "native_acceptance"):
+        result.update(group_discriminator(output))
     return result
 
 
@@ -471,6 +514,8 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     if children_joined and cleanup_failure is None:
         for value in native_stages(native_output):
             print(NATIVE_STAGE_PREFIX + value, flush=True)
+        if failure and (group := group_discriminator(native_output)):
+            print(GROUP_PREFIX + " ".join(key + "=" + group[key] for key in GROUP_FIELDS), flush=True)
     # Cleanup is required but must not erase the last useful failure stage.
     diagnostic_output = output.replace("MORPHEUS_ELEMENT_STAGE element_cleanup\n", "")
     if found := diagnostics(diagnostic_output, include_native=False):

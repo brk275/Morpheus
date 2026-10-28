@@ -111,3 +111,23 @@ Arc retention, extraction negatives, byte/count bounds and broadcast lag,
 alongside upstream keyed-map tests. Live application receipt and redaction
 tests are separate from these unit regressions. No local native build or test
 execution was used to claim acceptance.
+
+## Exact pending-event observation
+
+With E2EE enabled, `StickyEvents::pending_event_state(event_id, sender)` is a
+read-only query scoped to this room and one exact event/sender pair. It returns
+only `Pending`, `Absent`, or `Retrying`; `as_str()` exposes the fixed labels
+`pending`, `absent`, and `retrying`. The query acquires no asynchronous work,
+performs no fetch/decryption/key request, changes no queue or cache, and exposes
+no ciphertext, key, session identifier or raw event. `Pending` describes outer
+encrypted receipt presence, **not authenticated decrypted membership**.
+`Absent` describes only the current pending list; it does not prove the event
+was never received. `Retrying` prevents a temporarily drained retry list from
+being mistaken for absence. The existing 5000-entry pending cap applies.
+
+The Element interoperability fixture samples this only after its unchanged
+roster deadline has failed and only for the current Bob event ID observed in
+the original peer's decrypted cache. Identifiers stay process-private; one
+additional closed failure label is emitted. No production call, sync, trust,
+key-sharing or request policy is changed by this observation. Runtime cause
+and successful group interoperability remain unproven until hosted checks.

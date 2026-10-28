@@ -177,6 +177,32 @@ impl PendingEvent {
     }
 }
 
+/// Read-only presence of one exact event in the encrypted pending list.
+///
+/// Pending means received encrypted, not authenticated/decrypted membership.
+#[cfg(feature = "e2e-encryption")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingStickyEventState {
+    /// This exact unexpired outer event is waiting for decryption.
+    Pending,
+    /// No such pending event is parked. This does not prove non-reception.
+    Absent,
+    /// A retry temporarily owns the pending list; presence is indeterminate.
+    Retrying,
+}
+
+#[cfg(feature = "e2e-encryption")]
+impl PendingStickyEventState {
+    /// A fixed label only, without identifiers, payloads, session IDs or keys.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Absent => "absent",
+            Self::Retrying => "retrying",
+        }
+    }
+}
+
 /// The sticky events of a room.
 ///
 /// This is a cheap-to-clone handle over the map of a room, which every clone
@@ -399,6 +425,31 @@ impl StickyEvents {
                 state.pending = kept;
                 taken
             }
+        }
+    }
+
+    /// Observe only whether this room currently parks the exact outer event
+    /// and sender. Does not fetch, decrypt, request keys or mutate state. A
+    /// pending sender is not yet an authenticated decrypted identity.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn pending_event_state(
+        &self,
+        event_id: &ruma::EventId,
+        sender: &ruma::UserId,
+    ) -> PendingStickyEventState {
+        let Ok(_retry_guard) = self.inner.retry_lock.try_lock() else {
+            return PendingStickyEventState::Retrying;
+        };
+        let now = now_ms();
+        let state = self.inner.state.lock().unwrap();
+        if state.pending.iter().any(|event| {
+            event.meta.event_id.as_str() == event_id.as_str()
+                && event.meta.sender.as_str() == sender.as_str()
+                && event.meta.expires_at > now
+        }) {
+            PendingStickyEventState::Pending
+        } else {
+            PendingStickyEventState::Absent
         }
     }
 
@@ -625,9 +676,41 @@ mod tests {
         assert_eq!(session_id.as_deref(), Some("session2"));
 
         assert!(sticky.has_pending());
+        let event_id = owned_event_id!("$a:localhost");
+        let sender = owned_user_id!("@alice:localhost");
+        assert_eq!(
+            sticky.pending_event_state(&event_id, &sender),
+            super::PendingStickyEventState::Pending
+        );
+        assert_eq!(
+            sticky.pending_event_state(&owned_event_id!("$other:localhost"), &sender),
+            super::PendingStickyEventState::Absent
+        );
+        assert_eq!(
+            sticky.pending_event_state(&event_id, &owned_user_id!("@other:localhost")),
+            super::PendingStickyEventState::Absent
+        );
+        let guard = sticky.lock_pending_retries().await;
+        assert_eq!(
+            sticky.pending_event_state(&event_id, &sender),
+            super::PendingStickyEventState::Retrying
+        );
         let taken = sticky.take_pending(None);
         assert_eq!(taken.len(), 1);
+        drop(guard);
         assert!(!sticky.has_pending());
+        assert_eq!(
+            sticky.pending_event_state(&event_id, &sender),
+            super::PendingStickyEventState::Absent
+        );
+        sticky.park(vec![pending(Some("expired"), now.saturating_sub(1))]);
+        assert_eq!(
+            sticky.pending_event_state(&event_id, &sender),
+            super::PendingStickyEventState::Absent
+        );
+        assert_eq!(super::PendingStickyEventState::Pending.as_str(), "pending");
+        assert_eq!(super::PendingStickyEventState::Absent.as_str(), "absent");
+        assert_eq!(super::PendingStickyEventState::Retrying.as_str(), "retrying");
     }
 
     #[cfg(feature = "e2e-encryption")]

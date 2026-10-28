@@ -66,6 +66,35 @@ class EvidenceTests(unittest.TestCase):
         )))
         self.assertEqual(result, {"stage": "browser_roster", "failure": "browser_acceptance"})
 
+        # Existing failure-only roster schema: no raw identifiers or success facts.
+        fields = dict(original_roster="exact", late_roster="missing_bob",
+                      continuity_detail="same_live_event", late_current_bob="missing", late_bob_pending="pending")
+        marker = target.GROUP_PREFIX + " ".join(key + "=" + fields[key] for key in target.GROUP_FIELDS)
+        native = "\n".join(target.NATIVE_STAGE_PREFIX + stage for stage in target.NATIVE_STAGES)
+        failure = native + "\n" + marker + "\nMORPHEUS_ELEMENT_FAILURE native_acceptance"
+        self.assertEqual(target.group_discriminator(marker), fields)
+        self.assertEqual({key: target.diagnostics(failure)[key] for key in fields}, fields)
+        self.assertNotIn("original_roster", target.diagnostics(failure, include_native=False))
+        self.assertNotIn("original_roster", target.diagnostics(native + "\n" + marker))
+        self.assertEqual(target.evidence(failure), {})
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(failure, complete=True)
+        for malformed in (marker + "\n" + marker, marker + " private", marker.replace("missing_bob", "private_secret"),
+                          target.GROUP_PREFIX + "private" * 100_000,
+                          marker.replace(" late_roster=missing_bob", " late_roster=exact late_roster=missing_bob"),
+                          marker.replace("same_live_event", "wire_changed"),
+                          marker.replace("late_bob_pending=pending", "late_bob_pending=private_secret")):
+            with self.subTest(kind="invalid_group_marker"):
+                parsed = target.group_discriminator(malformed)
+                self.assertEqual(parsed, dict.fromkeys(target.GROUP_FIELDS, "unknown"))
+                self.assertNotIn("private", str(parsed))
+                self.assertEqual(target.evidence(malformed), {})
+        for state in ("pending", "absent", "retrying", "unknown"):
+            observed = marker.replace("late_bob_pending=pending", "late_bob_pending=" + state)
+            self.assertEqual(target.group_discriminator(observed)["late_bob_pending"], state)
+        self.assertEqual(target.group_discriminator("prefix" + marker), {})
+        self.assertLessEqual(len(marker), target.GROUP_MAX_LINE)
+
     def test_native_group_stages_are_closed_ordered_and_bounded(self):
         lines = [target.NATIVE_STAGE_PREFIX + value for value in target.NATIVE_STAGES]
         for count in range(1, len(lines) + 1):
