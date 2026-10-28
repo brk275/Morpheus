@@ -1244,6 +1244,12 @@ try {
     $ownedScratch = $script:HostInfoScratch
     $ownedMemo = $script:HostCanonicalPaths
     $ownedCanonical = $script:HostCanonicalInvoker
+    $ownedInitialInvoker = $script:HostInitialInvoker
+    $ownedAdmissionInvoker = $script:HostHashAdmissionInvoker
+    if ($ownedInitialInvoker -isnot [Delegate] -or $ownedAdmissionInvoker -isnot [Delegate] -or
+        -not [object]::ReferenceEquals($ownedInitialInvoker, $script:HostInitialInvokerOwner) -or
+        -not [object]::ReferenceEquals($ownedAdmissionInvoker, $script:HostHashAdmissionOwner) -or
+        $script:HostManagedInitialInfos -ne 0 -or $script:HostManagedAdmissions -ne 0) { throw 'identity' }
     $ownedHashInvoker = $script:HostHashInvoker
     if ($ownedHashInvoker -isnot [Delegate] -or $script:HostManagedHashes -ne 0 -or
         -not [object]::ReferenceEquals($ownedHashInvoker, $script:HostHashInvokerOwner) -or
@@ -1470,7 +1476,8 @@ try {
     } finally { $hashInput.Dispose(); $hash.Dispose() }
     $caseStage = 'inventory'
     $result = Get-HostRootInventory $good
-    if ($script:HostManagedHashes -lt 2) { throw 'hash' }
+    if ($script:HostManagedHashes -lt 2 -or $script:HostManagedAdmissions -lt 2 -or
+        $script:HostManagedInitialInfos -lt 2) { throw 'hash' }
     if ($result.files.Count -ne 2 -or $script:HostBytes -ne 5 -or
         $script:HostPreflightBudgetCause -cne 'unknown') { throw 'inventory' }
     $caseStage = 'digest_assertion'
@@ -1485,6 +1492,96 @@ try {
         $observed.write -cne [Convert]::ToHexString([byte[]]($ownedScratch[20..27])) -or
         $observed.identity -cne ([Convert]::ToHexString([byte[]]($ownedScratch[28..31])) +
                                [Convert]::ToHexString([byte[]]($ownedScratch[44..51])))) { throw 'identity' }
+    # New unbound native decoding must match every old field value/type and
+    # case-insensitive key exactly, using two fresh reads of the same locked handle.
+    $beforeInitial = $script:HostManagedInitialInfos
+    try {
+        $script:HostInitialInvoker = $null
+        $fallbackObserved = Get-HostHandleInfo $script:HostFileRecords[0].handle
+        if ($script:HostManagedInitialInfos -ne $beforeInitial) { throw 'identity' }
+    } finally { $script:HostInitialInvoker = $ownedInitialInvoker }
+    foreach ($key in @('attributes', 'directory', 'bytes', 'write', 'links', 'identity')) {
+        if ($observed[$key] -cne $fallbackObserved[$key] -or
+            $observed[$key].GetType() -ne $fallbackObserved[$key].GetType() -or
+            $observed[$key.ToUpperInvariant()] -cne $observed[$key]) { throw 'identity' }
+    }
+    # Complete managed admission is pure metadata: ordinary state is accepted,
+    # reference/primitive/Length/method probes fail without executing a getter.
+    $admissionInput = [IO.MemoryStream]::new([byte[]]@(1, 2, 3, 4), $false)
+    $admissionDigest = [Security.Cryptography.SHA256]::Create()
+    $probeBuffer = [byte[]]::new(4)
+    $script:AdmissionProbeCalls = 0
+    try {
+        $state = [object[]]@($script:HostHashInvoker, $script:HostHashInvokerOwner,
+            ${function:Assert-HostBudget}, $script:HostHashBudgetOwner,
+            ${function:Open-HostReadHandle}, $script:HostHashOpenOwner,
+            ${function:Get-HostHandleInfo}, $script:HostHashInfoOwner,
+            $script:HostLimits, $script:HostHashLimitsOwner, $script:HostHandles, $script:HostHashHandlesOwner,
+            $script:HostWatch, $script:HostBuffer, $script:HostCount, $script:HostBytes,
+            $script:HostMetadataBytes, $admissionInput, $admissionDigest, $null)
+        if ($ownedAdmissionInvoker.Invoke($null) -or
+            -not $ownedAdmissionInvoker.Invoke($state)) { throw 'identity' }
+        # Each current/owner slot independently rejects a different reference.
+        foreach ($offset in 0..11) {
+            $changedState = [object[]]$state.Clone(); $changedState[$offset] = [object]::new()
+            if ($ownedAdmissionInvoker.Invoke($changedState)) { throw 'identity' }
+        }
+        foreach ($offset in @(12, 14, 15, 16)) {
+            $changedState = [object[]]$state.Clone(); $changedState[$offset] = [long]0
+            if ($ownedAdmissionInvoker.Invoke($changedState)) { throw 'identity' }
+        }
+        foreach ($key in @('Seconds', 'Entries', 'TotalBytes', 'Handles', 'MetadataBytes')) {
+            $changedLimits = [hashtable]$script:HostLimits.Clone()
+            $changedLimits[$key] = if ($key -ceq 'TotalBytes') { [int]1 } else { [long]1 }
+            $changedState = [object[]]$state.Clone(); $changedState[8] = $changedLimits; $changedState[9] = $changedLimits
+            if ($ownedAdmissionInvoker.Invoke($changedState)) { throw 'identity' }
+        }
+        Add-Member -InputObject $probeBuffer -MemberType ScriptProperty -Name Length -Value {
+            $script:AdmissionProbeCalls++; throw 'accepted'
+        } -Force
+        $changedState = [object[]]$state.Clone(); $changedState[13] = $probeBuffer
+        if ($ownedAdmissionInvoker.Invoke($changedState) -or $script:AdmissionProbeCalls -ne 0) { throw 'identity' }
+        $admissionText = [IO.MemoryStream]::new()
+        try {
+            $changedState = [object[]]$state.Clone(); $changedState[19] = $admissionText
+            if (-not $ownedAdmissionInvoker.Invoke($changedState)) { throw 'identity' }
+            Add-Member -InputObject $admissionText -MemberType ScriptMethod -Name Write -Value {
+                $script:AdmissionProbeCalls++; throw 'accepted'
+            } -Force
+            if ($ownedAdmissionInvoker.Invoke($changedState) -or $script:AdmissionProbeCalls -ne 0) { throw 'identity' }
+        } finally { $admissionText.Dispose() }
+        Add-Member -InputObject $admissionDigest -MemberType ScriptMethod -Name TransformBlock -Value {
+            $script:AdmissionProbeCalls++; throw 'accepted'
+        } -Force
+        try {
+            if ($ownedAdmissionInvoker.Invoke($state) -or $script:AdmissionProbeCalls -ne 0) { throw 'identity' }
+        } finally { $admissionDigest.PSObject.Members.Remove('TransformBlock') }
+        Add-Member -InputObject $admissionInput -MemberType ScriptMethod -Name Read -Value {
+            $script:AdmissionProbeCalls++; throw 'accepted'
+        } -Force
+        if ($ownedAdmissionInvoker.Invoke($state) -or $script:AdmissionProbeCalls -ne 0 -or
+            $admissionInput.Position -ne 0 -or $null -ne $admissionDigest.Hash) { throw 'identity' }
+    } finally { $admissionInput.Dispose(); $admissionDigest.Dispose() }
+    # Same-object Native Invoke shadows return unsupported before a native
+    # read; the original PowerShell path still invokes the probe once.
+    $originalTypeForInitial = $script:HostType
+    $script:InitialInvokeProbeCalls = 0
+    Add-Member -InputObject $originalTypeForInitial -MemberType ScriptMethod -Name Invoke -Value {
+        param([IntPtr] $Handle)
+        $script:InitialInvokeProbeCalls++
+        return $this.DynamicInvoke([object[]]@($Handle))
+    } -Force
+    try {
+        $scratchBefore = [Convert]::ToHexString($ownedScratch)
+        if ($ownedInitialInvoker.Invoke($script:HostType, $script:HostInfo,
+            $script:HostFileRecords[0].handle, $ownedMemory, $ownedScratch) -ne 4 -or
+            $script:InitialInvokeProbeCalls -ne 0 -or
+            [Convert]::ToHexString($ownedScratch) -cne $scratchBefore) { throw 'identity' }
+        $beforeInitial = $script:HostManagedInitialInfos
+        $probeObserved = Get-HostHandleInfo $script:HostFileRecords[0].handle
+        if ($script:InitialInvokeProbeCalls -ne 1 -or $script:HostManagedInitialInfos -ne $beforeInitial -or
+            $probeObserved.identity -cne $observed.identity -or $probeObserved.bytes -ne $observed.bytes) { throw 'identity' }
+    } finally { $originalTypeForInitial.PSObject.Members.Remove('Invoke') }
     # Record/initial ETS shadows must refuse managed admission before any
     # Read or getter. The actual old caller must then retain its four ordinary
     # size accesses for one4-byte read/EOF (TextLimit0), with the same digest.
@@ -1711,10 +1808,18 @@ try {
             $ownedScratch, $null, $true) -ne 1 -or
         ($firstFailureTrace -join ',') -cne 'type') { throw 'identity' }
     $firstFailureTrace.Clear()
+    $initialTypeThunk = New-HostInitialInvoker $typeFailure $infoFailure
+    if ($initialTypeThunk.Invoke($typeFailure, $infoFailure, [IntPtr]::Zero, [IntPtr]::Zero,
+            $ownedScratch) -ne 1 -or ($firstFailureTrace -join ',') -cne 'type') { throw 'identity' }
+    $firstFailureTrace.Clear()
     $infoThunk = New-HostComparisonInvoker $typeSuccess $infoFailure
     if ($infoThunk.Invoke($typeSuccess, $infoFailure, [IntPtr]::Zero, [IntPtr]::Zero,
             $ownedScratch, $null, $true) -ne 2 -or
         ($firstFailureTrace -join ',') -cne 'type,info') { throw 'identity' }
+    $firstFailureTrace.Clear()
+    $initialInfoThunk = New-HostInitialInvoker $typeSuccess $infoFailure
+    if ($initialInfoThunk.Invoke($typeSuccess, $infoFailure, [IntPtr]::Zero, [IntPtr]::Zero,
+            $ownedScratch) -ne 2 -or ($firstFailureTrace -join ',') -cne 'type,info') { throw 'identity' }
     # Reparse refuses before an invalid Expected snapshot, after copying the
     # entire owned record into the same observable scratch buffer.
     $reparseInfo = [Func[IntPtr, IntPtr, int]] { param([IntPtr] $Handle, [IntPtr] $Memory)
@@ -1728,6 +1833,30 @@ try {
     if ($reparseThunk.Invoke($typeSuccess, $reparseInfo, [IntPtr]::Zero, $ownedMemory,
             $ownedScratch, $null, $true) -ne 3 -or
         ($firstFailureTrace -join ',') -cne 'type,info' -or $ownedScratch[1] -ne 4) { throw 'identity' }
+    $firstFailureTrace.Clear()
+    $initialReparseThunk = New-HostInitialInvoker $typeSuccess $reparseInfo
+    if ($initialReparseThunk.Invoke($typeSuccess, $reparseInfo, [IntPtr]::Zero, $ownedMemory,
+            $ownedScratch) -ne 3 -or ($firstFailureTrace -join ',') -cne 'type,info' -or
+            $ownedScratch[1] -ne 4) { throw 'identity' }
+    # Nonzero high size/index/time/link bytes exercise the complete52-byte
+    # decoder, including oversized-file values that must reach old cap checks.
+    $seedInfo = [Func[IntPtr, IntPtr, int]] { param([IntPtr] $Handle, [IntPtr] $Memory)
+        $record = [byte[]](0..51)
+        $record[0] = 32; $record[1] = 0; $record[2] = 0; $record[3] = 0
+        [Runtime.InteropServices.Marshal]::Copy($record, 0, $Memory, 52)
+        return 1
+    }
+    $seedThunk = New-HostInitialInvoker $typeSuccess $seedInfo
+    $seedObserved = $seedThunk.Invoke($typeSuccess, $seedInfo, [IntPtr]::Zero, $ownedMemory, $ownedScratch)
+    try {
+        $script:HostType = $typeSuccess; $script:HostInfo = $seedInfo
+        $seedFallback = Get-HostHandleInfo ([IntPtr]::Zero)
+    } finally { $script:HostType = $originalType; $script:HostInfo = $originalInfo }
+    if ($seedObserved.Count -ne 6 -or $seedObserved.bytes -le [uint64]4294967296) { throw 'identity' }
+    foreach ($key in @('attributes', 'directory', 'bytes', 'write', 'links', 'identity')) {
+        if ($seedObserved[$key] -cne $seedFallback[$key] -or
+            $seedObserved[$key].GetType() -ne $seedFallback[$key].GetType()) { throw 'identity' }
+    }
     $nativeTrace = [Collections.Generic.List[string]]::new()
     $typeProbe = [pscustomobject]@{ Delegate = $originalType; Calls = 0; Trace = $nativeTrace }
     $typeProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
@@ -1904,7 +2033,11 @@ try {
         Must-Refuse { Get-HostHandleInfo $comparisonRecord.handle $comparisonRecord.comparison $true }
         Must-Refuse { Open-HostDirectoryChain $good }
         Must-Refuse { Close-HostReader }
-        if (-not [object]::ReferenceEquals($ownedHashInvoker, $script:HostHashInvoker) -or
+        if (-not [object]::ReferenceEquals($ownedInitialInvoker, $script:HostInitialInvoker) -or
+            -not [object]::ReferenceEquals($ownedInitialInvoker, $script:HostInitialInvokerOwner) -or
+            -not [object]::ReferenceEquals($ownedAdmissionInvoker, $script:HostHashAdmissionInvoker) -or
+            -not [object]::ReferenceEquals($ownedAdmissionInvoker, $script:HostHashAdmissionOwner) -or
+            -not [object]::ReferenceEquals($ownedHashInvoker, $script:HostHashInvoker) -or
             -not [object]::ReferenceEquals($ownedHashInvoker, $script:HostHashInvokerOwner) -or
             -not [object]::ReferenceEquals(${function:Open-HostReadHandle}, $script:HostHashOpenOwner) -or
             -not [object]::ReferenceEquals(${function:Get-HostHandleInfo}, $script:HostHashInfoOwner) -or
@@ -1932,6 +2065,8 @@ if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScra
         $null -ne $script:HostHashBudgetOwner -or $null -ne $script:HostHashLimitsOwner -or
         $null -ne $script:HostHashHandlesOwner -or
         $null -ne $script:HostHashOpenOwner -or $null -ne $script:HostHashInfoOwner -or
+        $null -ne $script:HostInitialInvoker -or $null -ne $script:HostInitialInvokerOwner -or
+        $null -ne $script:HostHashAdmissionInvoker -or $null -ne $script:HostHashAdmissionOwner -or
     $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostCanonicalUnits -ne 0 -or
     $ownedMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
@@ -1964,6 +2099,8 @@ try {
         $null -ne $script:HostHashBudgetOwner -or $null -ne $script:HostHashLimitsOwner -or
         $null -ne $script:HostHashHandlesOwner -or
         $null -ne $script:HostHashOpenOwner -or $null -ne $script:HostHashInfoOwner -or
+        $null -ne $script:HostInitialInvoker -or $null -ne $script:HostInitialInvokerOwner -or
+        $null -ne $script:HostHashAdmissionInvoker -or $null -ne $script:HostHashAdmissionOwner -or
         $script:HostInfoBusy -or $script:HostHandles.Count -ne 0 -or
         $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostCanonicalUnits -ne 0 -or
@@ -2069,6 +2206,8 @@ try {
         $null -ne $script:HostHashBudgetOwner -or $null -ne $script:HostHashLimitsOwner -or
         $null -ne $script:HostHashHandlesOwner -or
         $null -ne $script:HostHashOpenOwner -or $null -ne $script:HostHashInfoOwner -or
+        $null -ne $script:HostInitialInvoker -or $null -ne $script:HostInitialInvokerOwner -or
+        $null -ne $script:HostHashAdmissionInvoker -or $null -ne $script:HostHashAdmissionOwner -or
         $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostCanonicalUnits -ne 0 -or
         $exceptionMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
@@ -2088,7 +2227,9 @@ try {
         $null -ne $script:HostHashInvoker -or $null -ne $script:HostHashInvokerOwner -or
         $null -ne $script:HostHashBudgetOwner -or $null -ne $script:HostHashLimitsOwner -or
         $null -ne $script:HostHashHandlesOwner -or
-        $null -ne $script:HostHashOpenOwner -or $null -ne $script:HostHashInfoOwner -or $null -ne $script:HostCanonicalInvoker -or
+        $null -ne $script:HostHashOpenOwner -or $null -ne $script:HostHashInfoOwner -or
+        $null -ne $script:HostInitialInvoker -or $null -ne $script:HostInitialInvokerOwner -or
+        $null -ne $script:HostHashAdmissionInvoker -or $null -ne $script:HostHashAdmissionOwner -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostInfoBusy) { throw 'identity' }
     Close-HostReader
     if ($closeProbe.Calls.Count -ne $ownedHandleCount) { throw 'identity' }
