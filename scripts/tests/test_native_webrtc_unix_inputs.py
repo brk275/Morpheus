@@ -549,6 +549,177 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
                     with self.subTest(case=label), self.assertRaises(_PIPELINE.Refused):
                         restore_bytes(changed_archive(lambda _: rows))
 
+        # Linux v4 retains the original approved gzip files AND every decoded
+        # member/alias. It stores only one representation of member contents.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(); root.chmod(0o700)
+            roles = ("assembled", "core", "linux", "python", "instrumented", "control")
+            folders = {}
+            for index, role in enumerate(roles):
+                folder = root / ("morpheus-webrtc-tools-" + f"{index:016x}")
+                folder.mkdir(mode=0o700); folders[role] = folder
+            profile, pins, bodies = {"materials": []}, {}, []
+            archive_paths, raw_archives = [], []
+            for index in range(2):
+                name = "synthetic-instrumented-" + str(index)
+                body = bytes(range(256))[::1 if index == 0 else -1] * 601 + b"partial"
+                bodies.append(body)
+                members = [{"raw_path": name + "/payload.bin", "kind": "regular",
+                            "bytes": len(body), "mode": 0o600, "sha256": hashlib.sha256(body).hexdigest()}]
+                if index == 0:
+                    members.append({"raw_path": name + "/empty.data", "kind": "regular",
+                                    "bytes": 0, "mode": 0o400, "sha256": hashlib.sha256(b"").hexdigest()})
+                uncompressed = io.BytesIO()
+                with tarfile.open(fileobj=uncompressed, mode="w:", format=tarfile.GNU_FORMAT) as tar:
+                    for row in members:
+                        data = b"" if row["bytes"] == 0 else body
+                        info = tarfile.TarInfo(row["raw_path"]); info.size = len(data); info.mode = row["mode"]
+                        tar.addfile(info, io.BytesIO(data))
+                raw = uncompressed.getvalue(); raw_archives.append(raw)
+                packed_gzip = _PIPELINE.gzip.compress(raw, mtime=0)
+                archive = folders["instrumented"] / "archives" / (name + ".tar.gz")
+                archive.parent.mkdir(mode=0o700, exist_ok=True)
+                archive.write_bytes(packed_gzip); archive.chmod(0o600); archive_paths.append(archive)
+                digest = hashlib.sha256(packed_gzip).hexdigest()
+                pins[digest] = {"name": name, "bytes": len(packed_gzip)}
+                profile["materials"].append({"name": name, "bytes": len(packed_gzip), "sha256": digest,
+                                             "format": "tar.gz", "members": members})
+                output = folders["instrumented"] / "tools" / name
+                output.parent.mkdir(mode=0o700, exist_ok=True); output.mkdir(mode=0o700)
+                for row in members:
+                    data = b"" if row["bytes"] == 0 else body
+                    path = output / Path(row["raw_path"]).name
+                    path.write_bytes(data); path.chmod(row["mode"])
+            for index, role in enumerate(roles):
+                if role == "instrumented": continue
+                path = folders[role] / "owned.data"
+                path.write_bytes(bodies[index % 2] if index < 3 else b"owned control DATA")
+                path.chmod((0o400, 0o600, 0o755)[index % 3])
+            inventories, expected_files = {}, {}
+            for role, folder in folders.items():
+                rows, directories = _PIPELINE.scan_tree(_MATERIAL, folder)
+                inventories[folder.name] = {"role": role, "files": list(rows.values()),
+                                            "directories": sorted(directories)}
+                for name, row in rows.items():
+                    expected_files[folder.name + "/" + name] = ((folder / name).read_bytes(), row["mode"])
+            header = {"schema": _PIPELINE.LINUX_GZIP_MEMBERS_SCHEMA, "roots": inventories,
+                      "pipeline_plan_sha256": "0" * 64, "build_admission_granted": False,
+                      "native_sources_complete": False, "build_ready": False, "distribution_ready": False}
+            with mock.patch.object(_PIPELINE, "GZIP_MEMBER_ARCHIVES", pins):
+                header["gzip_members"] = _PIPELINE.gzip_member_recipes(root, inventories,
+                    folders["instrumented"], profile, _MATERIAL)
+                canonical = _PIPELINE.handoff_canonical(inventories)
+                targets = _PIPELINE.gzip_recipe_index(header, canonical)
+                self.assertEqual(len(targets), 3)  # Two data blobs and one empty regular file.
+                self.assertTrue(all(row["offset"] % 512 == 0 for group in header["gzip_members"]
+                                    for row in group["members"]))
+                archive = _PIPELINE.pack_handoff(root, header, inventories, _MATERIAL)
+                packed = archive.read_bytes()
+                with tarfile.open(archive, "r:xz") as source:
+                    entries = [(member, source.extractfile(member).read() if member.isfile() else None)
+                               for member in source]
+                expected_physical = set(canonical.values()) - {canonical[value] for value in targets}
+                self.assertEqual({row.name for row, _ in entries if row.isfile()},
+                                 {"HANDOFF.json"} | expected_physical)
+                self.assertTrue(all(row.isfile() or row.isdir() for row, _ in entries))
+
+                def v4_archive(changed, change=lambda rows: rows):
+                    stream = io.BytesIO()
+                    with tarfile.open(fileobj=stream, mode="w:xz", format=tarfile.GNU_FORMAT) as target:
+                        for member, body in change(entries):
+                            if member.name == "HANDOFF.json":
+                                body = (json.dumps(changed, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                                member = tarfile.TarInfo("HANDOFF.json"); member.mode = 0o600; member.size = len(body)
+                            target.addfile(member, io.BytesIO(body) if body is not None else None)
+                    return stream.getvalue()
+
+                def restore_v4(content, *, maximum=None, mac_target=None):
+                    with TemporaryDirectory() as destination_temporary:
+                        destination = Path(destination_temporary).resolve(); destination.chmod(0o700)
+                        bundle = destination / "native-webrtc-handoff"; bundle.mkdir(mode=0o700)
+                        path = bundle / "handoff.tar.gz"; path.write_bytes(content); path.chmod(0o600)
+                        args = _PIPELINE.types.SimpleNamespace(plan_sha256="0" * 64,
+                            handoff_sha256=hashlib.sha256(content).hexdigest(), handoff_bytes=len(content))
+                        with mock.patch.object(_PIPELINE, "cache_identity", return_value={}), \
+                                mock.patch.object(_PIPELINE, "MAX_EXPANDED", maximum or _PIPELINE.MAX_EXPANDED):
+                            restored, _ = _PIPELINE.restore(args, destination, _MATERIAL, mac_target=mac_target)
+                        self.assertEqual(restored, header)
+                        inodes = set()
+                        for name, (body, mode) in expected_files.items():
+                            value = destination / name
+                            self.assertEqual(value.read_bytes(), body)
+                            self.assertEqual(stat.S_IMODE(value.stat().st_mode), mode)
+                            self.assertEqual(value.stat().st_nlink, 1)
+                            inodes.add((value.stat().st_dev, value.stat().st_ino))
+                        self.assertEqual(len(inodes), len(expected_files))
+                restore_v4(packed)
+                with self.assertRaises(_PIPELINE.Refused):
+                    restore_v4(packed, maximum=sum(len(value[0]) for value in expected_files.values()) - 1)
+                with self.assertRaises(_PIPELINE.Refused):
+                    restore_v4(packed, mac_target="mac-arm64")
+                for label in ("source", "source_bytes", "source_cycle", "duplicate", "offset", "slice", "offset_type", "overlap",
+                              "extent", "target_hash", "stream_hash", "stream_size", "unexpected", "missing"):
+                    changed = json.loads(json.dumps(header)); groups = changed["gzip_members"]
+                    group, member = groups[0], groups[0]["members"][0]
+                    if label == "source": group["sha256"] = "0" * 64
+                    elif label == "source_bytes": group["bytes"] += 1
+                    elif label == "source_cycle":
+                        member["sha256"], member["bytes"] = group["sha256"], group["bytes"]
+                    elif label == "duplicate": group["members"].append(dict(member))
+                    elif label == "offset": member["offset"] += 1
+                    elif label == "slice": member["offset"] += 512
+                    elif label == "offset_type": member["offset"] = True
+                    elif label == "overlap": group["members"].append(dict(member, sha256="0" * 64))
+                    elif label == "extent": member["bytes"] = group["expanded_bytes"] + 1
+                    elif label == "target_hash": member["sha256"] = "0" * 64
+                    elif label == "stream_hash": group["expanded_sha256"] = "0" * 64
+                    elif label == "stream_size": group["expanded_bytes"] += 512
+                    elif label == "unexpected": member["extra"] = 0
+                    elif label == "missing": groups.pop()
+                    with self.subTest(recipe_fault=label), self.assertRaises(_PIPELINE.Refused):
+                        restore_v4(v4_archive(changed))
+                derived = canonical[next(value for value in targets if value[1] > 0)]
+                body, mode = expected_files[derived]
+                duplicate = tarfile.TarInfo(derived); duplicate.size = len(body); duplicate.mode = mode
+                with self.assertRaises(_PIPELINE.Refused):
+                    restore_v4(v4_archive(header, lambda rows: rows + [(duplicate, body)]))
+                physical_source = canonical[(header["gzip_members"][0]["sha256"],
+                                             header["gzip_members"][0]["bytes"])]
+                with self.assertRaises(_PIPELINE.Refused):
+                    restore_v4(v4_archive(header, lambda rows: [row for row in rows if row[0].name != physical_source]))
+                # Invalid v4 metadata must retain the first refusal and clear
+                # PACK_ACTIVE even before any cache/output is created.
+                bad = dict(header, gzip_members=[])
+                with self.assertRaises(_PIPELINE.Refused):
+                    _PIPELINE.pack_handoff(root, bad, inventories, _MATERIAL)
+                self.assertFalse(_PIPELINE.PACK_ACTIVE)
+                self.assertEqual(_PIPELINE.pack_frame(), {"pack_failure": "refused", "pack_operation": "metadata_limit"})
+            # Inner gzip parsing is one stream, checksum/EOF-bound, supports
+            # partial reads, and cannot accept a newly hashed invalid suffix.
+            original = archive_paths[0].read_bytes()
+            for content in (original, original[:-1], original + b"suffix", original + original):
+                path = root / "gzip-case.data"; path.write_bytes(content); path.chmod(0o600)
+                row = {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+                if content != original:
+                    with self.assertRaises(_PIPELINE.Refused):
+                        with _PIPELINE.gzip_member_stream(path, row, _MATERIAL) as stream:
+                            stream.payload = True
+                            while stream.read(31): pass
+                else:
+                    with _PIPELINE.gzip_member_stream(path, row, _MATERIAL) as stream:
+                        stream.payload = True; observed = bytearray()
+                        while True:
+                            block = stream.read(31)
+                            if not block: break
+                            observed.extend(block)
+                        self.assertEqual(bytes(observed), raw_archives[0])
+                    with mock.patch.object(_PIPELINE, "MAX_EXPANDED", len(raw_archives[0]) - 1):
+                        with self.assertRaises(_PIPELINE.Refused):
+                            with _PIPELINE.gzip_member_stream(path, row, _MATERIAL) as stream:
+                                stream.payload = True
+                                while stream.read(1024 * 1024): pass
+                path.unlink()
+
     @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA pack")
     def test_actual_gnu_gzip_pack_reports_payload_footer_and_first_body_failure(self):
         def attempt(payload, cap, fail_fact=False):
