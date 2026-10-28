@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-identity-dispatch-contract-codex-windows-managed-comparison-contract-20261028-c6a2c153c3dde1d65b16faa79597091cc56b383a
+  group: windows-identity-dispatch-contract-codex-windows-managed-comparison-contract-20261028-0b7e43336a3dfe20eed064f29a7953a7791eb821
   cancel-in-progress: false
 
 jobs:
@@ -30,14 +30,14 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: c6a2c153c3dde1d65b16faa79597091cc56b383a
+          ref: 0b7e43336a3dfe20eed064f29a7953a7791eb821
           persist-credentials: false
       - name: Require the exact independently reviewed source
         shell: pwsh
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-          $expected = 'c6a2c153c3dde1d65b16faa79597091cc56b383a'
+          $expected = '0b7e43336a3dfe20eed064f29a7953a7791eb821'
           if ($expected -cnotmatch '^[0-9a-f]{40}$') { throw 'reviewed source is not bound' }
           $actual = @(& git -c core.hooksPath=NUL -c core.fsmonitor=false rev-parse --verify HEAD)
           if ($LASTEXITCODE -ne 0 -or $actual.Count -ne 1 -or $actual[0] -cne $expected) {
