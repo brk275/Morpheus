@@ -199,7 +199,7 @@ function Open-HostDirectoryChain([string] $LiteralPath) {
         # Same records, ROOT to LEAF, with every original native type/identity
         # read. Only prefix splitting, path allocation and dictionary probes
         # are avoided; no filesystem fact or successful check is reused.
-        foreach ($record in $cached) { Assert-HostIdentity $record $false }
+        foreach ($record in $cached) { Get-HostHandleInfo $record.handle $record.comparison $false }
         return $cached[$cached.Length - 1]
     }
     # Never publish an incomplete chain after a failed miss. A full cache is
@@ -217,7 +217,7 @@ function Open-HostDirectoryChain([string] $LiteralPath) {
             $script:HostDirectories.Add($current, $record)
         } else {
             $record = $script:HostDirectories[$current]
-            Assert-HostIdentity $record $false
+            Get-HostHandleInfo $record.handle $record.comparison $false
         }
         if ($remember) {
             if ($chain.Count -lt $script:HostDirectoryChainLimit) { $chain.Add($record) }
@@ -264,7 +264,7 @@ function Get-HostFileFact([string] $LiteralPath, [int] $TextLimit = 0, [uint64] 
         }
         $null = $digest.TransformFinalBlock([byte[]]::new(0), 0, 0)
         if ($size -ne $record.initial.bytes) { throw 'changed' }
-        Assert-HostIdentity $record $true
+        Get-HostHandleInfo $record.handle $record.comparison $true
         $fact = @{ bytes = $size; sha256 = [Convert]::ToHexString($digest.Hash).ToLowerInvariant() }
         if ($null -ne $text) { $fact.text = [Text.UTF8Encoding]::new($false, $true).GetString($text.ToArray()) }
         return $fact
@@ -326,7 +326,7 @@ function Get-HostRootInventory([string] $LiteralRoot) {
         }
     }
     foreach ($snapshot in $snapshots) {
-        Assert-HostBudget; Assert-HostIdentity $snapshot.directory $true
+        Assert-HostBudget; Get-HostHandleInfo $snapshot.directory.handle $snapshot.directory.comparison $true
         $again = Get-HostDirectoryNames $snapshot.directory.path
         if ($again.Count -ne $snapshot.names.Count) { throw 'changed' }
         for ($i = 0; $i -lt $again.Count; $i++) { if ($again[$i] -cne $snapshot.names[$i]) { throw 'changed' } }
@@ -456,8 +456,8 @@ function Get-HostToolchainInventory {
         $sdkInventory = Get-HostRootInventory $sdk
         $roots = @($vsInventory, $sdkInventory)
         $script:HostPreflightStage = 'final_identity'
-        foreach ($record in $script:HostDirectories.Values) { Assert-HostIdentity $record $false }
-        foreach ($record in $script:HostFileRecords) { Assert-HostBudget; Assert-HostIdentity $record $true }
+        foreach ($record in $script:HostDirectories.Values) { Get-HostHandleInfo $record.handle $record.comparison $false }
+        foreach ($record in $script:HostFileRecords) { Assert-HostBudget; Get-HostHandleInfo $record.handle $record.comparison $true }
         Assert-HostBudget
         return [ordered]@{ schema = 'morpheus-native-windows-host-toolchain-inventory-v1';
             visual_studio_root = $vs; visual_studio_year = '2022'; msvc_toolset_version = $version;
