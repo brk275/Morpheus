@@ -238,9 +238,13 @@ function New-HostChainInvoker([Delegate] $ComparisonCall) {
 function New-HostHashInvoker {
     $method = [Reflection.Emit.DynamicMethod]::new('ReadAndHashHostFile', [int],
         [Type[]]@([IO.Stream], [Security.Cryptography.HashAlgorithm], [byte[]], [IO.MemoryStream],
-            [uint64], [Diagnostics.Stopwatch], [long[]], [uint64], [uint64]))
+            [object], [Diagnostics.Stopwatch], [long[]], [uint64], [uint64], [uint64[]]))
     $il = $method.GetILGenerator()
     $size = $il.DeclareLocal([uint64]); $count = $il.DeclareLocal([int])
+    $record = $il.DeclareLocal([Collections.Hashtable])
+    $initial = $il.DeclareLocal([Collections.Hashtable])
+    $expected = $il.DeclareLocal([uint64])
+    $boxedBytes = $il.DeclareLocal([object])
     $elapsed = $il.DeclareLocal([TimeSpan])
     $read = $il.DefineLabel(); $body = $il.DefineLabel()
     $changed = $il.DefineLabel(); $afterText = $il.DefineLabel(); $adapted = $il.DefineLabel()
@@ -256,6 +260,48 @@ function New-HostHashInvoker {
     $seconds = [TimeSpan].GetMethod('get_TotalSeconds', [Type[]]@())
     $getType = [object].GetMethod('GetType', [Type[]]@())
     $typeFromHandle = [Type].GetMethod('GetTypeFromHandle', [Type[]]@([RuntimeTypeHandle]))
+    $asPSObject = [Management.Automation.PSObject].GetMethod('AsPSObject', [Type[]]@([object]))
+    $getMembers = [Management.Automation.PSObject].GetMethod('get_Members', [Type[]]@())
+    $memberCollection = [Management.Automation.PSMemberInfoCollection[Management.Automation.PSMemberInfo]]
+    $getMember = $memberCollection.GetMethod('get_Item', [Type[]]@([string]))
+    $contains = [Collections.Hashtable].GetMethod('ContainsKey', [Type[]]@([object]))
+    $item = [Collections.Hashtable].GetMethod('get_Item', [Type[]]@([object]))
+    # Admit only exact ordinary Hashtable -> Hashtable -> UInt64 facts. No
+    # initial/bytes property Value or conversion runs before the original Read.
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+    $il.Emit([Reflection.Emit.OpCodes]::Isinst, [Collections.Hashtable])
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $record)
+    foreach ($field in @(@($record, 'initial', $initial), @($initial, 'bytes', $boxedBytes))) {
+        $owner = $field[0]; $key = [string]$field[1]; $destination = $field[2]
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $owner)
+        $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $adapted)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $owner)
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getType)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldtoken, [Collections.Hashtable])
+        $il.Emit([Reflection.Emit.OpCodes]::Call, $typeFromHandle)
+        $il.Emit([Reflection.Emit.OpCodes]::Bne_Un, $adapted)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $owner)
+        $il.Emit([Reflection.Emit.OpCodes]::Call, $asPSObject)
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMembers)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldstr, $key)
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMember)
+        $il.Emit([Reflection.Emit.OpCodes]::Brtrue, $adapted)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $owner)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldstr, $key)
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $contains)
+        $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $adapted)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $owner)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldstr, $key)
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $item)
+        if ($key -ceq 'initial') { $il.Emit([Reflection.Emit.OpCodes]::Isinst, [Collections.Hashtable]) }
+        $il.Emit([Reflection.Emit.OpCodes]::Stloc, $destination)
+    }
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $boxedBytes)
+    $il.Emit([Reflection.Emit.OpCodes]::Isinst, [uint64])
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $adapted)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $boxedBytes)
+    $il.Emit([Reflection.Emit.OpCodes]::Unbox_Any, [uint64])
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $expected)
     # Fixed CLR type inspection cannot execute a PowerShell GetType shadow.
     # A derived/adapted clock resumes the old loop before any Read/hash call.
     $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]5)
@@ -299,7 +345,7 @@ function New-HostHashInvoker {
     $il.Emit([Reflection.Emit.OpCodes]::Add)
     $il.Emit([Reflection.Emit.OpCodes]::Stloc, $size)
     $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $size)
-    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $expected)
     $il.Emit([Reflection.Emit.OpCodes]::Bgt_Un, $changed)
     $il.Emit([Reflection.Emit.OpCodes]::Ldarg_1)
     $il.Emit([Reflection.Emit.OpCodes]::Ldarg_2)
@@ -337,8 +383,14 @@ function New-HostHashInvoker {
     $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $finalize)
     $il.Emit([Reflection.Emit.OpCodes]::Pop)
     $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $size)
-    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $expected)
     $il.Emit([Reflection.Emit.OpCodes]::Bne_Un, $changed)
+    # Return the accumulated size through one fresh private array element,
+    # avoiding a second PowerShell initial.bytes lookup after successful EOF.
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]9)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $size)
+    $il.Emit([Reflection.Emit.OpCodes]::Stelem_I8)
     $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
     $il.Emit([Reflection.Emit.OpCodes]::Ret)
     foreach ($code in @(1, 2, 3, 4, 5)) {
@@ -353,7 +405,7 @@ function New-HostHashInvoker {
     $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_7)
     $il.Emit([Reflection.Emit.OpCodes]::Ret)
     return $method.CreateDelegate([Func[IO.Stream, Security.Cryptography.HashAlgorithm, byte[], IO.MemoryStream,
-        uint64, Diagnostics.Stopwatch, long[], uint64, uint64, int]])
+        object, Diagnostics.Stopwatch, long[], uint64, uint64, uint64[], int]])
 }
 
 # Compile only fixed source expressions in the existing managed runtime. No
@@ -490,6 +542,8 @@ function Initialize-HostReader {
     $script:HostHashBudgetOwner = $null
     $script:HostHashLimitsOwner = $null
     $script:HostHashHandlesOwner = $null
+    $script:HostHashOpenOwner = $null
+    $script:HostHashInfoOwner = $null
     $script:HostHandles = [Collections.Generic.List[IntPtr]]::new()
     $script:HostCanonicalPaths = $null
     $script:HostCanonicalInvoker = $null
@@ -517,6 +571,8 @@ function Initialize-HostReader {
     $script:HostHashBudgetOwner = ${function:Assert-HostBudget}
     $script:HostHashLimitsOwner = $script:HostLimits
     $script:HostHashHandlesOwner = $script:HostHandles
+    $script:HostHashOpenOwner = ${function:Open-HostReadHandle}
+    $script:HostHashInfoOwner = ${function:Get-HostHandleInfo}
     # Pure lexical work is compiled before acquiring any unmanaged ownership.
     $script:HostCanonicalInvoker = New-HostCanonicalInvoker
     $system = Get-HostCanonicalPath $env:SystemRoot
@@ -807,6 +863,8 @@ function Get-HostFileFact([string] $LiteralPath, [int] $TextLimit = 0, [uint64] 
         $managed = $script:HostHashInvoker -is [Delegate] -and
             [object]::ReferenceEquals($script:HostHashInvoker, $script:HostHashInvokerOwner) -and
             [object]::ReferenceEquals(${function:Assert-HostBudget}, $script:HostHashBudgetOwner) -and
+            [object]::ReferenceEquals(${function:Open-HostReadHandle}, $script:HostHashOpenOwner) -and
+            [object]::ReferenceEquals(${function:Get-HostHandleInfo}, $script:HostHashInfoOwner) -and
             [object]::ReferenceEquals($limits, $script:HostHashLimitsOwner) -and
             [object]::ReferenceEquals($script:HostHandles, $script:HostHashHandlesOwner) -and
             $script:HostWatch -is [Diagnostics.Stopwatch] -and
@@ -846,12 +904,13 @@ function Get-HostFileFact([string] $LiteralPath, [int] $TextLimit = 0, [uint64] 
             # counters cannot change until the same synchronous file completes.
             $budget = [long[]]@($limits['Seconds'], $script:HostCount, $limits['Entries'],
                 $script:HostHandles.Count, $limits['Handles'], $script:HostMetadataBytes, $limits['MetadataBytes'])
+            $hashSize = [uint64[]]::new(1)
             $status = $script:HostHashInvoker.Invoke($stream, $digest, $buffer, $text,
-                [uint64]$record.initial.bytes, $script:HostWatch, $budget,
-                $script:HostBytes, [uint64]$limits['TotalBytes'])
+                $record, $script:HostWatch, $budget,
+                $script:HostBytes, [uint64]$limits['TotalBytes'], $hashSize)
             switch ($status) {
                 0 {
-                    $size = [uint64]$record.initial.bytes
+                    $size = $hashSize[0]
                     if ($script:HostManagedHashes -lt 200000) { $script:HostManagedHashes++ }
                     break
                 }
@@ -985,6 +1044,8 @@ function Close-HostReader {
             $script:HostHashBudgetOwner = $null
             $script:HostHashLimitsOwner = $null
             $script:HostHashHandlesOwner = $null
+            $script:HostHashOpenOwner = $null
+            $script:HostHashInfoOwner = $null
             if ($memory -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory) }
         } finally {
             # Retire lexical ownership even if native cleanup throws. No result
