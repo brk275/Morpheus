@@ -31,21 +31,24 @@ capture check.
 
 ## Appearance starting points
 
-**Settings → Appearance → Starting points** offers three original presets:
+**Settings → Appearance → Starting points** offers four original presets:
 
 | Preset | Typography and layout | Surfaces and geometry |
 | --- | --- | --- |
 | Nocturne | Sans-serif messages, stacked names, avatars and room context | Charcoal, pale mint accents, soft edges |
 | Terminal | Monospaced messages, aligned timestamp/nickname columns, no avatars | Dark green charcoal, square edges, narrow rail and tight spacing |
 | Paper | Serif messages, compact headers, no avatars | Warm light surfaces, forest accents, broad conversation inset |
+| Contrast | Keeps your existing fonts and layout | Black surfaces, bright text and yellow accents; explicit control and focus colors |
 
-Choosing a preset fills in ordinary appearance, typography, geometry and chat
-settings, including pane sizes and details-panel visibility. Subsequent edits
+Nocturne, Terminal and Paper fill in ordinary appearance, typography, geometry
+and chat settings, including pane sizes and details-panel visibility. Contrast
+changes the theme pack and high-contrast mode, preserving your existing fonts,
+layout, geometry and personal color overrides. Subsequent edits
 remain yours: there is no separate preset layer overriding them. Presets keep
 text scale, navigation mode, Space labels, DM grouping, unread sorting, notifications, shortcuts, media preferences and
 account settings intact. **Base palette** changes the palette alone.
 
-The corresponding built-in theme names are `nocturne`, `terminal` and `paper`.
+The corresponding built-in theme names are `nocturne`, `terminal`, `paper` and `contrast`.
 Their palette files are embedded in the app. Setting only
 `appearance.theme_pack = "terminal"` selects its colors; use the in-app preset
 or set the fields below to select its fonts and layout too.
@@ -817,7 +820,12 @@ also include `[roles]` and `[senders]`. These belong in the theme TOML beside
 | `shadow` | Shadow beneath popups, usually translucent; omitted keeps `#00000044` |
 | `media_backdrop` | Background behind an opened image; omitted keeps `#11131B` |
 | `presence_online` | The online dot beside member names; omitted keeps `#64C9A7` |
-| `avatar_ink` | Initials on avatar backgrounds, whose colors stay identity colors; omitted keeps `#FFFFFF` |
+| `avatar_1` | Fallback avatar/account background slot 1; omitted keeps `#A88CFF` |
+| `avatar_2` | Fallback avatar/account background slot 2; omitted keeps `#78C8B1` |
+| `avatar_3` | Fallback avatar/account background slot 3; omitted keeps `#F39F78` |
+| `avatar_4` | Fallback avatar/account background slot 4; omitted keeps `#64A5E8` |
+| `avatar_5` | Fallback avatar/account background slot 5; omitted keeps `#E78BA4` |
+| `avatar_ink` | Initials on fallback avatar backgrounds; omitted keeps `#FFFFFF` |
 
 Every built-in preset theme sets every role explicitly.
 
@@ -850,6 +858,11 @@ scrim = "#000000AA"
 shadow = "#00000044"
 media_backdrop = "#111216"
 presence_online = "#9FD5BD"
+avatar_1 = "#A88CFF"
+avatar_2 = "#78C8B1"
+avatar_3 = "#F39F78"
+avatar_4 = "#64A5E8"
+avatar_5 = "#E78BA4"
 avatar_ink = "#FFFFFF"
 
 [senders]

@@ -64,7 +64,7 @@ for sending and receiving; see the [policy](INVITATION_HISTORY_POLICY.md).
 
 | Available controls | Remaining acceptance |
 | --- | --- |
-| Nocturne, Terminal and Paper presets; editable TOML themes; independent fonts, scale, density and geometry. | Platform font coverage, installed controls and reload edge cases. |
+| Nocturne, Terminal, Paper and Contrast presets; editable TOML themes; independent fonts, scale, density and geometry. | Platform font coverage, installed controls and reload edge cases. |
 | Theme studio (compiled in native builds): Settings look changes are a draft shown at once and saved by Apply, with Undo/Redo, Discard, per-section reset, explicit conflict choices and account fences; five starting-point variations; advisory text contrast; composer line height and weight; per-control icon colors; theme pack import, preview, install and export. See [theme studio](THEME_STUDIO.md). | Further interaction tests, installed interaction, concurrent-edit and account-switch checks. |
 | Stacked/compact/nickname-column messages; avatar, timestamp and sender styling; semantic colors. | Complete rendered-text and accessibility checks. |
 | Rail/sidebar navigation, optional Space labels, grouped/combined conversations, unread ordering and pane sizes. | Long names, large Space lists and physical keyboard navigation. |

@@ -159,3 +159,42 @@ fn files_without_rooms_load_unchanged_and_rooms_round_trip() {
     let written = toml::to_string_pretty(&config).unwrap();
     assert_eq!(parse(&written).unwrap(), config);
 }
+
+#[test]
+fn avatar_slots_inherit_by_account_and_room_and_round_trip() {
+    for id in ["avatar_1", "avatar_2", "avatar_3", "avatar_4", "avatar_5"] {
+        let mut config = parse(&format!(
+            "schema_version = 1\n[colors]\n{id} = '#111111'\n\
+             [account_overrides.local-a.colors]\n{id} = '#22222280'\n\
+             [account_overrides.local-a.room_appearance.\"{ROOM}\".colors]\n{id} = '#33333300'\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.colors_for_room(Some("local-a"), Some(ROOM))[id],
+            "#33333300"
+        );
+        assert_eq!(
+            config.colors_for_room(Some("local-a"), Some(OTHER_ROOM))[id],
+            "#22222280"
+        );
+        assert_eq!(
+            config.colors_for_room(Some("local-b"), Some(ROOM))[id],
+            "#111111"
+        );
+        assert_eq!(config.colors_for_room(None, Some(ROOM))[id], "#111111");
+        assert_eq!(
+            parse(&toml::to_string_pretty(&config).unwrap()).unwrap(),
+            config
+        );
+        assert!(config.clear_room_appearance("local-a", ROOM));
+        assert_eq!(
+            config.colors_for_room(Some("local-a"), Some(ROOM))[id],
+            "#22222280"
+        );
+        assert!(config.clear_account_appearance("local-a"));
+        assert_eq!(
+            config.colors_for_room(Some("local-a"), Some(ROOM))[id],
+            "#111111"
+        );
+    }
+}
