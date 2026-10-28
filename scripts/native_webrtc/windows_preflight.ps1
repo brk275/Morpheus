@@ -874,19 +874,19 @@ function Get-HostFileFact([string] $LiteralPath, [int] $TextLimit = 0, [uint64] 
         # A fixed owner has plain numeric limits. ETS shadows or a probe's
         # alternative number/clock semantics retain the original loop below.
         if ($managed) {
-            $limitMembers = [Management.Automation.PSObject]::AsPSObject($limits).Members
+            $limitMembers = $limits.PSObject.Members
             foreach ($key in @('Seconds', 'Entries', 'TotalBytes', 'Handles', 'MetadataBytes')) {
                 if ($null -ne $limitMembers[$key]) { $managed = $false; break }
             }
-            $clockMember = [Management.Automation.PSObject]::AsPSObject($script:HostWatch).Members['Elapsed']
-            $secondsMember = [Management.Automation.PSObject]::AsPSObject([TimeSpan]::Zero).Members['TotalSeconds']
-            $bufferMember = [Management.Automation.PSObject]::AsPSObject($buffer).Members['Length']
-            $handlesMember = [Management.Automation.PSObject]::AsPSObject($script:HostHandles).Members['Count']
-            $readMember = [Management.Automation.PSObject]::AsPSObject($stream).Members['Read']
-            $digestMembers = [Management.Automation.PSObject]::AsPSObject($digest).Members
+            $clockMember = $script:HostWatch.PSObject.Members['Elapsed']
+            $secondsMember = ([TimeSpan]::Zero).PSObject.Members['TotalSeconds']
+            $bufferMember = $buffer.PSObject.Members['Length']
+            $handlesMember = $script:HostHandles.PSObject.Members['Count']
+            $readMember = $stream.PSObject.Members['Read']
+            $digestMembers = $digest.PSObject.Members
             $blockMember = $digestMembers['TransformBlock']; $finalMember = $digestMembers['TransformFinalBlock']
             $writeOrdinary = $null -eq $text -or
-                [Management.Automation.PSObject]::AsPSObject($text).Members['Write'] -is [Management.Automation.PSMethod]
+                $text.PSObject.Members['Write'] -is [Management.Automation.PSMethod]
             if ($readMember -isnot [Management.Automation.PSMethod] -or
                 $blockMember -isnot [Management.Automation.PSMethod] -or
                 $finalMember -isnot [Management.Automation.PSMethod] -or -not $writeOrdinary -or

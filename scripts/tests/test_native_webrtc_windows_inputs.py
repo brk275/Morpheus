@@ -1219,6 +1219,19 @@ foreach ($bad in @($null, '', 'FILE_HASH', "private`npath token payload", ('priv
     if ((Get-HostPreflightProgressMessage $bad $bad $bad $bad) -cne
         ' work=unknown entries=0 bytes=0 managed_hashes=0') { throw 'failure_context' }
 }
+# Intrinsic PSObject selects the metadata view even when ordinary dictionary
+# keys/ETS members use the same names. Looking up metadata never runs Value.
+$metadataProbe = @{ Members = 'not metadata'; PSObject = 'not the reserved view' }
+$script:MetadataGetterReads = 0
+Add-Member -InputObject $metadataProbe -MemberType ScriptProperty -Name Members -Value {
+    $script:MetadataGetterReads++; throw 'accepted'
+} -Force
+$viewMembers = $metadataProbe.PSObject.Members
+if ($viewMembers -isnot [Management.Automation.PSMemberInfoCollection[Management.Automation.PSMemberInfo]] -or
+    $viewMembers['Members'] -isnot [Management.Automation.PSScriptProperty] -or
+    $viewMembers['Count'] -isnot [Management.Automation.PSProperty] -or
+    $script:MetadataGetterReads -ne 0) { throw 'metadata' }
+$viewMembers.Remove('Members')
 $caseStage = 'synthetic_setup'
 $good = Join-Path $root 'good'
 [IO.Directory]::CreateDirectory((Join-Path $good 'include')) | Out-Null
@@ -1553,7 +1566,7 @@ try {
         if ($probeFact.bytes -ne 4 -or $script:HashBufferLengthCalls -le 0 -or
             $script:HostManagedHashes -ne $beforeManaged -or $probeFact.sha256 -cne
             '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
-    } finally { [Management.Automation.PSObject]::AsPSObject($script:HostBuffer).Members.Remove('Length') }
+    } finally { $script:HostBuffer.PSObject.Members.Remove('Length') }
     $savedIdentity = $observed.identity
     $comparisonRecord = $script:HostFileRecords[0]
     $savedComparison = [Convert]::ToHexString($comparisonRecord.comparison)
