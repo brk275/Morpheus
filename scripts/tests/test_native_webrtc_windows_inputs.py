@@ -1761,10 +1761,14 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
             source = PATH.parent / "native_webrtc/windows_preflight.ps1"
             pwsh = Path(os.environ["ProgramFiles"]) / "PowerShell/7/pwsh.exe"
             with tempfile.TemporaryDirectory() as temporary:
+                # The script is beside, never inside, the inventoried fixture roots.
+                script_path = Path(temporary).resolve() / "host-reader-case.ps1"
+                with script_path.open("x", encoding="utf-8", newline="") as stream:
+                    stream.write(script)
                 env = os.environ.copy()
                 env["MORPHEUS_HOST_READER_SOURCE"] = str(source)
                 env["MORPHEUS_HOST_TEST_ROOT"] = temporary
-                result = subprocess.run([str(pwsh), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                result = subprocess.run([str(pwsh), "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script_path)],
                     text=True, encoding="utf-8", capture_output=True, timeout=45, env=env)
             # The only forwarded child output is one exact finite diagnostic.
             # Unknown/multiple/raw lines and all child stderr stay withheld.
