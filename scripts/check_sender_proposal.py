@@ -27,6 +27,12 @@ def need(value):
         raise RuntimeError("refused")
 
 
+def bootstrap_phase(name):
+    need(name in ("guards", "inputs", "scanner", "download_source", "download_node", "download_pnpm",
+                  "source_tree", "apply_patch", "node_binary", "pnpm_binary"))
+    print(json.dumps({"sender_bootstrap": name}), flush=True)
+
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -116,7 +122,11 @@ def source_tree(archive, expected, destination):
                 need(len(data) == fact["bytes"] and digest(data) == fact["sha256"])
                 # This declared, irrelevant example link remains unmaterialized.
             else:
-                need(member.isfile() and member.size == fact["bytes"] <= 4 * 1024 * 1024)
+                need(member.isfile() and member.size == fact["bytes"]
+                     and (member.size <= 4 * 1024 * 1024
+                          or (relative == "spec/test-utils/test_indexeddb_cryptostore_dump/full_account/dump.json"
+                              and member.size == 4_920_911
+                              and fact["sha256"] == "e5b48b253421ac2f34e8f0c47c54dead056798f8537f7d7256017b4a57b9adc8")))
                 need(fact["mode"] in ("100644", "100755"))
                 data = source.extractfile(member).read(fact["bytes"] + 1)
                 need(len(data) == fact["bytes"] and digest(data) == fact["sha256"])
@@ -223,6 +233,7 @@ def checked_command(name, arguments, cwd, environment, root, scanner, seconds):
 
 
 def main():
+    bootstrap_phase("guards")
     parser = argparse.ArgumentParser()
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--patch", type=Path, required=True)
@@ -234,11 +245,13 @@ def main():
          and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
          and os.environ.get("GITHUB_ACTOR") == "brk275"
          and os.environ.get("GITHUB_TRIGGERING_ACTOR") == "brk275")
+    bootstrap_phase("inputs")
     raw = regular(args.inputs, 512 * 1024)
     need(digest(raw) == os.environ.get("MORPHEUS_SETUP_INPUTS_SHA256"))
     inputs = json.loads(raw)
     patch = regular(args.patch, 128 * 1024)
     need(digest(patch) == PROPOSAL == inputs["proposal_sha256"])
+    bootstrap_phase("scanner")
     need(digest(regular(args.scanner, 64 * 1024 * 1024)) == inputs["scanner_binary_sha256"])
     runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
     root = Path(tempfile.mkdtemp(prefix="morpheus-sender-source-", dir=runner_temp))
@@ -250,10 +263,15 @@ def main():
     write(root / "scanner.ignore", b"")
     write(root / "npmrc", b"registry=https://registry.npmjs.org/\nignore-scripts=true\n")
     for name in ("source", "node", "pnpm"):
+        bootstrap_phase("download_" + name)
         download(inputs[name], root / (name + ".archive"))
+    bootstrap_phase("source_tree")
     source_tree(root / "source.archive", inputs["source_files"], tree)
+    bootstrap_phase("apply_patch")
     apply_patch(tree, patch, inputs["proposal_files"])
+    bootstrap_phase("node_binary")
     selected_binary(root / "node.archive", inputs["node"]["binary"], tools / "node")
+    bootstrap_phase("pnpm_binary")
     selected_binary(root / "pnpm.archive", inputs["pnpm"]["binary"], tools / "pnpm")
     environment = {"PATH": str(tools) + ":/usr/bin:/bin", "CI": "true", "TZ": "UTC", "LANG": "C.UTF-8",
         "TMPDIR": str(root / "temp"), "XDG_CACHE_HOME": str(root / "cache"), "XDG_CONFIG_HOME": str(root / "config"), "PNPM_HOME": str(tools),
