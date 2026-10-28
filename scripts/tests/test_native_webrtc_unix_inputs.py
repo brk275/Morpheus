@@ -437,88 +437,117 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
             _PIPELINE.reset_pack_capture()
 
     @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA handoff")
-    def test_v2_handoff_deduplicates_bytes_but_restores_independent_files_and_modes(self):
-        payload = b"".join(hashlib.sha256(str(i).encode()).digest() for i in range(2048))
-        roles = ("assembled", "core", "linux", "python", "instrumented", "control")
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve(); root.chmod(0o700)
-            inventories, paths = {}, []
-            for index, role in enumerate(roles):
-                name = "morpheus-webrtc-tools-" + f"{index:016x}"
-                folder = root / name; folder.mkdir(mode=0o700)
-                body = payload if index < 3 else b"owned control DATA"
-                path = folder / "owned.data"; path.write_bytes(body)
-                mode = (0o400, 0o600, 0o755)[index % 3]; path.chmod(mode)
-                rows = [{"path": "owned.data", "bytes": len(body),
-                         "sha256": hashlib.sha256(body).hexdigest(), "mode": mode}]
-                paths.append((name + "/owned.data", mode, body))
-                inventories[name] = {"role": role, "files": rows, "directories": ["."]}
-            handoff = {"schema": "morpheus-native-linux-handoff-v2", "roots": inventories,
-                       "pipeline_plan_sha256": "0" * 64, "build_admission_granted": False,
-                       "native_sources_complete": False, "build_ready": False, "distribution_ready": False}
-            with mock.patch.object(_PIPELINE, "MAX_HANDOFF", 100_000):
-                archive = _PIPELINE.pack_handoff(root, handoff, inventories, _MATERIAL)
-            packed = archive.read_bytes()
-            self.assertLess(len(packed), 100_000)
-            with tarfile.open(archive, "r:gz") as source:
-                members = [(member, source.extractfile(member).read() if member.isfile() else None)
-                           for member in source]
-            self.assertEqual([member.name for member, _ in members if member.isfile()],
-                             ["HANDOFF.json", paths[0][0], paths[3][0]])
-            self.assertTrue(all(member.isfile() or member.isdir() for member, _ in members))
+    def test_versioned_handoff_deduplicates_bytes_but_restores_independent_files_and_modes(self):
+        for schema in ("morpheus-native-linux-handoff-v2", _PIPELINE.LINUX_XZ_SCHEMA):
+            # Two identical 64KiB blocks exceed DEFLATE history but fit the
+            # fixed XZ dictionary. The original whole-file alias proof remains.
+            payload = b"".join(hashlib.sha256(str(i).encode()).digest() for i in range(2048))
+            payload += payload
+            roles = ("assembled", "core", "linux", "python", "instrumented", "control")
+            with TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve(); root.chmod(0o700)
+                inventories, paths = {}, []
+                for index, role in enumerate(roles):
+                    name = "morpheus-webrtc-tools-" + f"{index:016x}"
+                    folder = root / name; folder.mkdir(mode=0o700)
+                    body = payload if index < 3 else b"owned control DATA"
+                    path = folder / "owned.data"; path.write_bytes(body)
+                    mode = (0o400, 0o600, 0o755)[index % 3]; path.chmod(mode)
+                    rows = [{"path": "owned.data", "bytes": len(body),
+                             "sha256": hashlib.sha256(body).hexdigest(), "mode": mode}]
+                    paths.append((name + "/owned.data", mode, body))
+                    inventories[name] = {"role": role, "files": rows, "directories": ["."]}
+                handoff = {"schema": schema, "roots": inventories,
+                           "pipeline_plan_sha256": "0" * 64, "build_admission_granted": False,
+                           "native_sources_complete": False, "build_ready": False, "distribution_ready": False}
+                with mock.patch.object(_PIPELINE, "MAX_HANDOFF", 200_000):
+                    archive = _PIPELINE.pack_handoff(root, handoff, inventories, _MATERIAL)
+                packed = archive.read_bytes()
+                self.assertLess(len(packed), 200_000)
+                if schema == "morpheus-native-linux-handoff-v2":
+                    gzip_bytes = len(packed)
+                    self.assertGreater(gzip_bytes, 100_000)
+                else:
+                    self.assertLess(len(packed), 100_000)
+                    self.assertLess(len(packed), gzip_bytes)
+                with tarfile.open(archive, "r:*") as source:
+                    members = [(member, source.extractfile(member).read() if member.isfile() else None)
+                               for member in source]
+                self.assertEqual([member.name for member, _ in members if member.isfile()],
+                                 ["HANDOFF.json", paths[0][0], paths[3][0]])
+                self.assertTrue(all(member.isfile() or member.isdir() for member, _ in members))
 
-            def restore_bytes(content, *, maximum=None):
-                with TemporaryDirectory() as destination_temporary:
-                    destination = Path(destination_temporary).resolve(); destination.chmod(0o700)
-                    bundle = destination / "native-webrtc-handoff"; bundle.mkdir(mode=0o700)
-                    (bundle / "handoff.tar.gz").write_bytes(content)
-                    (bundle / "handoff.tar.gz").chmod(0o600)
-                    args = _PIPELINE.types.SimpleNamespace(plan_sha256="0" * 64,
-                        handoff_sha256=hashlib.sha256(content).hexdigest(), handoff_bytes=len(content))
-                    with mock.patch.object(_PIPELINE, "cache_identity", return_value={}), \
-                            mock.patch.object(_PIPELINE, "MAX_EXPANDED", maximum or _PIPELINE.MAX_EXPANDED):
-                        restored, _ = _PIPELINE.restore(args, destination, _MATERIAL)
-                    self.assertEqual(restored, handoff)
-                    identities = set()
-                    for name, mode, body in paths:
-                        path = destination / name
-                        self.assertEqual(path.read_bytes(), body)
-                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
-                        self.assertEqual(path.stat().st_nlink, 1)
-                        identities.add((path.stat().st_dev, path.stat().st_ino))
-                    self.assertEqual(len(identities), 6)
-            restore_bytes(packed)
-            # Duplicate logical paths still count against the expanded limit.
-            with self.assertRaises(_PIPELINE.Refused):
-                restore_bytes(packed, maximum=sum(len(body) for _, _, body in paths) - 1)
+                def restore_bytes(content, *, maximum=None):
+                    with TemporaryDirectory() as destination_temporary:
+                        destination = Path(destination_temporary).resolve(); destination.chmod(0o700)
+                        bundle = destination / "native-webrtc-handoff"; bundle.mkdir(mode=0o700)
+                        (bundle / "handoff.tar.gz").write_bytes(content)
+                        (bundle / "handoff.tar.gz").chmod(0o600)
+                        args = _PIPELINE.types.SimpleNamespace(plan_sha256="0" * 64,
+                            handoff_sha256=hashlib.sha256(content).hexdigest(), handoff_bytes=len(content))
+                        with mock.patch.object(_PIPELINE, "cache_identity", return_value={}), \
+                                mock.patch.object(_PIPELINE, "MAX_EXPANDED", maximum or _PIPELINE.MAX_EXPANDED):
+                            restored, _ = _PIPELINE.restore(args, destination, _MATERIAL)
+                        self.assertEqual(restored, handoff)
+                        identities = set()
+                        for name, mode, body in paths:
+                            path = destination / name
+                            self.assertEqual(path.read_bytes(), body)
+                            self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+                            self.assertEqual(path.stat().st_nlink, 1)
+                            identities.add((path.stat().st_dev, path.stat().st_ino))
+                        self.assertEqual(len(identities), 6)
+                restore_bytes(packed)
+                if schema == _PIPELINE.LINUX_XZ_SCHEMA:
+                    self.assertTrue(packed.startswith(_PIPELINE.XZ_MAGIC))
+                    # Recomputed outer digests cannot authorize truncated, joined,
+                    # trailing or excessive-memory compressed streams.
+                    for invalid in (packed[:-1], packed + b"suffix", packed + packed):
+                        with self.assertRaises(_PIPELINE.Refused):
+                            restore_bytes(invalid)
+                    with mock.patch.object(_PIPELINE, "MAX_XZ_MEMORY", 1024):
+                        with self.assertRaises(_PIPELINE.Refused):
+                            restore_bytes(packed)
+                # Duplicate logical paths still count against the expanded limit.
+                with self.assertRaises(_PIPELINE.Refused):
+                    restore_bytes(packed, maximum=sum(len(body) for _, _, body in paths) - 1)
 
-            def changed_archive(change):
-                output = io.BytesIO()
-                with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.GNU_FORMAT) as target:
-                    for member, body in change(members):
+                def changed_archive(change):
+                    output = io.BytesIO()
+                    with tarfile.open(fileobj=output, mode="w:xz" if schema == _PIPELINE.LINUX_XZ_SCHEMA else "w:gz", format=tarfile.GNU_FORMAT) as target:
+                        for member, body in change(members):
+                            target.addfile(member, io.BytesIO(body) if body is not None else None)
+                    return output.getvalue()
+                # Compression magic cannot select a different internal schema.
+                opposite = io.BytesIO()
+                with tarfile.open(fileobj=opposite,
+                                  mode="w:gz" if schema == _PIPELINE.LINUX_XZ_SCHEMA else "w:xz",
+                                  format=tarfile.GNU_FORMAT) as target:
+                    for member, body in members:
                         target.addfile(member, io.BytesIO(body) if body is not None else None)
-                return output.getvalue()
-            first = next((member, body) for member, body in members if member.name == paths[0][0])
-            for label, change in [
-                ("duplicate", lambda rows: rows + [first]),
-                ("missing", lambda rows: [row for row in rows if row[0].name != paths[0][0]]),
-                ("digest", lambda rows: [(member, b"x" * len(body) if member.name == paths[0][0] else body)
-                                          for member, body in rows]),
-            ]:
-                with self.subTest(case=label), self.assertRaises(_PIPELINE.Refused):
-                    restore_bytes(changed_archive(change))
-            for label in ("alias", "mode", "hardlink", "unexpected"):
-                member = tarfile.TarInfo(paths[0][0]); member.size = len(payload); member.mode = 0o400
-                if label == "alias": member.name = paths[1][0]
-                elif label == "mode": member.mode = 0o600
-                elif label == "hardlink":
-                    member.type = tarfile.LNKTYPE; member.linkname = paths[1][0]; member.size = 0
-                else: member.name = "outside.data"
-                body = payload if member.isfile() else None
-                rows = [(member, body) if item.name == paths[0][0] else (item, content)
-                        for item, content in members]
-                with self.subTest(case=label), self.assertRaises(_PIPELINE.Refused):
-                    restore_bytes(changed_archive(lambda _: rows))
+                with self.assertRaises(_PIPELINE.Refused):
+                    restore_bytes(opposite.getvalue())
+                first = next((member, body) for member, body in members if member.name == paths[0][0])
+                for label, change in [
+                    ("duplicate", lambda rows: rows + [first]),
+                    ("missing", lambda rows: [row for row in rows if row[0].name != paths[0][0]]),
+                    ("digest", lambda rows: [(member, b"x" * len(body) if member.name == paths[0][0] else body)
+                                              for member, body in rows]),
+                ]:
+                    with self.subTest(case=label), self.assertRaises(_PIPELINE.Refused):
+                        restore_bytes(changed_archive(change))
+                for label in ("alias", "mode", "hardlink", "unexpected"):
+                    member = tarfile.TarInfo(paths[0][0]); member.size = len(payload); member.mode = 0o400
+                    if label == "alias": member.name = paths[1][0]
+                    elif label == "mode": member.mode = 0o600
+                    elif label == "hardlink":
+                        member.type = tarfile.LNKTYPE; member.linkname = paths[1][0]; member.size = 0
+                    else: member.name = "outside.data"
+                    body = payload if member.isfile() else None
+                    rows = [(member, body) if item.name == paths[0][0] else (item, content)
+                            for item, content in members]
+                    with self.subTest(case=label), self.assertRaises(_PIPELINE.Refused):
+                        restore_bytes(changed_archive(lambda _: rows))
 
     @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA pack")
     def test_actual_gnu_gzip_pack_reports_payload_footer_and_first_body_failure(self):
