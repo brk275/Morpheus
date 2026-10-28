@@ -1342,6 +1342,86 @@ try {
     # retain another independently checked handle for the same cached path.
     $originalInfo = $script:HostInfo
     $originalType = $script:HostType
+    # Real delegates take the emitted production comparison path. Probe only
+    # its managed entry; the actual native delegates and owned scratch remain.
+    $originalComparison = $script:HostComparisonInvoker
+    if ($originalComparison -isnot [Delegate] -or
+        -not [object]::ReferenceEquals($originalType, $script:HostComparisonType) -or
+        -not [object]::ReferenceEquals($originalInfo, $script:HostComparisonInfo)) { throw 'identity' }
+    $comparisonProbe = [pscustomobject]@{ Delegate = $originalComparison; Calls = 0 }
+    $comparisonProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
+        param([Delegate] $TypeCall, [Delegate] $InfoCall, [IntPtr] $Handle,
+              [IntPtr] $Memory, [byte[]] $Scratch, $Expected, [bool] $Content)
+        $this.Calls++
+        return $this.Delegate.Invoke($TypeCall, $InfoCall, $Handle, $Memory, $Scratch, $Expected, $Content)
+    }
+    try {
+        $script:HostComparisonInvoker = $comparisonProbe
+        foreach ($content in @($false, $true)) {
+            $beforeChecks = $comparisonProbe.Calls
+            if (@(Assert-HostIdentity $comparisonRecord $content).Count -ne 0 -or
+                $comparisonProbe.Calls -ne $beforeChecks + 1) { throw 'identity' }
+        }
+        foreach ($offset in @(0, 28, 31, 44, 48, 51, 20, 27, 32, 39, 40, 43)) {
+            $altered = [byte[]]$comparisonRecord.comparison.Clone()
+            $altered[$offset] = $altered[$offset] -bxor 1
+            $changed = @{ handle = $comparisonRecord.handle; comparison = $altered }
+            $beforeChecks = $comparisonProbe.Calls
+            $refusal = ''
+            try { Assert-HostIdentity $changed $true } catch { $refusal = $_.Exception.Message }
+            if ($refusal -cne 'changed' -or $comparisonProbe.Calls -ne $beforeChecks + 1) { throw 'identity' }
+            if ($offset -in @(20, 27, 32, 39, 40, 43)) {
+                Assert-HostIdentity $changed $false
+            } else { Must-Refuse { Assert-HostIdentity $changed $false } }
+        }
+        foreach ($offset in @(4, 11, 12, 19)) {
+            $altered = [byte[]]$comparisonRecord.comparison.Clone()
+            $altered[$offset] = $altered[$offset] -bxor 1
+            Assert-HostIdentity @{ handle = $comparisonRecord.handle; comparison = $altered } $true
+        }
+        foreach ($invalid in @($null, [byte[]]::new(51), 'private invalid snapshot')) {
+            $refusal = ''
+            try { Get-HostHandleInfo $comparisonRecord.handle $invalid $true } catch { $refusal = $_.Exception.Message }
+            if ($refusal -cne 'identity') { throw 'identity' }
+        }
+        if ([Convert]::ToHexString($comparisonRecord.comparison) -cne $savedComparison -or
+            -not [object]::ReferenceEquals($ownedScratch, $script:HostInfoScratch) -or
+            $script:HostInfoBusy) { throw 'identity' }
+    } finally { $script:HostComparisonInvoker = $originalComparison }
+    # Exercise emitted first-failure branches using same-signature managed
+    # delegates. No native handle is fabricated or foreign pointer dereferenced.
+    $firstFailureTrace = [Collections.Generic.List[string]]::new()
+    $typeFailure = [Func[IntPtr, uint32]] { param([IntPtr] $Handle)
+        $firstFailureTrace.Add('type'); return [uint32]0
+    }
+    $typeSuccess = [Func[IntPtr, uint32]] { param([IntPtr] $Handle)
+        $firstFailureTrace.Add('type'); return [uint32]1
+    }
+    $infoFailure = [Func[IntPtr, IntPtr, int]] { param([IntPtr] $Handle, [IntPtr] $Memory)
+        $firstFailureTrace.Add('info'); return 0
+    }
+    $typeThunk = New-HostComparisonInvoker $typeFailure $infoFailure
+    if ($typeThunk.Invoke($typeFailure, $infoFailure, [IntPtr]::Zero, [IntPtr]::Zero,
+            $ownedScratch, $null, $true) -ne 1 -or
+        ($firstFailureTrace -join ',') -cne 'type') { throw 'identity' }
+    $firstFailureTrace.Clear()
+    $infoThunk = New-HostComparisonInvoker $typeSuccess $infoFailure
+    if ($infoThunk.Invoke($typeSuccess, $infoFailure, [IntPtr]::Zero, [IntPtr]::Zero,
+            $ownedScratch, $null, $true) -ne 2 -or
+        ($firstFailureTrace -join ',') -cne 'type,info') { throw 'identity' }
+    # Reparse refuses before an invalid Expected snapshot, after copying the
+    # entire owned record into the same observable scratch buffer.
+    $reparseInfo = [Func[IntPtr, IntPtr, int]] { param([IntPtr] $Handle, [IntPtr] $Memory)
+        $firstFailureTrace.Add('info')
+        $record = [byte[]]::new(52); $record[1] = 4
+        [Runtime.InteropServices.Marshal]::Copy($record, 0, $Memory, 52)
+        return 1
+    }
+    $firstFailureTrace.Clear()
+    $reparseThunk = New-HostComparisonInvoker $typeSuccess $reparseInfo
+    if ($reparseThunk.Invoke($typeSuccess, $reparseInfo, [IntPtr]::Zero, $ownedMemory,
+            $ownedScratch, $null, $true) -ne 3 -or
+        ($firstFailureTrace -join ',') -cne 'type,info' -or $ownedScratch[1] -ne 4) { throw 'identity' }
     $nativeTrace = [Collections.Generic.List[string]]::new()
     $typeProbe = [pscustomobject]@{ Delegate = $originalType; Calls = 0; Trace = $nativeTrace }
     $typeProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
@@ -1471,7 +1551,11 @@ try {
     $script:HostInfoBusy = $true
     try {
         Must-Refuse { Get-HostHandleInfo $script:HostFileRecords[0].handle }
+        Must-Refuse { Get-HostHandleInfo $comparisonRecord.handle $comparisonRecord.comparison $true }
         Must-Refuse { Close-HostReader }
+        if (-not [object]::ReferenceEquals($originalComparison, $script:HostComparisonInvoker) -or
+            -not [object]::ReferenceEquals($originalType, $script:HostComparisonType) -or
+            -not [object]::ReferenceEquals($originalInfo, $script:HostComparisonInfo)) { throw 'identity' }
         if ($script:HostInfoMemory -ne $ownedMemory -or
             -not [object]::ReferenceEquals($ownedMemo, $script:HostCanonicalPaths) -or
             -not [object]::ReferenceEquals($ownedDirectoryChain, $script:HostLastDirectoryChain)) { throw 'identity' }
@@ -1482,6 +1566,8 @@ try {
     Must-Refuse { [IO.File]::WriteAllBytes((Join-Path $good 'tool.bin'), [byte[]]@(9)) }
 } finally { Close-HostReader }
 if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
+    $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
+    $null -ne $script:HostComparisonInfo -or
     $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
     $ownedMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
     $null -ne $script:HostLastDirectoryChain -or @($ownedDirectoryChain | Where-Object { $null -ne $_ }).Count -ne 0) { throw 'identity' }
@@ -1506,6 +1592,8 @@ try {
     Close-HostReader
     Close-HostReader
     if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
+        $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
+        $null -ne $script:HostComparisonInfo -or
         $script:HostInfoBusy -or $script:HostHandles.Count -ne 0 -or
         $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
         $failedMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
@@ -1603,6 +1691,8 @@ try {
         $closeProbe.Consumed -ne $expectedConsumed -or
         $script:HostHandles[$ownedHandleCount - 1] -ne [IntPtr]::Zero -or
         $script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
+        $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
+        $null -ne $script:HostComparisonInfo -or
         $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
         $exceptionMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
         $null -ne $script:HostLastDirectoryChain -or @($exceptionChain | Where-Object { $null -ne $_ }).Count -ne 0) { throw 'identity' }
@@ -1615,6 +1705,8 @@ try {
     }
     if ($closeProbe.Calls.Count -ne $ownedHandleCount -or $script:HostHandles.Count -ne 0 -or
         $script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
+        $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
+        $null -ne $script:HostComparisonInfo -or
         $script:HostInfoBusy) { throw 'identity' }
     Close-HostReader
     if ($closeProbe.Calls.Count -ne $ownedHandleCount) { throw 'identity' }
@@ -1669,10 +1761,14 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
             source = PATH.parent / "native_webrtc/windows_preflight.ps1"
             pwsh = Path(os.environ["ProgramFiles"]) / "PowerShell/7/pwsh.exe"
             with tempfile.TemporaryDirectory() as temporary:
+                # The script is beside, never inside, the inventoried fixture roots.
+                script_path = Path(temporary).resolve() / "host-reader-case.ps1"
+                with script_path.open("x", encoding="utf-8", newline="") as stream:
+                    stream.write(script)
                 env = os.environ.copy()
                 env["MORPHEUS_HOST_READER_SOURCE"] = str(source)
                 env["MORPHEUS_HOST_TEST_ROOT"] = temporary
-                result = subprocess.run([str(pwsh), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                result = subprocess.run([str(pwsh), "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script_path)],
                     text=True, encoding="utf-8", capture_output=True, timeout=45, env=env)
             # The only forwarded child output is one exact finite diagnostic.
             # Unknown/multiple/raw lines and all child stderr stay withheld.

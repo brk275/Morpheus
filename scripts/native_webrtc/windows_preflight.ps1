@@ -17,6 +17,104 @@ function New-HostReadDelegate([string] $Name, [Type] $Result, [Type[]] $Argument
         [Runtime.InteropServices.NativeLibrary]::GetExport($script:HostKernel, $Name), $delegateType)
 }
 
+# The repeated comparison executes as owned managed IL, like the delegate
+# declarations above. It calls no compiler, external tool or new native export.
+# Status is closed: 0=equal, 1=type, 2=identity, 3=reparse, 4=changed.
+function New-HostComparisonInvoker([Delegate] $TypeCall, [Delegate] $InfoCall) {
+    $typeMethod = $TypeCall.GetType().GetMethod('Invoke')
+    $infoMethod = $InfoCall.GetType().GetMethod('Invoke')
+    $method = [Reflection.Emit.DynamicMethod]::new('CompareHostReadIdentity', [int],
+        [Type[]]@([Delegate], [Delegate], [IntPtr], [IntPtr], [byte[]], [object], [bool]))
+    $il = $method.GetILGenerator()
+    $expected = $il.DeclareLocal([byte[]])
+    $typeOk = $il.DefineLabel(); $infoOk = $il.DefineLabel()
+    $notReparse = $il.DefineLabel(); $identityFailure = $il.DefineLabel()
+    $changed = $il.DefineLabel(); $equal = $il.DefineLabel()
+    $copy = [Runtime.InteropServices.Marshal].GetMethod('Copy',
+        [Type[]]@([IntPtr], [byte[]], [int], [int]))
+    $u32 = [BitConverter].GetMethod('ToUInt32', [Type[]]@([byte[]], [int]))
+    $u64 = [BitConverter].GetMethod('ToUInt64', [Type[]]@([byte[]], [int]))
+
+    # GetFileType(handle) == 1, then GetFileInformationByHandle(handle, memory)
+    # != 0. These original calls and their first-failure order are unchanged.
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Castclass, $TypeCall.GetType())
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $typeMethod)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_1)
+    $il.Emit([Reflection.Emit.OpCodes]::Beq, $typeOk)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_1)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($typeOk)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_1)
+    $il.Emit([Reflection.Emit.OpCodes]::Castclass, $InfoCall.GetType())
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_3)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $infoMethod)
+    $il.Emit([Reflection.Emit.OpCodes]::Brtrue, $infoOk)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($infoOk)
+
+    # Preserve the observable scratch copy, even when a later check refuses.
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_3)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]52)
+    $il.Emit([Reflection.Emit.OpCodes]::Call, $copy)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Call, $u32)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]0x400)
+    $il.Emit([Reflection.Emit.OpCodes]::And)
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $notReparse)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_3)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($notReparse)
+
+    # A bound Expected must be a byte[52], after the native/reparse checks.
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]5)
+    $il.Emit([Reflection.Emit.OpCodes]::Isinst, [byte[]])
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $expected)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $expected)
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $identityFailure)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $expected)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldlen)
+    $il.Emit([Reflection.Emit.OpCodes]::Conv_I4)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]52)
+    $il.Emit([Reflection.Emit.OpCodes]::Bne_Un, $identityFailure)
+
+    # Unconditional spans: attributes u32@0, volume u32@28, index u64@44.
+    # Content additionally compares size u64@32, write u64@20, links u32@40.
+    # Every load is inside the same fixed 52-byte records; equality is bitwise.
+    $fields = @(@(0, $u32), @(28, $u32), @(44, $u64),
+                @(32, $u64), @(20, $u64), @(40, $u32))
+    for ($i = 0; $i -lt $fields.Length; $i++) {
+        if ($i -eq 3) {
+            $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]6)
+            $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $equal)
+        }
+        $offset = [int]$fields[$i][0]; $read = $fields[$i][1]
+        $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, $offset)
+        $il.Emit([Reflection.Emit.OpCodes]::Call, $read)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $expected)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, $offset)
+        $il.Emit([Reflection.Emit.OpCodes]::Call, $read)
+        $il.Emit([Reflection.Emit.OpCodes]::Bne_Un, $changed)
+    }
+    $il.MarkLabel($equal)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($identityFailure)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($changed)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_4)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    return $method.CreateDelegate([Func[Delegate, Delegate, IntPtr, IntPtr, byte[], object, bool, int]])
+}
+
 function Initialize-HostReader {
     # One sequential reader owns its metadata scratch until Close-HostReader.
     # Refuse an overlapping initialization rather than lose live owned storage.
@@ -28,6 +126,9 @@ function Initialize-HostReader {
     $script:HostInfoMemory = [IntPtr]::Zero
     $script:HostInfoScratch = $null
     $script:HostInfoBusy = $false
+    $script:HostComparisonInvoker = $null
+    $script:HostComparisonType = $null
+    $script:HostComparisonInfo = $null
     $script:HostHandles = [Collections.Generic.List[IntPtr]]::new()
     $script:HostCanonicalPaths = $null
     $script:HostCanonicalUnits = 0
@@ -56,6 +157,11 @@ function Initialize-HostReader {
     $script:HostInfo = New-HostReadDelegate 'GetFileInformationByHandle' ([int]) ([Type[]]@([IntPtr], [IntPtr]))
     $script:HostType = New-HostReadDelegate 'GetFileType' ([uint32]) ([Type[]]@([IntPtr]))
     $script:HostClose = New-HostReadDelegate 'CloseHandle' ([int]) ([Type[]]@([IntPtr]))
+    # Emit before acquiring unmanaged scratch; a construction error cannot
+    # strand an owned allocation. The exact delegate objects fence this path.
+    $script:HostComparisonInvoker = New-HostComparisonInvoker $script:HostType $script:HostInfo
+    $script:HostComparisonType = $script:HostType
+    $script:HostComparisonInfo = $script:HostInfo
     # Allocate last: no further initialization can fail after unmanaged ownership
     # is acquired. The 52-byte Win32 record and ABI are unchanged.
     $script:HostInfoScratch = [byte[]]::new(52)
@@ -138,6 +244,20 @@ function Get-HostHandleInfo([IntPtr] $Handle, $Expected, [bool] $Content = $fals
     if ($script:HostInfoBusy -or $script:HostInfoMemory -eq [IntPtr]::Zero) { throw 'identity' }
     $script:HostInfoBusy = $true
     try {
+        if ($PSBoundParameters.ContainsKey('Expected') -and $null -ne $script:HostComparisonInvoker -and
+            [object]::ReferenceEquals($script:HostType, $script:HostComparisonType) -and
+            [object]::ReferenceEquals($script:HostInfo, $script:HostComparisonInfo)) {
+            $status = $script:HostComparisonInvoker.Invoke($script:HostType, $script:HostInfo,
+                $Handle, $script:HostInfoMemory, $script:HostInfoScratch, $Expected, $Content)
+            switch ($status) {
+                0 { return }
+                1 { throw 'type' }
+                2 { throw 'identity' }
+                3 { throw 'reparse' }
+                4 { throw 'changed' }
+                default { throw 'identity' }
+            }
+        }
         if ($script:HostType.Invoke($Handle) -ne 1) { throw 'type' }
         $memory = $script:HostInfoMemory
         if ($script:HostInfo.Invoke($Handle, $memory) -eq 0) { throw 'identity' }
@@ -354,6 +474,9 @@ function Close-HostReader {
             $script:HostInfoMemory = [IntPtr]::Zero
             $script:HostInfoScratch = $null
             $script:HostInfoBusy = $false
+            $script:HostComparisonInvoker = $null
+            $script:HostComparisonType = $null
+            $script:HostComparisonInfo = $null
             if ($memory -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory) }
         } finally {
             # Retire lexical ownership even if native cleanup throws. No result
