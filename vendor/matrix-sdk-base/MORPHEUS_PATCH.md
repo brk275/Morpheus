@@ -131,3 +131,15 @@ the original peer's decrypted cache. Identifiers stay process-private; one
 additional closed failure label is emitted. No production call, sync, trust,
 key-sharing or request policy is changed by this observation. Runtime cause
 and successful group interoperability remain unproven until hosted checks.
+
+## Temporary late-device failure category (diagnostic branch only)
+
+The existing temporary pending-event observer additionally retains a fixed enum
+from each already-performed ordinary sticky decrypt. It adds no decrypt, key
+request, network operation, error-string log or sender/session/key payload. The
+bounded pending record is cfg(E2EE); its last category follows unchanged retries.
+Only the existing failure-only Element marker exposes a fixed category through
+the existing temporary getter. Absence/retry locking, expiry, caps, protocol,
+trust and all acceptance assertions/deadlines remain unchanged. This entire
+diagnostic API/retention change must not be promoted into production solely for
+observation. The category does not prove original sender share/index state.

@@ -89,7 +89,8 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(parsed, dict.fromkeys(target.GROUP_FIELDS, "unknown"))
                 self.assertNotIn("private", str(parsed))
                 self.assertEqual(target.evidence(malformed), {})
-        for state in ("pending", "absent", "retrying", "unknown"):
+        for state in ("pending", "absent", "retrying", "unknown",
+                      "pending_missing_key", "pending_withheld_key", "pending_unknown_index", "pending_untrusted_sender", "pending_malformed", "pending_megolm_failure", "pending_identity_mismatch", "pending_no_crypto", "pending_internal_error", "pending_other"):
             observed = marker.replace("late_bob_pending=pending", "late_bob_pending=" + state)
             self.assertEqual(target.group_discriminator(observed)["late_bob_pending"], state)
         self.assertEqual(target.group_discriminator("prefix" + marker), {})

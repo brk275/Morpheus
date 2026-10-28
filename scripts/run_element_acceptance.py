@@ -65,7 +65,8 @@ GROUP_ROSTERS = frozenset(("exact", "missing_alice", "missing_bob", "missing_car
 GROUP_VALUES = (GROUP_ROSTERS, GROUP_ROSTERS,
                 frozenset(("same_live_event", "changed_live_event", "not_unique", "unknown")),
                 frozenset(("present", "missing", "ambiguous", "unknown")),
-                frozenset(("pending", "absent", "retrying", "unknown")))
+                frozenset(("pending", "absent", "retrying", "unknown",
+                           "pending_missing_key", "pending_withheld_key", "pending_unknown_index", "pending_untrusted_sender", "pending_malformed", "pending_megolm_failure", "pending_identity_mismatch", "pending_no_crypto", "pending_internal_error", "pending_other")))
 GROUP_MAX_LINE = len(GROUP_PREFIX) + len(GROUP_FIELDS) - 1 + sum(
     len(key) + 1 + max(map(len, values)) for key, values in zip(GROUP_FIELDS, GROUP_VALUES))
 

@@ -160,6 +160,9 @@ pub(crate) struct PendingEvent {
     /// Receipt lifetime when the encrypted event was first collected. A retry
     /// may still finish after leave/rejoin; it must not revive that receipt.
     pub keyless_generation: u64,
+    /// Temporary diagnostic: fixed result of the latest ordinary decrypt only.
+    #[cfg(feature = "e2e-encryption")]
+    pub pending_diagnostic: PendingStickyEventState,
     /// The sticky metadata of the event, with a [`Payload::Encrypted`].
     pub meta: StickyMeta,
     /// The encrypted event.
@@ -185,6 +188,26 @@ impl PendingEvent {
 pub enum PendingStickyEventState {
     /// This exact unexpired outer event is waiting for decryption.
     Pending,
+    /// Ordinary decryption reported no Megolm session and no withheld code.
+    PendingMissingKey,
+    /// Ordinary decryption reported a withheld Megolm session.
+    PendingWithheldKey,
+    /// The available session starts after this event's message index.
+    PendingUnknownIndex,
+    /// The sender did not satisfy the configured identity trust requirement.
+    PendingUntrustedSender,
+    /// Malformed encrypted event or decrypted payload.
+    PendingMalformed,
+    /// A session exists, but its authenticated decryption failed.
+    PendingMegolmFailure,
+    /// Session identity keys did not match the encrypted sender identity.
+    PendingIdentityMismatch,
+    /// Encryption was not configured for the ordinary decrypt attempt.
+    PendingNoCrypto,
+    /// The ordinary decrypt returned an application/store error.
+    PendingInternalError,
+    /// A different fixed SDK decryption reason.
+    PendingOther,
     /// No such pending event is parked. This does not prove non-reception.
     Absent,
     /// A retry temporarily owns the pending list; presence is indeterminate.
@@ -193,10 +216,38 @@ pub enum PendingStickyEventState {
 
 #[cfg(feature = "e2e-encryption")]
 impl PendingStickyEventState {
+    /// Classify existing SDK output without copying its session/identity data.
+    pub(crate) fn from_reason(
+        reason: &matrix_sdk_common::deserialized_responses::UnableToDecryptReason,
+    ) -> Self {
+        use matrix_sdk_common::deserialized_responses::UnableToDecryptReason;
+        match reason {
+            UnableToDecryptReason::MissingMegolmSession { withheld_code: None } => Self::PendingMissingKey,
+            UnableToDecryptReason::MissingMegolmSession { withheld_code: Some(_) } => Self::PendingWithheldKey,
+            UnableToDecryptReason::UnknownMegolmMessageIndex => Self::PendingUnknownIndex,
+            UnableToDecryptReason::SenderIdentityNotTrusted(_) => Self::PendingUntrustedSender,
+            UnableToDecryptReason::MalformedEncryptedEvent
+            | UnableToDecryptReason::PayloadDeserializationFailure => Self::PendingMalformed,
+            UnableToDecryptReason::MegolmDecryptionFailure => Self::PendingMegolmFailure,
+            UnableToDecryptReason::MismatchedIdentityKeys => Self::PendingIdentityMismatch,
+            _ => Self::PendingOther,
+        }
+    }
+
     /// A fixed label only, without identifiers, payloads, session IDs or keys.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::PendingMissingKey => "pending_missing_key",
+            Self::PendingWithheldKey => "pending_withheld_key",
+            Self::PendingUnknownIndex => "pending_unknown_index",
+            Self::PendingUntrustedSender => "pending_untrusted_sender",
+            Self::PendingMalformed => "pending_malformed",
+            Self::PendingMegolmFailure => "pending_megolm_failure",
+            Self::PendingIdentityMismatch => "pending_identity_mismatch",
+            Self::PendingNoCrypto => "pending_no_crypto",
+            Self::PendingInternalError => "pending_internal_error",
+            Self::PendingOther => "pending_other",
             Self::Absent => "absent",
             Self::Retrying => "retrying",
         }
@@ -442,12 +493,12 @@ impl StickyEvents {
         };
         let now = now_ms();
         let state = self.inner.state.lock().unwrap();
-        if state.pending.iter().any(|event| {
+        if let Some(event) = state.pending.iter().find(|event| {
             event.meta.event_id.as_str() == event_id.as_str()
                 && event.meta.sender.as_str() == sender.as_str()
                 && event.meta.expires_at > now
         }) {
-            PendingStickyEventState::Pending
+            event.pending_diagnostic
         } else {
             PendingStickyEventState::Absent
         }
@@ -584,6 +635,8 @@ mod tests {
 
     fn pending(session_id: Option<&str>, expires_at: u64) -> PendingEvent {
         PendingEvent {
+            #[cfg(feature = "e2e-encryption")]
+            pending_diagnostic: super::PendingStickyEventState::Pending,
             keyless_generation: 1,
             meta: StickyMeta {
                 sender: owned_user_id!("@alice:localhost"),
@@ -711,6 +764,25 @@ mod tests {
         assert_eq!(super::PendingStickyEventState::Pending.as_str(), "pending");
         assert_eq!(super::PendingStickyEventState::Absent.as_str(), "absent");
         assert_eq!(super::PendingStickyEventState::Retrying.as_str(), "retrying");
+        // Only fixed categories survive; the matching event/sender check and
+        // retry lock above remain the authority for whether it is pending.
+        use matrix_sdk_common::deserialized_responses::{UnableToDecryptReason, VerificationLevel};
+        for (reason, expected) in [
+            (UnableToDecryptReason::MissingMegolmSession { withheld_code: None }, "pending_missing_key"),
+            (UnableToDecryptReason::UnknownMegolmMessageIndex, "pending_unknown_index"),
+            (UnableToDecryptReason::SenderIdentityNotTrusted(VerificationLevel::UnverifiedIdentity), "pending_untrusted_sender"),
+            (UnableToDecryptReason::MalformedEncryptedEvent, "pending_malformed"),
+            (UnableToDecryptReason::PayloadDeserializationFailure, "pending_malformed"),
+            (UnableToDecryptReason::MegolmDecryptionFailure, "pending_megolm_failure"),
+            (UnableToDecryptReason::MismatchedIdentityKeys, "pending_identity_mismatch"),
+            (UnableToDecryptReason::Unknown, "pending_other"),
+        ] {
+            assert_eq!(super::PendingStickyEventState::from_reason(&reason).as_str(), expected);
+        }
+        let mut classified = pending(Some("classified"), now + 60_000);
+        classified.pending_diagnostic = super::PendingStickyEventState::PendingMissingKey;
+        sticky.park(vec![classified]);
+        assert_eq!(sticky.pending_event_state(&event_id, &sender).as_str(), "pending_missing_key");
     }
 
     #[cfg(feature = "e2e-encryption")]
