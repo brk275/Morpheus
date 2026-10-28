@@ -205,6 +205,15 @@ fn rgb(red: u8, green: u8, blue: u8) -> Color {
     Color::from_rgb_u8(red, green, blue)
 }
 
+// Preview fixtures already choose explicit colors. Preserve that choice,
+// including non-palette samples, while palette-backed samples repaint live.
+fn preview_avatar_slot(accent: Color) -> i32 {
+    live::AVATAR_COLORS
+        .iter()
+        .position(|&(red, green, blue)| accent == rgb(red, green, blue))
+        .map_or(-1, |slot| slot as i32)
+}
+
 fn account(name: &str, handle: &str, initials: &str, status: &str, accent: Color) -> AccountItem {
     AccountItem {
         name: name.into(),
@@ -212,6 +221,7 @@ fn account(name: &str, handle: &str, initials: &str, status: &str, accent: Color
         initials: initials.into(),
         status: status.into(),
         accent,
+        avatar_slot: preview_avatar_slot(accent),
         ..Default::default()
     }
 }
@@ -276,6 +286,7 @@ fn message(
         reaction: reaction.into(),
         poll: PollCardData::default(),
         accent,
+        avatar_slot: preview_avatar_slot(accent),
         pinned: false,
     }
 }
@@ -291,6 +302,7 @@ fn member(name: &str, initials: &str, detail: &str, accent: Color, online: bool)
         is_account_user: false,
         is_creator: false,
         accent,
+        avatar_slot: preview_avatar_slot(accent),
         online,
     }
 }
@@ -757,6 +769,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
                 handle: item.handle.clone(),
                 initials: item.initials.clone(),
                 accent: item.accent,
+                avatar_slot: item.avatar_slot,
                 ..Default::default()
             }
         })
@@ -769,6 +782,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
     ui.set_active_account_initials(account.item.initials.clone());
     ui.set_active_account_status(account.item.status.clone());
     ui.set_active_account_accent(account.item.accent);
+    ui.set_active_account_avatar_slot(account.item.avatar_slot);
     ui.set_unsorted_channels(ModelRc::new(VecModel::from(
         account
             .channels

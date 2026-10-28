@@ -2084,6 +2084,9 @@ async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
         observed.borrow_mut().push(index);
         weak.upgrade().unwrap().set_theme_mode(index);
     });
+    let presets = Rc::new(RefCell::new(Vec::new()));
+    let observed = presets.clone();
+    ui.on_choose_style_preset(move |index| observed.borrow_mut().push(index));
     let densities = Rc::new(RefCell::new(Vec::new()));
     let observed = densities.clone();
     let weak = ui.as_weak();
@@ -2114,6 +2117,18 @@ async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
             assert_eq!(ui.get_theme_mode(), index);
             assert!(focused_control_has_label(ui, label));
         }
+        for (index, name) in ["Nocturne", "Terminal", "Paper", "Contrast"]
+            .iter()
+            .enumerate()
+        {
+            let label = format!("Apply {name} appearance preset");
+            tab_to_control(ui, &label);
+            let previous = presets.borrow().len();
+            key(ui, Key::Return);
+            assert_eq!(presets.borrow().len(), previous + 1);
+            assert_eq!(presets.borrow().last(), Some(&(index as i32)));
+            assert!(focused_control_has_label(ui, &label));
+        }
         for (index, label, activation) in [
             (0, "Use Compact room and message density", Key::Space),
             (1, "Use Comfortable room and message density", Key::Return),
@@ -2135,6 +2150,7 @@ async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
     // cover the shared ActionRect's disabled-retained-focus activation guard.
     // Keep later account scenarios on the same window with their prior state.
     ui.on_choose_theme(|_| {});
+    ui.on_choose_style_preset(|_| {});
     ui.on_choose_density(|_| {});
     apply_config(ui, &Config::default(), None);
     ui.set_page(0);
@@ -2366,6 +2382,7 @@ fn role_message(
         rich_body: StyledText::from_plain_text(&format!("{sender} body")),
         rich_accessible_body: format!("{sender} body").into(),
         accent,
+        avatar_slot: crate::preview_avatar_slot(accent),
         ..Default::default()
     }
 }
@@ -2671,6 +2688,86 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     settle(ui).await;
     assert_text_color(ui, "· 10:15 AM", muted, 1);
     assert_text_color(ui, "Own Author", ink, 1);
+
+    // The five avatar slots use live roles, independently of sender ink.
+    // Re-projecting colors retains the same timeline and call model owners.
+    let messages = ui.get_messages();
+    let members = ui.get_members();
+    let call_tiles = ui.get_native_call_tiles();
+    let draft = ui.get_composer_text();
+    let search = ui.get_room_search_query();
+    let account = ui.get_active_account_local_id();
+    let room = ui.get_active_room_id();
+    let defaults = ["#A88CFF", "#78C8B1", "#F39F78", "#64A5E8", "#E78BA4"];
+    crate::appearance::apply_theme(ui, &Config::default(), None);
+    for (slot, default) in defaults.iter().enumerate() {
+        let identity = ["A", "B", "C", "D", "E"][slot];
+        assert_eq!(crate::live::avatar_slot(identity), slot as i32);
+        assert_eq!(crate::live::accent(identity), color_from_hex(default));
+        assert_eq!(
+            ui.global::<crate::StyleTokens>()
+                .invoke_avatar_color(slot as i32),
+            color_from_hex(default)
+        );
+    }
+    let mut avatar_theme = bare.clone();
+    avatar_theme.roles.avatar_1 = Some("#102030".into());
+    avatar_theme.roles.avatar_2 = Some("#203040".into());
+    avatar_theme.roles.avatar_3 = Some("#304050".into());
+    avatar_theme.roles.avatar_4 = Some("#405060".into());
+    avatar_theme.roles.avatar_5 = Some("#506070".into());
+    crate::appearance::apply_theme(ui, &Config::default(), Some(&avatar_theme));
+    let changed = ["#102030", "#203040", "#304050", "#405060", "#506070"];
+    for (slot, value) in changed.iter().enumerate() {
+        assert_eq!(
+            ui.invoke_token_color(format!("avatar_{}", slot + 1).into()),
+            color_from_hex(value)
+        );
+    }
+    let mut avatar_config = Config::default();
+    avatar_config
+        .colors
+        .insert("avatar_1".into(), "#11223380".into());
+    let scoped = avatar_config
+        .account_overrides
+        .entry("avatar-a".into())
+        .or_default();
+    scoped.colors.insert("avatar_1".into(), "#223344".into());
+    scoped
+        .room_appearance
+        .entry("!avatar:example.org".into())
+        .or_default()
+        .colors
+        .insert("avatar_1".into(), "#334455".into());
+    for (active, open, expected) in [
+        ("avatar-a", "!avatar:example.org", "#334455"),
+        ("avatar-a", "!other:example.org", "#223344"),
+        ("avatar-b", "!avatar:example.org", "#11223380"),
+    ] {
+        ui.set_active_account_local_id(active.into());
+        ui.set_active_room_id(open.into());
+        crate::appearance::apply_theme(ui, &avatar_config, Some(&avatar_theme));
+        assert_eq!(
+            ui.invoke_token_color("avatar_1".into()),
+            color_from_hex(expected)
+        );
+    }
+    // Omitting all five roles after a reload restores every original slot.
+    crate::appearance::apply_theme(ui, &Config::default(), Some(&bare));
+    for (slot, default) in defaults.iter().enumerate() {
+        assert_eq!(
+            ui.global::<crate::StyleTokens>()
+                .invoke_avatar_color(slot as i32),
+            color_from_hex(default)
+        );
+    }
+    assert!(ui.get_messages() == messages);
+    assert!(ui.get_members() == members);
+    assert!(ui.get_native_call_tiles() == call_tiles);
+    assert_eq!(ui.get_composer_text(), draft);
+    assert_eq!(ui.get_room_search_query(), search);
+    ui.set_active_account_local_id(account);
+    ui.set_active_room_id(room);
 
     // Restore the window for the remaining account scenarios.
     ui.window().set_size(slint::PhysicalSize::new(1280, 900));
@@ -7074,6 +7171,7 @@ async fn exercise_account_ui(
     ui.set_native_call_tiles(ModelRc::new(VecModel::from(vec![CallTileItem {
         id: 7,
         name: "@private:example.org".into(),
+        avatar_slot: -1,
         live: true,
         frame_slot: 1,
         ..Default::default()
@@ -7081,6 +7179,7 @@ async fn exercise_account_ui(
     ui.set_native_call_featured(CallTileItem {
         id: 8,
         name: "@pinned:example.org".into(),
+        avatar_slot: -1,
         live: true,
         pinned: true,
         ..Default::default()
@@ -7990,6 +8089,7 @@ async fn assert_call_bar(ui: &AppWindow, runtime: &Handle) {
     ui.set_native_call_tiles(ModelRc::new(VecModel::from(vec![CallTileItem {
         id: 3,
         name: "Ada Lovelace".into(),
+        avatar_slot: -1,
         status: "joined".into(),
         frame_slot: -1,
         ..Default::default()

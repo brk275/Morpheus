@@ -1,10 +1,9 @@
 # Appearance contract, color tokens and Settings search
 
-**Status: source checkpoint 2, not built, formatted or executed.** This page
-records the contract, the token and search-target inventory and the native
-transparency choice that the code on this branch implements. The sections
-marked *Remaining* list what is not done yet; nothing here claims coverage of
-"all" appearance.
+This page describes the appearance contract, token inventory, Settings search
+and native transparency behavior implemented in source. It does not establish
+platform verification or beta readiness. The sections marked *Remaining*
+identify the controls and behavior that still have limits.
 
 The single source of truth is `crates/morpheus-config/src/registry.rs`:
 `COLOR_TOKENS`, `FIELDS` and `SETTING_TARGETS`. The validator, the Appearance
@@ -133,7 +132,7 @@ valid appearance and shows a fixed error. Settings writes the same keys.
 
 ## Color tokens
 
-52 tokens, all consumed by the interface. **Base** tokens are the theme pack's
+61 tokens, all consumed by the interface. **Base** tokens are the theme pack's
 eleven required colors; **Role** tokens are optional theme roles; **State**
 tokens are optional interaction states in a theme pack's `[states]` table.
 Fallbacks apply when neither `[colors]` nor the theme sets the token, so an
@@ -171,6 +170,11 @@ unset state keeps the previous look.
 | Accents and states | `presence_online` | Role (new) | `#64C9A7` |
 | Inputs and controls | `divider` | Base | built-in palette |
 | Calls | `voice` | Role | `#78C8B1` |
+| Avatars | `avatar_1` | Role | `#A88CFF` |
+| Avatars | `avatar_2` | Role | `#78C8B1` |
+| Avatars | `avatar_3` | Role | `#F39F78` |
+| Avatars | `avatar_4` | Role | `#64A5E8` |
+| Avatars | `avatar_5` | Role | `#E78BA4` |
 | Avatars | `avatar_ink` | Role (new) | `#FFFFFF` |
 | Surfaces | `message_hover` | State | `elevated` |
 | Inputs and controls | `control_hover` | State | each control's built-in hover, about `#32394B` |
@@ -199,6 +203,30 @@ their separate contrast tests, including 3:1 for the online indicator on every
 surface. With a preset, one `scrim` value replaces the per-dialog built-in
 dimming.
 
+### Fallback avatar and account backgrounds
+
+The Avatars group contains five **Fallback background** slots alongside
+**Avatar initials**. Edit `avatar_1` through `avatar_5` there, or put the same
+keys in the existing `[colors]` table of `config.toml`:
+
+```toml
+[colors]
+avatar_1 = "#A88CFF"
+avatar_2 = "#78C8B1"
+avatar_3 = "#F39F78"
+avatar_4 = "#64A5E8"
+avatar_5 = "#E78BA4"
+```
+
+These defaults preserve the original five colors and identity-slot order.
+A slot accepts `#RRGGBB` or `#RRGGBBAA`, including transparent colors. The
+same keys work in a theme's `[roles]`, and in the existing account and room
+color overrides. A room inherits omitted slots from its account, then global
+colors and the theme; an omitted theme role keeps the original slot color.
+Accepted edits use the normal live-reload path. Invalid edits keep the last
+valid appearance. No separate palette table or menu is needed, and uploaded
+avatar pictures and sender-name text palettes are unchanged.
+
 ### Deliberately not themeable
 
 - Message images, video, avatar pictures and sticker pixels.
@@ -210,21 +238,20 @@ dimming.
 
 ### Remaining literal defaults and planned tokens
 
-- Avatar and account background palettes come from a fixed five-color list in
-  the Rust models (`live.rs`, preview fixtures) and the call-stage placeholder
-  tiles. Editing them live needs model indices instead of baked colors; an
-  `[avatars]` palette is planned, not accepted yet.
-- Inputs, buttons, the composer and icons use `elevated`, `hover`, `ink` and
-  `muted`; separate `input_surface`, `button_surface`, `composer_surface` and
-  `icon` tokens are planned.
+Inputs, composers and icons already use the state tokens listed above,
+including `input_surface`, `composer_surface` and the per-control icon colors.
+
+- Ordinary button surfaces follow base colors, with `control_hover`,
+  `control_pressed` and `control_disabled` for interaction states. A separate
+  `button_surface` token is not supported.
 - Call stage tile and roster surfaces, in-app notification banners beyond the
   error/success roles, and unread badges other than the count badge use base
   tokens only. The call stage's buttons, focus rings, outlines and corners
   follow the control tokens and states.
 - Error texts keep slightly different built-in defaults per control until
   `error` is set; setting it recolors all of them.
-- Sender palette editing in the workspace is planned; it remains in theme files
-  (`[senders]`, 1–16 colors).
+- Sender-name palettes are editable in the Appearance workspace as well as in
+  theme files and `config.toml` (`[senders]`, 1–16 colors).
 
 ## Native window transparency
 
@@ -394,16 +421,13 @@ settings file; updates.
 
 - Number settings show their unit: `px` for lengths, `%` for percentages
   (including line height), `ms` for durations, and none for font weights.
-- Now editable (source only, not yet run): composer line height, default body
+- Editable controls include composer line height, default body
   weight including rich messages, per-control icon colors, and theme pack
   import and export; see [theme studio](THEME_STUDIO.md). Rich message bodies
   keep their natural line spacing. Explicit heading, sender and Markdown
   span weights remain unchanged by the default-body-weight setting.
 - Pane order, visibility and collapse are editable in Settings › Layout ›
   Pane arrangement and in TOML; see [customization](CUSTOMIZATION.md#pane-arrangement).
-- Still not editable: the avatar and account background palettes and shortcut
-  actions beyond the existing ones.
+- Shortcut actions beyond the existing ones are still not editable.
 - Native transparency has not been verified on any platform; see the plan
   above.
-- Formatting has not been run; expect `rustfmt` changes, especially in the
-  long registry tables, and Slint indentation fixes.
