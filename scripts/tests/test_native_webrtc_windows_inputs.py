@@ -1221,6 +1221,10 @@ try {
     $ownedScratch = $script:HostInfoScratch
     $ownedMemo = $script:HostCanonicalPaths
     $ownedCanonical = $script:HostCanonicalInvoker
+    $ownedChainInvoker = $script:HostChainInvoker
+    if ($ownedChainInvoker -isnot [Delegate] -or
+        -not [object]::ReferenceEquals($ownedChainInvoker, $script:HostChainInvokerOwner) -or
+        -not [object]::ReferenceEquals($script:HostComparisonInvoker, $script:HostChainComparison)) { throw 'identity' }
     if ($ownedMemory -eq [IntPtr]::Zero -or $ownedScratch.Length -ne 52 -or
         $script:HostCanonicalEntryLimit -ne 8192 -or $script:HostCanonicalUnitLimit -ne 1048576 -or
         $script:HostDirectoryChainLimit -ne 512 -or $null -ne $script:HostLastDirectoryPath -or
@@ -1431,6 +1435,9 @@ try {
     }
     try {
         $script:HostComparisonInvoker = $comparisonProbe
+        $beforeChecks = $comparisonProbe.Calls
+        $null = Open-HostDirectoryChain $good
+        if ($comparisonProbe.Calls -ne $beforeChecks + $script:HostLastDirectoryChain.Length) { throw 'identity' }
         foreach ($content in @($false, $true)) {
             $beforeChecks = $comparisonProbe.Calls
             if (@(Assert-HostIdentity $comparisonRecord $content).Count -ne 0 -or
@@ -1462,6 +1469,70 @@ try {
             -not [object]::ReferenceEquals($ownedScratch, $script:HostInfoScratch) -or
             $script:HostInfoBusy) { throw 'identity' }
     } finally { $script:HostComparisonInvoker = $originalComparison }
+    # A same-signature delegate probe is not the owned delegate: preserve the
+    # original comparison path without calling the probe or skipping ancestors.
+    $chainProbe = [Func[object[], Delegate, Delegate, Delegate, IntPtr, byte[], int]] {
+        param([object[]] $Records, [Delegate] $Comparison, [Delegate] $TypeCall,
+              [Delegate] $InfoCall, [IntPtr] $Memory, [byte[]] $Scratch)
+        throw 'accepted'
+    }
+    try {
+        $script:HostChainInvoker = $chainProbe
+        $null = Open-HostDirectoryChain $good
+    } finally { $script:HostChainInvoker = $ownedChainInvoker }
+    # A streamed leaf is observable only after metadata scratch ownership ends.
+    $null = Open-HostDirectoryChain $good | ForEach-Object {
+        if ($script:HostInfoBusy) { throw 'identity' }
+    }
+    # Current mutable Expected bytes reach the production managed chain too.
+    $realChain = $script:HostLastDirectoryChain
+    $realRoot = $realChain[0]
+    $realRootExpected = $realRoot.comparison
+    try {
+        $altered = [byte[]]$realRootExpected.Clone()
+        $altered[28] = $altered[28] -bxor 1
+        $realRoot.comparison = $altered
+        $refusal = ''
+        try { $null = Open-HostDirectoryChain $good } catch { $refusal = $_.Exception.Message }
+        if ($refusal -cne 'changed' -or $script:HostInfoBusy) { throw 'identity' }
+        $realRoot.comparison = $null
+        $refusal = ''
+        try { $null = Open-HostDirectoryChain $good } catch { $refusal = $_.Exception.Message }
+        if ($refusal -cne 'identity' -or $script:HostInfoBusy) { throw 'identity' }
+    } finally { $realRoot.comparison = $realRootExpected }
+    $realLeaf = $realChain[$realChain.Length - 1]
+    $adaptedLeaf = [pscustomobject]$realLeaf
+    try {
+        $realChain[$realChain.Length - 1] = $adaptedLeaf
+        $returnedLeaf = Open-HostDirectoryChain $good
+        if (-not [object]::ReferenceEquals($returnedLeaf, $adaptedLeaf) -or $script:HostInfoBusy) { throw 'identity' }
+    } finally { $realChain[$realChain.Length - 1] = $realLeaf }
+    # A ScriptProperty on an exact Hashtable shadows its same-named key.
+    # Metadata admission must not invoke it; original adaptation invokes it
+    # exactly once after all prior ancestor checks and before the leaf read.
+    $shadowLeaf = [hashtable]$realLeaf.Clone()
+    $script:ChainShadowReads = 0
+    $script:ChainShadowExpected = [byte[]]$realLeaf.comparison.Clone()
+    $script:ChainShadowExpected[28] = $script:ChainShadowExpected[28] -bxor 1
+    Add-Member -InputObject $shadowLeaf -MemberType ScriptProperty -Name comparison -Value {
+        $script:ChainShadowReads++
+        return ,$script:ChainShadowExpected
+    } -Force
+    try {
+        $realChain[$realChain.Length - 1] = $shadowLeaf
+        $script:HostInfoBusy = $true
+        try {
+            if ($ownedChainInvoker.Invoke($realChain, $originalComparison, $originalType,
+                $originalInfo, $ownedMemory, $ownedScratch) -ne -$realChain.Length -or
+                $script:ChainShadowReads -ne 0) { throw 'identity' }
+        } finally { $script:HostInfoBusy = $false }
+        $refusal = ''
+        try { $null = Open-HostDirectoryChain $good } catch { $refusal = $_.Exception.Message }
+        if ($refusal -cne 'changed' -or $script:ChainShadowReads -ne 1 -or $script:HostInfoBusy) { throw 'identity' }
+    } finally {
+        $realChain[$realChain.Length - 1] = $realLeaf
+        $script:ChainShadowExpected = $null
+    }
     # Exercise emitted first-failure branches using same-signature managed
     # delegates. No native handle is fabricated or foreign pointer dereferenced.
     $firstFailureTrace = [Collections.Generic.List[string]]::new()
@@ -1556,6 +1627,50 @@ try {
             $expectedAncestors.Add($script:HostDirectories[$prefix].handle)
         }
         $cachedChain = $script:HostLastDirectoryChain
+        # Execute the new managed loop against actual retained handles, using
+        # one same-signature trace adapter around the real comparison delegate.
+        # The independent literal-derived ancestor sequence above remains the oracle.
+        $chainTrace = [Collections.Generic.List[IntPtr]]::new()
+        $chainComparison = [Func[Delegate, Delegate, IntPtr, IntPtr, byte[], object, bool, int]] {
+            param([Delegate] $TypeCall, [Delegate] $InfoCall, [IntPtr] $Handle,
+                  [IntPtr] $Memory, [byte[]] $Scratch, $Expected, [bool] $Content)
+            $chainTrace.Add($Handle)
+            return $originalComparison.Invoke($TypeCall, $InfoCall, $Handle, $Memory, $Scratch, $Expected, $Content)
+        }
+        $chainTest = New-HostChainInvoker $chainComparison
+        $script:HostInfoBusy = $true
+        try {
+            if ($ownedChainInvoker.Invoke($cachedChain, $originalComparison, $originalType,
+                $originalInfo, $ownedMemory, $ownedScratch) -ne 0 -or
+                $chainTest.Invoke($cachedChain, $chainComparison, $originalType,
+                $originalInfo, $ownedMemory, $ownedScratch) -ne 0 -or
+                $chainTrace.Count -ne $expectedAncestors.Count) { throw 'identity' }
+            for ($i = 0; $i -lt $expectedAncestors.Count; $i++) {
+                if ($chainTrace[$i] -ne $expectedAncestors[$i]) { throw 'identity' }
+            }
+            $savedRootExpected = $cachedChain[0].comparison
+            try {
+                $changed = [byte[]]$savedRootExpected.Clone()
+                $changed[28] = $changed[28] -bxor 1
+                $cachedChain[0].comparison = $changed
+                $chainTrace.Clear()
+                if ($chainTest.Invoke($cachedChain, $chainComparison, $originalType,
+                    $originalInfo, $ownedMemory, $ownedScratch) -ne 4 -or
+                    $chainTrace.Count -ne 1 -or $chainTrace[0] -ne $expectedAncestors[0]) { throw 'identity' }
+            } finally { $cachedChain[0].comparison = $savedRootExpected }
+            # Adaptation at the leaf resumes at its index after exactly the
+            # preceding ancestor reads. No successful native result is cached.
+            $adapted = [object[]]$cachedChain.Clone()
+            $adapted[$adapted.Length - 1] = [pscustomobject]$cachedChain[$cachedChain.Length - 1]
+            $chainTrace.Clear()
+            if ($chainTest.Invoke($adapted, $chainComparison, $originalType,
+                $originalInfo, $ownedMemory, $ownedScratch) -ne -$adapted.Length -or
+                $chainTrace.Count -ne $adapted.Length - 1) { throw 'identity' }
+            $overLimit = [object[]]::new(513)
+            $chainTrace.Clear()
+            if ($chainTest.Invoke($overLimit, $chainComparison, $originalType,
+                $originalInfo, $ownedMemory, $ownedScratch) -ne -1 -or $chainTrace.Count -ne 0) { throw 'identity' }
+        } finally { $script:HostInfoBusy = $false }
         if ($script:HostLastDirectoryPath -cne $good -or
             $script:HostDirectoryChainLimit -ne 512 -or $cachedChain.Length -ne $expectedAncestors.Count) { throw 'identity' }
         $beforeChecks = $infoProbe.Calls; $beforeTrace = $infoHandles.Count
@@ -1626,8 +1741,12 @@ try {
     try {
         Must-Refuse { Get-HostHandleInfo $script:HostFileRecords[0].handle }
         Must-Refuse { Get-HostHandleInfo $comparisonRecord.handle $comparisonRecord.comparison $true }
+        Must-Refuse { Open-HostDirectoryChain $good }
         Must-Refuse { Close-HostReader }
         if (-not [object]::ReferenceEquals($ownedCanonical, $script:HostCanonicalInvoker) -or
+            -not [object]::ReferenceEquals($ownedChainInvoker, $script:HostChainInvoker) -or
+            -not [object]::ReferenceEquals($ownedChainInvoker, $script:HostChainInvokerOwner) -or
+            -not [object]::ReferenceEquals($originalComparison, $script:HostChainComparison) -or
             -not [object]::ReferenceEquals($originalComparison, $script:HostComparisonInvoker) -or
             -not [object]::ReferenceEquals($originalType, $script:HostComparisonType) -or
             -not [object]::ReferenceEquals($originalInfo, $script:HostComparisonInfo)) { throw 'identity' }
@@ -1642,7 +1761,8 @@ try {
 } finally { Close-HostReader }
 if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
     $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
-    $null -ne $script:HostComparisonInfo -or
+    $null -ne $script:HostComparisonInfo -or $null -ne $script:HostChainInvoker -or
+        $null -ne $script:HostChainInvokerOwner -or $null -ne $script:HostChainComparison -or
     $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostCanonicalUnits -ne 0 -or
     $ownedMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
@@ -1669,7 +1789,8 @@ try {
     Close-HostReader
     if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
         $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
-        $null -ne $script:HostComparisonInfo -or
+        $null -ne $script:HostComparisonInfo -or $null -ne $script:HostChainInvoker -or
+        $null -ne $script:HostChainInvokerOwner -or $null -ne $script:HostChainComparison -or
         $script:HostInfoBusy -or $script:HostHandles.Count -ne 0 -or
         $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostCanonicalUnits -ne 0 -or
@@ -1769,7 +1890,8 @@ try {
         $script:HostHandles[$ownedHandleCount - 1] -ne [IntPtr]::Zero -or
         $script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
         $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
-        $null -ne $script:HostComparisonInfo -or
+        $null -ne $script:HostComparisonInfo -or $null -ne $script:HostChainInvoker -or
+        $null -ne $script:HostChainInvokerOwner -or $null -ne $script:HostChainComparison -or
         $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostCanonicalUnits -ne 0 -or
         $exceptionMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
@@ -1784,7 +1906,8 @@ try {
     if ($closeProbe.Calls.Count -ne $ownedHandleCount -or $script:HostHandles.Count -ne 0 -or
         $script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
         $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
-        $null -ne $script:HostComparisonInfo -or $null -ne $script:HostCanonicalInvoker -or
+        $null -ne $script:HostComparisonInfo -or $null -ne $script:HostChainInvoker -or
+        $null -ne $script:HostChainInvokerOwner -or $null -ne $script:HostChainComparison -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostInfoBusy) { throw 'identity' }
     Close-HostReader
     if ($closeProbe.Calls.Count -ne $ownedHandleCount) { throw 'identity' }
