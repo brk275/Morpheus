@@ -17,6 +17,7 @@ import hashlib
 import http.client
 import io
 import json
+import lzma
 import os
 from pathlib import Path
 import re
@@ -37,6 +38,10 @@ CACHE_RESERVE = 1_000_000_000
 MAX_EXPANDED = 32 * 1024 * 1024 * 1024
 MAX_MEMBERS = 1_000_000
 MAX_JSON = 128 * 1024 * 1024
+# Fixed codec memory, independent of source-controlled XZ dictionary headers.
+MAX_XZ_MEMORY = 128 * 1024 * 1024
+LINUX_XZ_SCHEMA = "morpheus-native-linux-handoff-v3"
+XZ_MAGIC = b"\xfd7zXZ\x00"
 INPUT_PLAN = "656733d46a801782283d8b8e573f65dff01cc83934da545c66c81b635656b454"
 PATCH_MANIFEST = "e97be792680220ec3d21f39a0a950599a3266fd3041e2a8d5027df36d946b714"
 SECURITY_PLAN = "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
@@ -65,10 +70,10 @@ POST_ASSEMBLY_PHASES = frozenset((
 # paths, exception text or input values enter this context.
 PACK_OPERATIONS = frozenset((
     "unknown", "cache_absence", "cache_create", "output_open", "output_mode",
-    "writer_create", "gzip_open", "metadata_encode", "metadata_limit",
+    "writer_create", "gzip_open", "xz_open", "metadata_encode", "metadata_limit",
     "metadata_header", "metadata_add", "root_select", "directory_header",
     "directory_add", "file_fact", "file_header", "file_open", "file_wrap",
-    "file_add", "file_close", "file_position", "gzip_finish", "output_flush", "output_sync", "output_close",
+    "file_add", "file_close", "file_position", "gzip_finish", "xz_finish", "output_flush", "output_sync", "output_close",
 ))
 PACK_FAILURE_CLASSES = frozenset((
     "compressed_capacity", "compressed_short_write", "refused", "os_space",
@@ -97,7 +102,7 @@ def pack_failed(error, failure=None):
         return
     if failure is None:
         if isinstance(error, Refused): failure = "refused"
-        elif isinstance(error, (gzip.BadGzipFile, zlib.error)): failure = "compression"
+        elif isinstance(error, (gzip.BadGzipFile, zlib.error, lzma.LZMAError)): failure = "compression"
         elif isinstance(error, tarfile.TarError): failure = "tar"
         elif isinstance(error, UnicodeError): failure = "encoding"
         elif isinstance(error, OSError):
@@ -562,6 +567,55 @@ def gzip_tar(path):
             yield archive
 
 
+class LimitedXzReader:
+    """One XZ stream, bounded decoder memory and per-call output, never seek back."""
+    def __init__(self, raw):
+        self.raw = raw
+        self.decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=MAX_XZ_MEMORY)
+
+    def read(self, size):
+        need(type(size) is int and 0 <= size <= 1024 * 1024)
+        output = bytearray()
+        while len(output) < size:
+            if self.decoder.eof:
+                # Do not accept another compressed stream or unparsed suffix.
+                need(not self.decoder.unused_data and self.raw.read(1) == b"")
+                break
+            incoming = self.raw.read(64 * 1024) if self.decoder.needs_input else b""
+            need(bool(incoming) or not self.decoder.needs_input)
+            try:
+                output.extend(self.decoder.decompress(incoming, max_length=size - len(output)))
+            except lzma.LZMAError:
+                raise Refused() from None
+        return bytes(output)
+
+
+@contextmanager
+def handoff_tar(path):
+    # The historical cache member name remains opaque transport metadata.
+    # Codec magic and the internal version must agree; no general auto-parser.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as raw:
+        magic = raw.read(6); raw.seek(0)
+        if magic == XZ_MAGIC:
+            incoming = LimitedXzReader(raw)
+            stream = ForwardGzip(incoming, MAX_EXPANDED + MAX_JSON + 1024 * MAX_MEMBERS)
+            with tarfile.open(fileobj=stream, mode="r:") as archive:
+                yield archive, "xz"
+            # GNU zero record padding is permitted; a second tar or arbitrary
+            # decompressed suffix is not. Drain also proves XZ checksum/EOF.
+            while True:
+                tail = stream.read(512)
+                if not tail: break
+                need(not any(tail))
+        else:
+            need(magic[:2] == b"\x1f\x8b")
+            with gzip.GzipFile(fileobj=raw, mode="rb") as compressed:
+                stream = ForwardGzip(compressed, MAX_EXPANDED + MAX_JSON + 1024 * MAX_MEMBERS)
+                with tarfile.open(fileobj=stream, mode="r:") as archive:
+                    yield archive, "gzip"
+
+
 @contextmanager
 def bounded_tar(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
@@ -622,7 +676,8 @@ def pack_handoff(temp, handoff, inventories, material):
     """Pack exact manifests; Linux v2 stores identical content once, never links."""
     global PACK_ACTIVE
     reset_pack_capture(True)
-    deduplicate = handoff["schema"] == "morpheus-native-linux-handoff-v2"
+    deduplicate = handoff["schema"] in ("morpheus-native-linux-handoff-v2", LINUX_XZ_SCHEMA)
+    xz = handoff["schema"] == LINUX_XZ_SCHEMA
     packed = set()
     try:
         pack_at("cache_absence")
@@ -638,8 +693,10 @@ def pack_handoff(temp, handoff, inventories, material):
                 os.chmod(output, 0o600)
                 pack_at("writer_create")
                 bounded = BoundedWriter(stream, MAX_HANDOFF)
-                pack_at("gzip_open")
-                with tarfile.open(fileobj=bounded, mode="w:gz", format=tarfile.GNU_FORMAT) as archive:
+                pack_at("xz_open" if xz else "gzip_open")
+                codec = {"preset": 6} if xz else {}
+                with tarfile.open(fileobj=bounded, mode="w:xz" if xz else "w:gz",
+                                  format=tarfile.GNU_FORMAT, **codec) as archive:
                     try:
                         pack_at("metadata_encode")
                         raw = (json.dumps(handoff, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -690,7 +747,7 @@ def pack_handoff(temp, handoff, inventories, material):
                         pack_failed(error)
                         raise
                     finally:
-                        pack_at("gzip_finish")
+                        pack_at("xz_finish" if xz else "gzip_finish")
                 pack_at("output_flush")
                 stream.flush()
                 pack_at("output_sync")
@@ -1024,7 +1081,7 @@ def stage(args, plan, temp, material):
     for name, root in all_roots.items():
         file_rows, dirs = scan_tree(material, root)
         inventories[root.name] = {"role": name, "files": list(file_rows.values()), "directories": sorted(dirs)}
-    handoff = {"schema": "morpheus-native-linux-handoff-v2", "pipeline_plan_sha256": args.plan_sha256,
+    handoff = {"schema": LINUX_XZ_SCHEMA, "pipeline_plan_sha256": args.plan_sha256,
         "source_run_id": os.environ["GITHUB_RUN_ID"], "source_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
         "source_commit": os.environ["GITHUB_SHA"], "roots": inventories,
         "build_admission_granted": False, "native_sources_complete": False,
@@ -1139,7 +1196,7 @@ def restore(args, temp, material, *, mac_target=None):
     deduplicate = False
     # The compressed bytes are admitted before parsing. Only exact regular
     # members from its bounded complete manifest can be copied, never links.
-    with gzip_tar(archive) as source:
+    with handoff_tar(archive) as (source, codec):
         for number, member in enumerate(source):
             need(number <= MAX_MEMBERS and not member.pax_headers and not member.issparse())
             if number == 0:
@@ -1151,9 +1208,10 @@ def restore(args, temp, material, *, mac_target=None):
                     raw.extend(block)
                 need(stream.read(1) == b"" and len(raw) == member.size)
                 header = json.loads(raw)
-                schemas = (("morpheus-native-linux-handoff-v1", "morpheus-native-linux-handoff-v2")
+                schemas = (("morpheus-native-linux-handoff-v1", "morpheus-native-linux-handoff-v2", LINUX_XZ_SCHEMA)
                            if mac_target is None else ("morpheus-native-macos-handoff-v1",))
                 need(header["schema"] in schemas
+                     and (header["schema"] == LINUX_XZ_SCHEMA) == (codec == "xz")
                      and header["pipeline_plan_sha256"] == args.plan_sha256
                      and header["build_admission_granted"] is False
                      and header["native_sources_complete"] is False
@@ -1176,7 +1234,7 @@ def restore(args, temp, material, *, mac_target=None):
                         need(full not in expected); expected[full] = row
                 need(len(expected) + len(dirs) <= MAX_MEMBERS
                      and sum(row["bytes"] for row in expected.values()) <= MAX_EXPANDED)
-                deduplicate = header["schema"] == "morpheus-native-linux-handoff-v2"
+                deduplicate = header["schema"] in ("morpheus-native-linux-handoff-v2", LINUX_XZ_SCHEMA)
                 if deduplicate:
                     # Canonical content lives at its first lexical declared path.
                     # The archive cannot choose an alias target or filesystem link.
