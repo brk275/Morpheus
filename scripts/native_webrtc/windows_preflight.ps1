@@ -115,6 +115,143 @@ function New-HostComparisonInvoker([Delegate] $TypeCall, [Delegate] $InfoCall) {
     return $method.CreateDelegate([Func[Delegate, Delegate, IntPtr, IntPtr, byte[], object, bool, int]])
 }
 
+# Complete unbound initial identity read/decoding, not a cached native fact.
+# Return a fresh literal-equivalent six-field Hashtable, or boxed closed status:
+# 1=type,2=identity,3=reparse,4=unsupported Invoke metadata (old path, no read yet).
+function New-HostInitialInvoker([Delegate] $TypeCall, [Delegate] $InfoCall) {
+    $typeMethod = $TypeCall.GetType().GetMethod('Invoke')
+    $infoMethod = $InfoCall.GetType().GetMethod('Invoke')
+    $method = [Reflection.Emit.DynamicMethod]::new('ReadInitialHostIdentity', [object],
+        [Type[]]@([Delegate], [Delegate], [IntPtr], [IntPtr], [byte[]]))
+    $il = $method.GetILGenerator(); $typeOk = $il.DefineLabel(); $infoOk = $il.DefineLabel()
+    $clean = $il.DefineLabel(); $unsupported = $il.DefineLabel()
+    $attributes = $il.DeclareLocal([uint32]); $result = $il.DeclareLocal([Collections.Hashtable])
+    $asPSObject = [Management.Automation.PSObject].GetMethod('AsPSObject', [Type[]]@([object]))
+    $getMembers = [Management.Automation.PSObject].GetMethod('get_Members', [Type[]]@())
+    $collection = [Management.Automation.PSMemberInfoCollection[Management.Automation.PSMemberInfo]]
+    $getMember = $collection.GetMethod('get_Item', [Type[]]@([string]))
+    # Preserve same-object ETS Invoke probes too: no native call precedes fallback.
+    foreach ($argument in @(0, 1)) {
+        $il.Emit([Reflection.Emit.OpCodes]::Ldarg, [short]$argument)
+        $il.Emit([Reflection.Emit.OpCodes]::Call, $asPSObject)
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMembers)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldstr, 'Invoke')
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMember)
+        $il.Emit([Reflection.Emit.OpCodes]::Isinst, [Management.Automation.PSMethod])
+        $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $unsupported)
+    }
+    $copy = [Runtime.InteropServices.Marshal].GetMethod('Copy', [Type[]]@([IntPtr], [byte[]], [int], [int]))
+    $u32 = [BitConverter].GetMethod('ToUInt32', [Type[]]@([byte[]], [int]))
+    $hex = [Convert].GetMethod('ToHexString', [Type[]]@([byte[]], [int], [int]))
+    $concat = [string].GetMethod('Concat', [Type[]]@([string], [string]))
+    $comparer = [StringComparer].GetMethod('get_OrdinalIgnoreCase', [Type[]]@())
+    $ctor = [Collections.Hashtable].GetConstructor([Type[]]@([int], [Collections.IEqualityComparer]))
+    $add = [Collections.Hashtable].GetMethod('Add', [Type[]]@([object], [object]))
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Castclass, $TypeCall.GetType())
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $typeMethod)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_1)
+    $il.Emit([Reflection.Emit.OpCodes]::Beq, $typeOk)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_1)
+    $il.Emit([Reflection.Emit.OpCodes]::Box, [int])
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($typeOk)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_1)
+    $il.Emit([Reflection.Emit.OpCodes]::Castclass, $InfoCall.GetType())
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_3)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $infoMethod)
+    $il.Emit([Reflection.Emit.OpCodes]::Brtrue, $infoOk)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_2)
+    $il.Emit([Reflection.Emit.OpCodes]::Box, [int])
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($infoOk)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_3)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]52)
+    $il.Emit([Reflection.Emit.OpCodes]::Call, $copy)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Call, $u32)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $attributes)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $attributes)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]0x400)
+    $il.Emit([Reflection.Emit.OpCodes]::And)
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $clean)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_3)
+    $il.Emit([Reflection.Emit.OpCodes]::Box, [int])
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($clean)
+    # Exactly PowerShell's six-entry literal capacity and OrdinalIgnoreCase comparer.
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_6)
+    $il.Emit([Reflection.Emit.OpCodes]::Call, $comparer)
+    $il.Emit([Reflection.Emit.OpCodes]::Newobj, $ctor)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $result)
+    foreach ($field in @('attributes', 'directory', 'bytes', 'write', 'links', 'identity')) {
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $result)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldstr, $field)
+        switch ($field) {
+            'attributes' {
+                $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $attributes)
+                $il.Emit([Reflection.Emit.OpCodes]::Box, [uint32]); break
+            }
+            'directory' {
+                $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $attributes)
+                $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]0x10)
+                $il.Emit([Reflection.Emit.OpCodes]::And)
+                $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+                $il.Emit([Reflection.Emit.OpCodes]::Cgt_Un)
+                $il.Emit([Reflection.Emit.OpCodes]::Box, [bool]); break
+            }
+            'bytes' {
+                $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+                $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]32)
+                $il.Emit([Reflection.Emit.OpCodes]::Call, $u32)
+                $il.Emit([Reflection.Emit.OpCodes]::Conv_U8)
+                $il.Emit([Reflection.Emit.OpCodes]::Ldc_I8, [long]4294967296)
+                $il.Emit([Reflection.Emit.OpCodes]::Mul)
+                $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+                $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]36)
+                $il.Emit([Reflection.Emit.OpCodes]::Call, $u32)
+                $il.Emit([Reflection.Emit.OpCodes]::Conv_U8)
+                $il.Emit([Reflection.Emit.OpCodes]::Add)
+                $il.Emit([Reflection.Emit.OpCodes]::Box, [uint64]); break
+            }
+            'write' {
+                $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+                $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]20)
+                $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_8)
+                $il.Emit([Reflection.Emit.OpCodes]::Call, $hex); break
+            }
+            'links' {
+                $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+                $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]40)
+                $il.Emit([Reflection.Emit.OpCodes]::Call, $u32)
+                $il.Emit([Reflection.Emit.OpCodes]::Box, [uint32]); break
+            }
+            'identity' {
+                foreach ($span in @(@(28, 4), @(44, 8))) {
+                    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_S, [byte]4)
+                    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]$span[0])
+                    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]$span[1])
+                    $il.Emit([Reflection.Emit.OpCodes]::Call, $hex)
+                }
+                $il.Emit([Reflection.Emit.OpCodes]::Call, $concat); break
+            }
+        }
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $add)
+    }
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $result)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($unsupported)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_4)
+    $il.Emit([Reflection.Emit.OpCodes]::Box, [int])
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    return $method.CreateDelegate([Func[Delegate, Delegate, IntPtr, IntPtr, byte[], object]])
+}
+
 # Collapse the cached root-to-leaf comparison loop into the managed runtime.
 # Each entry is read live, never a retained native fact or handle/Expected copy.
 # 0=all checked; 1..4=the existing comparison status; -(index+1)=resume the
@@ -230,6 +367,123 @@ function New-HostChainInvoker([Delegate] $ComparisonCall) {
     $il.Emit([Reflection.Emit.OpCodes]::Not)
     $il.Emit([Reflection.Emit.OpCodes]::Ret)
     return $method.CreateDelegate([Func[object[], Delegate, Delegate, Delegate, IntPtr, byte[], int]])
+}
+
+# Evaluate the COMPLETE existing per-file hash admission in managed code.
+# This is pure owner/type/ETS metadata work: no Value/getter, FS or native read.
+# Unsupported/probed state returns false and uses the original admission below.
+function New-HostHashAdmissionInvoker {
+    $method = [Reflection.Emit.DynamicMethod]::new('AdmitHostHashOwners', [bool], [Type[]]@([object[]]))
+    $il = $method.GetILGenerator(); $no = $il.DefineLabel(); $textDone = $il.DefineLabel()
+    $limits = $il.DeclareLocal([Collections.Hashtable]); $value = $il.DeclareLocal([object])
+    $zeroSpan = $il.DeclareLocal([TimeSpan])
+    $asPSObject = [Management.Automation.PSObject].GetMethod('AsPSObject', [Type[]]@([object]))
+    $getMembers = [Management.Automation.PSObject].GetMethod('get_Members', [Type[]]@())
+    $collection = [Management.Automation.PSMemberInfoCollection[Management.Automation.PSMemberInfo]]
+    $limitMembers = $il.DeclareLocal($collection)
+    $getMember = $collection.GetMethod('get_Item', [Type[]]@([string]))
+    $item = [Collections.Hashtable].GetMethod('get_Item', [Type[]]@([object]))
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $no)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldlen)
+    $il.Emit([Reflection.Emit.OpCodes]::Conv_I4)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]20)
+    $il.Emit([Reflection.Emit.OpCodes]::Bne_Un, $no)
+    # Same invoker and three function owners; exact limits and handles owners.
+    foreach ($pair in @(@(0, 1), @(2, 3), @(4, 5), @(6, 7), @(8, 9), @(10, 11))) {
+        foreach ($offset in $pair) {
+            $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+            $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]$offset)
+            $il.Emit([Reflection.Emit.OpCodes]::Ldelem_Ref)
+        }
+        $il.Emit([Reflection.Emit.OpCodes]::Bne_Un, $no)
+    }
+    foreach ($typed in @(@(0, [Delegate]), @(12, [Diagnostics.Stopwatch]), @(13, [byte[]]),
+        @(10, [Collections.Generic.List[IntPtr]]), @(14, [int]), @(15, [uint64]), @(16, [int]))) {
+        $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]$typed[0])
+        $il.Emit([Reflection.Emit.OpCodes]::Ldelem_Ref)
+        $il.Emit([Reflection.Emit.OpCodes]::Isinst, [Type]$typed[1])
+        $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $no)
+    }
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_8)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldelem_Ref)
+    $il.Emit([Reflection.Emit.OpCodes]::Isinst, [Collections.Hashtable])
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $limits)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $limits)
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $no)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $limits)
+    $il.Emit([Reflection.Emit.OpCodes]::Call, $asPSObject)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMembers)
+    $il.Emit([Reflection.Emit.OpCodes]::Stloc, $limitMembers)
+    foreach ($key in @('Seconds', 'Entries', 'TotalBytes', 'Handles', 'MetadataBytes')) {
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $limitMembers)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldstr, $key)
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMember)
+        $il.Emit([Reflection.Emit.OpCodes]::Brtrue, $no)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $limits)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldstr, $key)
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $item)
+        if ($key -ceq 'TotalBytes') {
+            $il.Emit([Reflection.Emit.OpCodes]::Stloc, $value)
+            $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $value)
+            $il.Emit([Reflection.Emit.OpCodes]::Isinst, [long])
+            $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $no)
+            $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $value)
+            $il.Emit([Reflection.Emit.OpCodes]::Unbox_Any, [long])
+            $il.Emit([Reflection.Emit.OpCodes]::Ldc_I8, [long]0)
+            $il.Emit([Reflection.Emit.OpCodes]::Blt, $no)
+        } else {
+            $il.Emit([Reflection.Emit.OpCodes]::Isinst, [int])
+            $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $no)
+        }
+    }
+    # Metadata-only ordinary properties/methods, including global TypeData.
+    $checks = @(@(12, 'Elapsed', [Management.Automation.PSProperty]),
+        @(-1, 'TotalSeconds', [Management.Automation.PSProperty]),
+        @(13, 'Length', [Management.Automation.PSProperty]),
+        @(10, 'Count', [Management.Automation.PSProperty]),
+        @(17, 'Read', [Management.Automation.PSMethod]),
+        @(18, 'TransformBlock', [Management.Automation.PSMethod]),
+        @(18, 'TransformFinalBlock', [Management.Automation.PSMethod]))
+    foreach ($check in $checks) {
+        if ($check[0] -eq -1) {
+            $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $zeroSpan)
+            $il.Emit([Reflection.Emit.OpCodes]::Box, [TimeSpan])
+        } else {
+            $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+            $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]$check[0])
+            $il.Emit([Reflection.Emit.OpCodes]::Ldelem_Ref)
+        }
+        $il.Emit([Reflection.Emit.OpCodes]::Call, $asPSObject)
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMembers)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldstr, [string]$check[1])
+        $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMember)
+        $il.Emit([Reflection.Emit.OpCodes]::Isinst, [Type]$check[2])
+        $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $no)
+    }
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]19)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldelem_Ref)
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $textDone)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]19)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldelem_Ref)
+    $il.Emit([Reflection.Emit.OpCodes]::Call, $asPSObject)
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMembers)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldstr, 'Write')
+    $il.Emit([Reflection.Emit.OpCodes]::Callvirt, $getMember)
+    $il.Emit([Reflection.Emit.OpCodes]::Isinst, [Management.Automation.PSMethod])
+    $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $no)
+    $il.MarkLabel($textDone)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_1)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    $il.MarkLabel($no)
+    $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+    $il.Emit([Reflection.Emit.OpCodes]::Ret)
+    return $method.CreateDelegate([Func[object[], bool]])
 }
 
 # Own the complete synchronous 1MiB payload-read/hash loop in managed code.
@@ -528,12 +782,18 @@ function Initialize-HostReader {
     $script:HostPreflightBudgetCause = 'unknown'
     $script:HostPreflightWork = 'idle'
     $script:HostManagedHashes = 0
+    $script:HostManagedAdmissions = 0
+    $script:HostManagedInitialInfos = 0
     $script:HostInfoMemory = [IntPtr]::Zero
     $script:HostInfoScratch = $null
     $script:HostInfoBusy = $false
     $script:HostComparisonInvoker = $null
     $script:HostComparisonType = $null
     $script:HostComparisonInfo = $null
+    $script:HostInitialInvoker = $null
+    $script:HostInitialInvokerOwner = $null
+    $script:HostHashAdmissionInvoker = $null
+    $script:HostHashAdmissionOwner = $null
     $script:HostChainInvoker = $null
     $script:HostChainInvokerOwner = $null
     $script:HostChainComparison = $null
@@ -566,6 +826,8 @@ function Initialize-HostReader {
     $script:HostLastDirectoryPath = $null
     $script:HostLastDirectoryChain = $null
     $script:HostDirectoryChainLimit = 512
+    $script:HostHashAdmissionInvoker = New-HostHashAdmissionInvoker
+    $script:HostHashAdmissionOwner = $script:HostHashAdmissionInvoker
     $script:HostHashInvoker = New-HostHashInvoker
     $script:HostHashInvokerOwner = $script:HostHashInvoker
     $script:HostHashBudgetOwner = ${function:Assert-HostBudget}
@@ -587,6 +849,8 @@ function Initialize-HostReader {
     $script:HostComparisonInvoker = New-HostComparisonInvoker $script:HostType $script:HostInfo
     $script:HostComparisonType = $script:HostType
     $script:HostComparisonInfo = $script:HostInfo
+    $script:HostInitialInvoker = New-HostInitialInvoker $script:HostType $script:HostInfo
+    $script:HostInitialInvokerOwner = $script:HostInitialInvoker
     $script:HostChainInvoker = New-HostChainInvoker $script:HostComparisonInvoker
     $script:HostChainInvokerOwner = $script:HostChainInvoker
     $script:HostChainComparison = $script:HostComparisonInvoker
@@ -693,7 +957,8 @@ function Get-HostHandleInfo([IntPtr] $Handle, $Expected, [bool] $Content = $fals
     if ($script:HostInfoBusy -or $script:HostInfoMemory -eq [IntPtr]::Zero) { throw 'identity' }
     $script:HostInfoBusy = $true
     try {
-        if ($PSBoundParameters.ContainsKey('Expected') -and $null -ne $script:HostComparisonInvoker -and
+        $hasExpected = $PSBoundParameters.ContainsKey('Expected')
+        if ($hasExpected -and $null -ne $script:HostComparisonInvoker -and
             [object]::ReferenceEquals($script:HostType, $script:HostComparisonType) -and
             [object]::ReferenceEquals($script:HostInfo, $script:HostComparisonInfo)) {
             $status = $script:HostComparisonInvoker.Invoke($script:HostType, $script:HostInfo,
@@ -704,6 +969,24 @@ function Get-HostHandleInfo([IntPtr] $Handle, $Expected, [bool] $Content = $fals
                 2 { throw 'identity' }
                 3 { throw 'reparse' }
                 4 { throw 'changed' }
+                default { throw 'identity' }
+            }
+        }
+        if (-not $hasExpected -and $script:HostInitialInvoker -is [Delegate] -and
+            [object]::ReferenceEquals($script:HostInitialInvoker, $script:HostInitialInvokerOwner) -and
+            [object]::ReferenceEquals($script:HostType, $script:HostComparisonType) -and
+            [object]::ReferenceEquals($script:HostInfo, $script:HostComparisonInfo)) {
+            $initial = $script:HostInitialInvoker.Invoke($script:HostType, $script:HostInfo,
+                $Handle, $script:HostInfoMemory, $script:HostInfoScratch)
+            if ($initial -is [Collections.Hashtable]) {
+                if ($script:HostManagedInitialInfos -lt 200000) { $script:HostManagedInitialInfos++ }
+                return $initial
+            }
+            switch ($initial) {
+                1 { throw 'type' }
+                2 { throw 'identity' }
+                3 { throw 'reparse' }
+                4 { break } # Getter/method probe: no native call occurred yet.
                 default { throw 'identity' }
             }
         }
@@ -860,43 +1143,59 @@ function Get-HostFileFact([string] $LiteralPath, [int] $TextLimit = 0, [uint64] 
     try {
         $script:HostPreflightWork = 'file_hash'
         $limits = $script:HostLimits
-        $managed = $script:HostHashInvoker -is [Delegate] -and
-            [object]::ReferenceEquals($script:HostHashInvoker, $script:HostHashInvokerOwner) -and
-            [object]::ReferenceEquals(${function:Assert-HostBudget}, $script:HostHashBudgetOwner) -and
-            [object]::ReferenceEquals(${function:Open-HostReadHandle}, $script:HostHashOpenOwner) -and
-            [object]::ReferenceEquals(${function:Get-HostHandleInfo}, $script:HostHashInfoOwner) -and
-            [object]::ReferenceEquals($limits, $script:HostHashLimitsOwner) -and
-            [object]::ReferenceEquals($script:HostHandles, $script:HostHashHandlesOwner) -and
-            $script:HostWatch -is [Diagnostics.Stopwatch] -and
-            $buffer -is [byte[]] -and $script:HostHandles -is [Collections.Generic.List[IntPtr]] -and
-            $script:HostCount -is [int] -and $script:HostBytes -is [uint64] -and
-            $script:HostMetadataBytes -is [int]
-        # A fixed owner has plain numeric limits. ETS shadows or a probe's
-        # alternative number/clock semantics retain the original loop below.
-        if ($managed) {
-            $limitMembers = $limits.PSObject.Members
-            foreach ($key in @('Seconds', 'Entries', 'TotalBytes', 'Handles', 'MetadataBytes')) {
-                if ($null -ne $limitMembers[$key]) { $managed = $false; break }
+        $managed = $false
+        if ($script:HostHashAdmissionInvoker -is [Delegate] -and
+            [object]::ReferenceEquals($script:HostHashAdmissionInvoker, $script:HostHashAdmissionOwner)) {
+            # Fixed twenty-slot state, no member Value/property evaluation.
+            $admissionState = [object[]]@($script:HostHashInvoker, $script:HostHashInvokerOwner,
+                ${function:Assert-HostBudget}, $script:HostHashBudgetOwner,
+                ${function:Open-HostReadHandle}, $script:HostHashOpenOwner,
+                ${function:Get-HostHandleInfo}, $script:HostHashInfoOwner,
+                $limits, $script:HostHashLimitsOwner, $script:HostHandles, $script:HostHashHandlesOwner,
+                $script:HostWatch, $buffer, $script:HostCount, $script:HostBytes,
+                $script:HostMetadataBytes, $stream, $digest, $text)
+            $managed = $script:HostHashAdmissionInvoker.Invoke($admissionState)
+            if ($managed -and $script:HostManagedAdmissions -lt 200000) { $script:HostManagedAdmissions++ }
+        }
+        if (-not $managed) {
+            $managed = $script:HostHashInvoker -is [Delegate] -and
+                [object]::ReferenceEquals($script:HostHashInvoker, $script:HostHashInvokerOwner) -and
+                [object]::ReferenceEquals(${function:Assert-HostBudget}, $script:HostHashBudgetOwner) -and
+                [object]::ReferenceEquals(${function:Open-HostReadHandle}, $script:HostHashOpenOwner) -and
+                [object]::ReferenceEquals(${function:Get-HostHandleInfo}, $script:HostHashInfoOwner) -and
+                [object]::ReferenceEquals($limits, $script:HostHashLimitsOwner) -and
+                [object]::ReferenceEquals($script:HostHandles, $script:HostHashHandlesOwner) -and
+                $script:HostWatch -is [Diagnostics.Stopwatch] -and
+                $buffer -is [byte[]] -and $script:HostHandles -is [Collections.Generic.List[IntPtr]] -and
+                $script:HostCount -is [int] -and $script:HostBytes -is [uint64] -and
+                $script:HostMetadataBytes -is [int]
+            # A fixed owner has plain numeric limits. ETS shadows or a probe's
+            # alternative number/clock semantics retain the original loop below.
+            if ($managed) {
+                $limitMembers = $limits.PSObject.Members
+                foreach ($key in @('Seconds', 'Entries', 'TotalBytes', 'Handles', 'MetadataBytes')) {
+                    if ($null -ne $limitMembers[$key]) { $managed = $false; break }
+                }
+                $clockMember = $script:HostWatch.PSObject.Members['Elapsed']
+                $secondsMember = ([TimeSpan]::Zero).PSObject.Members['TotalSeconds']
+                $bufferMember = $buffer.PSObject.Members['Length']
+                $handlesMember = $script:HostHandles.PSObject.Members['Count']
+                $readMember = $stream.PSObject.Members['Read']
+                $digestMembers = $digest.PSObject.Members
+                $blockMember = $digestMembers['TransformBlock']; $finalMember = $digestMembers['TransformFinalBlock']
+                $writeOrdinary = $null -eq $text -or
+                    $text.PSObject.Members['Write'] -is [Management.Automation.PSMethod]
+                if ($readMember -isnot [Management.Automation.PSMethod] -or
+                    $blockMember -isnot [Management.Automation.PSMethod] -or
+                    $finalMember -isnot [Management.Automation.PSMethod] -or -not $writeOrdinary -or
+                    $clockMember -isnot [Management.Automation.PSProperty] -or
+                    $secondsMember -isnot [Management.Automation.PSProperty] -or
+                    $bufferMember -isnot [Management.Automation.PSProperty] -or
+                    $handlesMember -isnot [Management.Automation.PSProperty] -or
+                    $limits['Seconds'] -isnot [int] -or $limits['Entries'] -isnot [int] -or
+                    $limits['TotalBytes'] -isnot [long] -or $limits['TotalBytes'] -lt 0 -or
+                    $limits['Handles'] -isnot [int] -or $limits['MetadataBytes'] -isnot [int]) { $managed = $false }
             }
-            $clockMember = $script:HostWatch.PSObject.Members['Elapsed']
-            $secondsMember = ([TimeSpan]::Zero).PSObject.Members['TotalSeconds']
-            $bufferMember = $buffer.PSObject.Members['Length']
-            $handlesMember = $script:HostHandles.PSObject.Members['Count']
-            $readMember = $stream.PSObject.Members['Read']
-            $digestMembers = $digest.PSObject.Members
-            $blockMember = $digestMembers['TransformBlock']; $finalMember = $digestMembers['TransformFinalBlock']
-            $writeOrdinary = $null -eq $text -or
-                $text.PSObject.Members['Write'] -is [Management.Automation.PSMethod]
-            if ($readMember -isnot [Management.Automation.PSMethod] -or
-                $blockMember -isnot [Management.Automation.PSMethod] -or
-                $finalMember -isnot [Management.Automation.PSMethod] -or -not $writeOrdinary -or
-                $clockMember -isnot [Management.Automation.PSProperty] -or
-                $secondsMember -isnot [Management.Automation.PSProperty] -or
-                $bufferMember -isnot [Management.Automation.PSProperty] -or
-                $handlesMember -isnot [Management.Automation.PSProperty] -or
-                $limits['Seconds'] -isnot [int] -or $limits['Entries'] -isnot [int] -or
-                $limits['TotalBytes'] -isnot [long] -or $limits['TotalBytes'] -lt 0 -or
-                $limits['Handles'] -isnot [int] -or $limits['MetadataBytes'] -isnot [int]) { $managed = $false }
         }
         $size = [uint64]0
         if ($managed) {
@@ -1036,6 +1335,10 @@ function Close-HostReader {
             $script:HostComparisonInvoker = $null
             $script:HostComparisonType = $null
             $script:HostComparisonInfo = $null
+            $script:HostInitialInvoker = $null
+            $script:HostInitialInvokerOwner = $null
+            $script:HostHashAdmissionInvoker = $null
+            $script:HostHashAdmissionOwner = $null
             $script:HostChainInvoker = $null
             $script:HostChainInvokerOwner = $null
             $script:HostChainComparison = $null

@@ -4168,7 +4168,7 @@ async fn assert_appearance_workspace_and_search(
                     std::ops::ControlFlow::Continue(())
                 }
             })
-            .is_break();
+            .is_some();
         if contains_row {
             result_viewports.push(item_bounds(&node));
         }
