@@ -223,6 +223,7 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                     window.set_saved_accounts(slint::ModelRc::new(slint::VecModel::from(vec![
                         super::SavedAccountItem {
                             id: "preview-casey".into(),
+                            avatar_slot: -1,
                             handle: "@casey:example.org".into(),
                             active: true,
                             removal_pending: false,
@@ -230,6 +231,7 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                         },
                         super::SavedAccountItem {
                             id: "preview-personal".into(),
+                            avatar_slot: -1,
                             handle: "@river:example.net".into(),
                             active: false,
                             removal_pending: false,
@@ -237,6 +239,7 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                         },
                         super::SavedAccountItem {
                             id: "preview-community".into(),
+                            avatar_slot: -1,
                             handle: "@workshop:example.org".into(),
                             active: false,
                             removal_pending: true,
@@ -294,12 +297,14 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                             name: "Workshop".into(),
                             initials: "W".into(),
                             accent: super::rgb(109, 180, 156),
+                            avatar_slot: -1,
                         },
                         super::SpaceItem {
                             id: "!preview-study:example.org".into(),
                             name: "Quiet Study and Shared Notes".into(),
                             initials: "QS".into(),
                             accent: super::rgb(135, 157, 208),
+                            avatar_slot: -1,
                         },
                     ])));
                     apply_config(&window, &terminal_sidebar, Some(&terminal_theme));

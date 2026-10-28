@@ -391,13 +391,20 @@ impl Config {
     /// scale and reduced motion.
     pub fn apply_style_preset(&mut self, preset: BuiltInStylePreset) {
         self.appearance.theme_pack = Some(preset.theme_name().into());
-        self.typography = Typography::default();
-        self.geometry = Geometry {
-            focus_width: self.geometry.focus_width,
-            ..Geometry::default()
-        };
-        self.chat = ChatStyle::default();
+        // Contrast changes only the palette/mode. Existing personal text,
+        // layout and geometry choices remain in place.
+        if preset != BuiltInStylePreset::Contrast {
+            self.typography = Typography::default();
+            self.geometry = Geometry {
+                focus_width: self.geometry.focus_width,
+                ..Geometry::default()
+            };
+            self.chat = ChatStyle::default();
+        }
         match preset {
+            BuiltInStylePreset::Contrast => {
+                self.appearance.theme = ThemeMode::HighContrast;
+            }
             BuiltInStylePreset::Nocturne => {
                 self.appearance.theme = ThemeMode::Dark;
                 self.appearance.font_family = "Inter".into();
@@ -1287,16 +1294,18 @@ pub enum BuiltInStylePreset {
     Nocturne,
     Terminal,
     Paper,
+    Contrast,
 }
 
 impl BuiltInStylePreset {
-    pub const ALL: [Self; 3] = [Self::Nocturne, Self::Terminal, Self::Paper];
+    pub const ALL: [Self; 4] = [Self::Nocturne, Self::Terminal, Self::Paper, Self::Contrast];
 
     pub fn theme_name(self) -> &'static str {
         match self {
             Self::Nocturne => "nocturne",
             Self::Terminal => "terminal",
             Self::Paper => "paper",
+            Self::Contrast => "contrast",
         }
     }
 
@@ -1305,6 +1314,7 @@ impl BuiltInStylePreset {
             Self::Nocturne => include_str!("../../../themes/nocturne.toml"),
             Self::Terminal => include_str!("../../../themes/terminal.toml"),
             Self::Paper => include_str!("../../../themes/paper.toml"),
+            Self::Contrast => include_str!("../../../themes/contrast.toml"),
         }
     }
 
@@ -2531,13 +2541,24 @@ pub struct ThemeRoles {
     /// Online-member status dot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_online: Option<String>,
+    /// Fallback avatar/account backgrounds in the original identity-slot order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_3: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_4: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_5: Option<String>,
     /// Initials drawn on avatar backgrounds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_ink: Option<String>,
 }
 
 impl ThemeRoles {
-    pub fn entries(&self) -> [(&'static str, Option<&str>); 25] {
+    pub fn entries(&self) -> [(&'static str, Option<&str>); 30] {
         [
             ("error", self.error.as_deref()),
             ("error_surface", self.error_surface.as_deref()),
@@ -2563,6 +2584,11 @@ impl ThemeRoles {
             ("shadow", self.shadow.as_deref()),
             ("media_backdrop", self.media_backdrop.as_deref()),
             ("presence_online", self.presence_online.as_deref()),
+            ("avatar_1", self.avatar_1.as_deref()),
+            ("avatar_2", self.avatar_2.as_deref()),
+            ("avatar_3", self.avatar_3.as_deref()),
+            ("avatar_4", self.avatar_4.as_deref()),
+            ("avatar_5", self.avatar_5.as_deref()),
             ("avatar_ink", self.avatar_ink.as_deref()),
         ]
     }
@@ -3610,6 +3636,29 @@ mod tests {
         assert_ne!(styles[0], styles[1]);
         assert_ne!(styles[1], styles[2]);
         assert_ne!(styles[0], styles[2]);
+        assert_eq!(
+            &BuiltInStylePreset::ALL[..3],
+            &[
+                BuiltInStylePreset::Nocturne,
+                BuiltInStylePreset::Terminal,
+                BuiltInStylePreset::Paper,
+            ]
+        );
+        let mut personal = original.clone();
+        personal.appearance.font_family = "Personal family".into();
+        personal.typography.message_size = 19;
+        personal.geometry.corner_radius = 17;
+        personal.chat.nickname_brackets = true;
+        personal.colors.insert("link".into(), "#123456".into());
+        let mut expected = personal.clone();
+        expected.appearance.theme = ThemeMode::HighContrast;
+        expected.appearance.theme_pack = Some("contrast".into());
+        personal.apply_style_preset(BuiltInStylePreset::Contrast);
+        assert_eq!(
+            personal, expected,
+            "Contrast changes only the palette and mode"
+        );
+        personal.validate().unwrap();
     }
 
     #[test]
@@ -3667,13 +3716,16 @@ mod tests {
         assert_eq!(partial.roles.timestamp, None);
         assert_eq!(partial.roles.own_surface, None);
         assert_eq!(partial.senders.colors, None);
+        for id in ["avatar_1", "avatar_2", "avatar_3", "avatar_4", "avatar_5"] {
+            assert_eq!(partial.roles.get(id), None);
+        }
         let message_roles = format!(
             "{encoded}\n[roles]\ntimestamp = '#A5AFBE'\nsender = '#E8EDF2'\nmessage = '#E8EDF2'\nown_message = '#F3F6FA'\nown_surface = '#20283A'\n"
         );
         let message_roles: ThemePack = toml::from_str(&message_roles).unwrap();
         message_roles.validate().unwrap();
         assert_eq!(message_roles.roles.own_surface.as_deref(), Some("#20283A"));
-        assert_eq!(message_roles.roles.entries().len(), 25);
+        assert_eq!(message_roles.roles.entries().len(), 30);
         for field in [
             "timestamp",
             "sender",
@@ -3688,6 +3740,35 @@ mod tests {
                 "{field} must be #RRGGBB or #RRGGBBAA"
             );
         }
+    }
+
+    #[test]
+    fn avatar_background_roles_are_optional_and_round_trip_with_alpha() {
+        let legacy: ThemePack =
+            toml::from_str(include_str!("../../../themes/aurora.toml")).unwrap();
+        let mut encoded = toml::to_string_pretty(&legacy).unwrap();
+        encoded.push_str("\n[roles]\n");
+        let colors = [
+            ("avatar_1", "#102030"),
+            ("avatar_2", "#40506080"),
+            ("avatar_3", "#70809000"),
+            ("avatar_4", "#aAbBcC"),
+            ("avatar_5", "#dDeEfFff"),
+        ];
+        for (id, value) in colors {
+            encoded.push_str(&format!("{id} = '{value}'\n"));
+        }
+        let theme: ThemePack = toml::from_str(&encoded).unwrap();
+        theme.validate().unwrap();
+        for (id, value) in colors {
+            assert_eq!(theme.roles.get(id), Some(value));
+        }
+        let round_trip = toml::to_string_pretty(&theme).unwrap();
+        let round_trip: ThemePack = toml::from_str(&round_trip).unwrap();
+        round_trip.validate().unwrap();
+        assert_eq!(round_trip, theme);
+        assert_eq!(round_trip.colors, legacy.colors);
+        assert!(round_trip.senders.is_empty());
     }
 
     #[test]
@@ -3713,6 +3794,8 @@ mod tests {
         }
         for extension in [
             "[roles]\nunknwon = '#123456'\n",
+            "[roles]\navatar_0 = '#123456'\n",
+            "[roles]\navatar_6 = '#123456'\n",
             "[senders]\ncolours = ['#123456']\n",
         ] {
             assert!(toml::from_str::<ThemePack>(&format!("{encoded}\n{extension}")).is_err());
@@ -3877,14 +3960,25 @@ mod tests {
     }
 
     #[test]
-    fn interaction_states_are_optional_validated_and_absent_from_shipped_presets() {
+    fn interaction_states_are_optional_validated_and_presets_keep_their_contracts() {
         let legacy: ThemePack =
             toml::from_str(include_str!("../../../themes/aurora.toml")).unwrap();
         let encoded = toml::to_string_pretty(&legacy).unwrap();
         assert!(!encoded.contains("[states]"));
-        // Presets keep their exact look: every state follows its color.
+        // The original presets keep their exact look; Contrast sets its states.
         for preset in BuiltInStylePreset::ALL {
-            assert!(preset.theme().unwrap().states.is_empty(), "{preset:?}");
+            let theme = preset.theme().unwrap();
+            if preset == BuiltInStylePreset::Contrast {
+                assert!(
+                    theme
+                        .states
+                        .entries()
+                        .iter()
+                        .all(|(_, value)| value.is_some())
+                );
+            } else {
+                assert!(theme.states.is_empty(), "{preset:?}");
+            }
         }
         // Every state is a registry token of the State source, and back.
         for (name, _) in ThemeStates::default().entries() {
@@ -4029,7 +4123,21 @@ mod tests {
         for preset in BuiltInStylePreset::ALL {
             let theme = preset.theme().unwrap();
             let roles = &theme.roles;
+            let text_minimum = if preset == BuiltInStylePreset::Contrast {
+                7.0
+            } else {
+                4.5
+            };
             assert!(roles.entries().iter().all(|(_, value)| value.is_some()));
+            for (id, expected) in [
+                ("avatar_1", "#A88CFF"),
+                ("avatar_2", "#78C8B1"),
+                ("avatar_3", "#F39F78"),
+                ("avatar_4", "#64A5E8"),
+                ("avatar_5", "#E78BA4"),
+            ] {
+                assert_eq!(roles.get(id), Some(expected));
+            }
             let surfaces = [
                 &theme.colors.rail,
                 &theme.colors.sidebar,
@@ -4040,7 +4148,12 @@ mod tests {
             ];
             for foreground in [&roles.error, &roles.success, &roles.link, &roles.voice] {
                 for background in surfaces {
-                    assert_contrast(&theme.name, foreground.as_deref().unwrap(), background, 4.5);
+                    assert_contrast(
+                        &theme.name,
+                        foreground.as_deref().unwrap(),
+                        background,
+                        text_minimum,
+                    );
                 }
             }
             // The online dot is a non-text indicator beside member names.
@@ -4063,7 +4176,7 @@ mod tests {
                     &theme.name,
                     foreground.as_deref().unwrap(),
                     background.as_deref().unwrap(),
-                    4.5,
+                    text_minimum,
                 );
             }
             for background in surfaces.into_iter().map(String::as_str).chain([
@@ -4090,7 +4203,56 @@ mod tests {
                     .map(String::as_str)
                     .chain([roles.own_surface.as_deref().unwrap()])
                 {
-                    assert_contrast(&theme.name, foreground.as_deref().unwrap(), background, 4.5);
+                    assert_contrast(
+                        &theme.name,
+                        foreground.as_deref().unwrap(),
+                        background,
+                        text_minimum,
+                    );
+                }
+            }
+            if preset == BuiltInStylePreset::Contrast {
+                for background in [
+                    theme.states.input_surface.as_deref().unwrap(),
+                    theme.states.composer_surface.as_deref().unwrap(),
+                    theme.states.control_hover.as_deref().unwrap(),
+                    theme.states.nav_hover.as_deref().unwrap(),
+                ] {
+                    assert_contrast(&theme.name, &theme.colors.ink, background, 7.0);
+                    assert_contrast(&theme.name, &theme.colors.muted, background, 7.0);
+                    assert_contrast(&theme.name, &theme.colors.divider, background, 3.0);
+                    assert_contrast(
+                        &theme.name,
+                        roles.focus.as_deref().unwrap(),
+                        background,
+                        3.0,
+                    );
+                }
+                assert_contrast(
+                    &theme.name,
+                    &theme.colors.accent_ink,
+                    &theme.colors.accent,
+                    7.0,
+                );
+                assert_contrast(
+                    &theme.name,
+                    roles.focus.as_deref().unwrap(),
+                    &theme.colors.accent,
+                    3.0,
+                );
+                for background in [
+                    &roles.avatar_1,
+                    &roles.avatar_2,
+                    &roles.avatar_3,
+                    &roles.avatar_4,
+                    &roles.avatar_5,
+                ] {
+                    assert_contrast(
+                        &theme.name,
+                        roles.avatar_ink.as_deref().unwrap(),
+                        background.as_deref().unwrap(),
+                        7.0,
+                    );
                 }
             }
             assert_ne!(roles.own_surface, Some(theme.colors.canvas.clone()));
@@ -4098,7 +4260,7 @@ mod tests {
                 &theme.name,
                 roles.voice.as_deref().unwrap(),
                 roles.selection.as_deref().unwrap(),
-                4.5,
+                text_minimum,
             );
             for foreground in theme.senders.colors.as_ref().unwrap() {
                 for background in [
@@ -4109,7 +4271,7 @@ mod tests {
                     roles.selection.as_deref().unwrap(),
                     roles.own_surface.as_deref().unwrap(),
                 ] {
-                    assert_contrast(&theme.name, foreground, background, 4.5);
+                    assert_contrast(&theme.name, foreground, background, text_minimum);
                 }
             }
         }
@@ -4389,6 +4551,11 @@ mod tests {
         for preset in BuiltInStylePreset::ALL {
             let mut reset = custom.clone();
             reset.apply_style_preset(preset);
+            if preset == BuiltInStylePreset::Contrast {
+                assert_eq!(reset.typography, custom.typography);
+                assert_eq!(reset.chat, custom.chat);
+                continue;
+            }
             assert_eq!(reset.typography.sender_weight, None);
             assert_eq!(reset.chat.timestamp_format, TimestampFormat::TwelveHour);
             assert!(!reset.chat.timestamp_brackets);
@@ -4446,6 +4613,9 @@ mod tests {
             ("canvas", "red"),
             ("canvas", "#1010100"),
             ("not_a_token", "#101010"),
+            ("avatar_1", "#1234"),
+            ("avatar_5", "private-invalid-avatar-color"),
+            ("avatar_6", "#101010"),
         ] {
             let mut bad = config.clone();
             bad.colors.insert(key.into(), value.into());
@@ -4833,6 +5003,11 @@ mod tests {
             themed.apply_style_preset(preset);
             themed.validate().unwrap();
             assert_eq!(themed.geometry.focus_width, 5, "{preset:?}");
+            if preset == BuiltInStylePreset::Contrast {
+                assert_eq!(themed.geometry, config.geometry);
+                assert_eq!(themed.typography, config.typography);
+                continue;
+            }
             assert_eq!(themed.geometry.icon_size, 18, "{preset:?}");
             assert_eq!(themed.geometry.control_radius, None, "{preset:?}");
             assert_eq!(themed.typography.composer_size, None, "{preset:?}");

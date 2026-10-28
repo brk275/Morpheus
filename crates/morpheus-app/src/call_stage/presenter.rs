@@ -18,7 +18,7 @@ use super::clear_stage;
 use crate::{
     AppWindow, CallParticipantItem, CallTileItem,
     calls::CallController,
-    live::{accent, initials},
+    live::{accent, avatar_slot, initials},
     video_render::{FRAME_SLOTS, StageLayout, TileMedium, TileState, TileView, VideoUpdate},
 };
 
@@ -330,6 +330,7 @@ fn tile_item(tile: &TileView) -> CallTileItem {
         },
         initials: initials(&tile.user_id).into(),
         accent: accent(&tile.user_id),
+        avatar_slot: avatar_slot(&tile.user_id),
         status: status(tile).into(),
         frame_slot: tile
             .frame_slot

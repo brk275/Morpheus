@@ -368,6 +368,11 @@ fn theme_projection(
             media_backdrop: role("media_backdrop"),
             presence_online: role("presence_online"),
             avatar_ink: role("avatar_ink"),
+            avatar_1: role("avatar_1"),
+            avatar_2: role("avatar_2"),
+            avatar_3: role("avatar_3"),
+            avatar_4: role("avatar_4"),
+            avatar_5: role("avatar_5"),
         },
         senders,
     )
@@ -425,7 +430,7 @@ fn transparency_status(percent: u8) -> &'static str {
 /// Stable identity token, independent of message text, palette length and theme.
 /// Use the existing avatar hash's polynomial with an explicit 64-bit width,
 /// then retain 31 bits so Slint's signed model index is always nonnegative.
-/// Avatar colors remain unchanged and are never used as the custom palette.
+/// Avatar backgrounds use separate live roles, never this custom name palette.
 pub(super) fn sender_palette_index(sender: &str) -> i32 {
     let hash = sender.bytes().fold(0u64, |current, byte| {
         current.wrapping_mul(31).wrapping_add(u64::from(byte))
@@ -940,7 +945,9 @@ mod theme_tests {
                 "accent": "#0A0A0A", "accent_ink": "#0B0B0B"
             },
             "roles": {"error": "#121314", "focus": "#212223", "selection_ink": "#313233",
-                      "own_surface": "#616263", "timestamp": "#717273"},
+                      "own_surface": "#616263", "timestamp": "#717273",
+                      "avatar_1": "#010203", "avatar_2": "#111213", "avatar_3": "#212223",
+                      "avatar_4": "#313233", "avatar_5": "#414243"},
             "senders": {"colors": ["#414243", "#515253"]}
         }))
         .unwrap();
@@ -951,6 +958,19 @@ mod theme_tests {
         );
         assert!(roles.error.present && roles.focus.present && roles.selection_ink.present);
         assert!(!roles.success.present);
+        for (role, value) in [
+            roles.avatar_1,
+            roles.avatar_2,
+            roles.avatar_3,
+            roles.avatar_4,
+            roles.avatar_5,
+        ]
+        .into_iter()
+        .zip(["#010203", "#111213", "#212223", "#313233", "#414243"])
+        {
+            assert!(role.present);
+            assert_eq!(role.color, color_from_hex(value));
+        }
         // Message-surface roles project individually; omitted ones stay absent
         // so the rows keep their previous ink, muted and transparent colors.
         assert!(roles.own_surface.present && roles.timestamp.present);

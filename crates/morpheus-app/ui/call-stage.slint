@@ -19,6 +19,7 @@ export struct CallTileItem {
     name: string,
     initials: string,
     accent: color,
+    avatar-slot: int,
     // Shown whenever the tile has no picture.
     status: string,
     // Index into the stage's frames, or -1 when nothing is decoded.
@@ -178,7 +179,8 @@ component StageTile inherits Rectangle {
                 height: root.avatar-size;
                 // Avatar roundness, when set, applies to call avatars too.
                 border-radius: StyleTokens.avatar-roundness >= 0 ? self.width * StyleTokens.avatar-roundness / 100 : self.width / 2;
-                background: root.tile.departed ? root.palette.hover : root.tile.accent;
+                background: root.tile.departed ? root.palette.hover
+                    : root.tile.avatar-slot >= 0 ? StyleTokens.avatar-color(root.tile.avatar-slot) : root.tile.accent;
                 Text {
                     text: root.tile.initials;
                     color: root.tile.departed ? root.palette.muted : root.palette.avatar-ink;

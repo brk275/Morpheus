@@ -39,6 +39,11 @@ scrim = "#25342F99"
 shadow = "#25342F33"
 media_backdrop = "#1F2724"
 presence_online = "#2E684A"
+avatar_1 = "#A88CFF"
+avatar_2 = "#78C8B1"
+avatar_3 = "#F39F78"
+avatar_4 = "#64A5E8"
+avatar_5 = "#E78BA4"
 avatar_ink = "#FFFFFF"
 
 [senders]
