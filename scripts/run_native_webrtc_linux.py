@@ -619,9 +619,11 @@ def scan_tree(material, root):
 
 
 def pack_handoff(temp, handoff, inventories, material):
-    """Original pack operations, with first-failure capture before cleanup."""
+    """Pack exact manifests; Linux v2 stores identical content once, never links."""
     global PACK_ACTIVE
     reset_pack_capture(True)
+    deduplicate = handoff["schema"] == "morpheus-native-linux-handoff-v2"
+    packed = set()
     try:
         pack_at("cache_absence")
         cache_dir = temp / "native-webrtc-handoff"
@@ -656,9 +658,17 @@ def pack_handoff(temp, handoff, inventories, material):
                                 info = tarfile.TarInfo(member); info.type = tarfile.DIRTYPE; info.mode = 0o700
                                 pack_at("directory_add")
                                 archive.addfile(info)
-                            for row in root_spec["files"]:
+                            rows = root_spec["files"]
+                            if deduplicate:
+                                rows = sorted(rows, key=lambda row: row["path"])
+                            for row in rows:
                                 pack_at("file_fact")
                                 material.file_fact(root / row["path"], row, row["mode"])
+                                if deduplicate:
+                                    identity = (row["sha256"], row["bytes"])
+                                    if identity in packed:
+                                        continue
+                                    packed.add(identity)
                                 pack_at("file_header")
                                 info = tarfile.TarInfo(name + "/" + row["path"])
                                 info.size, info.mode = row["bytes"], row["mode"]
@@ -1014,7 +1024,7 @@ def stage(args, plan, temp, material):
     for name, root in all_roots.items():
         file_rows, dirs = scan_tree(material, root)
         inventories[root.name] = {"role": name, "files": list(file_rows.values()), "directories": sorted(dirs)}
-    handoff = {"schema": "morpheus-native-linux-handoff-v1", "pipeline_plan_sha256": args.plan_sha256,
+    handoff = {"schema": "morpheus-native-linux-handoff-v2", "pipeline_plan_sha256": args.plan_sha256,
         "source_run_id": os.environ["GITHUB_RUN_ID"], "source_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
         "source_commit": os.environ["GITHUB_SHA"], "roots": inventories,
         "build_admission_granted": False, "native_sources_complete": False,
@@ -1083,6 +1093,40 @@ def cache_identity(args, material, after_save=False):
     return {key: value[key] for key in ("id", "key", "ref", "version", "size_in_bytes")}
 
 
+def copy_handoff_duplicate(source, destination, row, total, material):
+    """Recreate a declared v2 alias as a separate owned regular file, never a link."""
+    before = source.lstat()
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        source_stat = os.fstat(source_fd)
+        need(material.identity(source_stat) == material.identity(before)
+             and stat.S_ISREG(source_stat.st_mode) and source_stat.st_uid == os.geteuid()
+             and source_stat.st_nlink == 1 and source_stat.st_size == row["bytes"])
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            digest, count = hashlib.sha256(), 0
+            with os.fdopen(source_fd, "rb", closefd=False) as incoming, \
+                    os.fdopen(destination_fd, "wb", closefd=False) as outgoing:
+                while True:
+                    block = incoming.read(1024 * 1024)
+                    if not block:
+                        break
+                    count += len(block); total += len(block)
+                    need(count <= row["bytes"] and total <= MAX_EXPANDED)
+                    digest.update(block)
+                    need(outgoing.write(block) == len(block))
+                need(count == row["bytes"] and digest.hexdigest() == row["sha256"])
+                outgoing.flush(); os.fchmod(destination_fd, row["mode"]); os.fsync(destination_fd)
+            need(material.identity(os.fstat(source_fd)) == material.identity(source_stat)
+                 == material.identity(source.lstat()))
+        finally:
+            os.close(destination_fd)
+    finally:
+        os.close(source_fd)
+    return total
+
+
 def restore(args, temp, material, *, mac_target=None):
     need(mac_target is None or mac_target in ("mac-arm64", "mac-x64"))
     cache = cache_identity(args, material)
@@ -1091,6 +1135,8 @@ def restore(args, temp, material, *, mac_target=None):
     need(fact == {"sha256": args.handoff_sha256, "bytes": args.handoff_bytes}
          and fact["bytes"] <= MAX_HANDOFF)
     expected, dirs, header, seen, total = {}, {}, None, set(), 0
+    canonical, duplicate_targets = {}, {}
+    deduplicate = False
     # The compressed bytes are admitted before parsing. Only exact regular
     # members from its bounded complete manifest can be copied, never links.
     with gzip_tar(archive) as source:
@@ -1105,7 +1151,9 @@ def restore(args, temp, material, *, mac_target=None):
                     raw.extend(block)
                 need(stream.read(1) == b"" and len(raw) == member.size)
                 header = json.loads(raw)
-                need(header["schema"] == ("morpheus-native-linux-handoff-v1" if mac_target is None else "morpheus-native-macos-handoff-v1")
+                schemas = (("morpheus-native-linux-handoff-v1", "morpheus-native-linux-handoff-v2")
+                           if mac_target is None else ("morpheus-native-macos-handoff-v1",))
+                need(header["schema"] in schemas
                      and header["pipeline_plan_sha256"] == args.plan_sha256
                      and header["build_admission_granted"] is False
                      and header["native_sources_complete"] is False
@@ -1128,6 +1176,19 @@ def restore(args, temp, material, *, mac_target=None):
                         need(full not in expected); expected[full] = row
                 need(len(expected) + len(dirs) <= MAX_MEMBERS
                      and sum(row["bytes"] for row in expected.values()) <= MAX_EXPANDED)
+                deduplicate = header["schema"] == "morpheus-native-linux-handoff-v2"
+                if deduplicate:
+                    # Canonical content lives at its first lexical declared path.
+                    # The archive cannot choose an alias target or filesystem link.
+                    for name, row in sorted(expected.items()):
+                        need(type(row["bytes"]) is int and 0 <= row["bytes"] <= MAX_EXPANDED
+                             and type(row["sha256"]) is str and HEX.fullmatch(row["sha256"])
+                             and type(row["mode"]) is int and row["mode"] in
+                             (0o400, 0o444, 0o500, 0o555, 0o600, 0o644, 0o700, 0o755))
+                        identity = (row["sha256"], row["bytes"])
+                        first = canonical.setdefault(identity, name)
+                        if first != name:
+                            duplicate_targets.setdefault(first, []).append(name)
                 for name in sorted(dirs, key=lambda x: (x.count("/"), x)):
                     need(name not in expected and ((temp / name).parent == temp or
                          (temp / name).parent.is_dir()))
@@ -1140,6 +1201,8 @@ def restore(args, temp, material, *, mac_target=None):
                 continue
             need(member.isfile() and member.name in expected)
             row = expected[member.name]
+            if deduplicate:
+                need(canonical[(row["sha256"], row["bytes"])] == member.name)
             need(member.size == row["bytes"] and member.mode == row["mode"])
             stream = source.extractfile(member); need(stream is not None)
             destination = temp / member.name
@@ -1157,6 +1220,11 @@ def restore(args, temp, material, *, mac_target=None):
                     out.flush(); os.fchmod(fd, row["mode"]); os.fsync(fd)
             finally:
                 os.close(fd)
+            if deduplicate:
+                for alias in duplicate_targets.get(member.name, ()):
+                    need(alias not in seen)
+                    total = copy_handoff_duplicate(destination, temp / alias, expected[alias], total, material)
+                    seen.add(alias)
     need(seen == set(expected) | set(dirs))
     for name, spec in header["roots"].items():
         material.topology(temp / name, {r["path"]: r for r in spec["files"]}, set(spec["directories"]))
