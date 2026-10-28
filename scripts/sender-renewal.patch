@@ -16,7 +16,7 @@
  
  /**
   * Create a promise that will resolve once a mocked method is called.
-@@ -1472,6 +1475,203 @@
+@@ -1472,6 +1475,200 @@
              });
          });
  
@@ -175,20 +175,17 @@
 +                expect(manager.status).toBe(Status.Connected);
 +            });
 +
-+            it(
-+                "refreshes a returning active participation without treating content refreshes as arrivals",
-+                async () => {
-+                    const { manager, own } = await joined();
-+                    await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
-+                    await vi.advanceTimersByTimeAsync(250);
-+                    await manager.onRTCSessionMemberUpdate([own]);
-+                    await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
-+                    await vi.advanceTimersByTimeAsync(4999);
-+                    expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
-+                    await vi.advanceTimersByTimeAsync(1);
-+                    expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(3);
-+                },
-+            );
++            it("refreshes a returning active participation without treating content refreshes as arrivals", async () => {
++                const { manager, own } = await joined();
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(250);
++                await manager.onRTCSessionMemberUpdate([own]);
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(4999);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++                await vi.advanceTimersByTimeAsync(1);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(3);
++            });
 +
 +            it("preserves an in-flight delayed-leave restart and its subsequent maintenance", async () => {
 +                const { manager, own } = await joined();
@@ -252,7 +249,7 @@
  
      SendJoinEvent = "SendJoinEvent",
      //  -> MembershipActionType.SendJoinEvent if we run into a rate limit and need to retry
-@@ -206,6 +212,125 @@
+@@ -206,6 +212,122 @@
      implements IMembershipManager
  {
      private activated = false;
@@ -282,10 +279,7 @@
 +        }
 +        this.peerRefreshScheduled = true;
 +        this.scheduler.requestMembershipRefresh(
-+            Math.max(
-+                Date.now() + PEER_REFRESH_DEBOUNCE_MS,
-+                this.lastPeerRefreshAttempt + PEER_REFRESH_MIN_INTERVAL_MS,
-+            ),
++            Math.max(Date.now() + PEER_REFRESH_DEBOUNCE_MS, this.lastPeerRefreshAttempt + PEER_REFRESH_MIN_INTERVAL_MS),
 +        );
 +    }
 +
@@ -378,7 +372,7 @@
      private readonly logger: Logger;
      protected callIntent: RTCCallIntent | undefined;
      protected applicationData: Record<string, unknown> | undefined;
-@@ -232,6 +357,7 @@
+@@ -232,6 +354,7 @@
              this.logger.error("MembershipManager is already running. Ignoring join request.");
              return;
          }
@@ -386,7 +380,7 @@
          this.publishedTransports = publishedTransports;
          this.leavePromiseResolvers = undefined;
          this.activated = true;
-@@ -247,6 +373,7 @@
+@@ -247,6 +370,7 @@
              .finally(() => {
                  // Should already be set to false when calling `leave` in non error cases.
                  this.activated = false;
@@ -394,7 +388,7 @@
                  // Here the scheduler is not running anymore so we the `membershipLoopHandler` is not called to emit.
                  if (this.oldStatus && this.oldStatus !== this.status) {
                      this.emit(MembershipManagerEvent.StatusChanged, this.oldStatus, this.status);
-@@ -275,6 +402,7 @@
+@@ -275,6 +399,7 @@
              // reset scheduled actions so we will not do any new actions.
              this.leavePromiseResolvers = Promise.withResolvers<boolean>();
              this.activated = false;
@@ -402,7 +396,7 @@
              this.scheduler.initiateLeave();
              if (timeout) setTimeout(() => this.leavePromiseResolvers?.resolve(false), timeout);
          }
-@@ -289,6 +417,8 @@
+@@ -289,6 +414,8 @@
          }
  
          this._ownMembership = memberships.find((m) => isMyMembership(m, this.userId, this.deviceId));
@@ -411,7 +405,7 @@
  
          if (!this._ownMembership) {
              // If one of these actions are scheduled or are getting inserted in the next iteration, we should already
-@@ -307,6 +437,7 @@
+@@ -307,6 +434,7 @@
                  );
              } else {
                  // Only react to our own membership missing if we have not already scheduled sending a new membership DirectMembershipManagerAction.Join
@@ -419,7 +413,7 @@
                  this.scheduler.initiateJoin();
              }
          }
-@@ -344,7 +475,7 @@
+@@ -344,7 +472,7 @@
       */
      public constructor(
          private readonly joinConfig: (SessionConfig & MembershipConfig) | undefined,
@@ -428,7 +422,7 @@
          protected readonly client: MembershipManagerClient,
          public readonly slotDescription: SlotDescription,
          parentLogger?: Logger,
-@@ -480,6 +611,9 @@
+@@ -480,6 +608,9 @@
                  } else {
                      return createInsertActionUpdate(MembershipActionType.SendLeaveEvent);
                  }
@@ -438,7 +432,7 @@
              }
              case MembershipActionType.SendJoinEvent: {
                  return this.sendJoinEvent();
-@@ -734,17 +868,25 @@
+@@ -734,17 +865,25 @@
          );
      };
  
@@ -466,7 +460,7 @@
                  // A successful (re-)join is a fresh membership: failures accumulated by the previous one
                  // (e.g. delayed event restarts that timed out before the server sent our leave) must not carry over.
                  this.state.networkErrorRetries.clear();
-@@ -757,7 +899,9 @@
+@@ -757,7 +896,9 @@
                  const actionsWithoutUpdateExpiry = this.scheduler.actions.filter(
                      (a) =>
                          a.type !== MembershipActionType.UpdateExpiry && // A new UpdateExpiry action with an updated will be scheduled,
@@ -477,7 +471,7 @@
                  );
                  return {
                      replace: [
-@@ -772,7 +916,7 @@
+@@ -772,7 +913,7 @@
                  };
              })
              .catch((e) => {
@@ -486,7 +480,7 @@
                  if (update) return update;
                  throw e;
              });
-@@ -1195,7 +1339,7 @@
+@@ -1195,7 +1336,7 @@
      }
  
      public get status(): Status {
@@ -495,7 +489,7 @@
          if (actions.length === 1) {
              const { type } = actions[0];
              switch (type) {
-@@ -1253,9 +1397,13 @@
+@@ -1253,9 +1394,13 @@
   * rather than state events.
   */
  export class StickyEventMembershipManager extends MembershipManager {

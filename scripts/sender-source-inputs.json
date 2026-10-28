@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "proposal_binding_sha256": "c7a07393a0e7c9d4be267763c112615b9b052d9d02692c3dbe1b311f0b998da8",
-  "proposal_sha256": "d34f174eee84b33d0e1d7c417f74c38d481f17cdec4c88eac875b72477156b19",
+  "proposal_binding_sha256": "ecaa473204d6f746e0bf3cc1003cde91b461ee0ee683de190ce9f7b5cd3d6f00",
+  "proposal_sha256": "cc8e316c77ebc086f3f400cca15a02392cebbe0014411ac086f9a3fada858a98",
   "source": {
     "url": "https://codeload.github.com/matrix-org/matrix-js-sdk/tar.gz/fa4772a4ddd335a5a8bfbf8bb21df49b70f7a999",
     "bytes": 3194146,
@@ -2452,8 +2452,8 @@
   "proposal_files": {
     "spec/unit/matrixrtc/MembershipManager.spec.ts": {
       "before_sha256": "f6196f5d19115c16a61daba760d2dc2ea4357d16a2d9fbe1d892d45e5f4e76fc",
-      "after_sha256": "8b5d9273efbd98eaea16e90da315b860eb8f733fb9edbb969114ae507a3bd187",
-      "after_bytes": 94217
+      "after_sha256": "efe42a999c414cb94e0ad6058402febcf4843c294d65d4900c3ef54a8c548a67",
+      "after_bytes": 94130
     },
     "spec/unit/matrixrtc/mocks.ts": {
       "before_sha256": "b14ad040fa37e5cba74d2f7e1022ac0bfb0805f846dd6a8e3e15856e5567f405",
@@ -2462,8 +2462,8 @@
     },
     "src/matrixrtc/MembershipManager.ts": {
       "before_sha256": "75c8517b4216c84073c579026dd8bfdef8c49892b8b9a69a8ad1be64c8ed7340",
-      "after_sha256": "8cd46d12836cfedab684c813e6e58096cc4a512062b94e4e614db0bb42325a7c",
-      "after_bytes": 74401
+      "after_sha256": "2c610c022a11dcd69c6c664e21313ca105fbf253c78d0ef7ac6e0a4108977f5e",
+      "after_bytes": 74354
     },
     "src/matrixrtc/MembershipManagerActionScheduler.ts": {
       "before_sha256": "3a4ef26cc897253e2498bb593d008485ee5aa98f33793660f892003f13ae9628",

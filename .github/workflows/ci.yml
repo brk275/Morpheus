@@ -18,7 +18,7 @@ jobs:
       github.event.repository.private == false &&
       github.ref == 'refs/heads/codex/diagnostic-sender-renewal-20261028' &&
       github.actor == 'brk275' && github.triggering_actor == 'brk275' &&
-      inputs.admission_sha256 == '640333f5128511503cb4cc73b624fd2cc149132eb2f6b0dbb17c8c9f20d6b298'
+      inputs.admission_sha256 == '8db6f6ffa6b03e214bbb16cb97d266543c9a47d42295138f0527e771f2ba7274'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

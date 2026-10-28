@@ -2,7 +2,6 @@
 """Temporary owner-admitted upstream source check. Never a stock/beta gate."""
 from pathlib import Path, PurePosixPath
 import argparse
-import difflib
 import hashlib
 import json
 import os
@@ -20,7 +19,7 @@ import urllib.request
 MAX_DOWNLOAD = 128 * 1024 * 1024
 MAX_LOG = 8 * 1024 * 1024
 SOURCE_PREFIX = "matrix-js-sdk-fa4772a4ddd335a5a8bfbf8bb21df49b70f7a999"
-PROPOSAL = "d34f174eee84b33d0e1d7c417f74c38d481f17cdec4c88eac875b72477156b19"
+PROPOSAL = "cc8e316c77ebc086f3f400cca15a02392cebbe0014411ac086f9a3fada858a98"
 
 
 def need(value):
@@ -181,7 +180,7 @@ def apply_patch(tree, patch, files):
     need(seen == set(files))
 
 
-def checked_command(name, arguments, cwd, environment, root, scanner, seconds, allow_failure=False):
+def checked_command(name, arguments, cwd, environment, root, scanner, seconds):
     print(json.dumps({"sender_stage": name, "status": "started"}), flush=True)
     logs = root / name
     logs.mkdir(mode=0o700)
@@ -230,8 +229,7 @@ def checked_command(name, arguments, cwd, environment, root, scanner, seconds, a
     if status:
         # Only a bounded, independently scanned tail is exposed on failure.
         sys.stdout.write(log.read_text(errors="replace")[-65536:])
-    need(status == 0 or allow_failure)
-    return status
+    need(status == 0)
 
 
 def main():
@@ -287,41 +285,7 @@ def main():
         str(local_store), "--reporter", "append-only"], tree, environment, root, args.scanner, 300)
     need(regular(tree / "pnpm-lock.yaml", 512 * 1024) == lock)
     paths = list(inputs["proposal_files"])
-    format_status = checked_command("format", [pnpm, "exec", "oxfmt", "--check", *paths],
-                                    tree, environment, root, args.scanner, 120, allow_failure=True)
-    if format_status:
-        # A formatter-only capture in the disposable source tree never admits
-        # the resulting source to lint, typecheck or tests in this job.
-        before_format = {name: regular(tree / name, 4 * 1024 * 1024) for name in paths}
-        for name, data in before_format.items():
-            need(digest(data) == inputs["proposal_files"][name]["after_sha256"])
-        checked_command("format_capture", [pnpm, "exec", "oxfmt", *paths],
-                        tree, environment, root, args.scanner, 120)
-        after_format = {name: regular(tree / name, 4 * 1024 * 1024) for name in paths}
-        capture = root / "format-source-diff"
-        capture.mkdir(mode=0o700)
-        delta = "".join(line for name in paths for line in difflib.unified_diff(
-            before_format[name].decode().splitlines(keepends=True),
-            after_format[name].decode().splitlines(keepends=True),
-            fromfile="a/" + name, tofile="b/" + name)).encode()
-        need(0 < len(delta) <= 2 * 1024 * 1024)
-        write(capture / "format.patch", delta)
-        hashes = [{"path": name, "before_sha256": digest(before_format[name]),
-                   "after_sha256": digest(after_format[name]), "after_bytes": len(after_format[name])}
-                  for name in paths]
-        write(capture / "hashes.json", (json.dumps(hashes, sort_keys=True) + "\n").encode())
-        report = root / "format-source-diff-scan.json"
-        scan = subprocess.run([str(args.scanner), "dir", str(capture), "--config", str(root / "scanner.toml"),
-            "--gitleaks-ignore-path", str(root / "scanner.ignore"), "--ignore-gitleaks-allow", "--redact=100",
-            "--max-target-megabytes", "0", "--report-format", "json", "--report-path", str(report), "--no-banner"],
-            cwd=root, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
-        need(scan.returncode == 0 and json.loads(report.read_text()) == [])
-        print(json.dumps({"sender_format_capture": "scanned", "diff_bytes": len(delta),
-                          "diff_sha256": digest(delta), "files": hashes, "findings": 0}), flush=True)
-        print("MORPHEUS_FORMAT_DIFF_BEGIN", flush=True)
-        sys.stdout.write(delta.decode())
-        print("MORPHEUS_FORMAT_DIFF_END", flush=True)
-        raise RuntimeError("formatting")
+    checked_command("format", [pnpm, "exec", "oxfmt", "--check", *paths], tree, environment, root, args.scanner, 120)
     checked_command("lint", [pnpm, "exec", "oxlint", *paths], tree, environment, root, args.scanner, 120)
     checked_command("typecheck", [pnpm, "run", "lint:types"], tree, environment, root, args.scanner, 600)
     checked_command("manager_session_tests", [pnpm, "exec", "vitest", "run", "--environment=node", "--no-api",
