@@ -121,6 +121,25 @@ function New-HostComparisonInvoker([Delegate] $TypeCall, [Delegate] $InfoCall) {
 # this preserves its Regex cache/culture and PowerShell comparison semantics.
 function New-HostCanonicalInvoker {
     $e = [Linq.Expressions.Expression]
+    # Select exact public signatures once. PowerShell must not choose among
+    # collection/params overloads or Return's Type/Expression alternatives.
+    # These delegates build only the fixed graph below; no input is compiled.
+    $expressions = [Collections.Generic.IEnumerable[Linq.Expressions.Expression]]
+    $parameters = [Collections.Generic.IEnumerable[Linq.Expressions.ParameterExpression]]
+    $new = $e.GetMethod('New', [Type[]]@([Reflection.ConstructorInfo], $expressions)).CreateDelegate(
+        [Func[Reflection.ConstructorInfo, Collections.Generic.IEnumerable[Linq.Expressions.Expression], Linq.Expressions.NewExpression]])
+    $returnValue = $e.GetMethod('Return', [Type[]]@([Linq.Expressions.LabelTarget], [Linq.Expressions.Expression])).CreateDelegate(
+        [Func[Linq.Expressions.LabelTarget, Linq.Expressions.Expression, Linq.Expressions.GotoExpression]])
+    $staticCall = $e.GetMethod('Call', [Type[]]@([Reflection.MethodInfo], $expressions)).CreateDelegate(
+        [Func[Reflection.MethodInfo, Collections.Generic.IEnumerable[Linq.Expressions.Expression], Linq.Expressions.MethodCallExpression]])
+    $instanceCall = $e.GetMethod('Call', [Type[]]@([Linq.Expressions.Expression], [Reflection.MethodInfo], $expressions)).CreateDelegate(
+        [Func[Linq.Expressions.Expression, Reflection.MethodInfo, Collections.Generic.IEnumerable[Linq.Expressions.Expression], Linq.Expressions.MethodCallExpression]])
+    $block = $e.GetMethod('Block', [Type[]]@($expressions)).CreateDelegate(
+        [Func[Collections.Generic.IEnumerable[Linq.Expressions.Expression], Linq.Expressions.BlockExpression]])
+    $variableBlock = $e.GetMethod('Block', [Type[]]@($parameters, $expressions)).CreateDelegate(
+        [Func[Collections.Generic.IEnumerable[Linq.Expressions.ParameterExpression], Collections.Generic.IEnumerable[Linq.Expressions.Expression], Linq.Expressions.BlockExpression]])
+    $lambda = $e.GetMethod('Lambda', [Type[]]@([Type], [Linq.Expressions.Expression], $parameters)).CreateDelegate(
+        [Func[Type, Linq.Expressions.Expression, Collections.Generic.IEnumerable[Linq.Expressions.ParameterExpression], Linq.Expressions.LambdaExpression]])
     $resultType = [ValueTuple[string, int]]
     $resultCtor = $resultType.GetConstructor([Type[]]@([string], [int]))
     $value = $e::Parameter([string], 'value')
@@ -134,8 +153,8 @@ function New-HostCanonicalInvoker {
     $nullString = $e::Constant($null, [string])
     $refused = @{}
     foreach ($code in @(-1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)) {
-        $refused[$code] = $e::Return($finish,
-            $e::New($resultCtor, [Linq.Expressions.Expression[]]@($nullString, $e::Constant([int]$code))))
+        $refused[$code] = $returnValue.Invoke($finish,
+            $new.Invoke($resultCtor, [Linq.Expressions.Expression[]]@($nullString, $e::Constant([int]$code))))
     }
     $empty = [string].GetMethod('IsNullOrEmpty', [Type[]]@([string]))
     $charAt = [string].GetMethod('get_Chars', [Type[]]@([int]))
@@ -157,52 +176,52 @@ function New-HostCanonicalInvoker {
     $isMatch = [Text.RegularExpressions.Regex].GetMethod('IsMatch', [Type[]]@([string]))
     $length = $e::Property($value, 'Length')
     $partObject = $e::Convert($part, [object])
-    $partEmpty = $e::Call($psEquals, [Linq.Expressions.Expression[]]@(
+    $partEmpty = $staticCall.Invoke($psEquals, [Linq.Expressions.Expression[]]@(
         $partObject, $e::Constant('', [object]), $ignoreCase))
-    $dot = $e::Call($psEquals, [Linq.Expressions.Expression[]]@(
+    $dot = $staticCall.Invoke($psEquals, [Linq.Expressions.Expression[]]@(
         $partObject, $e::Constant('.', [object]), $ignoreCase))
-    $dotDot = $e::Call($psEquals, [Linq.Expressions.Expression[]]@(
+    $dotDot = $staticCall.Invoke($psEquals, [Linq.Expressions.Expression[]]@(
         $partObject, $e::Constant('..', [object]), $ignoreCase))
-    $git = $e::Call($psEquals, [Linq.Expressions.Expression[]]@(
+    $git = $staticCall.Invoke($psEquals, [Linq.Expressions.Expression[]]@(
         $partObject, $e::Constant('.git', [object]), $ignoreCase))
-    $trimmedFull = $e::Call($full, $trimEnd, [Linq.Expressions.Expression[]]@($slash))
-    $trimmedValue = $e::Call($value, $trimEnd, [Linq.Expressions.Expression[]]@($slash))
-    $normalized = $e::Call($psEquals, [Linq.Expressions.Expression[]]@(
+    $trimmedFull = $instanceCall.Invoke($full, $trimEnd, [Linq.Expressions.Expression[]]@($slash))
+    $trimmedValue = $instanceCall.Invoke($value, $trimEnd, [Linq.Expressions.Expression[]]@($slash))
+    $normalized = $staticCall.Invoke($psEquals, [Linq.Expressions.Expression[]]@(
         $e::Convert($trimmedFull, [object]), $e::Convert($trimmedValue, [object]), $caseSensitive))
-    $componentChecks = $e::Block([Linq.Expressions.Expression[]]@(
+    $componentChecks = $block.Invoke([Linq.Expressions.Expression[]]@(
         $e::IfThen($partEmpty, $refused[8]),
         $e::IfThen($e::OrElse($dot, $dotDot), $refused[9]),
-        $e::IfThen($e::Call($part, $endsWith, [Linq.Expressions.Expression[]]@($e::Constant('.'))), $refused[10]),
-        $e::IfThen($e::Call($part, $endsWith, [Linq.Expressions.Expression[]]@($e::Constant(' '))), $refused[11]),
-        $e::IfThen($e::Call($e::Constant($device), $isMatch, [Linq.Expressions.Expression[]]@($part)), $refused[12]),
+        $e::IfThen($instanceCall.Invoke($part, $endsWith, [Linq.Expressions.Expression[]]@($e::Constant('.'))), $refused[10]),
+        $e::IfThen($instanceCall.Invoke($part, $endsWith, [Linq.Expressions.Expression[]]@($e::Constant(' '))), $refused[11]),
+        $e::IfThen($instanceCall.Invoke($e::Constant($device), $isMatch, [Linq.Expressions.Expression[]]@($part)), $refused[12]),
         $e::IfThen($git, $refused[13]), $e::Empty()))
     $asciiLoop = $e::Loop($e::IfThenElse($e::LessThan($index, $length),
-        $e::Block([Linq.Expressions.Expression[]]@(
+        $block.Invoke([Linq.Expressions.Expression[]]@(
             $e::IfThen($e::GreaterThan($e::Convert(
-                $e::Call($value, $charAt, [Linq.Expressions.Expression[]]@($index)), [int]), $e::Constant([int]127)), $refused[-1]),
+                $instanceCall.Invoke($value, $charAt, [Linq.Expressions.Expression[]]@($index)), [int]), $e::Constant([int]127)), $refused[-1]),
             $e::PostIncrementAssign($index), $e::Empty())), $e::Break($asciiDone)), $asciiDone)
     $componentLoop = $e::Loop($e::IfThenElse($e::LessThan($index, $e::ArrayLength($parts)),
-        $e::Block([Linq.Expressions.Expression[]]@(
+        $block.Invoke([Linq.Expressions.Expression[]]@(
             $e::Assign($part, $e::ArrayIndex($parts, $index)),
             $e::IfThen($e::Not($e::AndAlso($partEmpty, $e::Equal($length, $e::Constant([int]3)))), $componentChecks),
             $e::PostIncrementAssign($index), $e::Empty())), $e::Break($partsDone)), $partsDone)
-    $body = $e::Block([Linq.Expressions.ParameterExpression[]]@($full, $parts, $part, $index),
+    $body = $variableBlock.Invoke([Linq.Expressions.ParameterExpression[]]@($full, $parts, $part, $index),
         [Linq.Expressions.Expression[]]@(
-            $e::IfThen($e::Call($empty, [Linq.Expressions.Expression[]]@($value)), $refused[1]),
+            $e::IfThen($staticCall.Invoke($empty, [Linq.Expressions.Expression[]]@($value)), $refused[1]),
             $e::IfThen($e::GreaterThan($length, $e::Constant([int]1024)), $refused[2]),
             $e::Assign($index, $zero), $asciiLoop,
-            $e::IfThen($e::Not($e::Call($e::Constant($drive), $isMatch, [Linq.Expressions.Expression[]]@($value))), $refused[3]),
-            $e::IfThen($e::Call($e::Call($value, $substring, [Linq.Expressions.Expression[]]@($e::Constant([int]2))),
+            $e::IfThen($e::Not($instanceCall.Invoke($e::Constant($drive), $isMatch, [Linq.Expressions.Expression[]]@($value))), $refused[3]),
+            $e::IfThen($instanceCall.Invoke($instanceCall.Invoke($value, $substring, [Linq.Expressions.Expression[]]@($e::Constant([int]2))),
                 $contains, [Linq.Expressions.Expression[]]@($e::Constant(':'))), $refused[4]),
-            $e::IfThen($e::Call($value, $contains, [Linq.Expressions.Expression[]]@($e::Constant('/'))), $refused[5]),
-            $e::IfThen($e::Call($e::Constant($invalid), $isMatch, [Linq.Expressions.Expression[]]@($value)), $refused[6]),
-            $e::Assign($full, $e::Call($getFullPath, [Linq.Expressions.Expression[]]@($value))),
+            $e::IfThen($instanceCall.Invoke($value, $contains, [Linq.Expressions.Expression[]]@($e::Constant('/'))), $refused[5]),
+            $e::IfThen($instanceCall.Invoke($e::Constant($invalid), $isMatch, [Linq.Expressions.Expression[]]@($value)), $refused[6]),
+            $e::Assign($full, $staticCall.Invoke($getFullPath, [Linq.Expressions.Expression[]]@($value))),
             $e::IfThen($e::Not($normalized), $refused[7]),
-            $e::Assign($parts, $e::Call($e::Call($value, $substring, [Linq.Expressions.Expression[]]@($e::Constant([int]3))),
+            $e::Assign($parts, $instanceCall.Invoke($instanceCall.Invoke($value, $substring, [Linq.Expressions.Expression[]]@($e::Constant([int]3))),
                 $split, [Linq.Expressions.Expression[]]@($slash, $e::Constant([StringSplitOptions]::None)))),
             $e::Assign($index, $zero), $componentLoop,
-            $e::Label($finish, $e::New($resultCtor, [Linq.Expressions.Expression[]]@($full, $zero)))))
-    return $e::Lambda([Func[string, ValueTuple[string, int]]], $body,
+            $e::Label($finish, $new.Invoke($resultCtor, [Linq.Expressions.Expression[]]@($full, $zero)))))
+    return $lambda.Invoke([Func[string, ValueTuple[string, int]]], $body,
         [Linq.Expressions.ParameterExpression[]]@($value)).Compile()
 }
 
