@@ -1218,12 +1218,14 @@ try {
     $ownedMemory = $script:HostInfoMemory
     $ownedScratch = $script:HostInfoScratch
     $ownedMemo = $script:HostCanonicalPaths
+    $ownedCanonical = $script:HostCanonicalInvoker
     if ($ownedMemory -eq [IntPtr]::Zero -or $ownedScratch.Length -ne 52 -or
         $script:HostCanonicalEntryLimit -ne 8192 -or $script:HostCanonicalUnitLimit -ne 1048576 -or
         $script:HostDirectoryChainLimit -ne 512 -or $null -ne $script:HostLastDirectoryPath -or
         $null -ne $script:HostLastDirectoryChain) { throw 'identity' }
-    # Count actual lexical validations, not a mock result. Exact repeats alone
-    # may hit; case-distinct inputs and every refused input reach the old body.
+    if ($ownedCanonical -isnot [Delegate]) { throw 'identity' }
+    # Count actual compiled or original lexical validations, never mock results.
+    # Exact repeats alone may hit; full-cache misses still validate every time.
     $script:OriginalCanonicalValidator = ${function:Get-CanonicalHostPath}
     $script:CanonicalValidationCount = 0
     $originalEntryLimit = $script:HostCanonicalEntryLimit
@@ -1233,7 +1235,15 @@ try {
         $script:CanonicalValidationCount++
         & $script:OriginalCanonicalValidator $Value
     }
+    $canonicalProbe = [pscustomobject]@{ Delegate = $ownedCanonical }
+    $canonicalProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
+        param([string] $Value)
+        $validated = $this.Delegate.Invoke($Value)
+        if ($validated.Item2 -ne -1) { $script:CanonicalValidationCount++ }
+        return $validated
+    }
     try {
+        $script:HostCanonicalInvoker = $canonicalProbe
         $first = Join-Path $root 'MemoCase'
         $differentCase = Join-Path $root 'memocase'
         $beforeCount = $ownedMemo.Count
@@ -1271,7 +1281,69 @@ try {
         if ((Get-HostCanonicalPath $third) -cne $third -or $ownedMemo.Count -ne 1 -or
             $script:CanonicalValidationCount -ne $beforeValidation + 2) { throw 'identity' }
     } finally {
+        $script:HostCanonicalInvoker = $ownedCanonical
         Set-Item -Path Function:Get-CanonicalHostPath -Value $script:OriginalCanonicalValidator
+        $script:HostCanonicalEntryLimit = $originalEntryLimit
+        $script:HostCanonicalUnitLimit = $originalUnitLimit
+        $ownedMemo.Clear(); $script:HostCanonicalUnits = 0
+    }
+    # The actual compiled entry must preserve original results and first errors.
+    # Unicode stays on the exact original body, including cached Regex culture.
+    $lexicalProbe = [pscustomobject]@{ Delegate = $ownedCanonical; Calls = 0; Status = 0 }
+    $lexicalProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
+        param([string] $Value)
+        $this.Calls++
+        $result = $this.Delegate.Invoke($Value)
+        $this.Status = $result.Item2
+        return $result
+    }
+    $priorCulture = [Threading.Thread]::CurrentThread.CurrentCulture
+    $lexicalCases = @('', $null, 'C:\', 'c:\normal\name.h', 'relative/:bad',
+        'C:\x:stream/*', 'C:\bad/name*', ('C:\bad' + [char]0 + 'name'),
+        'C:\part.', 'C:\part ', 'C:\.git', 'C:\.GIT', 'C:\CON', 'C:\nul.txt',
+        'C:\com1', 'C:\LPT9.txt', 'C:\COM0', 'C:\COM10', 'C:\CONx',
+        'C:\.\name', 'C:\..\name', 'C:\\name', 'C:\name\',
+        ('C:\' + ('x' * 1021)), ('C:\' + ('x' * 1022)),
+        ('C:\caf' + [char]0xe9 + '\name.h'),
+        ('C:\cafe' + [char]0x301 + '\name.h'),
+        ('C:\.gi' + [char]0xad + 't'),
+        ('C:\.g' + [char]0x131 + 't'),
+        ('C:\' + [char]0x130 + '\name.h'),
+        ([string][char]0x212a + ':\name.h'),
+        ('C:\name.' + [char]0x200b), ('C:\' + [char]0xd800 + '.h'))
+    try {
+        $script:HostCanonicalInvoker = $lexicalProbe
+        $script:HostCanonicalEntryLimit = 0
+        $script:HostCanonicalUnitLimit = 0
+        foreach ($culture in @('en-US', 'tr-TR', 'ja-JP')) {
+            [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo($culture)
+            foreach ($candidate in $lexicalCases) {
+                $expectedPath = $null; $expectedError = ''; $expectedType = ''
+                try { $expectedPath = Get-CanonicalHostPath $candidate } catch {
+                    $problem = $_.Exception
+                    while ($null -ne $problem.InnerException) { $problem = $problem.InnerException }
+                    $expectedError = $problem.Message; $expectedType = $problem.GetType().FullName
+                }
+                $beforeCalls = $lexicalProbe.Calls
+                $actualPath = $null; $actualError = ''; $actualType = ''
+                try { $actualPath = Get-HostCanonicalPath $candidate } catch {
+                    $problem = $_.Exception
+                    while ($null -ne $problem.InnerException) { $problem = $problem.InnerException }
+                    $actualError = $problem.Message; $actualType = $problem.GetType().FullName
+                }
+                if ($lexicalProbe.Calls -ne $beforeCalls + 1 -or
+                    -not [string]::Equals($expectedPath, $actualPath, [StringComparison]::Ordinal) -or
+                    -not [string]::Equals($expectedError, $actualError, [StringComparison]::Ordinal) -or
+                    $expectedType -cne $actualType) { throw 'identity' }
+                if ($candidate -ceq 'c:\normal\name.h' -and $lexicalProbe.Status -ne 0) { throw 'identity' }
+                if ($null -ne $candidate -and $candidate.Contains([string][char]0xe9) -and
+                    $lexicalProbe.Status -ne -1) { throw 'identity' }
+            }
+        }
+        if ($ownedMemo.Count -ne 0 -or $script:HostCanonicalUnits -ne 0) { throw 'identity' }
+    } finally {
+        [Threading.Thread]::CurrentThread.CurrentCulture = $priorCulture
+        $script:HostCanonicalInvoker = $ownedCanonical
         $script:HostCanonicalEntryLimit = $originalEntryLimit
         $script:HostCanonicalUnitLimit = $originalUnitLimit
         $ownedMemo.Clear(); $script:HostCanonicalUnits = 0
@@ -1553,7 +1625,8 @@ try {
         Must-Refuse { Get-HostHandleInfo $script:HostFileRecords[0].handle }
         Must-Refuse { Get-HostHandleInfo $comparisonRecord.handle $comparisonRecord.comparison $true }
         Must-Refuse { Close-HostReader }
-        if (-not [object]::ReferenceEquals($originalComparison, $script:HostComparisonInvoker) -or
+        if (-not [object]::ReferenceEquals($ownedCanonical, $script:HostCanonicalInvoker) -or
+            -not [object]::ReferenceEquals($originalComparison, $script:HostComparisonInvoker) -or
             -not [object]::ReferenceEquals($originalType, $script:HostComparisonType) -or
             -not [object]::ReferenceEquals($originalInfo, $script:HostComparisonInfo)) { throw 'identity' }
         if ($script:HostInfoMemory -ne $ownedMemory -or
@@ -1568,7 +1641,8 @@ try {
 if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
     $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
     $null -ne $script:HostComparisonInfo -or
-    $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
+    $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
+        $script:HostCanonicalUnits -ne 0 -or
     $ownedMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
     $null -ne $script:HostLastDirectoryChain -or @($ownedDirectoryChain | Where-Object { $null -ne $_ }).Count -ne 0) { throw 'identity' }
 # Cleanup remains idempotent; no freed metadata pointer or lexical owner is reused.
@@ -1595,7 +1669,8 @@ try {
         $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
         $null -ne $script:HostComparisonInfo -or
         $script:HostInfoBusy -or $script:HostHandles.Count -ne 0 -or
-        $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
+        $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
+        $script:HostCanonicalUnits -ne 0 -or
         $failedMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
         $null -ne $script:HostLastDirectoryChain) { throw 'identity' }
 } finally { $env:SystemRoot = $originalSystemRoot }
@@ -1693,7 +1768,8 @@ try {
         $script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
         $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
         $null -ne $script:HostComparisonInfo -or
-        $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
+        $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
+        $script:HostCanonicalUnits -ne 0 -or
         $exceptionMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
         $null -ne $script:HostLastDirectoryChain -or @($exceptionChain | Where-Object { $null -ne $_ }).Count -ne 0) { throw 'identity' }
     # Remaining retained handles are still owned, and second cleanup attempts
@@ -1706,7 +1782,7 @@ try {
     if ($closeProbe.Calls.Count -ne $ownedHandleCount -or $script:HostHandles.Count -ne 0 -or
         $script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
         $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
-        $null -ne $script:HostComparisonInfo -or
+        $null -ne $script:HostComparisonInfo -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostInfoBusy) { throw 'identity' }
     Close-HostReader
     if ($closeProbe.Calls.Count -ne $ownedHandleCount) { throw 'identity' }
