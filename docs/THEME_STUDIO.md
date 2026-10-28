@@ -99,13 +99,14 @@ another account.
 
 ## Starting points, variations and style profiles
 
-- The **starting points** Nocturne, Terminal and Paper, and their
+- The **starting points** Nocturne, Terminal, Paper and Contrast, and their
   **variations**, fill in ordinary editable settings. The variations are
   Nocturne Compact, Nocturne Large Print, Terminal Soft, Paper Wide and
   Contrast Reading, which uses the built-in high-contrast colors. In Settings
   a choice is drafted, so you see it before you apply it. Neither changes text
   size, Reduce motion, the focus ring, accounts, notifications, shortcuts or
-  devices.
+  devices. Contrast changes only the theme pack and high-contrast mode; your
+  fonts, layout, geometry and personal color overrides remain in place.
 - **Style profiles** are named local looks you can save, preview, import and
   export as small TOML files; see [style profiles](STYLE_PROFILES.md).
   - A profile preview and a draft exclude each other: apply or discard the

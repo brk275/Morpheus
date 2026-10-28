@@ -35,6 +35,11 @@ export struct ThemeRoleSet {
     media-backdrop: ColorRole,
     presence-online: ColorRole,
     avatar-ink: ColorRole,
+    avatar-1: ColorRole,
+    avatar-2: ColorRole,
+    avatar-3: ColorRole,
+    avatar-4: ColorRole,
+    avatar-5: ColorRole,
 }
 
 // Optional interaction states. An absent state keeps the color it follows,
@@ -82,6 +87,15 @@ export struct BaseColorSet {
 export global StyleTokens {
     in-out property <length> radius: 10px;
     in-out property <ThemeRoleSet> roles;
+    // Stable model slots select live colors; no timeline/model rebuild is
+    // needed when a theme or account/room override changes these roles.
+    public pure function avatar-color(slot: int) -> color {
+        if slot == 1 { return StyleTokens.roles.avatar-2.present ? StyleTokens.roles.avatar-2.color : #78c8b1; }
+        if slot == 2 { return StyleTokens.roles.avatar-3.present ? StyleTokens.roles.avatar-3.color : #f39f78; }
+        if slot == 3 { return StyleTokens.roles.avatar-4.present ? StyleTokens.roles.avatar-4.color : #64a5e8; }
+        if slot == 4 { return StyleTokens.roles.avatar-5.present ? StyleTokens.roles.avatar-5.color : #e78ba4; }
+        return StyleTokens.roles.avatar-1.present ? StyleTokens.roles.avatar-1.color : #a88cff;
+    }
     in-out property <ThemeStateSet> states;
     in-out property <BaseColorSet> base;
     // Share of each window surface's own alpha that is painted, 0 to 1.

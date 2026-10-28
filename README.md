@@ -15,7 +15,7 @@ for implemented features and remaining work.
 
 ## Make it yours
 
-Start with **Nocturne**, **Terminal** or **Paper**, then change the details:
+Start with **Nocturne**, **Terminal**, **Paper** or **Contrast**, then change the details:
 
 - **Typography** — separate fonts for the interface, messages and code.
 - **Messages** — stacked, compact or nickname-column layouts; avatars, timestamps and spacing.
