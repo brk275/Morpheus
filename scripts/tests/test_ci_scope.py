@@ -1,4 +1,6 @@
 import ast
+import hashlib
+import os
 import json
 import tempfile
 import subprocess
@@ -767,6 +769,149 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual(selected["check_route"], "helpers")
                 self.assertFalse(selected["native"] or selected["config"] or selected["wayland"])
                 self.assertFalse(selected["manual"])
+
+    def test_frozen_appearance_reuse_checks_actual_merge_tree_and_independent_inputs(self):
+        # Real immutable Git DATA, not candidate code or a native build. The
+        # synthetic hashes below are confined to this existing selector test.
+        real_run = subprocess.run
+        safe_env = {key: value for key, value in os.environ.items() if not key.startswith(("GIT_", "SSH_"))}
+        safe_env.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", GIT_ATTR_NOSYSTEM="1",
+                        GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1", GIT_OPTIONAL_LOCKS="0",
+                        GIT_AUTHOR_NAME="Morpheus fixture", GIT_COMMITTER_NAME="Morpheus fixture",
+                        GIT_AUTHOR_EMAIL="fixture@example.invalid", GIT_COMMITTER_EMAIL="fixture@example.invalid",
+                        GIT_AUTHOR_DATE="2000-01-01T00:00:00+0000", GIT_COMMITTER_DATE="2000-01-01T00:00:00+0000")
+        command = ["git", "--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+                   "-c", "core.fsmonitor=false", "-c", "core.attributesFile=/dev/null", "-c", "gc.auto=0"]
+        with tempfile.TemporaryDirectory() as temporary:
+            def git(*args, data=None):
+                return real_run(command + list(args), input=data, cwd=temporary, env=safe_env,
+                                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+
+            git("init", "--quiet")
+
+            def commit(entries, message):
+                git("read-tree", "--empty")
+                for path, (mode, data) in sorted(entries.items()):
+                    blob = git("hash-object", "--no-filters", "-w", "--stdin", data=data).decode().strip()
+                    git("update-index", "--add", "--cacheinfo", mode, blob, path)
+                tree = git("write-tree").decode().strip()
+                source = git("commit-tree", tree, data=(message + "\n").encode()).decode().strip()
+                return source, tree
+
+            ui = "crates/morpheus-app/src/main.rs"
+            windows = tuple(path for path, _ in ci_scope.APPEARANCE_REUSE_WINDOWS_INPUTS)
+            selectors = ci_scope.NATIVE_REUSE_SELECTORS
+            workflow = b"name: controlled frozen workflow\n"
+            native_entries = {ui: ("100644", b"reviewed UI"), "Cargo.lock": ("100644", b"reviewed lock"),
+                              ".github/workflows/ci.yml": ("100644", workflow),
+                              **{path: ("100644", b"old selector") for path in selectors},
+                              **{path: ("100644", b"old Windows input") for path in windows}}
+            composed_entries = native_entries | {path: ("100644", b"qualified " + path.encode()) for path in windows}
+            independent_entries = composed_entries | {ui: ("100644", b"independent source has no UI qualification")}
+            native, native_tree = commit(native_entries, "native execution")
+            source, tree = commit(composed_entries, "reviewed composition")
+            independent, independent_tree = commit(independent_entries, "independent Windows execution")
+            window_blobs = tuple((path, git("rev-parse", independent + ":" + path).decode().strip()) for path in windows)
+            globals_changed = {
+                "APPEARANCE_REUSE_SOURCE": source, "APPEARANCE_REUSE_TREE": tree,
+                "APPEARANCE_REUSE_NATIVE_SOURCE": native, "APPEARANCE_REUSE_NATIVE_TREE": native_tree,
+                "APPEARANCE_REUSE_WINDOWS_SOURCE": independent, "APPEARANCE_REUSE_WINDOWS_TREE": independent_tree,
+                "APPEARANCE_REUSE_WINDOWS_INPUTS": window_blobs,
+                "REVIEWED_CONTROL_WORKFLOW_SHA256": hashlib.sha256(workflow).hexdigest(),
+                "REVIEWED_CONTROL_WORKFLOW_BYTES": len(workflow),
+            }
+            qualification = ci_scope.APPEARANCE_REUSE_QUALIFICATION | {
+                "source": source, "tree": tree, "native_source": native, "native_tree": native_tree,
+                "windows_source": independent, "windows_tree": independent_tree,
+                "windows_inputs": window_blobs, "workflow_sha256": hashlib.sha256(workflow).hexdigest(),
+            }
+            repository = {"full_name": "brk275/Morpheus", "private": False, "owner": {"login": "brk275"}}
+            trusted_env = {"GITHUB_ACTOR": "brk275", "GITHUB_TRIGGERING_ACTOR": "brk275",
+                           "GITHUB_REPOSITORY": "brk275/Morpheus"}
+            candidate_entries = composed_entries | {path: ("100644", b"new reviewed selector") for path in selectors}
+            calls = []
+
+            def execute(argv, **kwargs):
+                calls.append(argv)
+                self.assertEqual(kwargs["timeout"], 10)
+                self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+                self.assertEqual(kwargs["env"]["GIT_NO_LAZY_FETCH"], "1")
+                self.assertEqual(kwargs["env"]["GIT_CONFIG_GLOBAL"], "/dev/null")
+                self.assertNotIn("GIT_DIR", kwargs["env"])
+                self.assertNotIn("SSH_ASKPASS", kwargs["env"])
+                return real_run(argv, cwd=temporary, **kwargs)
+
+            def compare(entries=None, *, pr=False, changes=None, environment=None, paths=None,
+                        name=None, force=False, changed_qualification=None, selection=False):
+                candidate, _ = commit(candidate_entries if entries is None else entries, "candidate")
+                git("update-ref", "refs/heads/fixture", candidate)
+                git("symbolic-ref", "HEAD", "refs/heads/fixture")
+                event = {"repository": repository, "sender": {"login": "brk275"}}
+                event_name = name or ("pull_request" if pr else "push")
+                actual_env = trusted_env | {"GITHUB_SHA": candidate, "GITHUB_EVENT_NAME": event_name,
+                    "GITHUB_REF": "refs/pull/7/merge" if pr else "refs/heads/main", "GITHUB_BASE_REF": "main" if pr else "",
+                    "GIT_DIR": "untrusted", "SSH_ASKPASS": "untrusted"}
+                if pr:
+                    event |= {"number": 7, "action": "synchronize", "pull_request": {
+                        "number": 7, "state": "open", "merged": False, "user": {"login": "brk275"},
+                        "base": {"ref": "main", "sha": native, "repo": repository},
+                        "head": {"sha": source, "repo": repository}}}
+                else:
+                    event |= {"before": native, "after": candidate, "ref": "refs/heads/main",
+                              "forced": False, "deleted": False}
+                event |= changes or {}
+                actual_env |= environment or {}
+                selected_paths = [ui] if paths is None else paths
+                calls.clear()
+                with (patch.multiple(ci_scope, **globals_changed),
+                      patch.object(ci_scope, "APPEARANCE_REUSE_QUALIFICATION", qualification if changed_qualification is None else changed_qualification),
+                      patch.dict(ci_scope.os.environ, actual_env),
+                      patch.object(ci_scope.subprocess, "run", side_effect=execute)):
+                    if selection:
+                        with patch.object(ci_scope, "changed_paths", return_value=(selected_paths, force)):
+                            return event_selection(event, event_name)
+                    return ci_scope.qualified_appearance_input_reuse(selected_paths, event, event_name, force)
+
+            self.assertEqual(len({job[1] for job in qualification["jobs"]}), 1)
+            self.assertEqual(len({job[2] for job in qualification["jobs"]}), 4)
+            self.assertTrue(compare())
+            self.assertTrue(compare(pr=True))
+            self.assertTrue(compare(paths=[ui] + list(selectors)))
+            selected = compare(selection=True)
+            self.assertEqual(selected["check_route"], "helpers")
+            self.assertFalse(selected["native"] or selected["config"] or selected["wayland"])
+            for changes in ({"forced": True}, {"deleted": True}, {"ref": "refs/heads/topic"},
+                            {"before": "0" * 40}, {"sender": {"login": "other"}},
+                            {"repository": repository | {"private": True}}):
+                self.assertFalse(compare(changes=changes)); self.assertEqual(calls, [])
+            for key in ("GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR", "GITHUB_REPOSITORY", "GITHUB_REF", "GITHUB_SHA"):
+                self.assertFalse(compare(environment={key: "other"})); self.assertEqual(calls, [])
+            for name in ("workflow_dispatch", "release", "workflow_run"):
+                self.assertFalse(compare(name=name)); self.assertEqual(calls, [])
+            self.assertFalse(compare(force=True)); self.assertEqual(calls, [])
+            for paths in ([], list(selectors), ["README.md"], [ui, "Cargo.lock"], [ui, "vendor/sdk.rs"],
+                          [ui, ".github/workflows/ci.yml"], [ui, "unknown.rs"], [ui, ui]):
+                self.assertFalse(compare(paths=paths)); self.assertEqual(calls, [])
+            for field in ("source", "tree", "native_source", "native_tree", "windows_source", "windows_tree", "workflow_sha256"):
+                self.assertFalse(compare(changed_qualification=qualification | {field: "f" * 40})); self.assertEqual(calls, [])
+            jobs = qualification["jobs"]
+            for bad in (jobs[:3], (jobs[0],) * 4, (jobs[0][:2] + (jobs[0][2] + 1,),) + jobs[1:]):
+                self.assertFalse(compare(changed_qualification=qualification | {"jobs": bad})); self.assertEqual(calls, [])
+            for field in (ui, "Cargo.lock", ".github/workflows/ci.yml", windows[0]):
+                changed = candidate_entries | {field: ("100644", b"unqualified change")}
+                self.assertFalse(compare(changed))
+                # A PR head still matching the checkpoint cannot hide an
+                # unqualified input inherited by its actual synthetic merge.
+                self.assertFalse(compare(changed, pr=True))
+            for mode in ("100755", "120000"):
+                self.assertFalse(compare(candidate_entries | {selectors[0]: (mode, b"replacement")}))
+            directory = dict(candidate_entries)
+            del directory[selectors[0]]
+            directory[selectors[0] + "/child.py"] = ("100644", b"directory is not an excluded file")
+            self.assertFalse(compare(directory))
+            selected = compare(candidate_entries | {"Cargo.lock": ("100644", b"new dependency")}, selection=True)
+            self.assertEqual(selected["check_route"], "all")
+            self.assertEqual(selected["native_matrix"]["os"], list(PLATFORMS))
 
     def test_initial_push_selects_all(self):
         self.assertEqual(changed_paths({"before": "0" * 40, "after": "a" * 40}, "push"), ([], True))

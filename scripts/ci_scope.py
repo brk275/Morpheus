@@ -456,6 +456,174 @@ def qualified_vendor_main_reuse(paths, event, event_name, force_all=False):
         return False
 
 
+# One frozen product checkpoint, not a presentation path exemption. The actual
+# Rust/Slint desktop execution is B141; the composed source differs only in two
+# separately reviewed and executed Windows host-reader/helper files. Helpers
+# and the complete-history scanner still run. No artifact or release is reused.
+APPEARANCE_REUSE_SOURCE = "aadc478027b24de1219686384d3df37eb850cb98"
+APPEARANCE_REUSE_TREE = "786988124a09ede7c3c9107dbe3752ada97f36e7"
+APPEARANCE_REUSE_NATIVE_SOURCE = "b141b5c3e80ff30526fe357d8812c1915afec997"
+APPEARANCE_REUSE_NATIVE_TREE = "f78da249a6c8046d95dbaba04cdca977b77e60f9"
+APPEARANCE_REUSE_WINDOWS_SOURCE = "32c77a434a1704c0431bd96734bb9a494d95d1dd"
+APPEARANCE_REUSE_WINDOWS_TREE = "459f4a429b81e7996d4f8539153a711bfbe2a098"
+APPEARANCE_REUSE_RECEIPT = "466693c177f3a0036cda3afd5a3fd010e01ed1a9f307a198e5eb2d4c2c476532"
+APPEARANCE_REUSE_JOBS = (
+    ("ubuntu-24.04", 40719258169, 122926136226),
+    ("macos-15", 40719258169, 122926136364),
+    ("macos-15-intel", 40719258169, 122926136372),
+    ("windows-2025", 40719258169, 122926136713),
+)
+APPEARANCE_REUSE_WINDOWS_INPUTS = (
+    ("scripts/native_webrtc/windows_preflight.ps1", "a80cdd00e06ad66db4c821f8bf8009b5bdfebd9f"),
+    ("scripts/tests/test_native_webrtc_windows_inputs.py", "3dbc90f8a89f7b4cc29c5e27c9ec9413d8eab835"),
+)
+# These are the complete 22 product paths of the frozen composition. At least
+# one compiled Rust/Slint input must be present; a docs/control-only change does
+# not activate this checkpoint. Equality of the WHOLE remaining tree decides.
+APPEARANCE_REUSE_INPUTS = (
+    "crates/morpheus-config/src/lib.rs", "crates/morpheus-config/src/registry.rs",
+    "crates/morpheus-config/tests/room_appearance.rs",
+    "themes/nocturne.toml", "themes/paper.toml", "themes/terminal.toml", "themes/contrast.toml",
+    "docs/APPEARANCE.md", "docs/CUSTOMIZATION.md",
+    "crates/morpheus-app/src/account_access_ui_tests.rs", "crates/morpheus-app/src/account_identity.rs",
+    "crates/morpheus-app/src/appearance.rs", "crates/morpheus-app/src/call_stage/presenter.rs",
+    "crates/morpheus-app/src/live.rs", "crates/morpheus-app/src/main.rs",
+    "crates/morpheus-app/src/preview_capture.rs", "crates/morpheus-app/ui/app-window.slint",
+    "crates/morpheus-app/ui/call-stage.slint", "crates/morpheus-app/ui/style-tokens.slint",
+    "README.md", "docs/FEATURE_MATRIX.md", "docs/THEME_STUDIO.md",
+)
+APPEARANCE_REUSE_QUALIFICATION = {
+    "source": APPEARANCE_REUSE_SOURCE, "tree": APPEARANCE_REUSE_TREE,
+    "native_source": APPEARANCE_REUSE_NATIVE_SOURCE, "native_tree": APPEARANCE_REUSE_NATIVE_TREE,
+    "windows_source": APPEARANCE_REUSE_WINDOWS_SOURCE, "windows_tree": APPEARANCE_REUSE_WINDOWS_TREE,
+    "workflow_sha256": REVIEWED_CONTROL_WORKFLOW_SHA256,
+    "receipt_sha256": APPEARANCE_REUSE_RECEIPT, "route": "desktop",
+    "jobs": APPEARANCE_REUSE_JOBS, "windows_inputs": APPEARANCE_REUSE_WINDOWS_INPUTS,
+}
+
+
+def qualified_appearance_input_reuse(paths, event, event_name, force_all=False):
+    qualified = APPEARANCE_REUSE_QUALIFICATION
+    if (force_all is not False or event_name not in ("push", "pull_request")
+            or type(qualified) is not dict or set(qualified) != {
+                "source", "tree", "native_source", "native_tree", "windows_source", "windows_tree",
+                "workflow_sha256", "receipt_sha256", "route", "jobs", "windows_inputs"}):
+        return False
+    frozen = (APPEARANCE_REUSE_SOURCE, APPEARANCE_REUSE_TREE,
+              APPEARANCE_REUSE_NATIVE_SOURCE, APPEARANCE_REUSE_NATIVE_TREE,
+              APPEARANCE_REUSE_WINDOWS_SOURCE, APPEARANCE_REUSE_WINDOWS_TREE)
+    revisions = tuple(qualified[key] for key in (
+        "source", "tree", "native_source", "native_tree", "windows_source", "windows_tree"))
+    if (revisions != frozen or any(type(value) is not str or re.fullmatch(r"[0-9a-f]{40}", value) is None
+                                   for value in revisions)
+            or qualified["workflow_sha256"] != REVIEWED_CONTROL_WORKFLOW_SHA256
+            or qualified["receipt_sha256"] != APPEARANCE_REUSE_RECEIPT or qualified["route"] != "desktop"
+            or qualified["jobs"] != APPEARANCE_REUSE_JOBS
+            or qualified["windows_inputs"] != APPEARANCE_REUSE_WINDOWS_INPUTS):
+        return False
+    jobs = qualified["jobs"]
+    if (type(jobs) is not tuple or len(jobs) != 4
+            or any(type(job) is not tuple or len(job) != 3 or job[0] not in PLATFORMS
+                   or type(job[1]) is not int or job[1] <= 0 or type(job[2]) is not int or job[2] <= 0 for job in jobs)
+            or {job[0] for job in jobs} != set(PLATFORMS) or len({job[2] for job in jobs}) != 4):
+        return False
+    if (type(paths) not in (list, tuple) or not paths or any(type(path) is not str for path in paths)
+            or len(set(paths)) != len(paths)
+            or not set(paths) <= set(APPEARANCE_REUSE_INPUTS) | set(NATIVE_REUSE_SELECTORS)
+            or not any(path in APPEARANCE_REUSE_INPUTS and path.endswith((".rs", ".slint")) for path in paths)
+            or type(event) is not dict):
+        return False
+
+    def owned_repository(value):
+        return (type(value) is dict and value.get("full_name") == "brk275/Morpheus"
+                and value.get("private") is False and type(value.get("owner")) is dict
+                and value["owner"].get("login") == "brk275")
+
+    if (not owned_repository(event.get("repository")) or type(event.get("sender")) is not dict
+            or event["sender"].get("login") != "brk275"
+            or any(os.environ.get(key) != "brk275" for key in ("GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR"))
+            or os.environ.get("GITHUB_REPOSITORY") != "brk275/Morpheus"
+            or os.environ.get("GITHUB_EVENT_NAME") != event_name
+            or event.get("forced", False) is not False or event.get("deleted", False) is not False):
+        return False
+    candidate = os.environ.get("GITHUB_SHA")
+    if type(candidate) is not str or re.fullmatch(r"[0-9a-f]{40}", candidate) is None:
+        return False
+    if event_name == "push":
+        if (event.get("ref") != "refs/heads/main" or os.environ.get("GITHUB_REF") != "refs/heads/main"
+                or event.get("after") != candidate or event.get("forced") is not False
+                or event.get("deleted") is not False or type(event.get("before")) is not str
+                or re.fullmatch(r"[0-9a-f]{40}", event["before"]) is None or event["before"] == "0" * 40):
+            return False
+    else:
+        pull = event.get("pull_request")
+        if (type(pull) is not dict or pull.get("state") != "open" or pull.get("merged") is not False
+                or type(pull.get("user")) is not dict or pull["user"].get("login") != "brk275"
+                or type(event.get("number")) is not int or event["number"] <= 0
+                or pull.get("number") != event["number"]
+                or event.get("action") not in ("opened", "synchronize", "reopened")
+                or os.environ.get("GITHUB_BASE_REF") != "main"
+                or os.environ.get("GITHUB_REF") != f"refs/pull/{event['number']}/merge"):
+            return False
+        for field in ("base", "head"):
+            value = pull.get(field)
+            if (type(value) is not dict or not owned_repository(value.get("repo"))
+                    or type(value.get("sha")) is not str or re.fullmatch(r"[0-9a-f]{40}", value["sha"]) is None):
+                return False
+        if pull["base"].get("ref") != "main":
+            return False
+    command = ["git", "--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+               "-c", "core.fsmonitor=false", "-c", "core.attributesFile=/dev/null"]
+    environment = {key: value for key, value in os.environ.items() if not key.startswith(("GIT_", "SSH_"))}
+    environment.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", GIT_NO_REPLACE_OBJECTS="1",
+                       GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_ATTR_NOSYSTEM="1")
+    options = {"stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL, "timeout": 10, "env": environment}
+    try:
+        def output(args):
+            return subprocess.run(command + args, check=True, **options).stdout
+
+        # The PR checkout is a synthetic merge. Checking only head.sha would
+        # miss unqualified dependency/workflow changes inherited from its base.
+        if output(["rev-parse", "--verify", "HEAD^{commit}"]) != candidate.encode() + b"\n":
+            return False
+        for source, tree in ((qualified["source"], qualified["tree"]),
+                             (qualified["native_source"], qualified["native_tree"]),
+                             (qualified["windows_source"], qualified["windows_tree"])):
+            if (output(["cat-file", "-t", source]) != b"commit\n"
+                    or output(["rev-parse", "--verify", source + "^{tree}"]) != tree.encode() + b"\n"):
+                return False
+        selectors = output(["ls-tree", "--full-tree", "-z", candidate, "--", *NATIVE_REUSE_SELECTORS])
+        if (type(selectors) is not bytes or re.fullmatch(
+                rb"100644 blob [0-9a-f]{40}\tscripts/ci_scope\.py\x00"
+                rb"100644 blob [0-9a-f]{40}\tscripts/tests/test_ci_scope\.py\x00", selectors) is None):
+            return False
+        windows_paths = tuple(path for path, _ in APPEARANCE_REUSE_WINDOWS_INPUTS)
+        expected = b"".join(b"100644 blob " + blob.encode() + b"\t" + path.encode() + b"\0"
+                            for path, blob in APPEARANCE_REUSE_WINDOWS_INPUTS)
+        for source in (qualified["source"], qualified["windows_source"]):
+            if output(["ls-tree", "--full-tree", "-z", source, "--", *windows_paths]) != expected:
+                return False
+        differences = output(["diff-tree", "--no-commit-id", "--name-only", "-z", "--no-ext-diff",
+            "--no-textconv", "--no-renames", "--ignore-submodules=none", "-r",
+            qualified["native_source"], qualified["source"]])
+        if differences != b"".join(path.encode() + b"\0" for path in windows_paths):
+            return False
+        spec = qualified["source"] + ":.github/workflows/ci.yml"
+        if output(["cat-file", "-s", spec]) != str(REVIEWED_CONTROL_WORKFLOW_BYTES).encode() + b"\n":
+            return False
+        workflow = output(["cat-file", "blob", spec])
+        if (type(workflow) is not bytes or len(workflow) != REVIEWED_CONTROL_WORKFLOW_BYTES
+                or hashlib.sha256(workflow).hexdigest() != REVIEWED_CONTROL_WORKFLOW_SHA256):
+            return False
+        compared = subprocess.run(command + ["diff-tree", "--quiet", "--exit-code", "--no-ext-diff",
+            "--no-textconv", "--no-renames", "--ignore-submodules=none", "-r", qualified["source"], candidate,
+            "--", ".", ":(top,exclude)scripts/ci_scope.py", ":(top,exclude)scripts/tests/test_ci_scope.py"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, env=environment)
+        return type(compared.returncode) is int and compared.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def event_selection(event, event_name):
     if event_name != "workflow_dispatch":
         paths, force_all = changed_paths(event, event_name)
@@ -466,6 +634,8 @@ def event_selection(event, event_name):
         if qualified_apply_main_reuse(paths, event, event_name, force_all):
             route = "helpers"
         if qualified_vendor_main_reuse(paths, event, event_name, force_all):
+            route = "helpers"
+        if route != "helpers" and qualified_appearance_input_reuse(paths, event, event_name, force_all):
             route = "helpers"
         if route == "desktop":
             selected = {"native": True, "native_matrix": {"os": list(PLATFORMS)},
