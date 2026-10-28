@@ -41,6 +41,19 @@ MAX_JSON = 128 * 1024 * 1024
 # Fixed codec memory, independent of source-controlled XZ dictionary headers.
 MAX_XZ_MEMORY = 128 * 1024 * 1024
 LINUX_XZ_SCHEMA = "morpheus-native-linux-handoff-v3"
+LINUX_GZIP_MEMBERS_SCHEMA = "morpheus-native-linux-handoff-v4"
+# The exact existing instrumentation stager bounds, not a new archive domain.
+MAX_GZIP_MEMBER_EXPANDED = 2 * 1024 * 1024 * 1024 + 32 * 1024 * 1024
+MAX_GZIP_MEMBER_BYTES = 512 * 1024 * 1024
+MAX_GZIP_MEMBER_COUNT = 10000
+# Original immutable GCS archives already stored by the instrumentation stager.
+# Recipes remove only a second representation of their exact regular DATA.
+GZIP_MEMBER_ARCHIVES = {
+    "9329714322846c2b47dd518ac08e437b8c7d8075c514dc7ec3eb3e3a1e0faeb6":
+        {"bytes": 514553540, "name": "msan-chained-origins-noble-lib"},
+    "a749c9e47cb4584bc944c887440b1d1c51501f7d9bb99eea276ebcba0aa6c1ec":
+        {"bytes": 493707167, "name": "msan-no-origins-noble-lib"},
+}
 XZ_MAGIC = b"\xfd7zXZ\x00"
 INPUT_PLAN = "656733d46a801782283d8b8e573f65dff01cc83934da545c66c81b635656b454"
 PATCH_MANIFEST = "e97be792680220ec3d21f39a0a950599a3266fd3041e2a8d5027df36d946b714"
@@ -672,14 +685,251 @@ def scan_tree(material, root):
     return files, directories
 
 
+class GzipMemberStream:
+    """One approved gzip DATA stream; bounded input/output and full byte proof."""
+    def __init__(self, raw, row):
+        self.raw, self.row = raw, row
+        self.maximum = min(MAX_EXPANDED, MAX_GZIP_MEMBER_EXPANDED)
+        if "expanded_bytes" in row:
+            need(type(row["expanded_bytes"]) is int and 0 < row["expanded_bytes"] <= self.maximum)
+            self.maximum = row["expanded_bytes"]
+        self.decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        self.pending = b""
+        self.position = self.compressed = 0
+        self.digest, self.compressed_digest = hashlib.sha256(), hashlib.sha256()
+        self.payload, self.parser_bytes = False, 0
+
+    def tell(self):
+        return self.position
+
+    def read(self, size=-1):
+        need(type(size) is int and 0 <= size <= 1024 * 1024)
+        if not self.payload:
+            need(self.parser_bytes + size <= 65536)
+            self.parser_bytes += size
+        output = bytearray()
+        while len(output) < size:
+            if self.decoder.eof:
+                need(not self.pending and not self.decoder.unused_data and self.raw.read(1) == b""
+                     and self.compressed == self.row["bytes"]
+                     and self.compressed_digest.hexdigest() == self.row["sha256"])
+                break
+            if not self.pending:
+                self.pending = self.raw.read(64 * 1024)
+                need(bool(self.pending))
+                self.compressed += len(self.pending)
+                need(self.compressed <= self.row["bytes"])
+                self.compressed_digest.update(self.pending)
+            try:
+                block = self.decoder.decompress(self.pending, size - len(output))
+            except zlib.error:
+                raise Refused() from None
+            self.pending = self.decoder.unconsumed_tail
+            output.extend(block)
+            self.position += len(block)
+            need(self.position <= self.maximum)
+            self.digest.update(block)
+        return bytes(output)
+
+    def seek(self, offset, whence=0):
+        need(whence == 0 and type(offset) is int and self.position <= offset <= self.maximum)
+        while self.position < offset:
+            need(bool(self.read(min(1024 * 1024, offset - self.position))))
+        return self.position
+
+
+@contextmanager
+def gzip_member_stream(path, row, material):
+    before = path.lstat()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        actual = os.fstat(fd)
+        need(material.identity(actual) == material.identity(before)
+             and stat.S_ISREG(actual.st_mode) and actual.st_uid == os.geteuid()
+             and actual.st_nlink == 1 and actual.st_size == row["bytes"])
+        with os.fdopen(fd, "rb", closefd=False) as raw:
+            yield GzipMemberStream(raw, row)
+        need(material.identity(os.fstat(fd)) == material.identity(actual)
+             == material.identity(path.lstat()))
+    finally:
+        os.close(fd)
+
+
+def handoff_canonical(inventories):
+    canonical = {}
+    for name, spec in sorted(inventories.items()):
+        for row in sorted(spec["files"], key=lambda value: value["path"]):
+            canonical.setdefault((row["sha256"], row["bytes"]), name + "/" + row["path"])
+    return canonical
+
+
+def gzip_recipe_index(header, canonical):
+    """Only the two pinned original instrumentation archives can be sources."""
+    groups = header["gzip_members"]
+    need(type(groups) is list and len(groups) == len(GZIP_MEMBER_ARCHIVES))
+    sources, targets, expanded = set(), set(), 0
+    physical = {(digest, row["bytes"]) for digest, row in GZIP_MEMBER_ARCHIVES.items()}
+    for group in groups:
+        need(type(group) is dict and set(group) ==
+             {"sha256", "bytes", "expanded_bytes", "expanded_sha256", "members"})
+        digest, size = group["sha256"], group["bytes"]
+        need(type(digest) is str and digest in GZIP_MEMBER_ARCHIVES
+             and type(size) is int and size == GZIP_MEMBER_ARCHIVES[digest]["bytes"])
+        identity = (digest, size)
+        need(identity in canonical and identity not in sources)
+        sources.add(identity)
+        need(type(group["expanded_bytes"]) is int and 0 < group["expanded_bytes"] <= min(MAX_EXPANDED, MAX_GZIP_MEMBER_EXPANDED)
+             and type(group["expanded_sha256"]) is str and HEX.fullmatch(group["expanded_sha256"])
+             and type(group["members"]) is list and 0 < len(group["members"]) <= MAX_GZIP_MEMBER_COUNT)
+        expanded += group["expanded_bytes"]; need(expanded <= MAX_EXPANDED)
+        end = 0
+        for member in group["members"]:
+            need(type(member) is dict and set(member) == {"offset", "bytes", "sha256"}
+                 and type(member["offset"]) is int and type(member["bytes"]) is int
+                 and 0 <= member["offset"] <= group["expanded_bytes"]
+                 and member["offset"] % 512 == 0 and 0 <= member["bytes"] <= MAX_GZIP_MEMBER_BYTES
+                 and member["bytes"] <= group["expanded_bytes"] - member["offset"]
+                 and member["offset"] >= end and type(member["sha256"]) is str
+                 and HEX.fullmatch(member["sha256"]))
+            target = (member["sha256"], member["bytes"])
+            # No nested recipe, physical source rewrite, cycle or duplicate blob.
+            need(target in canonical and target not in physical and target not in targets)
+            targets.add(target); need(len(targets) <= MAX_MEMBERS)
+            end = member["offset"] + member["bytes"]
+    need(sources == physical)
+    return targets
+
+
+def gzip_member_recipes(temp, inventories, instrumented_root, profile, material):
+    """Represent verified regular member bytes already present in stored gzip DATA.
+
+    Every compressed archive, extracted path, mode and inventory remains present
+    after restoration. Only duplicate information in the transport is removed.
+    """
+    canonical = handoff_canonical(inventories)
+    need(type(profile) is dict and type(profile["materials"]) is list
+         and len(profile["materials"]) == len(GZIP_MEMBER_ARCHIVES))
+    physical = {(digest, row["bytes"]) for digest, row in GZIP_MEMBER_ARCHIVES.items()}
+    assigned, groups = set(), []
+    for tool in sorted(profile["materials"], key=lambda value: value["sha256"]):
+        need(tool["sha256"] in GZIP_MEMBER_ARCHIVES and tool["format"] == "tar.gz")
+        pin = GZIP_MEMBER_ARCHIVES[tool["sha256"]]
+        need(tool["bytes"] == pin["bytes"] and tool["name"] == pin["name"])
+        archive = instrumented_root / "archives" / (tool["name"] + ".tar.gz")
+        row = {"sha256": tool["sha256"], "bytes": tool["bytes"]}
+        material.file_fact(archive, row)
+        need((row["sha256"], row["bytes"]) in canonical)
+        table = {member["raw_path"]: member for member in tool["members"]}
+        need(len(table) == len(tool["members"]) <= MAX_GZIP_MEMBER_COUNT)
+        seen, recipes = set(), []
+        with gzip_member_stream(archive, row, material) as incoming:
+            with tarfile.open(fileobj=incoming, mode="r:") as source:
+                while True:
+                    incoming.parser_bytes = 0
+                    member = source.next()
+                    if member is None:
+                        break
+                    need(len(seen) < MAX_GZIP_MEMBER_COUNT and member.name in table and member.name not in seen)
+                    material.relative(member.name)
+                    seen.add(member.name)
+                    declared = table[member.name]
+                    kind = ("regular" if member.isfile() else "directory" if member.isdir() else
+                            "symlink" if member.issym() else "unsupported")
+                    need((kind, member.size, member.mode) ==
+                         (declared["kind"], declared["bytes"], declared["mode"]))
+                    if kind == "symlink":
+                        need(member.linkname == declared["linkname"])
+                    elif kind == "regular":
+                        stream = source.extractfile(member); need(stream is not None)
+                        count, digest = 0, hashlib.sha256()
+                        incoming.payload = True
+                        try:
+                            while True:
+                                block = stream.read(1024 * 1024)
+                                if not block: break
+                                count += len(block); need(count <= declared["bytes"])
+                                digest.update(block)
+                        finally:
+                            incoming.payload = False
+                        need(count == declared["bytes"] and digest.hexdigest() == declared["sha256"])
+                        identity = (declared["sha256"], declared["bytes"])
+                        need(identity in canonical)
+                        # Sparse tar files retain their ordinary physical blob;
+                        # only a contiguous exact raw member can be a byte slice.
+                        if not member.issparse() and identity not in physical and identity not in assigned:
+                            assigned.add(identity)
+                            recipes.append({"offset": member.offset_data, "bytes": count,
+                                            "sha256": declared["sha256"]})
+                    elif kind != "directory":
+                        raise Refused()
+            # The approved gzip may contain ordinary tar padding. Read its full
+            # raw bytes for a digest/length and strict gzip checksum/one-stream EOF.
+            incoming.payload = True
+            while incoming.read(1024 * 1024):
+                pass
+            need(seen == set(table))
+            groups.append({**row, "expanded_bytes": incoming.position,
+                           "expanded_sha256": incoming.digest.hexdigest(), "members": recipes})
+    targets = gzip_recipe_index({"gzip_members": groups}, canonical)
+    need(targets == assigned)
+    return groups
+
+
+def restore_gzip_members(temp, header, canonical, expected, duplicate_targets, seen, total, material):
+    """Restore unique byte slices only after the outer XZ decoder has closed."""
+    for group in header["gzip_members"]:
+        source = canonical[(group["sha256"], group["bytes"])]
+        need(source in seen)
+        with gzip_member_stream(temp / source, group, material) as incoming:
+            incoming.payload = True
+            for member in group["members"]:
+                incoming.seek(member["offset"])
+                identity = (member["sha256"], member["bytes"])
+                name = canonical[identity]; need(name not in seen)
+                row, destination = expected[name], temp / name
+                fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+                complete = False
+                try:
+                    digest, count = hashlib.sha256(), 0
+                    with os.fdopen(fd, "wb", closefd=False) as out:
+                        while count < row["bytes"]:
+                            block = incoming.read(min(1024 * 1024, row["bytes"] - count)); need(bool(block))
+                            count += len(block); total += len(block)
+                            need(total <= MAX_EXPANDED)
+                            digest.update(block); need(out.write(block) == len(block))
+                        need(count == row["bytes"] and digest.hexdigest() == row["sha256"])
+                        out.flush(); os.fchmod(fd, row["mode"]); os.fsync(fd)
+                    complete = True
+                finally:
+                    os.close(fd)
+                    if not complete:
+                        destination.unlink()
+                seen.add(name)
+                for alias in duplicate_targets.get(name, ()):
+                    need(alias not in seen)
+                    total = copy_handoff_duplicate(destination, temp / alias, expected[alias], total, material)
+                    seen.add(alias)
+            while incoming.read(1024 * 1024):
+                pass
+            need(incoming.position == group["expanded_bytes"]
+                 and incoming.digest.hexdigest() == group["expanded_sha256"])
+    return total
+
+
 def pack_handoff(temp, handoff, inventories, material):
-    """Pack exact manifests; Linux v2 stores identical content once, never links."""
+    """Pack every exact manifest; versioned lossless DATA sharing, never links."""
     global PACK_ACTIVE
     reset_pack_capture(True)
-    deduplicate = handoff["schema"] in ("morpheus-native-linux-handoff-v2", LINUX_XZ_SCHEMA)
-    xz = handoff["schema"] == LINUX_XZ_SCHEMA
+    deduplicate = handoff["schema"] in ("morpheus-native-linux-handoff-v2", LINUX_XZ_SCHEMA,
+                                       LINUX_GZIP_MEMBERS_SCHEMA)
+    xz = handoff["schema"] in (LINUX_XZ_SCHEMA, LINUX_GZIP_MEMBERS_SCHEMA)
+    recipe_targets = set()
     packed = set()
     try:
+        if handoff["schema"] == LINUX_GZIP_MEMBERS_SCHEMA:
+            pack_at("metadata_limit")
+            recipe_targets = gzip_recipe_index(handoff, handoff_canonical(inventories))
         pack_at("cache_absence")
         cache_dir = temp / "native-webrtc-handoff"
         need(not os.path.lexists(cache_dir))
@@ -723,7 +973,7 @@ def pack_handoff(temp, handoff, inventories, material):
                                 material.file_fact(root / row["path"], row, row["mode"])
                                 if deduplicate:
                                     identity = (row["sha256"], row["bytes"])
-                                    if identity in packed:
+                                    if identity in recipe_targets or identity in packed:
                                         continue
                                     packed.add(identity)
                                 pack_at("file_header")
@@ -959,7 +1209,7 @@ def stage(args, plan, temp, material):
     core, _ = asset(assets, plan["core_plan"], material.CORE_PLAN)
     linux, _ = asset(assets, plan["linux_plan"], material.LINUX_PLAN)
     python, python_plan = asset(assets, plan["python_plan"], PYTHON_PLAN)
-    instrumented, _ = asset(assets, plan["instrumented_plan"], INSTRUMENTED_PLAN)
+    instrumented, instrumented_profile = asset(assets, plan["instrumented_plan"], INSTRUMENTED_PLAN)
     source_path, source_plan = asset(assets, plan["source_plan"], INPUT_PLAN)
     patch_path, patch_manifest = asset(assets, plan["patch_manifest"], PATCH_MANIFEST)
     security, _ = asset(assets, plan["security_plan"], SECURITY_PLAN)
@@ -1081,11 +1331,13 @@ def stage(args, plan, temp, material):
     for name, root in all_roots.items():
         file_rows, dirs = scan_tree(material, root)
         inventories[root.name] = {"role": name, "files": list(file_rows.values()), "directories": sorted(dirs)}
-    handoff = {"schema": LINUX_XZ_SCHEMA, "pipeline_plan_sha256": args.plan_sha256,
+    handoff = {"schema": LINUX_GZIP_MEMBERS_SCHEMA, "pipeline_plan_sha256": args.plan_sha256,
         "source_run_id": os.environ["GITHUB_RUN_ID"], "source_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
         "source_commit": os.environ["GITHUB_SHA"], "roots": inventories,
         "build_admission_granted": False, "native_sources_complete": False,
         "build_ready": False, "distribution_ready": False}
+    handoff["gzip_members"] = gzip_member_recipes(temp, inventories, roots["instrumented"],
+                                                 instrumented_profile, material)
     output, fact = stage_handoff(temp, handoff, inventories, material,
                                  publish_handoff=args.publish_handoff)
     POST_ASSEMBLY_PHASE = "handoff_emit"
@@ -1194,6 +1446,7 @@ def restore(args, temp, material, *, mac_target=None):
     expected, dirs, header, seen, total = {}, {}, None, set(), 0
     canonical, duplicate_targets = {}, {}
     deduplicate = False
+    recipe_targets = set()
     # The compressed bytes are admitted before parsing. Only exact regular
     # members from its bounded complete manifest can be copied, never links.
     with handoff_tar(archive) as (source, codec):
@@ -1208,10 +1461,11 @@ def restore(args, temp, material, *, mac_target=None):
                     raw.extend(block)
                 need(stream.read(1) == b"" and len(raw) == member.size)
                 header = json.loads(raw)
-                schemas = (("morpheus-native-linux-handoff-v1", "morpheus-native-linux-handoff-v2", LINUX_XZ_SCHEMA)
+                schemas = (("morpheus-native-linux-handoff-v1", "morpheus-native-linux-handoff-v2",
+                            LINUX_XZ_SCHEMA, LINUX_GZIP_MEMBERS_SCHEMA)
                            if mac_target is None else ("morpheus-native-macos-handoff-v1",))
                 need(header["schema"] in schemas
-                     and (header["schema"] == LINUX_XZ_SCHEMA) == (codec == "xz")
+                     and (header["schema"] in (LINUX_XZ_SCHEMA, LINUX_GZIP_MEMBERS_SCHEMA)) == (codec == "xz")
                      and header["pipeline_plan_sha256"] == args.plan_sha256
                      and header["build_admission_granted"] is False
                      and header["native_sources_complete"] is False
@@ -1234,7 +1488,8 @@ def restore(args, temp, material, *, mac_target=None):
                         need(full not in expected); expected[full] = row
                 need(len(expected) + len(dirs) <= MAX_MEMBERS
                      and sum(row["bytes"] for row in expected.values()) <= MAX_EXPANDED)
-                deduplicate = header["schema"] in ("morpheus-native-linux-handoff-v2", LINUX_XZ_SCHEMA)
+                deduplicate = header["schema"] in ("morpheus-native-linux-handoff-v2", LINUX_XZ_SCHEMA,
+                                                   LINUX_GZIP_MEMBERS_SCHEMA)
                 if deduplicate:
                     # Canonical content lives at its first lexical declared path.
                     # The archive cannot choose an alias target or filesystem link.
@@ -1247,6 +1502,9 @@ def restore(args, temp, material, *, mac_target=None):
                         first = canonical.setdefault(identity, name)
                         if first != name:
                             duplicate_targets.setdefault(first, []).append(name)
+                if header["schema"] == LINUX_GZIP_MEMBERS_SCHEMA:
+                    need(mac_target is None)
+                    recipe_targets = gzip_recipe_index(header, canonical)
                 for name in sorted(dirs, key=lambda x: (x.count("/"), x)):
                     need(name not in expected and ((temp / name).parent == temp or
                          (temp / name).parent.is_dir()))
@@ -1260,7 +1518,8 @@ def restore(args, temp, material, *, mac_target=None):
             need(member.isfile() and member.name in expected)
             row = expected[member.name]
             if deduplicate:
-                need(canonical[(row["sha256"], row["bytes"])] == member.name)
+                need(canonical[(row["sha256"], row["bytes"])] == member.name
+                     and (row["sha256"], row["bytes"]) not in recipe_targets)
             need(member.size == row["bytes"] and member.mode == row["mode"])
             stream = source.extractfile(member); need(stream is not None)
             destination = temp / member.name
@@ -1283,6 +1542,9 @@ def restore(args, temp, material, *, mac_target=None):
                     need(alias not in seen)
                     total = copy_handoff_duplicate(destination, temp / alias, expected[alias], total, material)
                     seen.add(alias)
+    if recipe_targets:
+        total = restore_gzip_members(temp, header, canonical, expected, duplicate_targets,
+                                     seen, total, material)
     need(seen == set(expected) | set(dirs))
     for name, spec in header["roots"].items():
         material.topology(temp / name, {r["path"]: r for r in spec["files"]}, set(spec["directories"]))
