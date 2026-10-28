@@ -410,10 +410,10 @@
     "sha256": "57bd48e1dfc09a469333371a975ef5f12e33bc948dc3dd7042edc3e02c4d196a"
   },
   "host_git": {
-    "bytes": 4576040,
+    "bytes": 4640352,
     "path": "/usr/bin/git",
-    "sha256": "d4d2ba562243015206d4248edfec871a74786499292d00ed072dbca2f5ae8073",
-    "version": "git version 2.55.0"
+    "sha256": "824d5b2fffef332ec7ba053e579659bb12f26a0b4747da6f9c6dc0e71d36f235",
+    "version": "git version 2.56.0"
   },
   "host_zstd": {
     "bytes": 1022760,
