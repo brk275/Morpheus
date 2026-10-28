@@ -8986,7 +8986,7 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "Starting points"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         Text { text: "Presets fill in editable settings. Fonts use installed families; a missing family falls back to your system font."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
-                        for name[index] in ["Nocturne", "Terminal", "Paper"] : ActionRect {
+                        for name[index] in ["Nocturne", "Terminal", "Paper", "Contrast"] : ActionRect {
                             property <int> reveal-request: index == 0 ? root.reveal-request("appearance.presets") : 0;
                             // Keyboard focus and search share the same bounded reveal.
                             changed has-focus => {
@@ -9009,7 +9009,7 @@ export component AppWindow inherits Window {
                             VerticalLayout {
                                 padding: 12px; spacing: 5px;
                                 Text { text: name; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; }
-                                Text { text: index == 0 ? "Charcoal · soft edges · avatars and room context" : index == 1 ? "Monospaced · square edges · aligned nickname columns" : "Warm paper · serif messages · quiet, open space";
+                                Text { text: index == 0 ? "Charcoal · soft edges · avatars and room context" : index == 1 ? "Monospaced · square edges · aligned nickname columns" : index == 2 ? "Warm paper · serif messages · quiet, open space" : "High contrast · clear text and focus · keeps your fonts and layout";
                                     color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
                             }
                         }

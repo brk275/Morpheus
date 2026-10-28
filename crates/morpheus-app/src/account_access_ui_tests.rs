@@ -2084,6 +2084,9 @@ async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
         observed.borrow_mut().push(index);
         weak.upgrade().unwrap().set_theme_mode(index);
     });
+    let presets = Rc::new(RefCell::new(Vec::new()));
+    let observed = presets.clone();
+    ui.on_choose_style_preset(move |index| observed.borrow_mut().push(index));
     let densities = Rc::new(RefCell::new(Vec::new()));
     let observed = densities.clone();
     let weak = ui.as_weak();
@@ -2114,6 +2117,15 @@ async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
             assert_eq!(ui.get_theme_mode(), index);
             assert!(focused_control_has_label(ui, label));
         }
+        for (index, name) in ["Nocturne", "Terminal", "Paper", "Contrast"].iter().enumerate() {
+            let label = format!("Apply {name} appearance preset");
+            tab_to_control(ui, &label);
+            let previous = presets.borrow().len();
+            key(ui, Key::Return);
+            assert_eq!(presets.borrow().len(), previous + 1);
+            assert_eq!(presets.borrow().last(), Some(&(index as i32)));
+            assert!(focused_control_has_label(ui, &label));
+        }
         for (index, label, activation) in [
             (0, "Use Compact room and message density", Key::Space),
             (1, "Use Comfortable room and message density", Key::Return),
@@ -2135,6 +2147,7 @@ async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
     // cover the shared ActionRect's disabled-retained-focus activation guard.
     // Keep later account scenarios on the same window with their prior state.
     ui.on_choose_theme(|_| {});
+    ui.on_choose_style_preset(|_| {});
     ui.on_choose_density(|_| {});
     apply_config(ui, &Config::default(), None);
     ui.set_page(0);
