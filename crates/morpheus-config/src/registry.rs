@@ -1925,14 +1925,7 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         "Appearance starting points",
         "Fill in fonts, layout, geometry and palette from an editable preset.",
         &[
-            "preset",
-            "theme",
-            "style",
-            "nocturne",
-            "terminal",
-            "paper",
-            "contrast",
-            "template",
+            "preset", "theme", "style", "nocturne", "terminal", "paper", "contrast", "template",
         ],
     ),
     target(

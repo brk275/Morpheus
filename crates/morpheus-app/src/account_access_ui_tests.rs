@@ -2117,7 +2117,10 @@ async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
             assert_eq!(ui.get_theme_mode(), index);
             assert!(focused_control_has_label(ui, label));
         }
-        for (index, name) in ["Nocturne", "Terminal", "Paper", "Contrast"].iter().enumerate() {
+        for (index, name) in ["Nocturne", "Terminal", "Paper", "Contrast"]
+            .iter()
+            .enumerate()
+        {
             let label = format!("Apply {name} appearance preset");
             tab_to_control(ui, &label);
             let previous = presets.borrow().len();
@@ -2702,7 +2705,8 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
         assert_eq!(crate::live::avatar_slot(identity), slot as i32);
         assert_eq!(crate::live::accent(identity), color_from_hex(default));
         assert_eq!(
-            ui.global::<crate::StyleTokens>().invoke_avatar_color(slot as i32),
+            ui.global::<crate::StyleTokens>()
+                .invoke_avatar_color(slot as i32),
             color_from_hex(default)
         );
     }
@@ -2752,7 +2756,8 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     crate::appearance::apply_theme(ui, &Config::default(), Some(&bare));
     for (slot, default) in defaults.iter().enumerate() {
         assert_eq!(
-            ui.global::<crate::StyleTokens>().invoke_avatar_color(slot as i32),
+            ui.global::<crate::StyleTokens>()
+                .invoke_avatar_color(slot as i32),
             color_from_hex(default)
         );
     }

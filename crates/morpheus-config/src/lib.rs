@@ -3969,7 +3969,13 @@ mod tests {
         for preset in BuiltInStylePreset::ALL {
             let theme = preset.theme().unwrap();
             if preset == BuiltInStylePreset::Contrast {
-                assert!(theme.states.entries().iter().all(|(_, value)| value.is_some()));
+                assert!(
+                    theme
+                        .states
+                        .entries()
+                        .iter()
+                        .all(|(_, value)| value.is_some())
+                );
             } else {
                 assert!(theme.states.is_empty(), "{preset:?}");
             }
@@ -4215,9 +4221,19 @@ mod tests {
                     assert_contrast(&theme.name, &theme.colors.ink, background, 7.0);
                     assert_contrast(&theme.name, &theme.colors.muted, background, 7.0);
                     assert_contrast(&theme.name, &theme.colors.divider, background, 3.0);
-                    assert_contrast(&theme.name, roles.focus.as_deref().unwrap(), background, 3.0);
+                    assert_contrast(
+                        &theme.name,
+                        roles.focus.as_deref().unwrap(),
+                        background,
+                        3.0,
+                    );
                 }
-                assert_contrast(&theme.name, &theme.colors.accent_ink, &theme.colors.accent, 7.0);
+                assert_contrast(
+                    &theme.name,
+                    &theme.colors.accent_ink,
+                    &theme.colors.accent,
+                    7.0,
+                );
                 assert_contrast(
                     &theme.name,
                     roles.focus.as_deref().unwrap(),
