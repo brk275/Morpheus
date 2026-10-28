@@ -1209,6 +1209,29 @@ $root = [IO.Path]::GetFullPath($env:MORPHEUS_HOST_TEST_ROOT)
 foreach ($bad in @('relative', '\\server\share\x', 'C:\x:stream', 'C:\x\..\other', 'C:\x\bad.', 'C:\x\bad ', 'C:\x\CON.txt')) {
     Must-Refuse { Get-CanonicalHostPath $bad }
 }
+foreach ($work in @('idle', 'directory_open', 'enumeration', 'entry_type', 'file_open',
+    'file_hash', 'file_identity', 'receipt_row', 'snapshot_identity', 'snapshot_names', 'final_directory', 'final_file', 'json')) {
+    $progress = Get-HostPreflightProgressMessage $work 200001 ([uint64]68719476736) 200000
+    if ($progress -cne (' work=' + $work + ' entries=200001 bytes=68719476736 managed_hashes=200000')) { throw 'failure_context' }
+}
+foreach ($bad in @($null, '', 'FILE_HASH', "private`npath token payload", ('private' * 1000),
+    [pscustomobject]@{ private = 'unexported' }, -1, [long]200002, [uint64]68719476737)) {
+    if ((Get-HostPreflightProgressMessage $bad $bad $bad $bad) -cne
+        ' work=unknown entries=0 bytes=0 managed_hashes=0') { throw 'failure_context' }
+}
+# Intrinsic PSObject selects the metadata view even when ordinary dictionary
+# keys/ETS members use the same names. Looking up metadata never runs Value.
+$metadataProbe = @{ Members = 'not metadata'; PSObject = 'not the reserved view' }
+$script:MetadataGetterReads = 0
+Add-Member -InputObject $metadataProbe -MemberType ScriptProperty -Name Members -Value {
+    $script:MetadataGetterReads++; throw 'accepted'
+} -Force
+$viewMembers = $metadataProbe.PSObject.Members
+if ($viewMembers -isnot [Management.Automation.PSMemberInfoCollection[Management.Automation.PSMemberInfo]] -or
+    $viewMembers['Members'] -isnot [Management.Automation.PSScriptProperty] -or
+    $viewMembers['Count'] -isnot [Management.Automation.PSProperty] -or
+    $script:MetadataGetterReads -ne 0) { throw 'metadata' }
+$viewMembers.Remove('Members')
 $caseStage = 'synthetic_setup'
 $good = Join-Path $root 'good'
 [IO.Directory]::CreateDirectory((Join-Path $good 'include')) | Out-Null
@@ -1221,6 +1244,14 @@ try {
     $ownedScratch = $script:HostInfoScratch
     $ownedMemo = $script:HostCanonicalPaths
     $ownedCanonical = $script:HostCanonicalInvoker
+    $ownedHashInvoker = $script:HostHashInvoker
+    if ($ownedHashInvoker -isnot [Delegate] -or $script:HostManagedHashes -ne 0 -or
+        -not [object]::ReferenceEquals($ownedHashInvoker, $script:HostHashInvokerOwner) -or
+        -not [object]::ReferenceEquals(${function:Assert-HostBudget}, $script:HostHashBudgetOwner) -or
+        -not [object]::ReferenceEquals($script:HostLimits, $script:HostHashLimitsOwner) -or
+        -not [object]::ReferenceEquals($script:HostHandles, $script:HostHashHandlesOwner) -or
+        -not [object]::ReferenceEquals(${function:Open-HostReadHandle}, $script:HostHashOpenOwner) -or
+        -not [object]::ReferenceEquals(${function:Get-HostHandleInfo}, $script:HostHashInfoOwner)) { throw 'identity' }
     $ownedChainInvoker = $script:HostChainInvoker
     if ($ownedChainInvoker -isnot [Delegate] -or
         -not [object]::ReferenceEquals($ownedChainInvoker, $script:HostChainInvokerOwner) -or
@@ -1391,7 +1422,55 @@ try {
         $script:HostPreflightBudgetCause = 'unknown'
     }
     $caseStage = 'inventory'
+    # Actual emitted loop: two positive 1MiB-buffer reads, optional text,
+    # exact digest/size, ordered budget statuses and both growth/short-read refusals.
+    $caseStage = 'digest_assertion'
+    $payload = [byte[]]::new(1048580); [Array]::Fill[byte]($payload, [byte]90)
+    foreach ($difference in @(0, -1, 1)) {
+        $hashInput = [IO.MemoryStream]::new($payload, $false)
+        $hash = [Security.Cryptography.SHA256]::Create()
+        $copied = [IO.MemoryStream]::new(); $hashSize = [uint64[]]::new(1)
+        try {
+            $status = $ownedHashInvoker.Invoke($hashInput, $hash, $script:HostBuffer, $copied,
+                @{ initial = @{ bytes = [uint64]($payload.Length + $difference) } }, $script:HostWatch,
+                [long[]]@(180, 0, 200000, 0, 200256, 0, 31457280), [uint64]0, [uint64]68719476736, $hashSize)
+            if ($difference -eq 0) {
+                if ($status -ne 0 -or $hashSize[0] -ne $payload.Length -or
+                    $hashInput.Position -ne $payload.Length -or $copied.Length -ne $payload.Length -or
+                    [Convert]::ToHexString($hash.Hash).ToLowerInvariant() -cne '63251aaae2535511a27c37c773030570cd316072c26a8138ab2a7ef540b4ae9c') { throw 'hash' }
+            } elseif ($status -ne 6) { throw 'hash' }
+        } finally { $hashInput.Dispose(); $hash.Dispose(); $copied.Dispose() }
+    }
+    foreach ($first in @(1, 2, 3, 4, 5)) {
+        $budget = [long[]]@(180, 0, 200000, 0, 200256, 0, 31457280)
+        $currentBytes = [uint64]0
+        if ($first -le 1) { $budget[0] = -1 }
+        if ($first -le 2) { $budget[1] = 200001 }
+        if ($first -le 3) { $currentBytes = [uint64]68719476737 }
+        if ($first -le 4) { $budget[3] = 200257 }
+        if ($first -le 5) { $budget[5] = 31457281 }
+        $hashInput = [IO.MemoryStream]::new([byte[]]@(1, 2, 3, 4), $false)
+        $hash = [Security.Cryptography.SHA256]::Create(); $copied = [IO.MemoryStream]::new()
+        $hashSize = [uint64[]]::new(1)
+        try {
+            if ($ownedHashInvoker.Invoke($hashInput, $hash, $script:HostBuffer, $copied,
+                @{ initial = @{ bytes = [uint64]4 } },
+                $script:HostWatch, $budget, $currentBytes, [uint64]68719476736, $hashSize) -ne $first -or
+                $hashInput.Position -ne 4 -or $copied.Length -ne 0) { throw 'hash' }
+        } finally { $hashInput.Dispose(); $hash.Dispose(); $copied.Dispose() }
+    }
+    # EOF performs no positive-Read budget check, matching the original loop.
+    $hashInput = [IO.MemoryStream]::new(); $hash = [Security.Cryptography.SHA256]::Create()
+    $hashSize = [uint64[]]::new(1)
+    try {
+        if ($ownedHashInvoker.Invoke($hashInput, $hash, $script:HostBuffer, $null,
+            @{ initial = @{ bytes = [uint64]0 } },
+            $script:HostWatch, [long[]]@(-1, 200001, 200000, 200257, 200256, 31457281, 31457280),
+            [uint64]68719476737, [uint64]68719476736, $hashSize) -ne 0) { throw 'hash' }
+    } finally { $hashInput.Dispose(); $hash.Dispose() }
+    $caseStage = 'inventory'
     $result = Get-HostRootInventory $good
+    if ($script:HostManagedHashes -lt 2) { throw 'hash' }
     if ($result.files.Count -ne 2 -or $script:HostBytes -ne 5 -or
         $script:HostPreflightBudgetCause -cne 'unknown') { throw 'inventory' }
     $caseStage = 'digest_assertion'
@@ -1406,6 +1485,88 @@ try {
         $observed.write -cne [Convert]::ToHexString([byte[]]($ownedScratch[20..27])) -or
         $observed.identity -cne ([Convert]::ToHexString([byte[]]($ownedScratch[28..31])) +
                                [Convert]::ToHexString([byte[]]($ownedScratch[44..51])))) { throw 'identity' }
+    # Record/initial ETS shadows must refuse managed admission before any
+    # Read or getter. The actual old caller must then retain its four ordinary
+    # size accesses for one4-byte read/EOF (TextLimit0), with the same digest.
+    $script:HashRecordOpenOriginal = ${function:Open-HostReadHandle}
+    $script:HashRecordProbePath = Join-Path $good 'tool.bin'
+    foreach ($field in @('initial', 'bytes')) {
+        $script:HashRecordProbeField = $field
+        $script:HashRecordGetterCount = 0
+        $script:HashRecordProbeInitial = @{ bytes = [uint64]4 }
+        $shadowRecord = @{ initial = $script:HashRecordProbeInitial }
+        $shadowTarget = if ($field -ceq 'initial') { $shadowRecord } else { $script:HashRecordProbeInitial }
+        $recordGetter = {
+            $script:HashRecordGetterCount++
+            if ($script:HashRecordProbeField -ceq 'initial') { return ,$script:HashRecordProbeInitial }
+            return [uint64]4
+        }
+        Add-Member -InputObject $shadowTarget -MemberType ScriptProperty -Name $field -Value $recordGetter -Force
+        $hashInput = [IO.MemoryStream]::new([byte[]]@(1, 2, 3, 4), $false)
+        $hash = [Security.Cryptography.SHA256]::Create(); $copied = [IO.MemoryStream]::new()
+        $hashSize = [uint64[]]::new(1)
+        try {
+            if ($ownedHashInvoker.Invoke($hashInput, $hash, $script:HostBuffer, $copied,
+                $shadowRecord, $script:HostWatch, [long[]]@(180, 0, 200000, 0, 200256, 0, 31457280),
+                [uint64]0, [uint64]68719476736, $hashSize) -ne 7 -or
+                $hashInput.Position -ne 0 -or $script:HashRecordGetterCount -ne 0 -or
+                $copied.Length -ne 0 -or $hashSize[0] -ne 0 -or $null -ne $hash.Hash) { throw 'hash' }
+        } finally { $hashInput.Dispose(); $hash.Dispose(); $copied.Dispose() }
+        $beforeManaged = $script:HostManagedHashes
+        try {
+            Set-Item Function:Open-HostReadHandle -Value {
+                param([string] $LiteralPath, [bool] $Directory)
+                $opened = & $script:HashRecordOpenOriginal $LiteralPath $Directory
+                if (-not $Directory -and $LiteralPath -ceq $script:HashRecordProbePath) {
+                    $script:HashRecordProbeInitial = $opened['initial']
+                    $target = if ($script:HashRecordProbeField -ceq 'initial') { $opened } else { $opened['initial'] }
+                    Add-Member -InputObject $target -MemberType ScriptProperty -Name $script:HashRecordProbeField -Value {
+                        $script:HashRecordGetterCount++
+                        if ($script:HashRecordProbeField -ceq 'initial') { return ,$script:HashRecordProbeInitial }
+                        return [uint64]4
+                    } -Force
+                }
+                return $opened
+            }
+            $probeFact = Get-HostFileFact $script:HashRecordProbePath
+            if ($script:HashRecordGetterCount -ne 4 -or $script:HostManagedHashes -ne $beforeManaged -or
+                $probeFact.bytes -ne 4 -or $probeFact.sha256 -cne
+                '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
+        } finally { Set-Item Function:Open-HostReadHandle -Value $script:HashRecordOpenOriginal }
+    }
+    # Same-signature invoker and function/Length probes retain the original
+    # loop. The completed-managed counter must not rise on any fallback.
+    $probePath = Join-Path $good 'tool.bin'
+    $hashProbe = [Func[IO.Stream, Security.Cryptography.HashAlgorithm, byte[], IO.MemoryStream,
+        object, Diagnostics.Stopwatch, long[], uint64, uint64, uint64[], int]] {
+        param($Stream, $Digest, $Buffer, $Text, $Record, $Watch, $Budget, $CurrentBytes, $MaxBytes, $ResultSize)
+        throw 'accepted'
+    }
+    $beforeManaged = $script:HostManagedHashes
+    try {
+        $script:HostHashInvoker = $hashProbe
+        $probeFact = Get-HostFileFact $probePath
+        if ($probeFact.bytes -ne 4 -or $script:HostManagedHashes -ne $beforeManaged) { throw 'hash' }
+    } finally { $script:HostHashInvoker = $ownedHashInvoker }
+    $savedHashBudget = ${function:Assert-HostBudget}
+    $script:HashBudgetProbe = $savedHashBudget
+    $script:HashBudgetCalls = 0
+    try {
+        Set-Item Function:Assert-HostBudget -Value { $script:HashBudgetCalls++; & $script:HashBudgetProbe }
+        $probeFact = Get-HostFileFact $probePath
+        if ($probeFact.bytes -ne 4 -or $script:HashBudgetCalls -le 0 -or
+            $script:HostManagedHashes -ne $beforeManaged) { throw 'hash' }
+    } finally { Set-Item Function:Assert-HostBudget -Value $savedHashBudget }
+    $script:HashBufferLengthCalls = 0
+    Add-Member -InputObject $script:HostBuffer -MemberType ScriptProperty -Name Length -Value {
+        $script:HashBufferLengthCalls++; return 1
+    } -Force
+    try {
+        $probeFact = Get-HostFileFact $probePath
+        if ($probeFact.bytes -ne 4 -or $script:HashBufferLengthCalls -le 0 -or
+            $script:HostManagedHashes -ne $beforeManaged -or $probeFact.sha256 -cne
+            '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
+    } finally { $script:HostBuffer.PSObject.Members.Remove('Length') }
     $savedIdentity = $observed.identity
     $comparisonRecord = $script:HostFileRecords[0]
     $savedComparison = [Convert]::ToHexString($comparisonRecord.comparison)
@@ -1743,7 +1904,11 @@ try {
         Must-Refuse { Get-HostHandleInfo $comparisonRecord.handle $comparisonRecord.comparison $true }
         Must-Refuse { Open-HostDirectoryChain $good }
         Must-Refuse { Close-HostReader }
-        if (-not [object]::ReferenceEquals($ownedCanonical, $script:HostCanonicalInvoker) -or
+        if (-not [object]::ReferenceEquals($ownedHashInvoker, $script:HostHashInvoker) -or
+            -not [object]::ReferenceEquals($ownedHashInvoker, $script:HostHashInvokerOwner) -or
+            -not [object]::ReferenceEquals(${function:Open-HostReadHandle}, $script:HostHashOpenOwner) -or
+            -not [object]::ReferenceEquals(${function:Get-HostHandleInfo}, $script:HostHashInfoOwner) -or
+            -not [object]::ReferenceEquals($ownedCanonical, $script:HostCanonicalInvoker) -or
             -not [object]::ReferenceEquals($ownedChainInvoker, $script:HostChainInvoker) -or
             -not [object]::ReferenceEquals($ownedChainInvoker, $script:HostChainInvokerOwner) -or
             -not [object]::ReferenceEquals($originalComparison, $script:HostChainComparison) -or
@@ -1763,6 +1928,10 @@ if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScra
     $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
     $null -ne $script:HostComparisonInfo -or $null -ne $script:HostChainInvoker -or
         $null -ne $script:HostChainInvokerOwner -or $null -ne $script:HostChainComparison -or
+        $null -ne $script:HostHashInvoker -or $null -ne $script:HostHashInvokerOwner -or
+        $null -ne $script:HostHashBudgetOwner -or $null -ne $script:HostHashLimitsOwner -or
+        $null -ne $script:HostHashHandlesOwner -or
+        $null -ne $script:HostHashOpenOwner -or $null -ne $script:HostHashInfoOwner -or
     $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostCanonicalUnits -ne 0 -or
     $ownedMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
@@ -1791,6 +1960,10 @@ try {
         $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
         $null -ne $script:HostComparisonInfo -or $null -ne $script:HostChainInvoker -or
         $null -ne $script:HostChainInvokerOwner -or $null -ne $script:HostChainComparison -or
+        $null -ne $script:HostHashInvoker -or $null -ne $script:HostHashInvokerOwner -or
+        $null -ne $script:HostHashBudgetOwner -or $null -ne $script:HostHashLimitsOwner -or
+        $null -ne $script:HostHashHandlesOwner -or
+        $null -ne $script:HostHashOpenOwner -or $null -ne $script:HostHashInfoOwner -or
         $script:HostInfoBusy -or $script:HostHandles.Count -ne 0 -or
         $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostCanonicalUnits -ne 0 -or
@@ -1892,6 +2065,10 @@ try {
         $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
         $null -ne $script:HostComparisonInfo -or $null -ne $script:HostChainInvoker -or
         $null -ne $script:HostChainInvokerOwner -or $null -ne $script:HostChainComparison -or
+        $null -ne $script:HostHashInvoker -or $null -ne $script:HostHashInvokerOwner -or
+        $null -ne $script:HostHashBudgetOwner -or $null -ne $script:HostHashLimitsOwner -or
+        $null -ne $script:HostHashHandlesOwner -or
+        $null -ne $script:HostHashOpenOwner -or $null -ne $script:HostHashInfoOwner -or
         $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostCanonicalUnits -ne 0 -or
         $exceptionMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
@@ -1907,7 +2084,11 @@ try {
         $script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
         $null -ne $script:HostComparisonInvoker -or $null -ne $script:HostComparisonType -or
         $null -ne $script:HostComparisonInfo -or $null -ne $script:HostChainInvoker -or
-        $null -ne $script:HostChainInvokerOwner -or $null -ne $script:HostChainComparison -or $null -ne $script:HostCanonicalInvoker -or
+        $null -ne $script:HostChainInvokerOwner -or $null -ne $script:HostChainComparison -or
+        $null -ne $script:HostHashInvoker -or $null -ne $script:HostHashInvokerOwner -or
+        $null -ne $script:HostHashBudgetOwner -or $null -ne $script:HostHashLimitsOwner -or
+        $null -ne $script:HostHashHandlesOwner -or
+        $null -ne $script:HostHashOpenOwner -or $null -ne $script:HostHashInfoOwner -or $null -ne $script:HostCanonicalInvoker -or
         $script:HostInfoBusy) { throw 'identity' }
     Close-HostReader
     if ($closeProbe.Calls.Count -ne $ownedHandleCount) { throw 'identity' }
