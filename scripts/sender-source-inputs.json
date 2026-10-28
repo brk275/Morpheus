@@ -2496,7 +2496,7 @@
       "tar_mode": 493
     }
   },
-  "scanner_binary_sha256": "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f",
+  "scanner_binary_sha256": "88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509",
   "registry_review_sha256": "63bd5482cbad90c4940ea706317c3825075229e65bd9a993b557e4db99ae5a98",
   "advisory_summary_sha256": "b0aeeffd3945ec883c98de599c2d3c4726aadafdfe870b3fc0f0b782a10b111e",
   "existing_tests_only": true,
