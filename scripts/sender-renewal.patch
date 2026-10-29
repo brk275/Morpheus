@@ -1,0 +1,626 @@
+--- a/src/matrixrtc/MembershipManager.ts
++++ b/src/matrixrtc/MembershipManager.ts
+@@ -98,6 +98,10 @@
+  * of time.
+  */
+ const MEMBERSHIP_STICKY_DURATION_MS = 60 * 60 * 1000; // 60 minutes
++const PEER_REFRESH_DEBOUNCE_MS = 250;
++const PEER_REFRESH_MIN_INTERVAL_MS = 5000;
++// Bound active-peer bookkeeping for one participation; saturation disables only this optimisation.
++const MAX_PEER_REFRESH_IDENTITIES = 256;
+ 
+ /**
+  * The different types of actions the MembershipManager can take.
+@@ -108,6 +112,9 @@
+     //  -> MembershipActionType.SendJoinEvent if successful
+     //  -> DelayedLeaveActionType.SendDelayedEvent on error, retry sending the first delayed event.
+     //  -> DelayedLeaveActionType.RestartDelayedEvent on success start updating the delayed event
++
++    /** Republish only our current membership for newly observed active peers. @internal */
++    RefreshMembership = "RefreshMembership",
+ 
+     SendJoinEvent = "SendJoinEvent",
+     //  -> MembershipActionType.SendJoinEvent if we run into a rate limit and need to retry
+@@ -218,6 +225,122 @@
+     implements IMembershipManager
+ {
+     private activated = false;
++    private peerRefreshGeneration = 0;
++    private readonly seenPeerMemberships = new Set<string>();
++    private readonly pendingPeerMemberships = new Map<string, symbol>();
++    private peerRefreshSaturated = false;
++    private peerRefreshScheduled = false;
++    private lastPeerRefreshAttempt = -Infinity;
++
++    protected get refreshMembershipForNewPeers(): boolean {
++        return false;
++    }
++
++    private resetPeerRefresh(): void {
++        this.peerRefreshGeneration++;
++        this.seenPeerMemberships.clear();
++        this.pendingPeerMemberships.clear();
++        this.peerRefreshSaturated = false;
++        this.peerRefreshScheduled = false;
++        this.lastPeerRefreshAttempt = -Infinity;
++    }
++
++    private schedulePeerRefresh(): void {
++        if (!this.activated || this.peerRefreshScheduled || !this.pendingPeerMemberships.size) {
++            return;
++        }
++        this.peerRefreshScheduled = true;
++        this.scheduler.requestMembershipRefresh(
++            Math.max(Date.now() + PEER_REFRESH_DEBOUNCE_MS, this.lastPeerRefreshAttempt + PEER_REFRESH_MIN_INTERVAL_MS),
++        );
++    }
++
++    private observePeerMemberships(memberships: CallMembership[]): void {
++        if (
++            !this.refreshMembershipForNewPeers ||
++            this.room.hasEncryptionStateEvent?.() !== true ||
++            this.peerRefreshSaturated
++        ) {
++            return;
++        }
++        const current = new Set<string>();
++        for (const member of memberships) {
++            if (
++                isMyMembership(member, this.userId, this.deviceId) ||
++                member.isExpired() ||
++                member.slotId !== computeSlotId(this.slotDescription)
++            ) {
++                continue;
++            }
++            const identity = [member.userId, member.deviceId, member.memberId];
++            if (identity.some((value) => typeof value !== "string" || !value.length || value.length > 255)) {
++                continue;
++            }
++            const key = JSON.stringify(identity);
++            current.add(key);
++            if (current.size > MAX_PEER_REFRESH_IDENTITIES) {
++                this.peerRefreshSaturated = true;
++                this.pendingPeerMemberships.clear();
++                return;
++            }
++        }
++        for (const key of current) {
++            if (!this.seenPeerMemberships.has(key)) this.pendingPeerMemberships.set(key, Symbol());
++        }
++        // A later active transition of the same participation also needs a fresh current event.
++        this.seenPeerMemberships.clear();
++        for (const key of current) this.seenPeerMemberships.add(key);
++        // A peer which left during the debounce must not provoke a send.
++        for (const key of this.pendingPeerMemberships.keys()) {
++            if (!current.has(key)) this.pendingPeerMemberships.delete(key);
++        }
++        this.schedulePeerRefresh();
++    }
++
++    private async refreshMembershipForPeers(): Promise<ActionUpdate> {
++        const generation = this.peerRefreshGeneration;
++        if (!this.activated || !this.ownMembership || !this.pendingPeerMemberships.size) {
++            this.peerRefreshScheduled = false;
++            return {};
++        }
++        const earliest = this.lastPeerRefreshAttempt + PEER_REFRESH_MIN_INTERVAL_MS;
++        if (Date.now() < earliest) {
++            return { insert: [{ ts: earliest, type: MembershipActionType.RefreshMembership }] };
++        }
++        this.lastPeerRefreshAttempt = Date.now();
++        // Use the same delayed-leave protection as periodic renewal, including its recovery paths.
++        const protection = await this.ensureDelayedLeaveEventProtectsMembership();
++        if (generation !== this.peerRefreshGeneration || !this.activated) {
++            return {};
++        }
++        if (protection) {
++            const deferred =
++                "insert" in protection ? protection.insert : "replace" in protection ? protection.replace : [];
++            if (deferred.some((action) => action.type === MembershipActionType.UpdateExpiry)) {
++                // Keep the exact protection retry timestamp and the coalescing
++                // flag. A later arrival must not shorten Retry-After, and the
++                // retry must still pass this refresh's throttle/lifetime checks.
++                const actions = deferred
++                    .filter((action) => action.type !== MembershipActionType.RefreshMembership)
++                    .map((action) =>
++                        action.type === MembershipActionType.UpdateExpiry
++                            ? { ...action, type: MembershipActionType.RefreshMembership }
++                            : action,
++                    );
++                return "replace" in protection ? { replace: actions } : { insert: actions };
++            }
++            // A genuine rejoin owns its ordinary SendDelayedEvent/SendJoinEvent
++            // recovery; do not keep a refresh flag that those actions cannot clear.
++            this.peerRefreshScheduled = false;
++            return protection;
++        }
++        if (!this.ownMembership || !this.pendingPeerMemberships.size) {
++            this.peerRefreshScheduled = false;
++            return {};
++        }
++        return this.sendJoinEvent(MembershipActionType.RefreshMembership);
++    }
++
+     private readonly logger: Logger;
+     protected callIntent: RTCCallIntent | undefined;
+     protected callCapabilities: RTCCallCapability[] | undefined;
+@@ -245,6 +368,7 @@
+             this.logger.error("MembershipManager is already running. Ignoring join request.");
+             return;
+         }
++        this.resetPeerRefresh();
+         this.publishedTransports = publishedTransports;
+         this.leavePromiseResolvers = undefined;
+         this.activated = true;
+@@ -260,6 +384,7 @@
+             .finally(() => {
+                 // Should already be set to false when calling `leave` in non error cases.
+                 this.activated = false;
++                this.resetPeerRefresh();
+                 // Here the scheduler is not running anymore so we the `membershipLoopHandler` is not called to emit.
+                 if (this.oldStatus && this.oldStatus !== this.status) {
+                     this.emit(MembershipManagerEvent.StatusChanged, this.oldStatus, this.status);
+@@ -288,6 +413,7 @@
+             // reset scheduled actions so we will not do any new actions.
+             this.leavePromiseResolvers = Promise.withResolvers<boolean>();
+             this.activated = false;
++            this.resetPeerRefresh();
+             this.scheduler.initiateLeave();
+             if (timeout) setTimeout(() => this.leavePromiseResolvers?.resolve(false), timeout);
+         }
+@@ -302,6 +428,8 @@
+         }
+ 
+         this._ownMembership = memberships.find((m) => isMyMembership(m, this.userId, this.deviceId));
++
++        if (this._ownMembership) this.observePeerMemberships(memberships);
+ 
+         if (!this._ownMembership) {
+             // If one of these actions are scheduled or are getting inserted in the next iteration, we should already
+@@ -320,6 +448,7 @@
+                 );
+             } else {
+                 // Only react to our own membership missing if we have not already scheduled sending a new membership DirectMembershipManagerAction.Join
++                this.peerRefreshScheduled = false;
+                 this.scheduler.initiateJoin();
+             }
+         }
+@@ -357,7 +486,7 @@
+      */
+     public constructor(
+         private readonly joinConfig: (SessionConfig & MembershipConfig) | undefined,
+-        protected readonly room: Pick<Room, "roomId" | "getVersion">,
++        protected readonly room: Pick<Room, "roomId" | "getVersion"> & Partial<Pick<Room, "hasEncryptionStateEvent">>,
+         protected readonly client: MembershipManagerClient,
+         public readonly slotDescription: SlotDescription,
+         parentLogger?: Logger,
+@@ -494,6 +623,9 @@
+                 } else {
+                     return createInsertActionUpdate(MembershipActionType.SendLeaveEvent);
+                 }
++            }
++            case MembershipActionType.RefreshMembership: {
++                return this.refreshMembershipForPeers();
+             }
+             case MembershipActionType.SendJoinEvent: {
+                 return this.sendJoinEvent();
+@@ -755,17 +887,29 @@
+     /** Sends the event that marks our membership as left. */
+     protected clientSendLeaveMembership: () => Promise<ISendEventResponse> = () => this.clientSendMembership({});
+ 
+-    private async sendJoinEvent(): Promise<ActionUpdate> {
++    private async sendJoinEvent(retryType = MembershipActionType.SendJoinEvent): Promise<ActionUpdate> {
++        // Only arrivals known before encryption starts are covered by this send. Later arrivals need another send.
++        const coveredPeers = [...this.pendingPeerMemberships];
++        const generation = this.peerRefreshGeneration;
+         const myMembership = this.makeMyMembership(this.membershipEventExpiryMs);
+         return await this.clientSendMembership(myMembership)
+             .then(() => {
++                if (generation === this.peerRefreshGeneration) {
++                    for (const [key, arrival] of coveredPeers) {
++                        // The same participation may leave and return while encryption is in flight.
++                        // That later arrival still needs its own current membership publication.
++                        if (this.pendingPeerMemberships.get(key) === arrival) this.pendingPeerMemberships.delete(key);
++                    }
++                    if (retryType === MembershipActionType.RefreshMembership) this.peerRefreshScheduled = false;
++                    this.schedulePeerRefresh();
++                }
+                 this.setAndEmitProbablyLeft(false);
+                 this.state.startTime = Date.now();
+                 this.state.membershipExpiryTs = this.membershipExpiryTsOf(myMembership);
+                 // The next update should already use twice the membershipEventExpiryTimeout
+                 this.state.expireUpdateIterations = 1;
+                 this.state.hasMemberStateEvent = true;
+-                this.resetRateLimitCounter(MembershipActionType.SendJoinEvent);
++                this.resetRateLimitCounter(retryType);
+                 // A successful (re-)join is a fresh membership: failures accumulated by the previous one
+                 // (e.g. delayed event restarts that timed out before the server sent our leave) must not carry over.
+                 this.state.networkErrorRetries.clear();
+@@ -778,7 +922,9 @@
+                 const actionsWithoutUpdateExpiry = this.scheduler.actions.filter(
+                     (a) =>
+                         a.type !== MembershipActionType.UpdateExpiry && // A new UpdateExpiry action with an updated will be scheduled,
+-                        a.type !== MembershipActionType.SendJoinEvent, // Manually remove the SendJoinEvent action,
++                        a.type !== MembershipActionType.SendJoinEvent && // Manually remove the SendJoinEvent action,
++                        (retryType !== MembershipActionType.RefreshMembership ||
++                            (a.type !== retryType && a.type !== MembershipActionType.RestartDelayedEvent)),
+                 );
+                 return {
+                     replace: [
+@@ -793,7 +939,7 @@
+                 };
+             })
+             .catch((e) => {
+-                const update = this.actionUpdateFromErrors(e, MembershipActionType.SendJoinEvent, "sendStateEvent");
++                const update = this.actionUpdateFromErrors(e, retryType, "sendStateEvent");
+                 if (update) return update;
+                 throw e;
+             });
+@@ -1241,7 +1387,7 @@
+     }
+ 
+     public get status(): Status {
+-        const actions = this.scheduler.actions;
++        const actions = this.scheduler.actions.filter((a) => a.type !== MembershipActionType.RefreshMembership);
+         if (actions.length === 1) {
+             const { type } = actions[0];
+             switch (type) {
+@@ -1299,9 +1445,13 @@
+  * rather than state events.
+  */
+ export class StickyEventMembershipManager extends MembershipManager {
++    protected override get refreshMembershipForNewPeers(): boolean {
++        return true;
++    }
++
+     public constructor(
+         joinConfig: (SessionConfig & MembershipConfig) | undefined,
+-        room: Pick<Room, "getLiveTimeline" | "roomId" | "getVersion">,
++        room: Pick<Room, "getLiveTimeline" | "roomId" | "getVersion"> & Partial<Pick<Room, "hasEncryptionStateEvent">>,
+         private readonly clientWithSticky: MembershipManagerClient &
+             Pick<MatrixClient, "_unstable_sendStickyEvent" | "_unstable_sendStickyDelayedEvent">,
+         sessionDescription: SlotDescription,
+--- a/src/matrixrtc/MembershipManagerActionScheduler.ts
++++ b/src/matrixrtc/MembershipManagerActionScheduler.ts
+@@ -57,6 +57,35 @@
+     private wakeup: (update: ActionUpdate) => void = (update: ActionUpdate): void => {
+         this.logger.error("Cannot call wakeup before calling `startWithJoin()`");
+     };
++    private membershipRefreshAt?: number;
++    private wakeForMembershipRefresh?: () => void;
++
++    /**
++     * Queue a coalesced current-membership refresh without replacing ordinary maintenance.
++     * @param ts - Earliest Unix timestamp in milliseconds at which to process the refresh.
++     * @internal
++     */
++    public requestMembershipRefresh(ts: number): void {
++        if (!this.running) {
++            return;
++        }
++        this.membershipRefreshAt = Math.min(this.membershipRefreshAt ?? ts, ts);
++        this.wakeForMembershipRefresh?.();
++    }
++
++    private drainMembershipRefresh(): void {
++        if (this.membershipRefreshAt === undefined) {
++            return;
++        }
++        const queued = this._actions.find((a) => a.type === MembershipActionType.RefreshMembership);
++        if (queued) {
++            queued.ts = Math.min(queued.ts, this.membershipRefreshAt);
++        } else {
++            this._actions.push({ ts: this.membershipRefreshAt, type: MembershipActionType.RefreshMembership });
++        }
++        this.membershipRefreshAt = undefined;
++    }
++
+     private _actions: Action[] = [];
+     public get actions(): Action[] {
+         return this._actions;
+@@ -77,14 +106,20 @@
+         this.running = true;
+         this._actions = [{ ts: Date.now(), type: MembershipActionType.SendDelayedEvent }];
+         try {
+-            while (this._actions.length > 0) {
++            while (this._actions.length > 0 || this.membershipRefreshAt !== undefined) {
++                this.drainMembershipRefresh();
+                 // Sort so next (smallest ts) action is at the beginning
+                 this._actions.sort((a, b) => a.ts - b.ts);
+                 const nextAction = this._actions[0];
+                 let wakeupUpdate: ActionUpdate | undefined = undefined;
++                let refreshWoken = false;
+ 
+                 // while we await for the next action, wakeup has to resolve the wakeupPromise
+                 const wakeupPromise = new Promise<void>((resolve) => {
++                    this.wakeForMembershipRefresh = (): void => {
++                        refreshWoken = true;
++                        resolve();
++                    };
+                     this.wakeup = (update: ActionUpdate): void => {
+                         wakeupUpdate = update;
+                         resolve();
+@@ -92,6 +127,11 @@
+                 });
+                 if (nextAction.ts > Date.now()) await Promise.race([wakeupPromise, sleep(nextAction.ts - Date.now())]);
+ 
++                // An additive refresh wakeup only re-sorts: it must not consume the sleeping restart/expiry action.
++                if (refreshWoken && !wakeupUpdate) {
++                    continue;
++                }
++                this.wakeForMembershipRefresh = undefined;
+                 let handlerResult: ActionUpdate = {};
+                 if (!wakeupUpdate) {
+                     this.logger.debug(
+@@ -124,15 +164,19 @@
+             // Set the rtc session running state since we cannot recover from here and the consumer user of the
+             // MatrixRTCSession class needs to manually rejoin.
+             this.running = false;
++            this.membershipRefreshAt = undefined;
++            this.wakeForMembershipRefresh = undefined;
+         }
+ 
+         this.logger.debug("Leave MembershipManager ActionScheduler loop (no more actions)");
+     }
+ 
+     public initiateJoin(): void {
++        this.membershipRefreshAt = undefined;
+         this.wakeup?.({ replace: [{ ts: Date.now(), type: MembershipActionType.SendDelayedEvent }] });
+     }
+     public initiateLeave(): void {
++        this.membershipRefreshAt = undefined;
+         this.wakeup?.({ replace: [{ ts: Date.now(), type: MembershipActionType.SendScheduledDelayedLeaveEvent }] });
+     }
+ }
+--- a/spec/unit/matrixrtc/MembershipManager.spec.ts
++++ b/spec/unit/matrixrtc/MembershipManager.spec.ts
+@@ -31,11 +31,14 @@
+     makeMockClient,
+     makeMockRoom,
+     sessionMembershipTemplate,
++    rtcMembershipTemplate,
++    mockRTCEvent,
+     mockCallMembership,
+     type MockClient,
+ } from "./mocks.ts";
++import { CallMembership } from "../../../src/matrixrtc/CallMembership.ts";
+ import { MembershipManager, StickyEventMembershipManager } from "../../../src/matrixrtc/MembershipManager.ts";
+-import { type SessionMembershipData } from "../../../src/matrixrtc/membershipData/index.ts";
++import { type RtcMembershipData, type SessionMembershipData } from "../../../src/matrixrtc/membershipData/index.ts";
+ 
+ /**
+  * Create a promise that will resolve once a mocked method is called.
+@@ -1634,6 +1637,223 @@
+             });
+         });
+ 
++        describe("encrypted sticky membership refresh for new peers", () => {
++            const ownId = "@alice:example.org:AAAAAAA_m.call";
++
++            function stickyMembership(data: RtcMembershipData & { user_id: string }) {
++                const event = mockRTCEvent(data, room.roomId, Date.now() + 3600000);
++                return new CallMembership(event, CallMembership.membershipDataFromMatrixEvent(event), ["xx"], "xx");
++            }
++
++            function peer(deviceId: string, memberId = deviceId) {
++                return stickyMembership({
++                    ...rtcMembershipTemplate,
++                    user_id: "@bob:example.org",
++                    member: { user_id: "@bob:example.org", device_id: deviceId, id: memberId },
++                });
++            }
++
++            async function joined(
++                encrypted = true,
++                config: ConstructorParameters<typeof StickyEventMembershipManager>[0] = undefined,
++            ) {
++                vi.mocked(room.hasEncryptionStateEvent).mockReturnValue(encrypted);
++                const manager = new StickyEventMembershipManager(config, room, client, callSession, ownId);
++                manager.join([focus]);
++                await vi.advanceTimersByTimeAsync(1);
++                const content = vi.mocked(client._unstable_sendStickyEvent).mock.calls[0][4] as RtcMembershipData;
++                const own = stickyMembership({ ...content, user_id: "@alice:example.org" });
++                await manager.onRTCSessionMemberUpdate([own]);
++                return { manager, own, content };
++            }
++
++            it("coalesces new participants and devices through the original current-membership sender", async () => {
++                const { manager, own, content } = await joined();
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await manager.onRTCSessionMemberUpdate([own, peer("B1"), peer("B2")]);
++                await vi.advanceTimersByTimeAsync(249);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(1);
++                await vi.advanceTimersByTimeAsync(1);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++                expect(vi.mocked(client._unstable_sendStickyEvent).mock.lastCall).toEqual([
++                    room.roomId,
++                    3600000,
++                    null,
++                    EventType.RTCMembership,
++                    content,
++                ]);
++                expect(manager.status).toBe(Status.Connected);
++            });
++
++            it("does not form a refresh feedback loop for unchanged membership identities", async () => {
++                const { manager, own } = await joined();
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(250);
++                // Different event objects/content updates for the same member are not new arrivals.
++                for (let i = 0; i < 3; i++) await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(10000);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++            });
++
++            it("cancels a vanished peer and cancels pending refresh on leave", async () => {
++                const { manager, own } = await joined();
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await manager.onRTCSessionMemberUpdate([own]);
++                await vi.advanceTimersByTimeAsync(250);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(1);
++                await manager.onRTCSessionMemberUpdate([own, peer("B2")]);
++                const leaving = manager.leave();
++                await vi.advanceTimersByTimeAsync(10000);
++                await leaving;
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(1);
++            });
++
++            it("retains a device arriving during encryption and bounds successive refreshes", async () => {
++                const { manager, own } = await joined();
++                const pendingSend = createAsyncHandle<{ event_id: string }>(client._unstable_sendStickyEvent);
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(250);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++                await manager.onRTCSessionMemberUpdate([own, peer("B1"), peer("B2")]);
++                pendingSend.resolve({ event_id: "fresh" });
++                await vi.advanceTimersByTimeAsync(4999);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++                await vi.advanceTimersByTimeAsync(1);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(3);
++            });
++
++            it("retains the same participation returning during an in-flight current-membership send", async () => {
++                const { manager, own, content } = await joined();
++                const pendingSend = createAsyncHandle<{ event_id: string }>(client._unstable_sendStickyEvent);
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(250);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++                await manager.onRTCSessionMemberUpdate([own]);
++                // Same user/device/member ID, but a later active transition than the in-flight send covers.
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                pendingSend.resolve({ event_id: "fresh" });
++                await vi.advanceTimersByTimeAsync(4999);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++                await vi.advanceTimersByTimeAsync(1);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(3);
++                expect(vi.mocked(client._unstable_sendStickyEvent).mock.lastCall).toEqual([
++                    room.roomId,
++                    3600000,
++                    null,
++                    EventType.RTCMembership,
++                    content,
++                ]);
++            });
++
++            it("preserves server retry-after instead of accelerating it for another arrival", async () => {
++                const { manager, own } = await joined();
++                vi.mocked(client._unstable_sendStickyEvent).mockRejectedValueOnce(rateLimitError(20));
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(250);
++                await manager.onRTCSessionMemberUpdate([own, peer("B1"), peer("B2")]);
++                await vi.advanceTimersByTimeAsync(19999);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++                await vi.advanceTimersByTimeAsync(1);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(3);
++            });
++
++            it("does not shorten delayed-leave protection Retry-After for another arrival", async () => {
++                const { manager, own } = await joined(true, {
++                    delayedLeaveEventDelayMs: 1000,
++                    delayedLeaveEventRestartMs: 60000,
++                });
++                const restarts = vi.mocked(client._unstable_restartScheduledDelayedEvent).mock.calls.length;
++                vi.mocked(client._unstable_restartScheduledDelayedEvent).mockRejectedValueOnce(rateLimitError(20));
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(250);
++                expect(client._unstable_restartScheduledDelayedEvent).toHaveBeenCalledTimes(restarts + 1);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(1);
++                await manager.onRTCSessionMemberUpdate([own, peer("B1"), peer("B2")]);
++                await vi.advanceTimersByTimeAsync(5000);
++                expect(client._unstable_restartScheduledDelayedEvent).toHaveBeenCalledTimes(restarts + 1);
++                await vi.advanceTimersByTimeAsync(14999);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(1);
++                await vi.advanceTimersByTimeAsync(1);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++            });
++
++            it("replaces a cancelled delayed leave before one throttled current-membership retry", async () => {
++                const { manager, own } = await joined();
++                vi.mocked(client._unstable_restartScheduledDelayedEvent).mockRejectedValueOnce(notFoundError());
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(250);
++                expect(client._unstable_sendStickyDelayedEvent).toHaveBeenCalledTimes(2);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(1);
++                await vi.advanceTimersByTimeAsync(4999);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(1);
++                await vi.advanceTimersByTimeAsync(1);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++                await vi.advanceTimersByTimeAsync(5000);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++                expect(manager.status).toBe(Status.Connected);
++            });
++
++            it("does not resend for unencrypted rooms or a different call slot", async () => {
++                const { manager, own } = await joined(false);
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(500);
++                vi.mocked(room.hasEncryptionStateEvent).mockReturnValue(true);
++                const otherSlot = stickyMembership({ ...rtcMembershipTemplate, slot_id: "m.call#OTHER" });
++                await manager.onRTCSessionMemberUpdate([own, otherSlot]);
++                await vi.advanceTimersByTimeAsync(500);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(1);
++            });
++
++            it("fails closed on bounded active-peer saturation without losing normal maintenance", async () => {
++                const { manager, own } = await joined();
++                await manager.onRTCSessionMemberUpdate([own, ...Array.from({ length: 257 }, (_, i) => peer(`B${i}`))]);
++                await vi.advanceTimersByTimeAsync(10000);
++                await manager.onRTCSessionMemberUpdate([own, peer("NEW")]);
++                await vi.advanceTimersByTimeAsync(10000);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(1);
++                expect(client._unstable_restartScheduledDelayedEvent).toHaveBeenCalled();
++                expect(manager.status).toBe(Status.Connected);
++            });
++
++            it("refreshes a returning active participation without treating content refreshes as arrivals", async () => {
++                const { manager, own } = await joined();
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(250);
++                await manager.onRTCSessionMemberUpdate([own]);
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(4999);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++                await vi.advanceTimersByTimeAsync(1);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(3);
++            });
++
++            it("preserves an in-flight delayed-leave restart and its subsequent maintenance", async () => {
++                const { manager, own } = await joined();
++                const restart = createAsyncHandle<void>(client._unstable_restartScheduledDelayedEvent);
++                await vi.advanceTimersByTimeAsync(5000);
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                restart.resolve();
++                await vi.advanceTimersByTimeAsync(250);
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
++                expect(manager.status).toBe(Status.Connected);
++                const restarts = vi.mocked(client._unstable_restartScheduledDelayedEvent).mock.calls.length;
++                await vi.advanceTimersByTimeAsync(5000);
++                expect(client._unstable_restartScheduledDelayedEvent).toHaveBeenCalledTimes(restarts + 1);
++            });
++
++            it("does not send after leave interrupts the delayed-leave protection request", async () => {
++                const { manager, own } = await joined();
++                const protection = createAsyncHandle<void>(client._unstable_restartScheduledDelayedEvent);
++                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
++                await vi.advanceTimersByTimeAsync(250);
++                const leaving = manager.leave();
++                protection.resolve();
++                await vi.advanceTimersByTimeAsync(1000);
++                await leaving;
++                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(1);
++            });
++        });
++
+         describe("background timers", () => {
+             it("rejoins rather than letting the sticky event vanish while the restart stays rate limited", async () => {
+                 // A sticky event vanishes an hour after it was sent, whatever `expires` (4h by default) says, so that
+--- a/spec/unit/matrixrtc/mocks.ts
++++ b/spec/unit/matrixrtc/mocks.ts
+@@ -133,6 +133,7 @@
+     const room = Object.assign(new EventEmitter(), {
+         roomId: roomId,
+         hasMembershipState: vi.fn().mockReturnValue(true),
++        hasEncryptionStateEvent: vi.fn().mockReturnValue(false),
+         getLiveTimeline: vi.fn().mockReturnValue({
+             getState: vi.fn().mockReturnValue(roomState),
+         }),
