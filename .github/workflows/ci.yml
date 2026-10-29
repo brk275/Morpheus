@@ -948,12 +948,12 @@ jobs:
                   return "Manual check selection disagrees with the actual event."
               if manual == "false":
                   # Only the reviewed classifier selects these fixed automatic
-                  # routes. They cannot narrow the desktop platform matrix or
+                  # routes. They cannot narrow the native platform matrix or
                   # forge a selected job's success through manual event inputs.
-                  if platform != "all" or suite != "full" or route not in ("all", "desktop", "helpers"):
+                  if platform != "all" or suite != "full" or route not in ("all", "desktop", "vendor", "helpers"):
                       return "Automatic impact selection is missing or malformed."
-                  if route == "desktop" and (platforms != choices["all"] or config != "false" or wayland != "false"):
-                      return "Automatic desktop checks require every supported app platform."
+                  if route in ("desktop", "vendor") and (platforms != choices["all"] or config != "false" or wayland != "false"):
+                      return "Automatic desktop/vendor checks require every supported native platform."
                   if route == "helpers" and (native != "false" or config != "false" or wayland != "false"):
                       return "Automatic producer checks require the existing helper job only."
               else:

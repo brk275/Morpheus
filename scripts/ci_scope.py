@@ -222,10 +222,21 @@ AUTOMATIC_PRODUCER_INPUTS = frozenset((
             ))
 
 
+# Exact shared sender-index implementation; existing vendor checks exercise the
+# native transport, crypto, SDK consumers and FFI on all four platforms. A mixed
+# input or any sibling source keeps the conservative full route. Live stock
+# interoperability and full release verification remain separate required gates.
+AUTOMATIC_VENDOR_INPUTS = frozenset((
+    "vendor/matrix-rtc-livekit/src/transport_impl.rs",
+))
+
+
 def automatic_route(paths, force_all=False):
     if (force_all or not paths or any(type(path) is not str for path in paths)):
         return "all"
     changed = set(paths)
+    if changed <= AUTOMATIC_VENDOR_INPUTS:
+        return "vendor"
     if not changed <= AUTOMATIC_DESKTOP_INPUTS | AUTOMATIC_PRODUCER_INPUTS:
         return "all"
     return "desktop" if changed & AUTOMATIC_DESKTOP_INPUTS else "helpers"
@@ -238,8 +249,8 @@ AUTOMATIC_CONTROL_INPUTS = frozenset((
     "scripts/ci_scope.py", "scripts/tests/test_ci_scope.py",
     ".github/workflows/ci.yml", "scripts/tests/test_ci_acceptance.py",
 ))
-REVIEWED_CONTROL_WORKFLOW_SHA256 = "2b0422f336ee633146a69212a68ab6e87bd666c337c5dab1583b76a82c0f9b2d"
-REVIEWED_CONTROL_WORKFLOW_BYTES = 65769
+REVIEWED_CONTROL_WORKFLOW_SHA256 = "8098da9e123c94d429d8cee052d923fc5e2b729f19ac92b4f963080ee29e93b3"
+REVIEWED_CONTROL_WORKFLOW_BYTES = 65800
 
 
 def reviewed_control_only(paths, event, event_name, force_all=False):
@@ -633,7 +644,7 @@ def event_selection(event, event_name):
             route = "helpers"
         if route != "helpers" and qualified_appearance_input_reuse(paths, event, event_name, force_all):
             route = "helpers"
-        if route == "desktop":
+        if route in ("desktop", "vendor"):
             selected = {"native": True, "native_matrix": {"os": list(PLATFORMS)},
                         "config": False, "wayland": False}
         elif route == "helpers":

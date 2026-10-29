@@ -444,6 +444,33 @@ class ScopeTests(unittest.TestCase):
 
 
     @patch("scripts.ci_scope.changed_paths")
+    def test_exact_sender_index_input_selects_full_native_vendor_route_only(self, changed):
+        transport = "vendor/matrix-rtc-livekit/src/transport_impl.rs"
+        self.assertEqual(ci_scope.AUTOMATIC_VENDOR_INPUTS, {transport})
+        for event in ("push", "pull_request"):
+            changed.return_value = ([transport], False)
+            selected = event_selection({"inputs": {"platform": "linux", "checks": "helpers"}}, event)
+            self.assertEqual(selected, {
+                "native": True, "native_matrix": {"os": list(PLATFORMS)},
+                "config": False, "wayland": False, "manual": False,
+                "manual_platform": "all", "check_route": "vendor", "matrix_suite": "full",
+            })
+            for other in ("Cargo.lock", "vendor/matrix-rtc-livekit/Cargo.toml",
+                          "vendor/matrix-rtc-livekit/src/connection.rs", "vendor/matrix-rtc-core/src/keys.rs",
+                          "crates/morpheus-app/ui/app-window.slint", "scripts/ci_scope.py",
+                          ".github/workflows/ci.yml", "scripts/unknown.py", "README.md"):
+                changed.return_value = ([transport, other], False)
+                selected = event_selection({}, event)
+                self.assertEqual(selected["check_route"], "all", other)
+                self.assertEqual(selected["native_matrix"]["os"], list(PLATFORMS), other)
+            changed.return_value = ([transport], True)
+            self.assertEqual(event_selection({}, event)["check_route"], "all")
+        for raw in ("./" + transport, transport + "/../other.rs", transport.upper(), None):
+            self.assertEqual(ci_scope.automatic_route([raw]), "all")
+        self.assertEqual(event_selection({}, "workflow_dispatch")["check_route"], "all")
+        self.assertTrue(event_selection({}, "workflow_dispatch")["wayland"])
+
+    @patch("scripts.ci_scope.changed_paths")
     def test_exact_automatic_appearance_and_producer_batches_select_existing_routes(self, changed):
         app = set((
                 'crates/morpheus-app/src/account_access_ui_tests.rs',
