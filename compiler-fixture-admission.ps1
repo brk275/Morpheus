@@ -459,7 +459,7 @@ try {
     }
     $script:admissionStage = 'candidate_source'
     $null = Hash-AdmissionFile ([IO.Path]::Combine($candidate, 'scripts', 'native_webrtc', 'windows_preflight.ps1')) 141206 'b7de668894a4719abcbdf8ca8d61e1dc9801389612becda7e11d192809903a97'
-    $null = Hash-AdmissionFile ([IO.Path]::Combine($candidate, 'scripts', 'tests', 'test_native_webrtc_windows_inputs.py')) 169774 '3922d2b9f3cd9a208c002b3b8e1141c2653fa62b585c206a43960b10377bdc1b'
+    $null = Hash-AdmissionFile ([IO.Path]::Combine($candidate, 'scripts', 'tests', 'test_native_webrtc_windows_inputs.py')) 169788 '5f4f5d01d2946aed2885b835579a3839ca1215d643d2aed6a501316eade3ecdd'
     $script:admissionStage = 'fixture'
     # Only metadata work uses this clock. The separately bounded existing
     # fixture child retains its original45-second PowerShell-case timeout.
@@ -474,7 +474,7 @@ try {
     foreach ($record in $records) { Budget; Same-Identity $record.handle $record.identity }
     foreach ($record in $directories.Values) { Budget; Same-Identity $record.handle $record.identity }
     $output = [ordered]@{ schema = 'morpheus-reviewed-windows-compiler-fixture-admission-v1';
-        candidate_source = '5c8d1793abcb33ed3a1d79e7b22e8c981f8137a9';
+        candidate_source = '3043ad76abf8ecd36c9439793d34f4825d718401';
         compiler_input_manifest_sha256 = $manifestSha; powershell_version = $psVersion;
         framework = $framework; compiler_tool_files = 474; fixture_passed = $true;
         fixture_compiler_invoked = $true; wrapper_compilation_invoked = $false;
