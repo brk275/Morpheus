@@ -1,7 +1,8 @@
 param([string] $Mode = 'basic')
 
-# Only fixed Windows system DLL exports are called. No Add-Type/compiler,
-# external executable, batch file, SDK installer or shell command is invoked.
+# Only fixed Windows system DLL exports are called. Reader initialization also
+# uses bundled in-process Roslyn on fixed source (separate compiler admission).
+# No external executable, batch file, SDK installer or shell command is invoked.
 function New-HostReadDelegate([string] $Name, [Type] $Result, [Type[]] $Arguments) {
     $nameInfo = [Reflection.AssemblyName]::new('MorpheusHostRead_' + [Guid]::NewGuid().ToString('N'))
     $assembly = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($nameInfo, [Reflection.Emit.AssemblyBuilderAccess]::Run)
@@ -772,6 +773,726 @@ function New-HostCanonicalInvoker {
         [Linq.Expressions.ParameterExpression[]]@($value)).Compile()
 }
 
+# New explicit setup boundary: compile ONLY this fixed embedded source with
+# PowerShell's bundled in-process Roslyn/default reference assemblies. No
+# external compiler, SDK program, package, source file or output assembly runs.
+# This capability requires separate source/compiler admission before execution.
+function Get-HostOwnedTraversalType {
+    $source = @'
+// Fixed source compiled in-process by PowerShell's bundled Roslyn, only after
+// separate compiler/setup admission. No P/Invoke declaration, external process,
+// package, assembly download, parallel walk, or reusable filesystem fact cache.
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Collections.Specialized;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq.Expressions;
+using System.Management.Automation;
+using System.Management.Automation.Runspaces;
+using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+using Microsoft.Win32.SafeHandles;
+
+namespace Morpheus.OwnedTraversal20261028
+{
+    public sealed class Reader
+    {
+        private static readonly ConditionalWeakTable<List<IntPtr>, Reader> ownedReaders = new ConditionalWeakTable<List<IntPtr>, Reader>();
+        private sealed class Ownership { public bool Closed; public IntPtr Memory, Kernel; }
+        private static readonly ConditionalWeakTable<List<IntPtr>, Ownership> owners = new ConditionalWeakTable<List<IntPtr>, Ownership>();
+        private static readonly object ownerLock = new object();
+
+        // Initialization registers every owner, including a reader for which
+        // managed admission is never attempted or is refused. Close latches
+        // this private state even when no Reader instance was constructed.
+        public static void PrepareOwner(List<IntPtr> handles)
+        {
+            lock (ownerLock)
+            {
+                if (owners.TryGetValue(handles, out Ownership existing)) Fail("identity");
+                owners.Add(handles, new Ownership());
+            }
+        }
+        public static void PublishOwner(List<IntPtr> handles, IntPtr memory, IntPtr kernel)
+        {
+            lock (ownerLock)
+            {
+                if (!owners.TryGetValue(handles, out Ownership owner) || owner.Closed ||
+                    owner.Memory != IntPtr.Zero || memory == IntPtr.Zero || kernel == IntPtr.Zero) Fail("identity");
+                owner.Memory = memory; owner.Kernel = kernel;
+            }
+        }
+        // These objects remain owned by Initialize/Close-HostReader. In
+        // particular, SafeFileHandle wrappers below NEVER own the native handle.
+        public readonly List<IntPtr> Handles;
+        public readonly Dictionary<string, object> Directories;
+        public readonly List<object> FileRecords;
+        public readonly Dictionary<string, string> Memo;
+        public readonly Stopwatch Watch;
+        public readonly byte[] Scratch, Buffer;
+        public IntPtr Memory { get; private set; }
+        public readonly Hashtable Limits;
+        public int Entries, Metadata, MemoUnits, CompletedFiles, InitialReads, CompletedRoots;
+        public ulong Bytes;
+        public string Stage = "initialization", Work = "idle", Cause = "unknown";
+        private bool busy, entered, active, retired;
+        private string lastPath;
+        private Record[] lastChain;
+        private readonly Dictionary<string, Record> directoryRecords = new Dictionary<string, Record>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<Record> fileRecords = new List<Record>();
+        private readonly Func<IntPtr, uint, uint, IntPtr, uint, uint, IntPtr, IntPtr> open;
+        private readonly Func<IntPtr, uint> type;
+        private readonly Func<IntPtr, IntPtr, int> info;
+        private readonly ScriptBlock unicodeValidator;
+
+        private sealed class Record
+        {
+            public string Path;
+            public IntPtr Handle;
+            public Hashtable Initial, Public;
+            public byte[] Comparison;
+        }
+        private sealed class Pending { public string Path; public int Depth; }
+        private sealed class Snapshot { public Record Directory; public string[] Names; }
+
+        // A closed expression binds the already-owned native delegate's exact
+        // Invoke signature once. It introduces neither an export nor new ABI.
+        private static T Bind<T>(Delegate native) where T : Delegate
+        {
+            var signature = typeof(T).GetMethod("Invoke");
+            var parameters = signature.GetParameters();
+            var args = new ParameterExpression[parameters.Length];
+            for (int i = 0; i < args.Length; i++) args[i] = Expression.Parameter(parameters[i].ParameterType);
+            return Expression.Lambda<T>(Expression.Invoke(Expression.Constant(native, native.GetType()), args), args).Compile();
+        }
+
+        private Reader(List<IntPtr> handles, Dictionary<string, object> directories,
+            List<object> records, Dictionary<string, string> memo, int units,
+            Stopwatch watch, byte[] scratch, byte[] buffer, IntPtr memory,
+            Delegate openCall, Delegate typeCall, Delegate infoCall, Hashtable limits, ScriptBlock unicodeSource)
+        {
+            Handles = handles; Directories = directories; FileRecords = records;
+            Memo = memo; MemoUnits = units; Watch = watch; Scratch = scratch;
+            Buffer = buffer; Memory = memory; Limits = limits; unicodeValidator = unicodeSource;
+            open = Bind<Func<IntPtr, uint, uint, IntPtr, uint, uint, IntPtr, IntPtr>>(openCall);
+            type = Bind<Func<IntPtr, uint>>(typeCall);
+            info = Bind<Func<IntPtr, IntPtr, int>>(infoCall);
+        }
+
+        private static bool Property(object value, string name)
+        { return PSObject.AsPSObject(value).Members[name] is PSProperty; }
+        private static bool Method(object value, string name)
+        { return PSObject.AsPSObject(value).Members[name] is PSMethod; }
+        private static bool NoMember(object value, string name)
+        { return PSObject.AsPSObject(value).Members[name] == null; }
+
+        // Catalog inspection is metadata only: no PSMemberInfo.Value or getter
+        // runs, and no SHA/stream is constructed to discover its runtime type.
+        // Deny relevant extensions for every possible crypto implementation;
+        // ordinary .NET inherited methods remain the original methods.
+        private static bool Catalog(TypeData[] catalog)
+        {
+            if (catalog == null || catalog.Length > 1024) return false;
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+                "Read", "Write", "Dispose", "ToArray", "TransformBlock", "TransformFinalBlock", "Hash",
+                "GetString", "Invoke", "GetType", "Length", "Count", "Elapsed", "TotalSeconds",
+                "Contains", "Substring", "TrimEnd", "Split", "EndsWith", "Replace", "Trim", "ToLowerInvariant",
+                "Add", "TryGetValue", "ContainsKey", "Push", "Pop", "Clear", "Clone", "Values", "Keys",
+                "attributes", "directory", "bytes", "write", "links", "identity", "path", "handle",
+                "initial", "comparison", "depth", "names", "root", "files", "sha256", "fact", "text",
+                "Entries", "Metadata", "MemoUnits", "CompletedFiles", "InitialReads", "Stage", "Work", "Cause",
+                "Retire", "RunRoot", "RunToolchain", "TryCreate"
+            };
+            foreach (TypeData data in catalog)
+            {
+                if (data == null || data.TypeName == null || data.TypeName.Length > 1024 || data.Members.Count > 1024) return false;
+                string n = data.TypeName;
+                if (n.StartsWith("Morpheus.OwnedTraversal20261028.", StringComparison.OrdinalIgnoreCase) && data.Members.Count != 0) return false;
+                bool relevant = String.Equals(n, "System.Object", StringComparison.OrdinalIgnoreCase) || String.Equals(n, "System.ValueType", StringComparison.OrdinalIgnoreCase) || String.Equals(n, "System.Enum", StringComparison.OrdinalIgnoreCase) ||
+                    n.StartsWith("System.Security.Cryptography.", StringComparison.OrdinalIgnoreCase) ||
+                    n.StartsWith("System.IO.", StringComparison.OrdinalIgnoreCase) ||
+                    n.StartsWith("System.Text.", StringComparison.OrdinalIgnoreCase) ||
+                    n.StartsWith("System.Collections.", StringComparison.OrdinalIgnoreCase) ||
+                    n.StartsWith("Microsoft.Win32.SafeHandles.", StringComparison.OrdinalIgnoreCase) ||
+                    String.Equals(n, "System.Runtime.InteropServices.SafeHandle", StringComparison.OrdinalIgnoreCase) || String.Equals(n, "System.Runtime.ConstrainedExecution.CriticalFinalizerObject", StringComparison.OrdinalIgnoreCase) ||
+                    n.StartsWith("System.Diagnostics.Stopwatch", StringComparison.OrdinalIgnoreCase) ||
+                    n.StartsWith("Morpheus.OwnedTraversal20261028.", StringComparison.OrdinalIgnoreCase) ||
+                    String.Equals(n, "System.String", StringComparison.OrdinalIgnoreCase) || String.Equals(n, "System.Array", StringComparison.OrdinalIgnoreCase) || String.Equals(n, "System.Byte[]", StringComparison.OrdinalIgnoreCase) || String.Equals(n, "System.TimeSpan", StringComparison.OrdinalIgnoreCase) ||
+                    String.Equals(n, "System.Int32", StringComparison.OrdinalIgnoreCase) || String.Equals(n, "System.Int64", StringComparison.OrdinalIgnoreCase) || String.Equals(n, "System.UInt32", StringComparison.OrdinalIgnoreCase) || String.Equals(n, "System.UInt64", StringComparison.OrdinalIgnoreCase) ||
+                    String.Equals(n, "System.Boolean", StringComparison.OrdinalIgnoreCase) || String.Equals(n, "System.Double", StringComparison.OrdinalIgnoreCase);
+                if (!relevant) continue;
+                if (data.TypeAdapter != null || data.TypeConverter != null) return false;
+                foreach (KeyValuePair<string, TypeMemberData> member in data.Members)
+                {
+                    if (!names.Contains(member.Key)) continue;
+                    // PowerShell's default array Count alias is benign: the
+                    // original uses Count on one-dimensional names arrays.
+                    if (String.Equals(n, "System.Array", StringComparison.OrdinalIgnoreCase) && member.Key.Equals("Count", StringComparison.OrdinalIgnoreCase) &&
+                        member.Value is AliasPropertyData alias && alias.ReferencedMemberName == "Length" && alias.MemberType == null) continue;
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        public static Reader TryCreate(object currentValue, object ownersValue, TypeData[] catalog,
+            IntPtr memory, IntPtr memoryOwner, IntPtr kernel, IntPtr kernelOwner, bool scratchBusy, object entries, object bytes, object metadata,
+            object units, object entryLimit, object unitLimit, object chainLimit, string systemRoot)
+        {
+            // Fixed raw variable slots. No adapted field/Value access precedes
+            // these reference fences. Changed helpers/delegates/state use the
+            // entire original PowerShell route, before any new native call.
+            if (!(currentValue is object[] current) || !(ownersValue is object[] owners) || current.Length != 42 || owners.Length != 42) return null;
+            for (int i = 0; i < current.Length; i++) if (!Object.ReferenceEquals(current[i], owners[i])) return null;
+            if (!(current[1] is ScriptBlock)) return null;
+            if (!(current[16] is List<IntPtr> handleOwner)) return null;
+            lock (ownerLock)
+            {
+                if (!Reader.owners.TryGetValue(handleOwner, out Ownership owner) || owner.Closed ||
+                    owner.Memory != memory || owner.Kernel != kernel) return null;
+            }
+            if (scratchBusy || memory == IntPtr.Zero || memory != memoryOwner || kernel != kernelOwner || !(entries is int e) || e != 0 ||
+                !(bytes is ulong b) || b != 0 || !(metadata is int m) || m != 0 ||
+                !(units is int u) || !(entryLimit is int el) || el != 8192 ||
+                !(unitLimit is int ul) || ul != 1048576 || !(chainLimit is int cl) || cl != 512 || !Catalog(catalog)) return null;
+            if (current[15]?.GetType() != typeof(Hashtable) ||
+                current[16]?.GetType() != typeof(List<IntPtr>) ||
+                current[17]?.GetType() != typeof(Dictionary<string, object>) ||
+                current[18]?.GetType() != typeof(List<object>) ||
+                current[19]?.GetType() != typeof(Dictionary<string, string>) ||
+                current[20]?.GetType() != typeof(Stopwatch) ||
+                current[21]?.GetType() != typeof(byte[]) || current[22]?.GetType() != typeof(byte[])) return null;
+            var limits = (Hashtable)current[15]; var handles = (List<IntPtr>)current[16];
+            var directories = (Dictionary<string, object>)current[17]; var records = (List<object>)current[18];
+            var memo = (Dictionary<string, string>)current[19]; var watch = (Stopwatch)current[20];
+            var scratch = (byte[])current[21]; var buffer = (byte[])current[22];
+            if (handles.Count != 0 || directories.Count != 0 || records.Count != 0 || scratch.Length != 52 || buffer.Length != 1048576 ||
+                memo.Count != 1 || String.IsNullOrEmpty(systemRoot) || !memo.TryGetValue(systemRoot, out string cached) ||
+                !String.Equals(cached, systemRoot, StringComparison.Ordinal) || u != systemRoot.Length * 2) return null;
+            string[] keys = { "Entries", "Handles", "FileBytes", "TotalBytes", "Depth", "JsonBytes", "MetadataBytes", "Seconds" };
+            long[] values = { 200000, 200256, 2147483648, 68719476736, 64, 33554432, 31457280, 180 };
+            if (limits.Count != keys.Length) return null;
+            for (int i = 0; i < keys.Length; i++)
+            {
+                if (!NoMember(limits, keys[i])) return null;
+                object value = limits[keys[i]];
+                if (i == 2 || i == 3) { if (!(value is long l) || l != values[i]) return null; }
+                else if (!(value is int integer) || integer != values[i]) return null;
+            }
+            if (!Property(watch, "Elapsed") || !Property(TimeSpan.Zero, "TotalSeconds") ||
+                !Property(scratch, "Length") || !Property(buffer, "Length") || !Property(handles, "Count")) return null;
+            var table = Table(0);
+            foreach (string key in new[] { "attributes", "directory", "bytes", "write", "links", "identity", "path", "handle", "initial", "comparison", "depth", "names", "root", "files", "sha256", "fact", "text" })
+                if (!NoMember(table, key)) return null;
+            for (int i = 11; i <= 14; i++) if (!(current[i] is Delegate) || !Method(current[i], "Invoke")) return null;
+            if (kernel == IntPtr.Zero) return null;
+            string[] exports = { "CreateFileW", "GetFileType", "GetFileInformationByHandle", "CloseHandle" };
+            for (int i = 0; i < exports.Length; i++)
+                if (Marshal.GetFunctionPointerForDelegate((Delegate)current[11 + i]) != NativeLibrary.GetExport(kernel, exports[i])) return null;
+            // These ordinary state instances cannot execute callbacks. All
+            // factories used later are covered by the type catalog above.
+            lock (ownerLock)
+            {
+                if (!Reader.owners.TryGetValue(handles, out Ownership owner) || owner.Closed ||
+                    owner.Memory != memory || owner.Kernel != kernel) return null;
+                if (ownedReaders.TryGetValue(handles, out Reader existing)) return null;
+                var reader = new Reader(handles, directories, records, memo, u, watch, scratch, buffer, memory,
+                (Delegate)current[11], (Delegate)current[12], (Delegate)current[13], limits, (ScriptBlock)current[1]);
+                ownedReaders.Add(handles, reader);
+                return reader;
+            }
+        }
+
+        public void Retire()
+        {
+            lock (ownerLock)
+            {
+                if (active || busy) Fail("identity");
+                if (owners.TryGetValue(Handles, out Ownership owner))
+                { owner.Closed = true; owner.Memory = IntPtr.Zero; owner.Kernel = IntPtr.Zero; }
+                retired = true; Memory = IntPtr.Zero; lastPath = null;
+                if (lastChain != null) Array.Clear(lastChain, 0, lastChain.Length);
+                lastChain = null; directoryRecords.Clear(); fileRecords.Clear();
+                // Keep a weak closed-owner latch: the same initializing list
+                // cannot admit a replacement reader while Close is freeing
+                // its handles/scratch. A new Initialize creates a new list.
+            }
+        }
+
+        public static object[] Statistics(Reader reader)
+        {
+            object[] chain = null;
+            if (reader.lastChain != null)
+            {
+                chain = new object[reader.lastChain.Length];
+                for (int i = 0; i < chain.Length; i++) chain[i] = reader.lastChain[i].Public;
+            }
+            return new object[] { reader.Entries, reader.Bytes, reader.Metadata, reader.MemoUnits,
+                reader.CompletedFiles, reader.InitialReads, reader.Stage, reader.Work, reader.Cause,
+                reader.CompletedRoots, reader.lastPath, chain };
+        }
+        public static void RetireOwned(Reader reader) { if (reader != null) reader.Retire(); }
+        public static void RetireOwner(object ownerValue)
+        {
+            if (!(ownerValue is object[] owners) || owners.Length != 42 || !(owners[16] is List<IntPtr> handles)) return;
+            lock (ownerLock)
+            {
+                if (ownedReaders.TryGetValue(handles, out Reader reader)) reader.Retire();
+                else if (Reader.owners.TryGetValue(handles, out Ownership owner))
+                { owner.Closed = true; owner.Memory = IntPtr.Zero; owner.Kernel = IntPtr.Zero; }
+            }
+        }
+        public static OrderedDictionary RunOwnedToolchain(Reader reader, string systemRoot) { return reader.RunToolchain(systemRoot); }
+        public static Hashtable RunOwnedRoot(Reader reader, string root) { return reader.RunRoot(root); }
+        public static string ValidateOwnedPath(Reader reader, string value)
+        {
+            lock (ownerLock)
+            {
+                if (reader.retired || reader.active || reader.entered) Fail("identity");
+                reader.active = true;
+            }
+            try { return reader.Canonical(value); }
+            finally { lock (ownerLock) { reader.active = false; } }
+        }
+
+        private static Hashtable Table(int capacity) { return new Hashtable(capacity, StringComparer.OrdinalIgnoreCase); }
+        public static OrderedDictionary NewOrderedMap() { return new OrderedDictionary(StringComparer.OrdinalIgnoreCase); }
+        private static bool Equal(string a, string b, bool ignoreCase)
+        { return LanguagePrimitives.Equals(a, b, ignoreCase, CultureInfo.InvariantCulture); }
+        private static bool Match(string value, string pattern)
+        { return Regex.IsMatch(value, pattern, RegexOptions.IgnoreCase); }
+        private static void Fail(string reason) { throw new InvalidOperationException(reason); }
+        private void BudgetFailure(string cause)
+        { if (Cause == "unknown") Cause = cause; Fail("limit"); }
+
+        private void Budget()
+        {
+            // Same five predicates and short-circuit order as Assert-HostBudget.
+            if (Watch.Elapsed.TotalSeconds > 180) BudgetFailure("deadline");
+            else if (Entries > 200000) BudgetFailure("entries");
+            else if (Bytes > 68719476736UL) BudgetFailure("bytes");
+            else if (Handles.Count > 200256) BudgetFailure("handles");
+            else if (Metadata > 31457280) BudgetFailure("metadata");
+        }
+
+        private string Canonical(string value)
+        {
+            string full;
+            if (!String.IsNullOrEmpty(value) && Memo.TryGetValue(value, out full)) return full;
+            if (value != null && value.Length > 1024) Fail("path_length");
+            bool unicode = false;
+            if (value != null) foreach (char unit in value) if (unit > 127) { unicode = true; break; }
+            if (unicode)
+            {
+                // Preserve the original PowerShell Regex cache/culture and
+                // Unicode behavior in a fresh local scope. Exact owner slot1
+                // fences this original pure helper; no filesystem/native call,
+                // supplied script, custom method or getter is introduced.
+                var result = unicodeValidator.InvokeWithContext((Dictionary<string, ScriptBlock>)null,
+                    (List<PSVariable>)null, new object[] { value });
+                if (result.Count != 1 || !(result[0].BaseObject is string)) Fail("path_input");
+                full = (string)result[0].BaseObject;
+            }
+            else full = ValidateAsciiPath(value);
+            int units = value.Length + full.Length;
+            if (Memo.Count < 8192 && units <= 1048576 - MemoUnits)
+            { Memo.Add(value, full); MemoUnits += units; }
+            return full;
+        }
+
+        private static string ValidateAsciiPath(string value)
+        {
+            // ASCII-only old predicates/order and invariant PowerShell string
+            // equality. Non-ASCII uses the exact original pure helper above.
+            if (String.IsNullOrEmpty(value)) Fail("path_empty");
+            if (value.Length > 1024) Fail("path_length");
+            if (!Match(value, @"^[A-Za-z]:\\")) Fail("path_drive");
+            if (value.Substring(2).Contains(':')) Fail("path_colon");
+            if (value.Contains('/')) Fail("path_slash");
+            if (Match(value, "[\\x00-\\x1f*?\"<>|]")) Fail("path_chars");
+            string full = Path.GetFullPath(value);
+            if (!Equal(full.TrimEnd('\\'), value.TrimEnd('\\'), false)) Fail("path_normalized");
+            foreach (string part in value.Substring(3).Split('\\'))
+            {
+                if (Equal(part, "", true) && value.Length == 3) continue;
+                if (Equal(part, "", true)) Fail("path_part_empty");
+                if (Equal(part, ".", true) || Equal(part, "..", true)) Fail("path_part_dot");
+                if (part.EndsWith(".")) Fail("path_part_trailingdot");
+                if (part.EndsWith(" ")) Fail("path_part_trailingspace");
+                if (Match(part, @"^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)")) Fail("path_part_device");
+                if (Equal(part, ".git", true)) Fail("path_part_git");
+            }
+            return full;
+        }
+
+        private Hashtable ReadInfo(IntPtr handle, byte[] expected, bool bound, bool content)
+        {
+            if (busy || Memory == IntPtr.Zero) Fail("identity");
+            busy = true;
+            try
+            {
+                if (type(handle) != 1) Fail("type");
+                if (info(handle, Memory) == 0) Fail("identity");
+                Marshal.Copy(Memory, Scratch, 0, 52);
+                uint attributes = BitConverter.ToUInt32(Scratch, 0);
+                if ((attributes & 0x400) != 0) Fail("reparse");
+                if (bound)
+                {
+                    if (expected == null || expected.Length != 52) Fail("identity");
+                    if (attributes != BitConverter.ToUInt32(expected, 0) ||
+                        BitConverter.ToUInt32(Scratch, 28) != BitConverter.ToUInt32(expected, 28) ||
+                        BitConverter.ToUInt64(Scratch, 44) != BitConverter.ToUInt64(expected, 44) ||
+                        (content && (BitConverter.ToUInt64(Scratch, 32) != BitConverter.ToUInt64(expected, 32) ||
+                         BitConverter.ToUInt64(Scratch, 20) != BitConverter.ToUInt64(expected, 20) ||
+                         BitConverter.ToUInt32(Scratch, 40) != BitConverter.ToUInt32(expected, 40)))) Fail("changed");
+                    return null;
+                }
+                var result = Table(6);
+                result.Add("attributes", attributes);
+                result.Add("directory", (attributes & 0x10) != 0);
+                result.Add("bytes", (ulong)BitConverter.ToUInt32(Scratch, 32) * 4294967296UL + BitConverter.ToUInt32(Scratch, 36));
+                result.Add("write", Convert.ToHexString(Scratch, 20, 8));
+                result.Add("links", BitConverter.ToUInt32(Scratch, 40));
+                result.Add("identity", Convert.ToHexString(Scratch, 28, 4) + Convert.ToHexString(Scratch, 44, 8));
+                if (InitialReads < 200000) InitialReads++;
+                return result;
+            }
+            finally { busy = false; }
+        }
+
+        private Record Open(string literal, bool directory)
+        {
+            Budget();
+            string full = Canonical(literal);
+            IntPtr wide = Marshal.StringToHGlobalUni(@"\\?\" + full), handle;
+            try
+            {
+                handle = open(wide, directory ? 128U : 2147483648U, 1U,
+                    IntPtr.Zero, 3U, directory ? 0x02200000U : 0x00200000U, IntPtr.Zero);
+            }
+            finally { Marshal.FreeHGlobal(wide); }
+            if (handle == new IntPtr(-1)) Fail("open");
+            Handles.Add(handle); Budget();
+            Hashtable initial = ReadInfo(handle, null, false, false);
+            if ((bool)initial["directory"] != directory) Fail("type");
+            byte[] comparison = (byte[])Scratch.Clone();
+            var record = new Record { Path = full, Handle = handle, Initial = initial, Comparison = comparison };
+            var export = Table(4);
+            export.Add("path", full); export.Add("handle", handle);
+            export.Add("initial", initial); export.Add("comparison", comparison);
+            record.Public = export;
+            return record;
+        }
+
+        private Record Chain(string literal)
+        {
+            string full = Canonical(literal);
+            if (lastChain != null && lastChain.Length <= 512 && String.Equals(full, lastPath, StringComparison.Ordinal))
+            {
+                foreach (Record record in lastChain) ReadInfo(record.Handle, record.Comparison, true, false);
+                return lastChain[lastChain.Length - 1];
+            }
+            lastPath = null; lastChain = null;
+            var chain = new List<Record>();
+            bool remember = true;
+            string current = full.Substring(0, 3);
+            var parts = new List<string> { "" };
+            foreach (string part in full.Substring(3).Split('\\')) if (!Equal(part, "", true)) parts.Add(part);
+            foreach (string part in parts)
+            {
+                if (part != "") current = Path.Combine(current, part);
+                Record record;
+                if (!directoryRecords.TryGetValue(current, out record))
+                {
+                    record = Open(current, true);
+                    directoryRecords.Add(current, record);
+                    Directories.Add(current, record.Public);
+                }
+                else ReadInfo(record.Handle, record.Comparison, true, false);
+                if (remember)
+                {
+                    if (chain.Count < 512) chain.Add(record);
+                    else { remember = false; chain.Clear(); }
+                }
+            }
+            if (remember) { lastPath = full; lastChain = chain.ToArray(); }
+            return directoryRecords[full];
+        }
+
+        private Hashtable FileFact(string literal, int textLimit, ulong remaining)
+        {
+            Work = "file_open";
+            string full = Canonical(literal);
+            Chain(Path.GetDirectoryName(full));
+            Record record = Open(full, false);
+            fileRecords.Add(record); FileRecords.Add(record.Public);
+            ulong expected = (ulong)record.Initial["bytes"];
+            if (expected > 2147483648UL) { if (Cause == "unknown") Cause = "bytes"; Fail("file_size"); }
+            if (textLimit > 0 && expected > (ulong)textLimit) { if (Cause == "unknown") Cause = "bytes"; Fail("text_size"); }
+            if (expected > remaining) { if (Cause == "unknown") Cause = "bytes"; Fail("limit"); }
+            var safe = new SafeFileHandle(record.Handle, false);
+            var stream = new FileStream(safe, FileAccess.Read, 1048576, false);
+            var digest = SHA256.Create();
+            var text = textLimit > 0 ? new MemoryStream() : null;
+            try
+            {
+                Work = "file_hash";
+                ulong size = 0;
+                int count;
+                while ((count = stream.Read(Buffer, 0, Buffer.Length)) > 0)
+                {
+                    Budget(); size += (ulong)count;
+                    if (size > expected) Fail("changed");
+                    digest.TransformBlock(Buffer, 0, count, null, 0);
+                    if (text != null) text.Write(Buffer, 0, count);
+                }
+                digest.TransformFinalBlock(new byte[0], 0, 0);
+                if (size != expected) Fail("changed");
+                if (CompletedFiles < 200000) CompletedFiles++;
+                Work = "file_identity";
+                ReadInfo(record.Handle, record.Comparison, true, true);
+                var fact = Table(2);
+                fact.Add("bytes", size); fact.Add("sha256", Convert.ToHexString(digest.Hash).ToLowerInvariant());
+                if (text != null) fact["text"] = new UTF8Encoding(false, true).GetString(text.ToArray());
+                return fact;
+            }
+            finally
+            {
+                stream.Dispose(); safe.Dispose(); digest.Dispose();
+                if (text != null) text.Dispose();
+            }
+        }
+
+        private string[] Names(string directory)
+        {
+            var names = new List<string>();
+            var folded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string path in Directory.EnumerateFileSystemEntries(directory))
+            {
+                Budget();
+                string name = Path.GetFileName(path);
+                Canonical(Path.Combine(directory, name));
+                if (!folded.Add(name)) Fail("alias");
+                names.Add(name);
+                if (names.Count > 200000) { if (Cause == "unknown") Cause = "entries"; Fail("entries"); }
+            }
+            string[] result = names.ToArray(); Array.Sort(result, StringComparer.Ordinal);
+            return result;
+        }
+
+        private Hashtable Root(string literal)
+        {
+            string root = Canonical(literal);
+            Work = "directory_open"; Chain(root);
+            var pending = new Stack<Pending>(); pending.Push(new Pending { Path = root, Depth = 0 });
+            var snapshots = new List<Snapshot>(); var files = new List<object>();
+            while (pending.Count > 0)
+            {
+                Budget(); Pending next = pending.Pop();
+                if (next.Depth > 64) Fail("depth");
+                Work = "directory_open"; Record directory = Chain(next.Path);
+                Work = "enumeration"; string[] names = Names(next.Path);
+                snapshots.Add(new Snapshot { Directory = directory, Names = names });
+                foreach (string name in names)
+                {
+                    Entries++; Budget(); string path = Path.Combine(next.Path, name);
+                    Work = "entry_type"; FileAttributes attributes = File.GetAttributes(path);
+                    if ((attributes & FileAttributes.ReparsePoint) != 0) Fail("reparse");
+                    if ((attributes & FileAttributes.Directory) != 0)
+                    {
+                        Work = "directory_open"; Chain(path);
+                        pending.Push(new Pending { Path = path, Depth = next.Depth + 1 });
+                    }
+                    else
+                    {
+                        Hashtable fact = FileFact(path, 0, 68719476736UL - Bytes);
+                        Work = "receipt_row"; Bytes += (ulong)fact["bytes"]; Budget();
+                        string relative = Path.GetRelativePath(root, path).Replace('\\', '/');
+                        Metadata += 160 + 6 * relative.Length; Budget();
+                        var row = Table(3); row.Add("path", relative); row.Add("bytes", fact["bytes"]); row.Add("sha256", fact["sha256"]);
+                        files.Add(row);
+                    }
+                }
+            }
+            foreach (Snapshot snapshot in snapshots)
+            {
+                Work = "snapshot_identity"; Budget(); ReadInfo(snapshot.Directory.Handle, snapshot.Directory.Comparison, true, true);
+                Work = "snapshot_names"; string[] again = Names(snapshot.Directory.Path);
+                if (again.Length != snapshot.Names.Length) Fail("changed");
+                for (int i = 0; i < again.Length; i++) if (!Equal(again[i], snapshot.Names[i], false)) Fail("changed");
+            }
+            var result = Table(2); result.Add("root", root); result.Add("files", files.ToArray());
+            if (CompletedRoots < 2) CompletedRoots++;
+            return result;
+        }
+
+        private void Enter()
+        {
+            // Never import or reinterpret previously exposed/possibly mutated
+            // records. A reader performs either this complete call or the old
+            // path. No partial replay or post-native admission failure exists.
+            lock (ownerLock)
+            {
+                if (!owners.TryGetValue(Handles, out Ownership owner) || owner.Closed ||
+                    retired || entered || active || Handles.Count != 0 || Directories.Count != 0 || FileRecords.Count != 0 ||
+                    Entries != 0 || Bytes != 0 || Metadata != 0 || Memory == IntPtr.Zero || Scratch.Length != 52 || Buffer.Length != 1048576)
+                    Fail("identity");
+                entered = true; active = true;
+            }
+        }
+
+        public Hashtable RunRoot(string root)
+        { Enter(); try { return Root(root); } finally { lock (ownerLock) { active = false; } } }
+
+        public OrderedDictionary RunToolchain(string systemRoot)
+        {
+            Enter(); try { return Toolchain(systemRoot); } finally { lock (ownerLock) { active = false; } }
+        }
+
+        private OrderedDictionary Toolchain(string systemRoot)
+        {
+            Stage = "role_binding";
+            string drive = systemRoot.Substring(0, 2);
+            string vsBase = drive + @"\Program Files\Microsoft Visual Studio\2022";
+            var candidates = new List<string>();
+            foreach (string edition in new[] { "Enterprise", "Professional", "Community", "Preview", "BuildTools" })
+            { string path = Path.Combine(vsBase, edition); if (Directory.Exists(path)) candidates.Add(path); }
+            if (candidates.Count != 1) Fail("visual_studio_selection");
+            string vs = Canonical(candidates[0]), sdk = drive + @"\Program Files (x86)\Windows Kits\10";
+            string versionFile = Path.Combine(vs, "VC", "Auxiliary", "Build", "Microsoft.VCToolsVersion.default.txt");
+            Hashtable versionFact = FileFact(versionFile, 256, UInt64.MaxValue);
+            string version = ((string)versionFact["text"]).Trim();
+            if (!Match(version, @"^14\.[0-9]{1,3}\.[0-9]{1,6}$")) Fail("msvc_version");
+            string msvc = Path.Combine(vs, "VC", "Tools", "MSVC", version);
+            string vcvars = Path.Combine(vs, "VC", "vcvarsall.bat");
+            if (!File.Exists(vcvars)) vcvars = Path.Combine(vs, "VC", "Auxiliary", "Build", "vcvarsall.bat");
+            var roles = new OrderedDictionary(StringComparer.OrdinalIgnoreCase) {
+                { "vcvarsall", vcvars }, { "msvc_default_version", versionFile },
+                { "cl", Path.Combine(msvc, "bin", "Hostx64", "x64", "cl.exe") },
+                { "link", Path.Combine(msvc, "bin", "Hostx64", "x64", "link.exe") },
+                { "msvc_include", Path.Combine(msvc, "include", "vcruntime.h") },
+                { "msvc_lib", Path.Combine(msvc, "lib", "x64", "vcruntime.lib") },
+                { "sdk_rc", Path.Combine(sdk, "bin", "10.0.26100.0", "x64", "rc.exe") },
+                { "sdk_mt", Path.Combine(sdk, "bin", "10.0.26100.0", "x64", "mt.exe") },
+                { "sdk_um", Path.Combine(sdk, "Include", "10.0.26100.0", "um", "Windows.h") },
+                { "sdk_shared", Path.Combine(sdk, "Include", "10.0.26100.0", "shared", "sdkddkver.h") },
+                { "sdk_ucrt", Path.Combine(sdk, "Include", "10.0.26100.0", "ucrt", "stdlib.h") },
+                { "sdk_kernel_lib", Path.Combine(sdk, "Lib", "10.0.26100.0", "um", "x64", "kernel32.lib") },
+                { "sdk_ucrt_lib", Path.Combine(sdk, "Lib", "10.0.26100.0", "ucrt", "x64", "ucrt.lib") }
+            };
+            var roleFacts = NewOrderedMap();
+            foreach (DictionaryEntry role in roles)
+            {
+                Hashtable fact = FileFact((string)role.Value, 0, UInt64.MaxValue);
+                if ((ulong)fact["bytes"] == 0) Fail("role");
+                var row = Table(2); row.Add("path", role.Value); row.Add("fact", fact); roleFacts.Add(role.Key, row);
+            }
+            Stage = "vs_inventory"; Hashtable vsInventory = Root(vs);
+            Stage = "sdk_inventory"; Hashtable sdkInventory = Root(sdk);
+            Stage = "final_identity"; Work = "final_directory";
+            foreach (Record record in directoryRecords.Values) ReadInfo(record.Handle, record.Comparison, true, false);
+            Work = "final_file";
+            foreach (Record record in fileRecords) { Budget(); ReadInfo(record.Handle, record.Comparison, true, true); }
+            Budget();
+            return new OrderedDictionary(StringComparer.OrdinalIgnoreCase) {
+                { "schema", "morpheus-native-windows-host-toolchain-inventory-v2" },
+                { "visual_studio_root", vs }, { "visual_studio_year", "2022" },
+                { "msvc_toolset_version", version }, { "windows_sdk_version", "10.0.26100.0" },
+                { "roots", new object[] { vsInventory, sdkInventory } }, { "roles", roleFacts },
+                { "upstream_build_revision", "be1a8f6dcd7df7e46320192c5e2f364e50d79bbf" },
+                { "upstream_vs_toolchain_sha256", "d13a7b17b81c2084de5a76e907c458ca997a4ddcdef96d3b74c8fcb3aca5f463" },
+                { "upstream_setup_toolchain_sha256", "f6ae24c99ae0bfc72b093da415615119652f25415155dffb4db22f49b78ca8cf" },
+                { "entries", Entries }, { "total_bytes", Bytes }, { "limits", Limits },
+                { "environment_realized", false }, { "vcvars_or_compilers_executed", true },
+                { "preflight_implementation", "owned-managed-transaction-v1" },
+                { "preflight_compiler", "powershell-bundled-roslyn-in-process-v1" },
+                { "external_toolchain_executables_executed", false },
+                { "host_approval_granted", false }, { "build_ready", false }, { "distribution_ready", false }
+            };
+        }
+    }
+}
+
+'@
+    $null = Microsoft.PowerShell.Utility\Add-Type -TypeDefinition $source -Language CSharp -CompilerOptions '/optimize+' -PassThru
+    $script:HostTraversalCompilerReady = $true
+    return [Morpheus.OwnedTraversal20261028.Reader]
+}
+
+function New-HostOwnedTraversal {
+    $current = [object[]]@(${function:Assert-HostBudget}, ${function:Get-CanonicalHostPath}, ${function:Get-HostCanonicalPath},
+        ${function:Open-HostReadHandle}, ${function:Get-HostHandleInfo}, ${function:Assert-HostIdentity},
+        ${function:Open-HostDirectoryChain}, ${function:Get-HostDirectoryNames}, ${function:Get-HostRootInventory},
+        ${function:Get-HostToolchainInventory}, ${function:Close-HostReader},
+        $script:HostOpen, $script:HostType, $script:HostInfo, $script:HostClose,
+        $script:HostLimits, $script:HostHandles, $script:HostDirectories, $script:HostFileRecords,
+        $script:HostCanonicalPaths, $script:HostWatch, $script:HostInfoScratch, $script:HostBuffer,
+        $script:HostInitialInvoker, $script:HostComparisonInvoker, $script:HostChainInvoker,
+        $script:HostHashInvoker, $script:HostHashAdmissionInvoker, $script:HostCanonicalInvoker,
+        $script:HostInitialInvokerOwner, $script:HostHashAdmissionOwner, $script:HostHashInvokerOwner,
+        $script:HostComparisonType, $script:HostComparisonInfo, $script:HostChainInvokerOwner,
+        $script:HostChainComparison, $script:HostHashBudgetOwner, $script:HostHashLimitsOwner,
+        $script:HostHashHandlesOwner, $script:HostHashOpenOwner, $script:HostHashInfoOwner,
+        ${function:Get-HostFileFact})
+    $catalog = [Management.Automation.Runspaces.TypeData[]]@(Microsoft.PowerShell.Utility\Get-TypeData)
+    $type = Get-HostOwnedTraversalType
+    $reader = $type::TryCreate($current, $script:HostTraversalOwners, $catalog,
+        $script:HostInfoMemory, $script:HostTraversalMemoryOwner,
+        $script:HostKernel, $script:HostTraversalKernelOwner, $script:HostInfoBusy,
+        $script:HostCount, $script:HostBytes, $script:HostMetadataBytes,
+        $script:HostCanonicalUnits, $script:HostCanonicalEntryLimit, $script:HostCanonicalUnitLimit,
+        $script:HostDirectoryChainLimit, $env:SystemRoot)
+    if ($null -ne $reader) { $script:HostTraversalReader = $reader }
+    return $reader
+}
+
+# V2 distinguishes traversal implementation from compiler/tool execution.
+# Even an unsupported-state fallback has invoked the bundled compiler while
+# constructing its eligibility helper; it must never emit the old false flag.
+function Set-HostInventoryImplementation([Collections.IDictionary] $Inventory, [string] $Implementation) {
+    if (-not $script:HostTraversalCompilerReady -or
+        (-not [string]::Equals($Implementation, 'owned-managed-transaction-v1', [StringComparison]::Ordinal) -and
+         -not [string]::Equals($Implementation, 'powershell-original-fallback-v1', [StringComparison]::Ordinal))) {
+        throw 'receipt_provenance'
+    }
+    $Inventory['schema'] = 'morpheus-native-windows-host-toolchain-inventory-v2'
+    $Inventory['vcvars_or_compilers_executed'] = $true
+    $Inventory['preflight_implementation'] = $Implementation
+    $Inventory['preflight_compiler'] = 'powershell-bundled-roslyn-in-process-v1'
+    $Inventory['external_toolchain_executables_executed'] = $false
+    return $Inventory
+}
+
+function Invoke-HostOwnedTraversal($Reader, [string] $Root, [bool] $RootOnly = $false) {
+    if ($script:HostInfoBusy) { throw 'identity' }
+    $script:HostTraversalReader = $Reader
+    $script:HostInfoBusy = $true
+    try {
+        if ($RootOnly) { $result = [Morpheus.OwnedTraversal20261028.Reader]::RunOwnedRoot($Reader, $Root) }
+        else { $result = [Morpheus.OwnedTraversal20261028.Reader]::RunOwnedToolchain($Reader, $env:SystemRoot) }
+    } finally {
+        try {
+            $state = [Morpheus.OwnedTraversal20261028.Reader]::Statistics($Reader)
+            $script:HostCount = $state[0]; $script:HostBytes = $state[1]; $script:HostMetadataBytes = $state[2]
+            $script:HostCanonicalUnits = $state[3]; $script:HostManagedHashes = $state[4]
+            $script:HostManagedInitialInfos = $state[5]; $script:HostPreflightStage = $state[6]
+            $script:HostPreflightWork = $state[7]; $script:HostPreflightBudgetCause = $state[8]
+            $script:HostManagedTraversalRoots = $state[9]
+            $script:HostLastDirectoryPath = $state[10]; $script:HostLastDirectoryChain = $state[11]
+        } finally { $script:HostInfoBusy = $false }
+    }
+    if (-not $RootOnly) {
+        $result = Set-HostInventoryImplementation $result 'owned-managed-transaction-v1'
+    }
+    return $result
+}
+
 function Initialize-HostReader {
     # One sequential reader owns its metadata scratch until Close-HostReader.
     # Refuse an overlapping initialization rather than lose live owned storage.
@@ -784,6 +1505,12 @@ function Initialize-HostReader {
     $script:HostManagedHashes = 0
     $script:HostManagedAdmissions = 0
     $script:HostManagedInitialInfos = 0
+    $script:HostManagedTraversalRoots = 0
+    $script:HostTraversalReader = $null
+    $script:HostTraversalCompilerReady = $false
+    $script:HostTraversalOwners = $null
+    $script:HostTraversalMemoryOwner = [IntPtr]::Zero
+    $script:HostTraversalKernelOwner = [IntPtr]::Zero
     $script:HostInfoMemory = [IntPtr]::Zero
     $script:HostInfoScratch = $null
     $script:HostInfoBusy = $false
@@ -854,10 +1581,42 @@ function Initialize-HostReader {
     $script:HostChainInvoker = New-HostChainInvoker $script:HostComparisonInvoker
     $script:HostChainInvokerOwner = $script:HostChainInvoker
     $script:HostChainComparison = $script:HostComparisonInvoker
-    # Allocate last: no further initialization can fail after unmanaged ownership
-    # is acquired. The 52-byte Win32 record and ABI are unchanged.
+    # Compile/register before acquiring unmanaged scratch. Every initializing
+    # handles-list owner gets a private closed latch, even if no Reader admits.
+    $ownedType = Get-HostOwnedTraversalType
+    $ownedType::PrepareOwner($script:HostHandles)
+    # Capture provenance before allocation. Guard the additional owner-pointer
+    # publication so a failed assignment cannot strand the 52-byte allocation.
     $script:HostInfoScratch = [byte[]]::new(52)
-    $script:HostInfoMemory = [Runtime.InteropServices.Marshal]::AllocHGlobal(52)
+    # Capture exact object/function provenance before acquiring unmanaged storage.
+    $script:HostTraversalOwners = [object[]]@(${function:Assert-HostBudget}, ${function:Get-CanonicalHostPath}, ${function:Get-HostCanonicalPath},
+        ${function:Open-HostReadHandle}, ${function:Get-HostHandleInfo}, ${function:Assert-HostIdentity},
+        ${function:Open-HostDirectoryChain}, ${function:Get-HostDirectoryNames}, ${function:Get-HostRootInventory},
+        ${function:Get-HostToolchainInventory}, ${function:Close-HostReader},
+        $script:HostOpen, $script:HostType, $script:HostInfo, $script:HostClose,
+        $script:HostLimits, $script:HostHandles, $script:HostDirectories, $script:HostFileRecords,
+        $script:HostCanonicalPaths, $script:HostWatch, $script:HostInfoScratch, $script:HostBuffer,
+        $script:HostInitialInvoker, $script:HostComparisonInvoker, $script:HostChainInvoker,
+        $script:HostHashInvoker, $script:HostHashAdmissionInvoker, $script:HostCanonicalInvoker,
+        $script:HostInitialInvokerOwner, $script:HostHashAdmissionOwner, $script:HostHashInvokerOwner,
+        $script:HostComparisonType, $script:HostComparisonInfo, $script:HostChainInvokerOwner,
+        $script:HostChainComparison, $script:HostHashBudgetOwner, $script:HostHashLimitsOwner,
+        $script:HostHashHandlesOwner, $script:HostHashOpenOwner, $script:HostHashInfoOwner,
+        ${function:Get-HostFileFact})
+    $script:HostTraversalKernelOwner = $script:HostKernel
+    $ownedMemory = [Runtime.InteropServices.Marshal]::AllocHGlobal(52)
+    try {
+        $script:HostInfoMemory = $ownedMemory
+        $script:HostTraversalMemoryOwner = $ownedMemory
+        [Morpheus.OwnedTraversal20261028.Reader]::PublishOwner($script:HostHandles,
+            $ownedMemory, $script:HostKernel)
+    } catch {
+        [Morpheus.OwnedTraversal20261028.Reader]::RetireOwner($script:HostTraversalOwners)
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($ownedMemory)
+        $script:HostInfoMemory = [IntPtr]::Zero
+        $script:HostTraversalMemoryOwner = [IntPtr]::Zero
+        throw
+    }
 }
 
 function Assert-HostBudget {
@@ -1314,6 +2073,11 @@ function Get-HostRootInventory([string] $LiteralRoot) {
 
 function Close-HostReader {
     if ($script:HostInfoBusy) { throw 'identity' }
+    # Refuse an active borrowed reader before closing any handle or freeing
+    # scratch. Retirement latches this owner closed against new admissions.
+    if ($script:HostTraversalCompilerReady) {
+        [Morpheus.OwnedTraversal20261028.Reader]::RetireOwner($script:HostTraversalOwners)
+    }
     $good = $true
     try {
         if ($null -ne $script:HostHandles) {
@@ -1327,6 +2091,11 @@ function Close-HostReader {
         }
     } finally {
         try {
+            $script:HostTraversalReader = $null
+            $script:HostTraversalCompilerReady = $false
+            $script:HostTraversalOwners = $null
+            $script:HostTraversalMemoryOwner = [IntPtr]::Zero
+            $script:HostTraversalKernelOwner = [IntPtr]::Zero
             # Owned scratch is freed even when closing a native file handle fails.
             $memory = $script:HostInfoMemory
             $script:HostInfoMemory = [IntPtr]::Zero
@@ -1434,6 +2203,8 @@ function Get-HostToolchainInventory {
     $script:HostPreflightStage = 'initialization'
     Initialize-HostReader
     try {
+        $owned = New-HostOwnedTraversal
+        if ($null -ne $owned) { return (Invoke-HostOwnedTraversal $owned '') }
         $script:HostPreflightStage = 'role_binding'
         $drive = $env:SystemRoot.Substring(0, 2)
         $vsBase = $drive + '\Program Files\Microsoft Visual Studio\2022'
@@ -1478,7 +2249,7 @@ function Get-HostToolchainInventory {
         $script:HostPreflightWork = 'final_file'
         foreach ($record in $script:HostFileRecords) { Assert-HostBudget; Get-HostHandleInfo $record.handle $record.comparison $true }
         Assert-HostBudget
-        return [ordered]@{ schema = 'morpheus-native-windows-host-toolchain-inventory-v1';
+        $inventory = [ordered]@{ schema = 'morpheus-native-windows-host-toolchain-inventory-v1';
             visual_studio_root = $vs; visual_studio_year = '2022'; msvc_toolset_version = $version;
             windows_sdk_version = '10.0.26100.0'; roots = $roots; roles = $roleFacts;
             upstream_build_revision = 'be1a8f6dcd7df7e46320192c5e2f364e50d79bbf';
@@ -1487,6 +2258,7 @@ function Get-HostToolchainInventory {
             entries = $script:HostCount; total_bytes = $script:HostBytes; limits = $script:HostLimits;
             environment_realized = $false; vcvars_or_compilers_executed = $false;
             host_approval_granted = $false; build_ready = $false; distribution_ready = $false }
+        return (Set-HostInventoryImplementation $inventory 'powershell-original-fallback-v1')
     } finally { Close-HostReader }
 }
 

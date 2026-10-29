@@ -1144,6 +1144,8 @@ try {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $caseStage = 'source_parse'
+$inventorySite = 'unknown'
+$fixtureLineLimit = 1420
 try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
@@ -1475,6 +1477,7 @@ try {
             [uint64]68719476737, [uint64]68719476736, $hashSize) -ne 0) { throw 'hash' }
     } finally { $hashInput.Dispose(); $hash.Dispose() }
     $caseStage = 'inventory'
+    $inventorySite = 'ordinary'
     $result = Get-HostRootInventory $good
     if ($script:HostManagedHashes -lt 2 -or $script:HostManagedAdmissions -lt 2 -or
         $script:HostManagedInitialInfos -lt 2) { throw 'hash' }
@@ -2083,6 +2086,238 @@ try {
     $null = Get-HostCanonicalPath $good
     if (-not $script:HostCanonicalPaths.ContainsKey($good)) { throw 'identity' }
 } finally { Close-HostReader }
+# The complete owned root transaction is additional coverage. The preceding
+# ordinary root already proved the existing managed initial/admission/hash paths;
+# none of those assertions is replaced by this new path.
+$caseStage = 'reader_initialize'
+Initialize-HostReader
+$completeReader = $null
+try {
+    $catalog = [Management.Automation.Runspaces.TypeData[]]@(Microsoft.PowerShell.Utility\Get-TypeData)
+    # No managed Reader has yet registered this owner: a prior registration
+    # cannot accidentally satisfy all negative admission assertions.
+    # Every owner slot must fail before a read/open or a property getter.
+    for ($slot = 0; $slot -lt 42; $slot++) {
+        $changed = [object[]]$script:HostTraversalOwners.Clone()
+        $changed[$slot] = [object]::new()
+        $denied = [Morpheus.OwnedTraversal20261028.Reader]::TryCreate($changed,
+            $script:HostTraversalOwners, $catalog, $script:HostInfoMemory, $script:HostTraversalMemoryOwner,
+            $script:HostKernel, $script:HostTraversalKernelOwner, $false,
+            0, [uint64]0, 0, $script:HostCanonicalUnits, 8192, 1048576, 512, $env:SystemRoot)
+        if ($null -ne $denied -or $script:HostHandles.Count -ne 0 -or
+            [Convert]::ToHexString($script:HostInfoScratch) -cne ('00' * 52)) { throw 'identity' }
+    }
+    $completeReader = New-HostOwnedTraversal
+    if ($null -eq $completeReader) { throw 'identity' }
+    # Compiler source is fixed. These are the exact production lexical checks,
+    # compared with the retained original helper, including invariant-equality
+    # and Unicode ignorable-character cases. No filesystem access occurs here.
+    $lexical = @($good, ($good + '\ordinary.bin'), 'relative', 'C:/bad',
+        'C:\x:ads', 'C:\x.', 'C:\x ', 'C:\.git', 'C:\CON.txt',
+        ('C:\' + [char]0x00ad), ('C:\.' + [char]0x00ad),
+        ('C:\.g' + [char]0x0130 + 't'), ('C:\x.' + [char]0x00ad),
+        ('C:\x' + [char]0x200b), ('C:\x\' + [char]0x00ad))
+    foreach ($pathCase in $lexical) {
+        $originalValue = $null; $managedValue = $null
+        $originalError = $null; $managedError = $null
+        try { $originalValue = Get-CanonicalHostPath $pathCase } catch { $originalError = $_.Exception }
+        try { $managedValue = [Morpheus.OwnedTraversal20261028.Reader]::ValidateOwnedPath($completeReader, $pathCase) } catch { $managedError = $_.Exception }
+        if (($null -eq $originalError) -ne ($null -eq $managedError)) { throw 'path' }
+        if ($null -eq $originalError) {
+            if ($originalValue -cne $managedValue) { throw 'path' }
+        } else {
+            $originalLabel = ''; $managedLabel = ''
+            $pathLabels = @('path_empty', 'path_length', 'path_drive', 'path_colon', 'path_slash',
+                'path_chars', 'path_normalized', 'path_part_empty', 'path_part_dot',
+                'path_part_trailingdot', 'path_part_trailingspace', 'path_part_device', 'path_part_git')
+            $problem = $originalError
+            for ($i = 0; $i -lt 8 -and $null -ne $problem; $i++) {
+                if ($pathLabels -ccontains $problem.Message) { $originalLabel = $problem.Message; break }
+                $problem = $problem.InnerException
+            }
+            $problem = $managedError
+            for ($i = 0; $i -lt 8 -and $null -ne $problem; $i++) {
+                if ($pathLabels -ccontains $problem.Message) { $managedLabel = $problem.Message; break }
+                $problem = $problem.InnerException
+            }
+            if ($originalLabel -ceq '' -or $originalLabel -cne $managedLabel) { throw 'path' }
+        }
+    }
+    $literalOrdered = [ordered]@{ cl = 'first'; sdk_mt = 'second' }
+    $managedOrdered = [Morpheus.OwnedTraversal20261028.Reader]::NewOrderedMap()
+    $managedOrdered.Add('cl', 'first'); $managedOrdered.Add('sdk_mt', 'second')
+    if ($managedOrdered.GetType() -ne $literalOrdered.GetType() -or
+        $managedOrdered['CL'] -cne $literalOrdered['CL'] -or
+        $managedOrdered['SDK_MT'] -cne $literalOrdered['SDK_MT'] -or
+        @($managedOrdered.Keys)[0] -cne 'cl' -or @($managedOrdered.Keys)[1] -cne 'sdk_mt') { throw 'identity' }
+    # Exercise the active-reader close refusal without another thread or a
+    # production test hook. A temporary pure lexical method callback invokes
+    # Close while ValidateOwnedPath is active; the subsequent real root must
+    # still enter, proving no private owner latch was changed by the refusal.
+    $priorStringData = @(Microsoft.PowerShell.Utility\Get-TypeData -TypeName 'System.String')
+    $script:ActiveReaderCloseCalls = 0
+    Microsoft.PowerShell.Utility\Update-TypeData -TypeName 'System.String' -MemberType ScriptMethod -MemberName EndsWith -Force -Value {
+        param([string] $Suffix)
+        $script:ActiveReaderCloseCalls++
+        $beforeMemory = $script:HostInfoMemory
+        Must-Refuse { Close-HostReader }
+        if ($script:HostInfoMemory -ne $beforeMemory -or $script:HostHandles.Count -ne 0) { throw 'identity' }
+        $value = [string]$this
+        return ($value.Length -ge $Suffix.Length -and
+            [string]::CompareOrdinal($value, $value.Length - $Suffix.Length, $Suffix, 0, $Suffix.Length) -eq 0)
+    }
+    try {
+        $activePath = 'C:\owned-active-' + [char]0xe9 + '.bin'
+        $null = [Morpheus.OwnedTraversal20261028.Reader]::ValidateOwnedPath($completeReader, $activePath)
+        if ($script:ActiveReaderCloseCalls -le 0 -or $script:HostInfoMemory -eq [IntPtr]::Zero) { throw 'identity' }
+    } finally {
+        Microsoft.PowerShell.Utility\Remove-TypeData -TypeName 'System.String'
+        foreach ($priorData in $priorStringData) { Microsoft.PowerShell.Utility\Update-TypeData -TypeData $priorData -Force }
+    }
+    $caseStage = 'inventory'
+    $inventorySite = 'managed'
+    $completeResult = Invoke-HostOwnedTraversal $completeReader $good $true
+    if ($script:HostManagedTraversalRoots -ne 1 -or $script:HostManagedHashes -ne 2 -or
+        $completeResult.files.Count -ne 2 -or $script:HostBytes -ne 5 -or
+        $script:HostPreflightBudgetCause -cne 'unknown' -or $script:HostInfoBusy) { throw 'inventory' }
+    $completeTool = @($completeResult.files | Where-Object { $_.path -eq 'tool.bin' })
+    if ($completeTool.Count -ne 1 -or $completeTool[0].bytes -ne 4 -or
+        $completeTool[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
+    # Shared production receipt decoration is checked with this actual owned
+    # root's rows; this synthetic boundary case is not a full SDK inventory.
+    $receiptProbe = [ordered]@{ roots = @($completeResult); build_ready = $false;
+        host_approval_granted = $false; distribution_ready = $false }
+    $ownedReceipt = Set-HostInventoryImplementation $receiptProbe 'owned-managed-transaction-v1'
+    if ($ownedReceipt.schema -cne 'morpheus-native-windows-host-toolchain-inventory-v2' -or
+        $ownedReceipt.preflight_implementation -cne 'owned-managed-transaction-v1' -or
+        $ownedReceipt.preflight_compiler -cne 'powershell-bundled-roslyn-in-process-v1' -or
+        $ownedReceipt.vcvars_or_compilers_executed -ne $true -or
+        $ownedReceipt.external_toolchain_executables_executed -ne $false -or
+        $ownedReceipt.build_ready -ne $false -or $ownedReceipt.host_approval_granted -ne $false -or
+        $ownedReceipt.distribution_ready -ne $false) { throw 'identity' }
+    Must-Refuse { Set-HostInventoryImplementation ([ordered]@{}) 'unknown' }
+    Must-Refuse { Set-HostInventoryImplementation ([ordered]@{}) ('owned-managed-transaction-v1' + [char]0xad) }
+    # Existing filesystem mutation/retained-lock assertions follow unchanged;
+    # here compare the exact record/final identity integration as well.
+    foreach ($record in $script:HostFileRecords) { Assert-HostIdentity $record $true }
+    Must-Refuse { Invoke-HostOwnedTraversal $completeReader $good $true }
+} finally { Close-HostReader }
+if ($null -ne $script:HostTraversalReader -or $null -ne $script:HostTraversalOwners -or
+    $completeReader.Memory -ne [IntPtr]::Zero) { throw 'identity' }
+Must-Refuse { [Morpheus.OwnedTraversal20261028.Reader]::RunOwnedRoot($completeReader, $good) }
+# Exercise the original non-ASCII lexical helper within the actual complete
+# native transaction, not merely through the pure lexical comparison above.
+$unicodeRoot = Join-Path $root 'owned-unicode'
+$null = [IO.Directory]::CreateDirectory($unicodeRoot)
+$unicodeName = 'caf' + [char]0xe9 + '.bin'
+[IO.File]::WriteAllBytes((Join-Path $unicodeRoot $unicodeName), [byte[]]@(1, 2, 3, 4))
+Initialize-HostReader
+try {
+    $unicodeReader = New-HostOwnedTraversal
+    if ($null -eq $unicodeReader) { throw 'identity' }
+    $unicodeResult = Invoke-HostOwnedTraversal $unicodeReader $unicodeRoot $true
+    if ($script:HostManagedTraversalRoots -ne 1 -or $script:HostManagedHashes -ne 1 -or
+        $unicodeResult.files.Count -ne 1 -or $unicodeResult.files[0].path -cne $unicodeName -or
+        $unicodeResult.files[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
+} finally { Close-HostReader }
+# A replaced complete per-file helper must also choose the original route.
+Initialize-HostReader
+try {
+    $savedFileFact = ${function:Get-HostFileFact}
+    $script:CompleteFileFactOriginal = $savedFileFact
+    $script:CompleteFileFactCalls = 0
+    Set-Item Function:Get-HostFileFact -Value {
+        param([string] $LiteralPath, [int] $TextLimit = 0, [uint64] $RemainingBytes = [uint64]::MaxValue)
+        $script:CompleteFileFactCalls++
+        return & $script:CompleteFileFactOriginal $LiteralPath $TextLimit $RemainingBytes
+    }
+    try {
+        if ($null -ne (New-HostOwnedTraversal) -or $script:CompleteFileFactCalls -ne 0 -or
+            $script:HostHandles.Count -ne 0) { throw 'identity' }
+        $oldResult = Get-HostRootInventory $good
+        if ($oldResult.files.Count -ne 2 -or $script:CompleteFileFactCalls -ne 2 -or
+            $script:HostManagedTraversalRoots -ne 0) { throw 'inventory' }
+        $fallbackReceipt = Set-HostInventoryImplementation ([ordered]@{ roots = @($oldResult);
+            build_ready = $false; host_approval_granted = $false; distribution_ready = $false }) 'powershell-original-fallback-v1'
+        if ($fallbackReceipt.schema -cne 'morpheus-native-windows-host-toolchain-inventory-v2' -or
+            $fallbackReceipt.preflight_implementation -cne 'powershell-original-fallback-v1' -or
+            $fallbackReceipt.preflight_compiler -cne 'powershell-bundled-roslyn-in-process-v1' -or
+            $fallbackReceipt.vcvars_or_compilers_executed -ne $true -or
+            $fallbackReceipt.external_toolchain_executables_executed -ne $false -or
+            $fallbackReceipt.build_ready -ne $false -or $fallbackReceipt.host_approval_granted -ne $false -or
+            $fallbackReceipt.distribution_ready -ne $false) { throw 'identity' }
+    } finally { Set-Item Function:Get-HostFileFact -Value $savedFileFact }
+} finally { Close-HostReader }
+# Even an admitted reader that never entered its first transaction is retired.
+Initialize-HostReader
+$unenteredReader = New-HostOwnedTraversal
+if ($null -eq $unenteredReader) { throw 'identity' }
+Close-HostReader
+if ($unenteredReader.Memory -ne [IntPtr]::Zero -or $script:HostTraversalCompilerReady) { throw 'identity' }
+Must-Refuse { [Morpheus.OwnedTraversal20261028.Reader]::RunOwnedRoot($unenteredReader, $good) }
+# Never-admitted/never-requested owners must close too. Restore only the
+# cleared immutable lexical memo so it cannot accidentally mask a stale-owner
+# admission through the unrelated empty-memo gate. No freed pointer is read:
+# the private closed-owner latch must reject before metadata/native calls.
+Initialize-HostReader
+$neverOwners = $script:HostTraversalOwners
+$neverMemory = $script:HostInfoMemory; $neverKernel = $script:HostKernel
+$neverUnits = $script:HostCanonicalUnits
+Close-HostReader
+$neverOwners[19].Add($env:SystemRoot, $env:SystemRoot)
+try {
+    $denied = [Morpheus.OwnedTraversal20261028.Reader]::TryCreate($neverOwners, $neverOwners,
+        $catalog, $neverMemory, $neverMemory, $neverKernel, $neverKernel, $false,
+        0, [uint64]0, 0, $neverUnits, 8192, 1048576, 512, $env:SystemRoot)
+    if ($null -ne $denied -or $neverOwners[16].Count -ne 0) { throw 'identity' }
+} finally { $neverOwners[19].Clear() }
+# Same-object native Invoke and byte-array Length probes force the entire old
+# route before any probe/read. No PS getter is evaluated by admission.
+Initialize-HostReader
+try {
+    $script:CompleteNativeType = $script:HostType
+    $script:CompleteInvokeCalls = 0
+    Add-Member -InputObject $script:HostType -MemberType ScriptMethod -Name Invoke -Value {
+        param([IntPtr] $Handle)
+        $script:CompleteInvokeCalls++
+        return $script:CompleteNativeType.DynamicInvoke([object[]]@($Handle))
+    } -Force
+    try {
+        if ($null -ne (New-HostOwnedTraversal) -or $script:CompleteInvokeCalls -ne 0 -or
+            $script:HostHandles.Count -ne 0) { throw 'identity' }
+        $oldResult = Get-HostRootInventory $good
+        if ($oldResult.files.Count -ne 2 -or $script:CompleteInvokeCalls -le 0 -or
+            $script:HostManagedTraversalRoots -ne 0) { throw 'inventory' }
+    } finally { $script:HostType.PSObject.Members.Remove('Invoke') }
+} finally { Close-HostReader }
+Initialize-HostReader
+try {
+    $script:CompleteLengthCalls = 0
+    Add-Member -InputObject $script:HostBuffer -MemberType ScriptProperty -Name Length -Value {
+        $script:CompleteLengthCalls++
+        throw 'hash'
+    } -Force
+    try {
+        if ($null -ne (New-HostOwnedTraversal) -or $script:CompleteLengthCalls -ne 0 -or
+            $script:HostHandles.Count -ne 0) { throw 'identity' }
+    } finally { $script:HostBuffer.PSObject.Members.Remove('Length') }
+    # A global crypto method extension must be detected without constructing
+    # a digest or executing the user method, before the first file open.
+    $originalCryptoData = @(Microsoft.PowerShell.Utility\Get-TypeData -TypeName 'system.security.cryptography.hashalgorithm')
+    $script:CompleteCryptoCalls = 0
+    Microsoft.PowerShell.Utility\Update-TypeData -TypeName 'system.security.cryptography.hashalgorithm' -MemberType ScriptMethod -MemberName TransformBlock -Force -Value {
+        $script:CompleteCryptoCalls++
+        throw 'hash'
+    }
+    try {
+        if ($null -ne (New-HostOwnedTraversal) -or $script:CompleteCryptoCalls -ne 0 -or
+            $script:HostHandles.Count -ne 0) { throw 'identity' }
+    } finally {
+        Microsoft.PowerShell.Utility\Remove-TypeData -TypeName 'system.security.cryptography.hashalgorithm'
+        foreach ($priorData in $originalCryptoData) { Microsoft.PowerShell.Utility\Update-TypeData -TypeData $priorData -Force }
+    }
+} finally { Close-HostReader }
+
 # A pre-native initialization refusal still leaves idempotent cleanup state.
 $originalSystemRoot = $env:SystemRoot
 try {
@@ -2265,6 +2500,7 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
         # mapping only known runtime types to fixed categories, never printing them.
         $problem = $_.Exception
         for ($i = 0; $i -lt 8 -and $null -ne $problem; $i++) {
+            if ($closed -ccontains $problem.Message) { $category = 'check_' + $problem.Message; break }
             if ($problem -is [UnauthorizedAccessException]) { $category = 'access'; break }
             if ($problem -is [IO.IOException]) { $category = 'io'; break }
             if ($problem -is [ArgumentException]) { $category = 'argument'; break }
@@ -2278,7 +2514,7 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
         }
     }
     $construction = ''
-    if ($caseStage -ceq 'reader_initialize') {
+    if ($caseStage -cin @('reader_initialize', 'inventory')) {
         $failure = $_
         # Closed runtime kind and a line in our joined, reviewed function text.
         # Never render InvocationInfo, exception text, a path, or unknown types.
@@ -2292,15 +2528,34 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
             'System.InvalidOperationException' { 'invalid_operation'; break }
             'System.TypeLoadException' { 'type_load'; break }
             'System.Reflection.AmbiguousMatchException' { 'ambiguous'; break }
+            'System.Management.Automation.PSInvalidOperationException' { 'ps_operation'; break }
+            'System.Management.Automation.PSArgumentException' { 'ps_argument'; break }
+            'System.IndexOutOfRangeException' { 'index'; break }
+            'System.NullReferenceException' { 'null_reference'; break }
+            'System.InvalidProgramException' { 'invalid_program'; break }
+            'System.NotSupportedException' { 'unsupported'; break }
+            'System.FormatException' { 'format'; break }
+            'System.ObjectDisposedException' { 'disposed'; break }
             default { 'unknown' }
         }
         $line = 0
+        $origin = 'unknown'
         $invocation = $failure.InvocationInfo
         if ($null -ne $invocation -and [string]::IsNullOrEmpty($invocation.ScriptName) -and
             $invocation.ScriptLineNumber -gt 0 -and $invocation.ScriptLineNumber -le $definitionLineLimit) {
             $line = [int]$invocation.ScriptLineNumber
+            $origin = 'fn'
+        } elseif ($null -ne $invocation -and $caseStage -ceq 'inventory' -and
+            [string]::Equals($invocation.ScriptName, $PSCommandPath, [StringComparison]::OrdinalIgnoreCase) -and
+            $invocation.ScriptLineNumber -gt 0 -and $invocation.ScriptLineNumber -le $fixtureLineLimit) {
+            $line = [int]$invocation.ScriptLineNumber
+            $origin = 'case'
         }
         $construction = ' line=' + $line.ToString([Globalization.CultureInfo]::InvariantCulture) + ' kind=' + $kind
+        if ($caseStage -ceq 'inventory') {
+            $site = if ($inventorySite -cin @('ordinary', 'managed')) { $inventorySite } else { 'unknown' }
+            $construction += ' site=' + $site + ' origin=' + $origin
+        }
     }
     Write-Output ('MORPHEUS_HOST_READER_BOUNDARY_FAILED stage=' + $caseStage + ' category=' + $category + $construction)
     exit 1
@@ -2339,7 +2594,8 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
             if len(result.stdout) <= 160:
                 observed = result.stdout.strip()
                 kinds = ("binding", "invocation", "runtime", "cast", "argument", "argument_null",
-                         "invalid_operation", "type_load", "ambiguous", "unknown")
+                         "invalid_operation", "type_load", "ambiguous", "ps_operation", "ps_argument",
+                         "index", "null_reference", "invalid_program", "unsupported", "format", "disposed", "unknown")
                 # Joined non-nested function extents cannot exceed the source's
                 # line count. PowerShell additionally requires an empty filename.
                 line_limit = len(source.read_text(encoding="utf-8").splitlines())
@@ -2349,13 +2605,24 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
                                     + " category=" + category)
                         if observed == expected:
                             diagnostic = "stage=" + stage + " category=" + category
-                        elif stage == "reader_initialize" and observed.startswith(expected + " line="):
+                        elif stage in ("reader_initialize", "inventory") and observed.startswith(expected + " line="):
                             suffix = observed[len(expected + " line="):]
-                            line, separator, kind = suffix.partition(" kind=")
+                            line, separator, tail = suffix.partition(" kind=")
+                            kind = tail
+                            site = origin = ""
+                            if stage == "inventory":
+                                kind, site_separator, tail = tail.partition(" site=")
+                                site, origin_separator, origin = tail.partition(" origin=")
+                                if (not site_separator or not origin_separator or
+                                        site not in ("ordinary", "managed", "unknown") or
+                                        origin not in ("fn", "case", "unknown")):
+                                    continue
                             if (separator and 0 < len(line) <= 4 and line.isascii() and line.isdecimal()
                                     and int(line) <= line_limit and kind in kinds):
                                 diagnostic = ("stage=" + stage + " category=" + category
                                               + " line=" + line + " kind=" + kind)
+                                if stage == "inventory":
+                                    diagnostic += " site=" + site + " origin=" + origin
             self.assertEqual(result.returncode, 0,
                              "fixed Windows host reader boundary case failed " + diagnostic)
             self.assertTrue(result.stdout.strip() == "MORPHEUS_HOST_READER_BOUNDARIES_OK",

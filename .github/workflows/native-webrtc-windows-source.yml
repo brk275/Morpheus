@@ -53,7 +53,7 @@ jobs:
           GIT_CONFIG_VALUE_1: lf
         with:
           persist-credentials: false
-      - name: Read hosted tool identities without execution
+      - name: Read hosted identities without executing SDK tools
         if: inputs.phase == 'preflight'
         shell: pwsh
         env:
