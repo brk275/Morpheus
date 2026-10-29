@@ -725,7 +725,7 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
                 with self.assertRaises(_PIPELINE.Refused):
                     _PIPELINE.pack_handoff(root, bad, inventories, _MATERIAL)
                 self.assertFalse(_PIPELINE.PACK_ACTIVE)
-                self.assertEqual(_PIPELINE.pack_frame(), {"pack_failure": "refused", "pack_operation": "metadata_limit"})
+                self.assertEqual(_PIPELINE.pack_frame(), {"pack_failure": "refused", "pack_operation": "recipe_index"})
             # Inner gzip parsing is one stream, checksum/EOF-bound, supports
             # partial reads, and cannot accept a newly hashed invalid suffix.
             original = archive_paths[0].read_bytes()
@@ -936,7 +936,7 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
                 with self.assertRaises(_PIPELINE.Refused):
                     _PIPELINE.pack_handoff(root, bad, inventories, _MATERIAL)
                 self.assertFalse(_PIPELINE.PACK_ACTIVE)
-                self.assertEqual(_PIPELINE.pack_frame(), {"pack_failure": "refused", "pack_operation": "metadata_limit"})
+                self.assertEqual(_PIPELINE.pack_frame(), {"pack_failure": "refused", "pack_operation": "recipe_index"})
                 # Version6 shares raw ORIGINAL Git batch-capture payloads,
                 # while keeping both capture files and all checkout versions.
                 previous = folders["assembled"]
@@ -994,6 +994,58 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
                 self.assertNotIn((hashlib.sha256(opaque_pack).hexdigest(), len(opaque_pack)), batch_targets)
                 self.assertNotIn((hashlib.sha256(b"prepatch-only bytes").hexdigest(), len(b"prepatch-only bytes")), canonical)
                 targets = _PIPELINE.all_recipe_index(header, canonical)
+                # Only fixed source labels may distinguish index refusal from
+                # actual JSON capacity; no header values or paths are emitted.
+                for field, operation in (("xz_members", "recipe_archives"),
+                                         ("batch_members", "recipe_batches")):
+                    bad = json.loads(json.dumps(header))
+                    if field == "xz_members": bad[field] = []
+                    else: bad[field][0]["sha256"] = "0" * 64
+                    with self.subTest(pack_index=field), self.assertRaises(_PIPELINE.Refused):
+                        _PIPELINE.pack_handoff(root, bad, inventories, _MATERIAL)
+                    self.assertFalse(_PIPELINE.PACK_ACTIVE)
+                    self.assertEqual(_PIPELINE.pack_frame(), {"pack_failure": "refused", "pack_operation": operation})
+                bad = json.loads(json.dumps(header))
+                # Reverse the collision: the retained batch source is smaller
+                # than archive-derived content, so derive its existing nonzero
+                # target from a valid archive extent without changing any bound.
+                overlap = (hashlib.sha256(checkout_body).hexdigest(), len(checkout_body))
+                self.assertIn(overlap, batch_targets)
+                group = max(bad["xz_members"], key=lambda value: value["expanded_bytes"])
+                self.assertLessEqual(overlap[1], group["expanded_bytes"])
+                group["members"] = [{"offset": 0, "sha256": overlap[0], "bytes": overlap[1]}]
+                self.assertIn(overlap, _PIPELINE.archive_recipe_index(bad, canonical))
+                self.assertEqual(_PIPELINE.batch_recipe_index(bad, canonical), batch_targets)
+                with self.assertRaises(_PIPELINE.Refused):
+                    _PIPELINE.pack_handoff(root, bad, inventories, _MATERIAL)
+                self.assertEqual(_PIPELINE.pack_frame(),
+                                 {"pack_failure": "refused", "pack_operation": "recipe_target_overlap"})
+                bad = json.loads(json.dumps(header))
+                physical = bad["batch_members"][0]
+                group = bad["xz_members"][0]
+                group["expanded_bytes"] = max(group["expanded_bytes"], physical["bytes"])
+                group["members"] = [{"offset": 0, "sha256": physical["sha256"], "bytes": physical["bytes"]}]
+                with self.assertRaises(_PIPELINE.Refused):
+                    _PIPELINE.pack_handoff(root, bad, inventories, _MATERIAL)
+                self.assertEqual(_PIPELINE.pack_frame(),
+                                 {"pack_failure": "refused", "pack_operation": "recipe_physical_overlap"})
+                archive_bytes = sum(group["expanded_bytes"] for key in ("gzip_members", "xz_members")
+                                    for group in header[key])
+                batch_bytes = sum(group["bytes"] for group in header["batch_members"])
+                # Each validated domain fits, but their combined total does not.
+                with mock.patch.object(_PIPELINE, "MAX_EXPANDED", max(archive_bytes, batch_bytes)):
+                    with self.assertRaises(_PIPELINE.Refused):
+                        _PIPELINE.pack_handoff(root, header, inventories, _MATERIAL)
+                self.assertFalse(_PIPELINE.PACK_ACTIVE)
+                self.assertEqual(_PIPELINE.pack_frame(),
+                                 {"pack_failure": "refused", "pack_operation": "recipe_expanded_limit"})
+                with TemporaryDirectory(dir=root) as metadata_root:
+                    with mock.patch.object(_PIPELINE, "MAX_JSON", 1):
+                        with self.assertRaises(_PIPELINE.Refused):
+                            _PIPELINE.pack_handoff(Path(metadata_root), header, inventories, _MATERIAL)
+                    self.assertFalse(_PIPELINE.PACK_ACTIVE)
+                    self.assertEqual(_PIPELINE.pack_frame(),
+                                     {"pack_failure": "refused", "pack_operation": "metadata_limit"})
                 archive.unlink(); archive.parent.rmdir()  # Only this fixture's prior owned output.
                 archive = _PIPELINE.pack_handoff(root, header, inventories, _MATERIAL)
                 packed = archive.read_bytes()

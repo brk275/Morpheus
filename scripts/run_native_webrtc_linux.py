@@ -90,6 +90,8 @@ POST_ASSEMBLY_PHASES = frozenset((
 PACK_OPERATIONS = frozenset((
     "unknown", "cache_absence", "cache_create", "output_open", "output_mode",
     "writer_create", "gzip_open", "xz_open", "metadata_encode", "metadata_limit",
+    "recipe_index", "recipe_archives", "recipe_batches", "recipe_target_overlap",
+    "recipe_physical_overlap", "recipe_expanded_limit",
     "metadata_header", "metadata_add", "root_select", "directory_header",
     "directory_add", "file_fact", "file_header", "file_open", "file_wrap",
     "file_add", "file_close", "file_position", "gzip_finish", "xz_finish", "output_flush", "output_sync", "output_close",
@@ -1421,13 +1423,19 @@ def archive_recipe_index(header, canonical):
 
 
 def all_recipe_index(header, canonical):
+    if PACK_ACTIVE: pack_at("recipe_archives")
     archive_targets = archive_recipe_index(header, canonical)
+    if PACK_ACTIVE: pack_at("recipe_batches")
     batch_targets = batch_recipe_index(header, canonical)
     physical = {(digest, row["bytes"]) for pins in (GZIP_MEMBER_ARCHIVES, XZ_MEMBER_ARCHIVES)
                 for digest, row in pins.items()}
     physical.update((group["sha256"], group["bytes"]) for group in header["batch_members"])
-    need(not archive_targets & batch_targets and not (archive_targets | batch_targets) & physical
-         and sum(group["expanded_bytes"] for key in ("gzip_members", "xz_members") for group in header[key])
+    if PACK_ACTIVE: pack_at("recipe_target_overlap")
+    need(not archive_targets & batch_targets)
+    if PACK_ACTIVE: pack_at("recipe_physical_overlap")
+    need(not (archive_targets | batch_targets) & physical)
+    if PACK_ACTIVE: pack_at("recipe_expanded_limit")
+    need(sum(group["expanded_bytes"] for key in ("gzip_members", "xz_members") for group in header[key])
              + sum(group["bytes"] for group in header["batch_members"]) <= MAX_EXPANDED)
     return archive_targets | batch_targets
 
@@ -1443,7 +1451,7 @@ def pack_handoff(temp, handoff, inventories, material):
     packed = set()
     try:
         if handoff["schema"] in (LINUX_GZIP_MEMBERS_SCHEMA, LINUX_XZ_MEMBERS_SCHEMA, LINUX_BATCH_MEMBERS_SCHEMA):
-            pack_at("metadata_limit")
+            pack_at("recipe_index")
             index = (all_recipe_index if handoff["schema"] == LINUX_BATCH_MEMBERS_SCHEMA else
                      archive_recipe_index if handoff["schema"] == LINUX_XZ_MEMBERS_SCHEMA else gzip_recipe_index)
             recipe_targets = index(handoff, handoff_canonical(inventories))
