@@ -806,7 +806,7 @@ class ScopeTests(unittest.TestCase):
                 source = git("commit-tree", tree, data=(message + "\n").encode()).decode().strip()
                 return source, tree
 
-            ui = "crates/morpheus-app/src/account_access_ui_tests.rs"
+            ui = "crates/morpheus-app/src/main.rs"
             windows = tuple(path for path, _ in ci_scope.APPEARANCE_REUSE_WINDOWS_INPUTS)
             selectors = ci_scope.NATIVE_REUSE_SELECTORS
             workflow = b"name: controlled frozen workflow\n"
@@ -825,6 +825,7 @@ class ScopeTests(unittest.TestCase):
                 "APPEARANCE_REUSE_NATIVE_SOURCE": native, "APPEARANCE_REUSE_NATIVE_TREE": native_tree,
                 "APPEARANCE_REUSE_WINDOWS_SOURCE": independent, "APPEARANCE_REUSE_WINDOWS_TREE": independent_tree,
                 "APPEARANCE_REUSE_WINDOWS_INPUTS": window_blobs,
+                "APPEARANCE_REUSE_INPUTS": (ui,),
                 "REVIEWED_CONTROL_WORKFLOW_SHA256": hashlib.sha256(workflow).hexdigest(),
                 "REVIEWED_CONTROL_WORKFLOW_BYTES": len(workflow),
             }
