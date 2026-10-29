@@ -233,10 +233,13 @@ pub enum Error {
 #[cfg(test)]
 mod credential_policy_tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn custom_slot_never_falls_through_to_legacy_room_credentials() {
         let backend = matrix_rtc_core::testing::MockBackend::new();
+        *backend.openid_response.lock().unwrap() =
+            Err(matrix_rtc_core::BackendError::new("synthetic OpenID refusal"));
         let mut config = LiveKitTransportConfig {
             livekit_service_url: "https://rtc.example.org".into(),
             room_id: "!test:example.org".into(),
@@ -254,27 +257,32 @@ mod credential_policy_tests {
             .err()
             .unwrap();
         assert!(matches!(error, Error::UnsupportedAuthDialect));
+        assert_eq!(backend.openid_requests.load(Ordering::SeqCst), 0);
         config.token_endpoint = TokenEndpoint::Msc4195;
         let error = acquire_token(&http, &config, &backend, None)
             .await
             .err()
             .unwrap();
         assert!(matches!(error, Error::OpenIdToken(_)));
+        assert_eq!(backend.openid_requests.load(Ordering::SeqCst), 1);
         let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let error = acquire_token(&http, &config, &backend, Some(&active))
             .await
             .err()
             .unwrap();
         assert!(matches!(error, Error::IdentityRejected));
+        assert_eq!(backend.openid_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn invalid_focus_fails_before_requesting_openid() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        // MockBackend does not implement OpenID. Getting UnsafeEndpoint rather
-        // than OpenIdToken proves validation precedes that backend call. Own and
-        // remote transports both invoke acquire_token through connect_e2ee.
+        // Refuse OpenID explicitly so even a regression cannot reach HTTP.
+        // The zero-call assertion proves endpoint validation precedes OpenID.
+        // Own and remote transports invoke acquire_token through connect_e2ee.
         let backend = matrix_rtc_core::testing::MockBackend::new();
+        *backend.openid_response.lock().unwrap() =
+            Err(matrix_rtc_core::BackendError::new("synthetic OpenID refusal"));
         for service in [
             "http://remote.example.org",
             "https://user:secret@remote.example.org",
@@ -297,6 +305,7 @@ mod credential_policy_tests {
                     .err()
                     .unwrap();
                 assert!(matches!(error, Error::UnsafeEndpoint));
+                assert_eq!(backend.openid_requests.load(Ordering::SeqCst), 0);
             }
         }
     }
