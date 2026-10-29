@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,151 @@ import run_element_acceptance as target
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_initial_native_failure_reduction_is_source_bound_and_closed(self):
+        header = ("thread 'element_call_browser_peer_encrypted_media_and_departure' (123) panicked at "
+                  "crates/morpheus-rtc/tests/element_call_peer.rs:999:6:")
+        for message, reason in target.INITIAL_NATIVE_PANICS.items():
+            raw = header + "\n" + message + ": opaque-private-detail"
+            self.assertEqual(target.initial_native_reason(raw), reason)
+            published = target.NATIVE_REASON_PREFIX + target.initial_native_reason(raw) + "\n"
+            self.assertEqual(target.diagnostics(published), {"native_reason": reason})
+            self.assertNotIn("opaque", published)
+            for wrong in (raw.replace("element_call_peer.rs", "other.rs"), message,
+                          header + "\n" + message + "wrong-suffix", header + "\n" + message + ":" + "x" * 2_048):
+                with self.subTest(message=message, wrong=wrong):
+                    self.assertEqual(target.initial_native_reason(wrong), "unclassified")
+        first, second = list(target.INITIAL_NATIVE_PANICS)[:2]
+        self.assertEqual(target.initial_native_reason(header + "\n" + first + "\n" + header + "\n" + second), "multiple")
+        for status, kind in ((1, "exit_nonzero"), (101, "exit_nonzero"), (-signal.SIGABRT, "signal_abort"),
+                             (-signal.SIGSEGV, "signal_segv"), (-signal.SIGKILL, "signal_kill"),
+                             (-999, "signal_other"), (None, "unclassified"), (0, "unclassified"), (True, "unclassified")):
+            self.assertEqual(target.native_exit_kind(status), kind)
+        for prefix, field, values in ((target.NATIVE_REASON_PREFIX, "native_reason", target.NATIVE_REASONS),
+                                      (target.NATIVE_EXIT_PREFIX, "native_exit", target.NATIVE_EXITS)):
+            for value in values:
+                line = prefix + value
+                self.assertEqual(target.diagnostics(line), {field: value})
+                self.assertEqual(target.diagnostics(line, include_native=False), {})
+                self.assertEqual(target.diagnostics(line + "\n" + line), {field: "invalid"})
+            self.assertEqual(target.diagnostics(prefix + "opaque_private"), {field: "invalid"})
+            self.assertEqual(target.diagnostics(prefix + "x" * 128), {field: "invalid"})
+            self.assertEqual(target.diagnostics("embedded " + prefix + "unclassified"), {})
+
+    def test_observer_profiles_are_bound_to_exact_verified_sdk_and_image(self):
+        pairs = (
+            ("fa4772a4ddd335a5a8bfbf8bb21df49b70f7a999", "sha256:6d83fe15c425e1139edafdffe2b2073256608dcafdc554da5bf840de496891fe", "sdk42"),
+            ("3f05dc4d104a3dfc753c5e3549a18c74fab4b076", "sha256:c450902cf3f0dfa20ce23c9ab3b619959c571682dfa5cce16479a0c3d842896e", "sdk44"),
+        )
+        for index, (sdk, image, profile) in enumerate(pairs):
+            peer = {"sdk_revision": sdk, "image_digest": image, "official_image_identity_verified": True}
+            self.assertEqual(target.observer_profile(peer), profile)
+            for changes in ({"sdk_revision": "unknown"}, {"image_digest": "unknown"},
+                            {"official_image_identity_verified": False}, {"sdk_revision": pairs[1 - index][0]}):
+                with self.subTest(profile=profile, changes=changes), self.assertRaisesRegex(RuntimeError, "evidence"):
+                    target.observer_profile({**peer, **changes})
+
+    def test_pinned_observer_binds_sdk44_wrappers_and_retains_legacy_raw_binding(self):
+        # Execute only the exact observer function with disposable JS objects.
+        # No browser, network, SDK import, media source, or package install.
+        source = (target.REPO / "scripts/element_call_stock_peer.mjs").read_text()
+        installer = source.split("// BEGIN pinned SDK44 public-wrapper observer.", 1)[1].split("\n", 1)[1].split(
+            "// END pinned SDK44 public-wrapper observer.", 1)[0]
+        legacy = source.split("async function observeAudio(", 1)[1].split("const binding = () => {", 1)[1].split(
+            "\n        };", 1)[0]
+        fixture = r'''
+const vm = require("node:vm");
+const [installer, legacy] = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const context = vm.createContext({ setTimeout, clearTimeout, queueMicrotask });
+vm.runInContext(installer + `
+class MediaStream {
+  constructor(track) { this.track = track; }
+  getAudioTracks() { return this.track.kind === "audio" ? [this.track] : []; }
+  getVideoTracks() { return this.track.kind === "video" ? [this.track] : []; }
+}
+const owner = { room_id: "!room", user_id: "@owner", device_id: "DEVICE", member_id: "member", identity: "identity", track_sid: "SID" };
+function setup(kind = "audio") {
+  const stats = { type: "inbound-rtp", kind, trackIdentifier: "decoded", bytesReceived: 512, packetsReceived: 3 };
+  const track = { kind, source: kind === "audio" ? "microphone" : "screenShare", id: "SID", encrypted: true,
+    muted$: { value: false }, stats$: () => ({ subscribe(observer) { let live = true;
+      queueMicrotask(() => { if (live) observer.next(stats); }); return { unsubscribe() { live = false; } }; } }) };
+  const member = { local: false, userId: owner.user_id, deviceId: owner.device_id, memberId: owner.member_id,
+    backendIdentities: [owner.identity], tracks$: { value: [track] } };
+  const remote = { value: [member] };
+  const media = { id: "decoded", kind, enabled: true, readyState: "live" };
+  const props = kind === "audio" ? { track } : { video: track };
+  const element = { srcObject: new MediaStream(media), paused: false, muted: false, volume: 1,
+    __reactFiber$fixture: { memoizedProps: props, return: { memoizedProps: { tracks$: member.tracks$ }, return: {
+      memoizedProps: { vm: { remoteMembers$: remote } }, return: null } } } };
+  const membership = { userId: owner.user_id, deviceId: owner.device_id, memberId: owner.member_id,
+    backendIdentities: [owner.identity], rtcBackendIdentity: "@owner:DEVICE" };
+  const session = { room: { roomId: owner.room_id }, memberships: [membership, {}] };
+  globalThis.window = { rtcSession: session, matrixclient: { getDeviceId: () => "BROWSER",
+    matrixRTC: { roomSessions: new Map([[owner.room_id, session]]) } } };
+  globalThis.document = { querySelectorAll: () => [element] };
+  installStock44Observer();
+  return { track, member, remote, media, props, element, membership, session, stats };
+}
+async function check(kind, mutate) {
+  const value = setup(kind); if (mutate) mutate(value);
+  return await window.__morpheusStock44Binding({ owner, expectedMembers: 2, kind, deadline: Date.now() + 2000 });
+}
+globalThis.run = async () => {
+  for (const kind of ["audio", "video"]) {
+    if (!(await check(kind))) throw new Error("legitimate pinned44 binding refused");
+    for (const mutate of [
+      (x) => x.member.userId = "@wrong", (x) => x.member.deviceId = "WRONG",
+      (x) => x.member.memberId = "wrong", (x) => x.member.backendIdentities = ["wrong"],
+      (x) => x.member.backendIdentities = [owner.identity, owner.identity], (x) => x.member.local = true,
+      (x) => x.remote.value = [], (x) => x.member.tracks$.value = [{ ...x.track }],
+      (x) => x.props[kind === "audio" ? "track" : "video"] = { ...x.track },
+      (x) => x.element.__reactFiber$fixture = { memoizedProps: {}, return: null },
+      (x) => x.element.srcObject = null, (x) => x.media.id = "unrelated-decoded",
+      (x) => document.querySelectorAll = () => [x.element, { ...x.element }],
+      (x) => x.media.readyState = "ended", (x) => x.media.enabled = false,
+      (x) => x.track.id = "WRONG-SID", (x) => x.track.source = "camera",
+      (x) => x.track.encrypted = false, (x) => x.track.muted$.value = true,
+      (x) => x.stats.type = "outbound-rtp", (x) => x.stats.kind = "wrong",
+      (x) => x.stats.trackIdentifier = "wrong", (x) => x.stats.trackIdentifier = "",
+      (x) => x.stats.bytesReceived = 0, (x) => x.stats.packetsReceived = 0,
+      (x) => x.track.stats$ = null,
+      (x) => x.track.stats$ = () => ({ subscribe(observer) { queueMicrotask(() => observer.next(undefined)); return { unsubscribe() {} }; } }),
+      (x) => x.track.stats$ = () => ({ subscribe(observer) { queueMicrotask(() => {
+        x.member.tracks$.value = [{ ...x.track }]; observer.next(x.stats); }); return { unsubscribe() {} }; } }),
+      (x) => x.session.memberships.push(x.membership),
+      (x) => x.track.stats$ = () => ({ subscribe(observer) { queueMicrotask(() => {
+        x.remote.value = [{ ...x.member }]; observer.next(x.stats); }); return { unsubscribe() {} }; } }),
+    ]) if (await check(kind, mutate)) throw new Error("wrong or stale44 binding accepted");
+  }
+};
+`, context);
+(async () => {
+  await context.run();
+  vm.runInContext(`
+const fixture = setup("audio");
+const observerProfile = "sdk42", expectedMembers = 2, deadline = Date.now() + 2000;
+const raw = { kind: "audio", source: "microphone", sid: "SID", mediaStreamTrack: fixture.media, attachedElements: [fixture.element] };
+const publication = { track: raw, source: "microphone", kind: "audio", isLocal: false, isSubscribed: true,
+  isEncrypted: true, isMuted: false, trackSid: "SID" };
+const participant = { isLocal: false, identity: owner.identity, audioTrackPublications: new Map([["SID", publication]]),
+  getTrackPublicationBySid: (sid) => sid === "SID" ? publication : undefined };
+fixture.membership.rtcBackendIdentity = owner.identity;
+fixture.element.__reactFiber$fixture = { memoizedProps: { trackRef: { participant, publication, source: "microphone" } }, return: null };
+const binding = () => { ${legacy} };
+if (!binding()) throw new Error("legacy42 raw binding refused");
+participant.identity = "wrong";
+if (binding()) throw new Error("legacy wrong owner accepted");
+participant.identity = owner.identity; raw.attachedElements = [];
+if (binding()) throw new Error("legacy unattached track accepted");
+`, context);
+})().catch(() => { process.exitCode = 1; });
+'''
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Existing hosted Node runtime is unavailable")
+        self.assertTrue(Path(node).is_absolute(), "Existing hosted Node runtime must resolve absolutely")
+        result = subprocess.run([node, "-e", fixture], input=json.dumps([installer, legacy]),
+                                text=True, capture_output=True, timeout=20, env={"PATH": os.defpath})
+        self.assertEqual(result.returncode, 0, "Pinned synthetic observer contract failed")
+
     def test_requires_every_fixed_assertion_and_preserves_failure(self):
         complete = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in target.CHECKS)
         self.assertEqual(target.evidence(complete, complete=True), dict.fromkeys(target.CHECKS, True))
@@ -94,6 +240,9 @@ class EvidenceTests(unittest.TestCase):
                 runner = target.Runner(root, "scanner")
                 native = self.anchored_log(runner, "native.log", (
                     "opaque-fixture-panic\nMORPHEUS_ELEMENT_CHECK native_audio=true\n"
+                    "thread 'element_call_browser_peer_encrypted_media_and_departure' (123) panicked at "
+                    "crates/morpheus-rtc/tests/element_call_peer.rs:999:6:\n"
+                    "Browser microphone track was not subscribed: opaque-private-detail\n"
                     + target.NATIVE_STAGE_PREFIX + "microphone_cryptor\n"
                     + target.NATIVE_STAGE_PREFIX + "late_login\n").encode())
                 browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
@@ -125,7 +274,9 @@ class EvidenceTests(unittest.TestCase):
                 }, clear=True), mock.patch.object(target, "assert_contained"), \
                         mock.patch.object(target, "Runner", return_value=runner), \
                         mock.patch.object(runner, "command", return_value=""), \
-                        mock.patch.object(runner, "service", side_effect=[{"official_image_identity_verified": True, "base_url": "http://127.0.0.1:18080"},
+                        mock.patch.object(runner, "service", side_effect=[{"official_image_identity_verified": True, "base_url": "http://127.0.0.1:18080",
+                                                                         "sdk_revision": "fa4772a4ddd335a5a8bfbf8bb21df49b70f7a999",
+                                                                         "image_digest": "sha256:6d83fe15c425e1139edafdffe2b2073256608dcafdc554da5bf840de496891fe"},
                                                                       RuntimeError("fixture_operation") if service_failure else None]), \
                         mock.patch.object(runner, "start", side_effect=[browser, native]), \
                         mock.patch.object(target, "native_executable", return_value=Path("native")), \
@@ -145,6 +296,11 @@ class EvidenceTests(unittest.TestCase):
                                  {"native_audio": True, "official_image": True} if scanner_status == 0 and not join_failure and not service_failure else {})
                 self.assertEqual(target.diagnostics(output).get("native_stage"),
                                  "late_login" if scanner_status == 0 and not join_failure and not service_failure else None)
+                admitted = scanner_status == 0 and not join_failure and not service_failure
+                self.assertEqual(target.diagnostics(output).get("native_reason"),
+                                 "remote_microphone_subscription" if admitted else None)
+                self.assertEqual(target.diagnostics(output).get("native_exit"), "exit_nonzero" if admitted else None)
+                self.assertNotIn("opaque-private-detail", output)
 
     @staticmethod
     def anchored_log(runner, name, data):

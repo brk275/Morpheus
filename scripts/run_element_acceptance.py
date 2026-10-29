@@ -50,6 +50,25 @@ STAGES = frozenset((
 FAILURES = frozenset(("fixture_operation", "browser_acceptance", "native_acceptance", "deadline", "evidence", "log_scan"))
 NATIVE_STAGES = ("microphone_cryptor", "late_login", "late_sync", "late_bootstrap", "late_join", "group_roster", "same_device_rejoin")
 NATIVE_STAGE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_STAGE "
+NATIVE_REASON_PREFIX = "MORPHEUS_ELEMENT_NATIVE_REASON "
+NATIVE_EXIT_PREFIX = "MORPHEUS_ELEMENT_NATIVE_EXIT "
+INITIAL_NATIVE_PANICS = {
+    "Cannot publish native interop microphone": "local_microphone_publish",
+    "Cannot publish native interop camera": "local_camera_publish",
+    "Native interop microphone send failed": "local_microphone_send",
+    "Native interop camera send failed": "local_camera_send",
+    "Browser microphone track was not subscribed": "remote_microphone_subscription",
+    "Browser camera track was not subscribed": "remote_camera_subscription",
+    "No browser PCM stream": "remote_audio_stream",
+    "No browser I420 stream": "remote_video_stream",
+    "Morpheus did not decode Element Call microphone audio": "remote_audio_decode",
+    "Morpheus did not decode Element Call red/green video": "remote_video_decode",
+}
+NATIVE_REASONS = frozenset((*INITIAL_NATIVE_PANICS.values(), "unclassified", "multiple"))
+NATIVE_EXITS = frozenset(("exit_nonzero", "signal_abort", "signal_segv", "signal_bus", "signal_ill", "signal_kill", "signal_other", "unclassified"))
+NATIVE_PANIC_HEADER = re.compile(
+    r"^thread '[^'\r\n]{1,128}'(?: \([0-9]{1,10}\))? panicked at "
+    r"crates/morpheus-rtc/tests/element_call_peer\.rs:[1-9][0-9]{0,5}:[1-9][0-9]{0,3}:$")
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILES = 128
 MAX_LOG_ENTRIES = 65_536
@@ -57,6 +76,21 @@ MAX_LOG_DEPTH = 32
 CHECK_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
 STAGE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_STAGE ([a-z_]+)$", re.MULTILINE)
 FAILURE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_FAILURE ([a-z_]+)$", re.MULTILINE)
+
+
+def observer_profile(peer: dict) -> str:
+    profiles = {
+        ("fa4772a4ddd335a5a8bfbf8bb21df49b70f7a999", "sha256:6d83fe15c425e1139edafdffe2b2073256608dcafdc554da5bf840de496891fe"): "sdk42",
+        ("3f05dc4d104a3dfc753c5e3549a18c74fab4b076", "sha256:c450902cf3f0dfa20ce23c9ab3b619959c571682dfa5cce16479a0c3d842896e"): "sdk44",
+    }
+    if peer.get("official_image_identity_verified") is not True:
+        raise RuntimeError("evidence")
+    if not isinstance(peer.get("sdk_revision"), str) or not isinstance(peer.get("image_digest"), str):
+        raise RuntimeError("evidence")
+    selected = profiles.get((peer.get("sdk_revision"), peer.get("image_digest")))
+    if selected is None:
+        raise RuntimeError("evidence")
+    return selected
 
 
 def evidence(output: str, *, complete=False) -> dict[str, bool]:
@@ -87,6 +121,46 @@ def native_stages(output: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def initial_native_reason(output: str) -> str:
+    """Reduce only fixed source-bound panic messages after successful log scan."""
+    reasons = set()
+    previous = ""
+    for line in output.splitlines():
+        if len(line) <= 2_048 and NATIVE_PANIC_HEADER.fullmatch(previous):
+            for message, reason in INITIAL_NATIVE_PANICS.items():
+                if line == message or line.startswith(message + ":"):
+                    reasons.add(reason)
+        previous = line if len(line) <= 256 else ""
+    return next(iter(reasons)) if len(reasons) == 1 else "multiple" if reasons else "unclassified"
+
+
+def native_exit_kind(status) -> str:
+    if type(status) is not int or status == 0:
+        return "unclassified"
+    if status > 0:
+        return "exit_nonzero"
+    return {-signal.SIGABRT: "signal_abort", -signal.SIGSEGV: "signal_segv", -signal.SIGBUS: "signal_bus",
+            -signal.SIGILL: "signal_ill", -signal.SIGKILL: "signal_kill"}.get(status, "signal_other")
+
+
+def closed_native_field(output: str, prefix: str, allowed) -> str | None:
+    found = None
+    cursor = 0
+    while (start := output.find(prefix, cursor)) >= 0:
+        cursor = start + len(prefix)
+        if start and output[start - 1] != "\n":
+            continue
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        if found is not None or end - start > 96:
+            return "invalid"
+        value = output[start + len(prefix):end]
+        if value not in allowed:
+            return "invalid"
+        found = value
+    return found
+
+
 def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
@@ -97,6 +171,11 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
         result["failure"] = failures[-1]
     if include_native and (native := native_stages(output)):
         result["native_stage"] = native[-1]
+    if include_native:
+        for key, prefix, allowed in (("native_reason", NATIVE_REASON_PREFIX, NATIVE_REASONS),
+                                     ("native_exit", NATIVE_EXIT_PREFIX, NATIVE_EXITS)):
+            if (value := closed_native_field(output, prefix, allowed)) is not None:
+                result[key] = value
     return result
 
 
@@ -211,6 +290,9 @@ def wait_peers(native: Child, browser: Child, seconds=360):
         # A final browser.close error must not be hidden by earlier markers.
         native_status, browser_status = native.status(), browser.status()
         if native_status is not None and native_status != 0:
+            # Preserve the actual pre-cleanup observation; later SIGKILL is
+            # owned teardown and must never masquerade as the failure cause.
+            native.observed_failure_status = native_status
             raise RuntimeError("native_acceptance")
         if browser_status is not None and browser_status != 0:
             raise RuntimeError("browser_acceptance")
@@ -398,6 +480,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     native = None
     peers_complete = False
     children_joined = False
+    scan_complete = False
     cleanup_failure = None
     try:
         runner.mark("tool_install")
@@ -420,6 +503,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         media_fixtures(root)
         extra = {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture), "MORPHEUS_ELEMENT_PEER_ROOT": str(root),
                  "MORPHEUS_ELEMENT_PLAYWRIGHT_ROOT": str(tool), "MORPHEUS_ELEMENT_PEER_URL": peer["base_url"],
+                 "MORPHEUS_ELEMENT_OBSERVER_PROFILE": observer_profile(peer),
                  "MORPHEUS_ELEMENT_INTEROP_MODE": "sticky-2025", "MORPHEUS_ELEMENT_PEER_GO_FILE": str(root / "go"),
                  "MORPHEUS_ELEMENT_PEER_DONE_FILE": str(root / "done")}
         browser = runner.start(["node", "scripts/element_call_stock_peer.mjs"], extra=extra)
@@ -452,6 +536,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         if not children_joined or cleanup_failure is not None:
             raise RuntimeError("fixture_operation")
         output, native_output = runner.scan(native)
+        scan_complete = True
         # This is the exact native log snapshot included in the successful
         # scan, inspected only after owned group teardown and actual waits.
         if peers_complete and children_joined and not exact_native_pass(native_output):
@@ -472,6 +557,9 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     if children_joined and cleanup_failure is None:
         for value in native_stages(native_output):
             print(NATIVE_STAGE_PREFIX + value, flush=True)
+        if scan_complete and failure == "native_acceptance" and native is not None:
+            print(NATIVE_REASON_PREFIX + initial_native_reason(native_output), flush=True)
+            print(NATIVE_EXIT_PREFIX + native_exit_kind(getattr(native, "observed_failure_status", None)), flush=True)
     # Cleanup is required but must not erase the last useful failure stage.
     diagnostic_output = output.replace("MORPHEUS_ELEMENT_STAGE element_cleanup\n", "")
     if found := diagnostics(diagnostic_output, include_native=False):
