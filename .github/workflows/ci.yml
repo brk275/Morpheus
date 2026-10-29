@@ -63,7 +63,7 @@ jobs:
           info = path.lstat()
           assert stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= 1024 * 1024
           raw = path.read_bytes()
-          assert hashlib.sha256(raw).hexdigest() == 'be6cfe1b11e962790e6f4dea244bbec50889898aef72e8de0f9534f527f50a59'
+          assert hashlib.sha256(raw).hexdigest() == '98284e08c0a59e6242a8872cfdb38ac28e3fa19d24d12197412c1a1c10afdb93'
           manifest = json.loads(raw)
           assert manifest['excluded_control_paths'] == sorted(control)
           expected = manifest['tree_entries']

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -126,7 +127,10 @@ if (binding()) throw new Error("legacy unattached track accepted");
 `, context);
 })().catch(() => { process.exitCode = 1; });
 '''
-        result = subprocess.run(["node", "-e", fixture], input=json.dumps([installer, legacy]),
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Existing hosted Node runtime is unavailable")
+        self.assertTrue(Path(node).is_absolute(), "Existing hosted Node runtime must resolve absolutely")
+        result = subprocess.run([node, "-e", fixture], input=json.dumps([installer, legacy]),
                                 text=True, capture_output=True, timeout=20, env={"PATH": os.defpath})
         self.assertEqual(result.returncode, 0, "Pinned synthetic observer contract failed")
 
