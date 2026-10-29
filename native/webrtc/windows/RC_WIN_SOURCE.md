@@ -63,3 +63,30 @@ header does not supply that missing grant. Neither optional staging nor omission
 claims this tool's preferred-source/license closure, grants its execution or
 distribution, or waives any gate applicable to tools actually used. All twelve
 independent native build gates and the null build admission remain unchanged.
+
+## Complete hosted-toolchain inventory time policy
+
+The read-only Windows host-toolchain preflight uses fixed policy
+`complete-host-inventory-900s-v1`. One 900-second watch starts in
+`Initialize-HostReader` before native and managed setup and spans role hashes,
+the complete selected VS2022 edition root, the complete Windows Kits10 root,
+and final retained-handle identity checks. It never resets per file or root.
+Native cancellation and cleanup retain their separate aggregate 5000ms bound;
+uncertain cleanup still refuses reuse. No dispatch or environment time override
+is accepted.
+
+Inventory receipts use `morpheus-native-windows-host-toolchain-inventory-v3`
+and the explicit `inventory_policy` above. Closed cost suffixes use
+`owned-exclusive-wall-900s-v2`, with each component and their sum bounded to
+905000ms including cleanup. Consumers must match these exact identities and
+limits; old v2 receipts and v1 cost records remain evidence of the earlier
+180-second policy, not successful validation under this policy.
+
+The host-toolchain workflow alone has a 17-minute outer limit. Basic preflight
+remains five minutes, stage/build remains 240 minutes, and synthetic fixture
+case, child, metadata and job deadlines remain unchanged. These are offline
+validation limits, not application or media runtime limits. Entry, handle,
+byte, depth, metadata, JSON, buffer, native provenance, full hashing and final
+identity requirements are unchanged. This policy does not authorize toolchain
+admission or distribution. It is not a speed improvement or evidence that 900s
+is sufficient; a further failure requires diagnosis, not another time increase.
