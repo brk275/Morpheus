@@ -55,7 +55,7 @@ pub(crate) enum Decryption {
 pub(crate) async fn decrypt(
     e2ee: &e2ee::E2EE<'_>,
     room_id: &RoomId,
-    pending: PendingEvent,
+    mut pending: PendingEvent,
 ) -> Decryption {
     let event = TimelineEvent::from_plaintext(pending.event.clone());
 
@@ -69,9 +69,24 @@ pub(crate) async fn decrypt(
                 },
             }
         }
-        // Unable to decrypt, or no `OlmMachine` at all.
-        Ok(_) => Decryption::Pending(pending),
+        // Retain only a fixed classification from this already-completed
+        // ordinary decrypt. Do not retry, query keys or log raw crypto data.
+        Ok(Some(decrypted)) => {
+            pending.pending_diagnostic = match &decrypted.kind {
+                matrix_sdk_common::deserialized_responses::TimelineEventKind::UnableToDecrypt {
+                    utd_info,
+                    ..
+                } => super::PendingStickyEventState::from_reason(&utd_info.reason),
+                _ => super::PendingStickyEventState::PendingOther,
+            };
+            Decryption::Pending(pending)
+        }
+        Ok(None) => {
+            pending.pending_diagnostic = super::PendingStickyEventState::PendingNoCrypto;
+            Decryption::Pending(pending)
+        }
         Err(error) => {
+            pending.pending_diagnostic = super::PendingStickyEventState::PendingInternalError;
             warn!(?error, event_id = %pending.meta.event_id, "Failed to decrypt a sticky event");
             Decryption::Pending(pending)
         }

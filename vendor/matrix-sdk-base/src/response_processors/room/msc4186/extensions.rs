@@ -253,6 +253,8 @@ impl StickyEventsCollector<'_> {
                 // trying again right away.
                 Some(_) => self.pending.push(PendingEvent {
                     keyless_generation: self.keyless_generation,
+                    #[cfg(feature = "e2e-encryption")]
+                    pending_diagnostic: crate::sticky::PendingStickyEventState::Pending,
                     meta,
                     event: raw.clone(),
                 }),
@@ -261,6 +263,8 @@ impl StickyEventsCollector<'_> {
                 None => {
                     let event = PendingEvent {
                         keyless_generation: self.keyless_generation,
+                        #[cfg(feature = "e2e-encryption")]
+                        pending_diagnostic: crate::sticky::PendingStickyEventState::Pending,
                         meta,
                         event: raw.clone(),
                     };

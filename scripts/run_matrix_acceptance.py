@@ -585,6 +585,7 @@ OAUTH_LABELS = tuple("oauth-local-" + phase.replace("_", "-") for phase in OAUTH
 RING_LABELS = tuple(f"outgoing-ring-{mode}-{target}" for mode, target in RING_CASES)
 RTC_LABELS = ("local_rtc", "local_rtc-late-join", "local_rtc-sticky-2025-late-join")
 ELEMENT_LABEL = "element-call-rc-sticky2025-presynced"
+MODIFIED_ELEMENT_LABEL = "MODIFIED_PEER-original-sender-renewal"
 # Setup/build/browser-install stages never prove that a peer check entered.
 ELEMENT_TEST_STAGES = frozenset((
     "browser_login", "browser_identity", "browser_room_sync", "native_join_wait",
@@ -1251,11 +1252,15 @@ class RecoveryTestBinary:
 
 
 class Acceptance:
-    def __init__(self, root: Path, gitleaks: str, *, started=None, suite="full"):
+    def __init__(self, root: Path, gitleaks: str, *, started=None, suite="full",
+                 modified_sender_manifest_sha256=None):
         if suite not in SUITES:
             raise ValueError("Unknown acceptance suite")
         self.suite = suite
-        self.planned_checks = SUITES[suite]
+        self.modified_sender_manifest_sha256 = modified_sender_manifest_sha256
+        if modified_sender_manifest_sha256 is not None and suite != "element-interop":
+            raise ValueError("Modified peer is restricted to the isolated experiment")
+        self.planned_checks = (MODIFIED_ELEMENT_LABEL,) if modified_sender_manifest_sha256 is not None else SUITES[suite]
         self.root = private_directory(root)
         self.logs = private_directory(root / "logs")
         self.gitleaks = gitleaks
@@ -1475,7 +1480,20 @@ class Acceptance:
             if label == "moderation_local":
                 evidence["moderation_diagnostics"] = moderation_diagnostics(output)
             if element_checks:
-                evidence["element_checks"] = element_evidence(output)
+                if self.modified_sender_manifest_sha256 is not None:
+                    evidence.update(classification="MODIFIED_PEER", official_stock_acceptance=False,
+                                    beta_ready=False,
+                                    modified_sender_manifest_sha256=self.modified_sender_manifest_sha256)
+                    if label != MODIFIED_ELEMENT_LABEL or "MORPHEUS_ELEMENT_CHECK " in output:
+                        # A failed process cannot establish acceptance. Reject
+                        # mixed/wrong-route facts without printing raw output.
+                        evidence["modified_peer_checks"] = {}
+                        evidence["modified_peer_evidence"] = "rejected_mixed_or_wrong_label"
+                    else:
+                        evidence["modified_peer_checks"] = element_evidence(
+                            output.replace("MORPHEUS_MODIFIED_PEER_CHECK ", "MORPHEUS_ELEMENT_CHECK "))
+                else:
+                    evidence["element_checks"] = element_evidence(output)
                 evidence["element_diagnostics"] = element_diagnostics(output)
                 if timed_out:
                     evidence["element_diagnostics"]["failure"] = "deadline"
@@ -1573,9 +1591,18 @@ class Acceptance:
         if oauth_checks:
             record["oauth_checks"] = oauth_evidence(output, oauth_checks)
         if element_checks:
-            record["element_checks"] = element_evidence(output, complete=True)
-            record["element_peer"] = {"version": ELEMENT_VERSION, "image_digest": ELEMENT_IMAGE_DIGEST,
-                                      "protocol": "matrix_2_0_sticky2025", "baseline": "presynced"}
+            if self.modified_sender_manifest_sha256 is not None:
+                if (label != MODIFIED_ELEMENT_LABEL or "MORPHEUS_ELEMENT_CHECK " in output
+                        or output.splitlines().count("MORPHEUS_MODIFIED_PEER_RESULT official_stock_acceptance=false beta_ready=false") != 1):
+                    raise RuntimeError("Modified peer classification is incomplete")
+                record["modified_peer_checks"] = element_evidence(
+                    output.replace("MORPHEUS_MODIFIED_PEER_CHECK ", "MORPHEUS_ELEMENT_CHECK "), complete=True)
+                record.update(classification="MODIFIED_PEER", official_stock_acceptance=False, beta_ready=False,
+                              modified_sender_manifest_sha256=self.modified_sender_manifest_sha256)
+            else:
+                record["element_checks"] = element_evidence(output, complete=True)
+                record["element_peer"] = {"version": ELEMENT_VERSION, "image_digest": ELEMENT_IMAGE_DIGEST,
+                                          "protocol": "matrix_2_0_sticky2025", "baseline": "presynced"}
         return record
 
     def script(self, name: str, command: str) -> str:
@@ -1808,10 +1835,13 @@ class Acceptance:
         fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-group-fixture"), self.root)
         root = self.root / "element-interop"
         try:
-            self.run("element-call-rc-sticky2025-presynced", [
-                sys.executable, "scripts/run_element_acceptance.py", "--root", str(root),
-                "--fixture", str(fixture), "--gitleaks", self.gitleaks,
-            ], element_checks=True, seconds=1800, pid_namespace=True)
+            arguments = [sys.executable, "scripts/run_element_acceptance.py", "--root", str(root),
+                         "--fixture", str(fixture), "--gitleaks", self.gitleaks]
+            label = ELEMENT_LABEL
+            if self.modified_sender_manifest_sha256 is not None:
+                label = MODIFIED_ELEMENT_LABEL
+                arguments += ["--modified-sender-manifest-sha256", self.modified_sender_manifest_sha256]
+            self.run(label, arguments, element_checks=True, seconds=1800, pid_namespace=True)
         finally:
             # A separate cleanup also covers a killed helper, using only its
             # private nonce ownership record. It never touches shared services.
@@ -1874,7 +1904,11 @@ class Acceptance:
         if summary:
             with open(summary, "a", encoding="utf-8") as output:
                 output.write("### Disposable Matrix integration\n\n")
-                if self.suite == "full":
+                if self.modified_sender_manifest_sha256 is not None:
+                    output.write("MODIFIED_PEER original-sender renewal experiment. The browser SDK source is modified; "
+                                 "all existing baseline, late-join, group encryption/media, departure and key-rotation predicates remain. "
+                                 "This is not official stock interoperability or beta acceptance.\n\n")
+                elif self.suite == "full":
                     output.write("Full suite: real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
                                  "synthetic call media and OAuth browser-form protocol automation.\n\n")
                 elif self.suite == "rtc-recovery":
@@ -1972,7 +2006,12 @@ def main():
     parser.add_argument("--gitleaks", required=True)
     parser.add_argument("--suite", choices=tuple(SUITES), default="full",
                         help="Focused retries do not establish full acceptance (default: full)")
+    parser.add_argument("--modified-sender-root", type=Path)
+    parser.add_argument("--modified-sender-manifest-sha256")
     args = parser.parse_args()
+    modified = args.modified_sender_manifest_sha256 is not None
+    if modified != (args.modified_sender_root is not None) or (modified and args.suite != "element-interop"):
+        raise RuntimeError("Modified peer requires its isolated root, exact receipt and focused suite")
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_OS") != "Linux":
         raise RuntimeError("This harness is restricted to ephemeral Linux GitHub runners")
     if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
@@ -1995,8 +2034,25 @@ def main():
             raise RuntimeError("Could not verify absence of a pre-existing Matrix fixture")
         if set(result.stdout.splitlines()).intersection(names):
             raise RuntimeError("Pre-existing Matrix fixture found; refusing to modify it")
-    root = Path(tempfile.mkdtemp(prefix="morpheus-hosted-acceptance-", dir=os.environ.get("RUNNER_TEMP")))
-    acceptance = Acceptance(root, args.gitleaks, started=started, suite=args.suite)
+    if modified:
+        runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+        root = args.modified_sender_root
+        if (not root.is_absolute() or root.parent != runner_temp
+                or not re.fullmatch(r"morpheus-modified-sender-[a-zA-Z0-9_-]+", root.name)
+                or root.is_symlink() or set(path.name for path in root.iterdir()) != {"element-interop"}):
+            raise RuntimeError("Modified peer root is not the fresh hosted experiment root")
+        for directory in (root, root / "element-interop"):
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise RuntimeError("Modified peer directory is not private and owned")
+        if set(path.name for path in (root / "element-interop").iterdir()) != {"modified-peer"}:
+            raise RuntimeError("Modified peer root contains unrelated state")
+        from modified_sender_peer import verify_modified_assets
+        verify_modified_assets(root / "element-interop" / "modified-peer", args.modified_sender_manifest_sha256)
+    else:
+        root = Path(tempfile.mkdtemp(prefix="morpheus-hosted-acceptance-", dir=os.environ.get("RUNNER_TEMP")))
+    acceptance = Acceptance(root, args.gitleaks, started=started, suite=args.suite,
+                            modified_sender_manifest_sha256=args.modified_sender_manifest_sha256)
     body_failed = False
     try:
         acceptance.start_keyring()
@@ -2015,7 +2071,7 @@ def main():
                 acceptance.script("local_matrix_rtc", "up")
                 acceptance.script("local_matrix_rtc", "probe")
                 acceptance.element_case()
-            acceptance.group((ELEMENT_LABEL,), element_interop_checks)
+            acceptance.group(acceptance.planned_checks, element_interop_checks)
             acceptance.finish_checks()
             return
         if args.suite == "rtc-recovery":

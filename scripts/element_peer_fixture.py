@@ -217,7 +217,8 @@ def save_state(root: Path, state: dict):
 
 def up(root: Path, homeserver_url: str = "http://127.0.0.1:18008",
        livekit_service_url: str = "http://127.0.0.1:18010",
-       server_name: str = "morpheus-a.test") -> dict:
+       server_name: str = "morpheus-a.test", *,
+       modified_assets: Path | None = None) -> dict:
     """Start one stock-image peer and return immutable evidence plus local URL.
 
     Overall Docker/startup deadline is 420 seconds (image pull at most 300).
@@ -253,6 +254,11 @@ def up(root: Path, homeserver_url: str = "http://127.0.0.1:18008",
         verify_image(docker)
         set_stage(Stage.CREATE)
         cidfile = root / "element-peer.cid"
+        asset_mount = ()
+        if modified_assets is not None:
+            if modified_assets != root.parent / "modified-peer" / "dist":
+                raise FixtureError("modified peer assets are outside the private experiment root")
+            asset_mount = ("--mount", f"type=bind,src={modified_assets},dst=/app,readonly")
         result = docker.run(
             "create", "--name", "morpheus-element-" + state["owner"],
             "--cidfile", str(cidfile), "--label", OWNER_LABEL + "=" + state["owner"],
@@ -260,6 +266,7 @@ def up(root: Path, homeserver_url: str = "http://127.0.0.1:18008",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=32m", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--user", f"{os.getuid()}:{os.getgid()}",
             "--mount", f"type=bind,src={root},dst=/fixture",
+            *asset_mount,
             "--mount", f"type=bind,src={root / 'config.json'},dst=/app/config.json,readonly",
             "--entrypoint", "nginx", IMAGE, "-c", "/fixture/nginx.conf", "-g", "daemon off;",
         )
@@ -284,6 +291,8 @@ def up(root: Path, homeserver_url: str = "http://127.0.0.1:18008",
             "sdk_revision": SDK_REVISION, "protocol": "matrix_2_0_sticky2025",
             "official_image_identity_verified": True,
         }
+        if modified_assets is not None:
+            metadata["modified_peer_assets"] = True
         write_private(root / FIXTURE_FILE, json.dumps(metadata) + "\n", create=True)
         return metadata
     except BaseException:

@@ -49,6 +49,29 @@ STAGES = frozenset((
 FAILURES = frozenset(("fixture_operation", "browser_acceptance", "native_acceptance", "deadline", "evidence", "log_scan"))
 NATIVE_STAGES = ("microphone_cryptor", "late_login", "late_sync", "late_bootstrap", "late_join", "group_roster")
 NATIVE_STAGE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_STAGE "
+NATIVE_FAILURE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_FAILURE "
+NATIVE_FAILURE_CAUSES = {
+    "Three-member native rosters did not converge": "group_roster",
+    "Late-peer decoded media timed out": "late_decoded_media",
+    "Late peer did not decrypt Alice media": "late_decoded_media",
+    "Screen sender did not adopt the arrival key": "arrival_sender_activation",
+    "Late-peer leave failed": "late_leave",
+    "Late-peer logout failed": "late_logout",
+    "Cannot remove late-peer store": "late_store_removal",
+    "Late-peer departure missing from native roster": "native_departure_roster",
+    "Stock browser coordination timed out": "coordination_timeout",
+    "Departure did not produce a new sender index": "departure_index_unchanged",
+    "Actual same media senders did not adopt the departure key": "departure_sender_activation",
+    "Key receipt metadata missing": "key_receipt",
+    "Invalid private key receipt": "key_receipt",
+    "Cannot open private key receipt": "key_receipt",
+    "Cannot inspect private key receipt": "key_receipt",
+    "Invalid opened key receipt": "key_receipt",
+    "Cannot read private key receipt": "key_receipt",
+    "Key receipt exceeded bound": "key_receipt",
+    "Invalid key receipt shape": "key_receipt",
+}
+NATIVE_FAILURE_VALUES = frozenset((*NATIVE_FAILURE_CAUSES.values(), "unknown"))
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILES = 128
 MAX_LOG_ENTRIES = 65_536
@@ -56,6 +79,47 @@ MAX_LOG_DEPTH = 32
 CHECK_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
 STAGE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_STAGE ([a-z_]+)$", re.MULTILINE)
 FAILURE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_FAILURE ([a-z_]+)$", re.MULTILINE)
+
+
+GROUP_PREFIX = "MORPHEUS_ELEMENT_GROUP "
+GROUP_FIELDS = ("original_roster", "late_roster", "continuity_detail", "late_current_bob", "late_bob_pending")
+GROUP_ROSTERS = frozenset(("exact", "missing_alice", "missing_bob", "missing_carol", "missing_multiple",
+                           "unexpected_or_duplicate", "unavailable", "unknown"))
+GROUP_VALUES = (GROUP_ROSTERS, GROUP_ROSTERS,
+                frozenset(("same_live_event", "changed_live_event", "not_unique", "unknown")),
+                frozenset(("present", "missing", "ambiguous", "unknown")),
+                frozenset(("pending", "absent", "retrying", "unknown",
+                           "pending_missing_key", "pending_withheld_key", "pending_unknown_index", "pending_untrusted_sender", "pending_malformed", "pending_megolm_failure", "pending_identity_mismatch", "pending_no_crypto", "pending_internal_error", "pending_other")))
+GROUP_MAX_LINE = len(GROUP_PREFIX) + len(GROUP_FIELDS) - 1 + sum(
+    len(key) + 1 + max(map(len, values)) for key, values in zip(GROUP_FIELDS, GROUP_VALUES))
+
+
+def group_discriminator(output: str) -> dict[str, str]:
+    """One bounded complete fixed-label line; never copy an unbounded token."""
+    result = None
+    cursor = 0
+    while (start := output.find("MORPHEUS_ELEMENT_GROUP", cursor)) >= 0:
+        cursor = start + len("MORPHEUS_ELEMENT_GROUP")
+        if start and output[start - 1] != "\n":
+            continue
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        unknown = dict.fromkeys(GROUP_FIELDS, "unknown")
+        if result is not None or end - start > GROUP_MAX_LINE:
+            return unknown
+        line = output[start:end]
+        if not line.startswith(GROUP_PREFIX):
+            return unknown
+        fields = line[len(GROUP_PREFIX):].split(" ")
+        if len(fields) != len(GROUP_FIELDS):
+            return unknown
+        result = {}
+        for field, key, values in zip(fields, GROUP_FIELDS, GROUP_VALUES):
+            name, sep, value = field.partition("=")
+            if not sep or name != key or value not in values:
+                return unknown
+            result[key] = value
+    return result or {}
 
 
 def evidence(output: str, *, complete=False) -> dict[str, bool]:
@@ -86,6 +150,28 @@ def native_stages(output: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def native_failure_cause(output: str) -> str:
+    """Classify one fixed test-source panic after scan; never return its text."""
+    result = None
+    pattern = (r"(?m)^thread [^\r\n]{1,256} panicked at "
+               r"(?:/home/runner/work/Morpheus/Morpheus/)?"
+               r"crates/morpheus-rtc/tests/element_call_peer\.rs:[1-9][0-9]{0,5}:[1-9][0-9]{0,3}:\r?$")
+    for match in re.finditer(pattern, output):
+        if result is not None:
+            return "unknown"
+        start = match.end() + 1
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        if end - start > 512:
+            return "unknown"
+        payload = output[start:end].removesuffix("\r")
+        causes = {cause for message, cause in NATIVE_FAILURE_CAUSES.items()
+                  if payload == message or payload.startswith(message + ": ")
+                  or payload.endswith(" failed: " + message)}
+        result = next(iter(causes)) if len(causes) == 1 else "unknown"
+    return result or "unknown"
+
+
 def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
@@ -94,8 +180,16 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
         result["stage"] = stages[-1]
     if failures:
         result["failure"] = failures[-1]
+    if include_native and result.get("failure") == "native_acceptance":
+        causes = re.findall(r"^MORPHEUS_ELEMENT_NATIVE_FAILURE ([a-z_]{1,48})$", output, re.MULTILINE)
+        marker_count = len(re.findall(r"^MORPHEUS_ELEMENT_NATIVE_FAILURE", output, re.MULTILINE))
+        if marker_count == len(causes) == 1 and causes[0] in NATIVE_FAILURE_VALUES:
+            result["native_failure"] = causes[0]
     if include_native and (native := native_stages(output)):
         result["native_stage"] = native[-1]
+    if (include_native and result.get("native_stage") == "group_roster"
+            and result.get("failure") == "native_acceptance"):
+        result.update(group_discriminator(output))
     return result
 
 
@@ -381,7 +475,7 @@ class Runner:
                 native_output.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n"))
 
 
-def execute(root: Path, fixture: Path, gitleaks: str):
+def execute(root: Path, fixture: Path, gitleaks: str, *, modified_sender_manifest_sha256: str | None = None):
     if sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_OS") != "Linux":
         raise RuntimeError("configuration")
     if "MORPHEUS_ELEMENT_DIAG_REFRESH" in os.environ:
@@ -391,6 +485,10 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     if not fixture.is_file() or fixture.stat().st_mode & 0o077:
         raise RuntimeError("configuration")
     root = private_directory(root)
+    modified_assets = None
+    if modified_sender_manifest_sha256 is not None:
+        from modified_sender_peer import verify_modified_assets
+        modified_assets = verify_modified_assets(root / "modified-peer", modified_sender_manifest_sha256)
     runner = Runner(root, gitleaks)
     failure = None
     failed_stage = "configuration"
@@ -411,7 +509,9 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         built = runner.command(["cargo", "test", "--locked", "-p", "morpheus-rtc", "--features", "native-devices",
                                 "--test", "element_call_peer", "--no-run", "--message-format=json"], seconds=600)
         binary = native_executable(built)
-        peer = runner.service(lambda: up(root / "service"))
+        peer = runner.service(lambda: up(root / "service", modified_assets=modified_assets))
+        if (peer.get("modified_peer_assets") is True) is not (modified_assets is not None):
+            raise RuntimeError("evidence")
         if peer.get("official_image_identity_verified") is not True:
             raise RuntimeError("evidence")
         write_private(runner.logs / "image.log", "MORPHEUS_ELEMENT_CHECK official_image=true\n", create=True)
@@ -466,11 +566,18 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         except BaseException:
             failure = "fixture_operation"
             output, native_output, facts = "", "", {}
+    prefix = "MORPHEUS_ELEMENT_CHECK" if modified_assets is None else "MORPHEUS_MODIFIED_PEER_CHECK"
     for key, value in sorted(facts.items()):
-        print(f"MORPHEUS_ELEMENT_CHECK {key}={str(value).lower()}", flush=True)
+        print(f"{prefix} {key}={str(value).lower()}", flush=True)
+    if modified_assets is not None:
+        print("MORPHEUS_MODIFIED_PEER_RESULT official_stock_acceptance=false beta_ready=false", flush=True)
     if children_joined and cleanup_failure is None:
+        if failure == "native_acceptance" and native is not None:
+            print(NATIVE_FAILURE_PREFIX + native_failure_cause(native_output), flush=True)
         for value in native_stages(native_output):
             print(NATIVE_STAGE_PREFIX + value, flush=True)
+        if failure and (group := group_discriminator(native_output)):
+            print(GROUP_PREFIX + " ".join(key + "=" + group[key] for key in GROUP_FIELDS), flush=True)
     # Cleanup is required but must not erase the last useful failure stage.
     diagnostic_output = output.replace("MORPHEUS_ELEMENT_STAGE element_cleanup\n", "")
     if found := diagnostics(diagnostic_output, include_native=False):
@@ -482,7 +589,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         print("MORPHEUS_ELEMENT_FAILURE " + failure, flush=True)
         raise RuntimeError(failure)
     runner.mark("complete")
-    return facts
+    return facts if modified_assets is None else {"MODIFIED_PEER": True, "official_stock_acceptance": False, "checks": facts}
 
 
 def main():
@@ -490,6 +597,7 @@ def main():
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--fixture", required=True, type=Path)
     parser.add_argument("--gitleaks", required=True)
+    parser.add_argument("--modified-sender-manifest-sha256")
     args = parser.parse_args()
     # The outer acceptance runner has a longer watchdog and also calls down.
     # A graceful cancellation still lets this process kill its owned groups.
@@ -499,7 +607,8 @@ def main():
     signal.signal(signal.SIGINT, interrupted)
     signal.signal(signal.SIGALRM, interrupted)
     signal.alarm(1_740)
-    execute(args.root, args.fixture, args.gitleaks)
+    execute(args.root, args.fixture, args.gitleaks,
+            modified_sender_manifest_sha256=args.modified_sender_manifest_sha256)
 
 
 if __name__ == "__main__":

@@ -15,9 +15,30 @@ import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import run_element_acceptance as target
+import modified_sender_peer as modified
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_native_failure_discriminator_is_fixed_and_source_bound(self):
+        location = "thread 'fixed_test' (123) panicked at crates/morpheus-rtc/tests/element_call_peer.rs:723:6:\n"
+        panic = location + "Screen sender did not adopt the arrival key: Elapsed(())\n"
+        self.assertEqual(target.native_failure_cause(panic), "arrival_sender_activation")
+        unchanged = location + "assertion `left != right` failed: Departure did not produce a new sender index\n"
+        self.assertEqual(target.native_failure_cause(unchanged), "departure_index_unchanged")
+        for value in ("Screen sender did not adopt the arrival key\n",
+                      panic.replace("element_call_peer.rs", "unrelated.rs"),
+                      location + "private_credential\n", location + "x" * 513 + "\n", panic + panic):
+            with self.subTest(unrecognized=value[:32]):
+                self.assertEqual(target.native_failure_cause(value), "unknown")
+        marker = target.NATIVE_FAILURE_PREFIX + "departure_sender_activation\n"
+        failure = "MORPHEUS_ELEMENT_FAILURE native_acceptance\n"
+        self.assertEqual(target.diagnostics(marker + failure)["native_failure"], "departure_sender_activation")
+        for value in (marker, marker + marker + failure,
+                      marker + target.NATIVE_FAILURE_PREFIX + "private_credential\n" + failure,
+                      target.NATIVE_FAILURE_PREFIX + "private_credential\n" + failure):
+            self.assertNotIn("native_failure", target.diagnostics(value))
+        self.assertNotIn("native_failure", target.diagnostics(marker + failure, include_native=False))
+
     def test_requires_every_fixed_assertion_and_preserves_failure(self):
         complete = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in target.CHECKS)
         self.assertEqual(target.evidence(complete, complete=True), dict.fromkeys(target.CHECKS, True))
@@ -65,6 +86,36 @@ class EvidenceTests(unittest.TestCase):
             "MORPHEUS_ELEMENT_FAILURE browser_acceptance", "MORPHEUS_ELEMENT_FAILURE private_password",
         )))
         self.assertEqual(result, {"stage": "browser_roster", "failure": "browser_acceptance"})
+
+        # Existing failure-only roster schema: no raw identifiers or success facts.
+        fields = dict(original_roster="exact", late_roster="missing_bob",
+                      continuity_detail="same_live_event", late_current_bob="missing", late_bob_pending="pending")
+        marker = target.GROUP_PREFIX + " ".join(key + "=" + fields[key] for key in target.GROUP_FIELDS)
+        native = "\n".join(target.NATIVE_STAGE_PREFIX + stage for stage in target.NATIVE_STAGES)
+        failure = native + "\n" + marker + "\nMORPHEUS_ELEMENT_FAILURE native_acceptance"
+        self.assertEqual(target.group_discriminator(marker), fields)
+        self.assertEqual({key: target.diagnostics(failure)[key] for key in fields}, fields)
+        self.assertNotIn("original_roster", target.diagnostics(failure, include_native=False))
+        self.assertNotIn("original_roster", target.diagnostics(native + "\n" + marker))
+        self.assertEqual(target.evidence(failure), {})
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(failure, complete=True)
+        for malformed in (marker + "\n" + marker, marker + " private", marker.replace("missing_bob", "private_secret"),
+                          target.GROUP_PREFIX + "private" * 100_000,
+                          marker.replace(" late_roster=missing_bob", " late_roster=exact late_roster=missing_bob"),
+                          marker.replace("same_live_event", "wire_changed"),
+                          marker.replace("late_bob_pending=pending", "late_bob_pending=private_secret")):
+            with self.subTest(kind="invalid_group_marker"):
+                parsed = target.group_discriminator(malformed)
+                self.assertEqual(parsed, dict.fromkeys(target.GROUP_FIELDS, "unknown"))
+                self.assertNotIn("private", str(parsed))
+                self.assertEqual(target.evidence(malformed), {})
+        for state in ("pending", "absent", "retrying", "unknown",
+                      "pending_missing_key", "pending_withheld_key", "pending_unknown_index", "pending_untrusted_sender", "pending_malformed", "pending_megolm_failure", "pending_identity_mismatch", "pending_no_crypto", "pending_internal_error", "pending_other"):
+            observed = marker.replace("late_bob_pending=pending", "late_bob_pending=" + state)
+            self.assertEqual(target.group_discriminator(observed)["late_bob_pending"], state)
+        self.assertEqual(target.group_discriminator("prefix" + marker), {})
+        self.assertLessEqual(len(marker), target.GROUP_MAX_LINE)
 
     def test_native_group_stages_are_closed_ordered_and_bounded(self):
         lines = [target.NATIVE_STAGE_PREFIX + value for value in target.NATIVE_STAGES]
@@ -395,6 +446,86 @@ class OwnedProcessTests(unittest.TestCase):
                         if current == descendant_start:
                             os.kill(descendant, signal.SIGKILL)
 
+
+
+class ModifiedPeerAssetsTests(unittest.TestCase):
+    def make_assets(self, folder):
+        root = Path(folder) / "modified-peer"
+        root.mkdir(mode=0o700)
+        dist = root / "dist"
+        dist.mkdir(mode=0o700)
+        (dist / "index.html").write_bytes(b"synthetic app")
+        (dist / "config.json").write_bytes(b"")
+        receipt = {"schema": 1, "classification": "MODIFIED_PEER", "element_revision": modified.ELEMENT_REVISION,
+                   "sdk_revision": modified.SDK_REVISION, "proposal_sha256": modified.PROPOSAL_SHA256,
+                   "element_lock_sha256": modified.ELEMENT_LOCK_SHA256, "builder_source_sha256": "0" * 64,
+                   "assets": [{"path": name, "bytes": (dist / name).stat().st_size,
+                               "sha256": hashlib.sha256((dist / name).read_bytes()).hexdigest()}
+                              for name in ("index.html", "config.json")]}
+        return root, receipt
+
+    def seal(self, root, receipt):
+        raw = json.dumps(receipt, sort_keys=True).encode()
+        (root / "build-receipt.json").write_bytes(raw)
+        return hashlib.sha256(raw).hexdigest()
+
+    def test_exact_receipt_and_full_owned_tree_are_required(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root, receipt = self.make_assets(folder)
+            digest = self.seal(root, receipt)
+            self.assertEqual(modified.verify_modified_assets(root, digest), root / "dist")
+            with self.assertRaises(RuntimeError):
+                modified.verify_modified_assets(root, "f" * 64)
+            (root / "dist/index.html").write_bytes(b"changed")
+            with self.assertRaises(RuntimeError):
+                modified.verify_modified_assets(root, digest)
+
+    def test_wrong_proposal_and_path_escape_are_rejected_even_with_matching_receipt_hash(self):
+        for field in ("proposal", "path"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as folder:
+                root, receipt = self.make_assets(folder)
+                if field == "proposal":
+                    receipt["proposal_sha256"] = "f" * 64
+                else:
+                    receipt["assets"][0]["path"] = "../outside"
+                digest = self.seal(root, receipt)
+                with self.assertRaises(RuntimeError):
+                    modified.verify_modified_assets(root, digest)
+
+    def test_symlinks_hardlinks_and_unlisted_files_are_rejected(self):
+        for kind in ("symlink", "hardlink", "unlisted"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as folder:
+                root, receipt = self.make_assets(folder)
+                digest = self.seal(root, receipt)
+                path = root / "dist/index.html"
+                if kind == "unlisted":
+                    (root / "dist/unlisted").write_bytes(b"extra")
+                else:
+                    outside = Path(folder) / "outside"
+                    outside.write_bytes(path.read_bytes())
+                    path.unlink()
+                    if kind == "symlink":
+                        path.symlink_to(outside)
+                    else:
+                        os.link(outside, path)
+                with self.assertRaises(RuntimeError):
+                    modified.verify_modified_assets(root, digest)
+
+    def test_compressed_configuration_cannot_shadow_owned_loopback_configuration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root, receipt = self.make_assets(folder)
+            (root / "dist/config.json.gz").write_bytes(b"not a configuration")
+            receipt["assets"].append({"path": "config.json.gz", "bytes": 19,
+                                      "sha256": hashlib.sha256(b"not a configuration").hexdigest()})
+            digest = self.seal(root, receipt)
+            with self.assertRaises(RuntimeError):
+                modified.verify_modified_assets(root, digest)
+
+    def test_modified_labels_cannot_satisfy_official_stock_evidence(self):
+        output = "\n".join(f"MORPHEUS_MODIFIED_PEER_CHECK {name}=true" for name in target.CHECKS)
+        self.assertEqual(target.evidence(output), {})
+        with self.assertRaises(RuntimeError):
+            target.evidence(output, complete=True)
 
 if __name__ == "__main__":
     unittest.main()
