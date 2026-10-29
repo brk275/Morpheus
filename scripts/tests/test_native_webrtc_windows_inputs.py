@@ -1145,7 +1145,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $caseStage = 'source_parse'
 $inventorySite = 'unknown'
-$fixtureLineLimit = 1696
+$fixtureLineLimit = 1702
 try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
@@ -2297,7 +2297,7 @@ if ($pipelineReader.Memory -ne [IntPtr]::Zero -or $script:HostInfoMemory -ne [In
 # Deterministic lifetime oracle is a separately named TEST-ONLY class compiled
 # from the bound production definitions. No test hooks exist in production.
 $variant = $definitionText.Replace('Morpheus.OwnedTraversal20261028', 'Morpheus.OwnedTraversalPipelineFixture20261029')
-$variant = $variant.Replace('            bool twoReads = readAhead && Handles.Count < 200256;', '            bool twoReads = false;')
+$variant = $variant.Replace('            bool twoReads = readAhead && (payloadWorker != null || Handles.Count <= 200254);', '            bool twoReads = false;')
 $variantFields = @'
         private static TaskCompletionSource<int> fixtureStall;
         private int fixtureReadIndex;
@@ -2366,39 +2366,46 @@ $rangeVariant = $definitionText.Replace('Morpheus.OwnedTraversal20261028', 'Morp
 $rangeFields = @'
         private static int fixtureMode;
         private static int fixtureReads;
-        private static bool fixtureBothStarted;
-        private static TaskCompletionSource<int>[] fixtureStalls;
+        private static ManualResetEventSlim fixtureStall;
         private Stopwatch fixtureRangeClock;
         public static void FixtureMode(int mode)
         {
-            fixtureMode = mode; fixtureReads = 0; fixtureBothStarted = false;
-            fixtureStalls = new TaskCompletionSource<int>[2];
+            fixtureMode = mode; fixtureReads = 0; fixtureStall = null;
         }
-        private Task<int> FixtureRead(FileStream stream, byte[] buffer, int offset, int count, CancellationToken token)
+        private int FixtureRead(PayloadSlot slot)
         {
-            int ordinal = fixtureReads++;
-            if (fixtureMode == 3 && ordinal == 0) return Task.FromResult(0);
-            if (fixtureMode == 2 && ordinal < 2)
+            int ordinal = Interlocked.Increment(ref fixtureReads);
+            if (fixtureMode == 3 && ordinal == 1) return 0;
+            if (fixtureMode == 2 && ordinal == 1)
             {
-                fixtureStalls[ordinal] = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
-                if (ordinal == 1) fixtureBothStarted = true;
-                return fixtureStalls[ordinal].Task;
+                var stall = new ManualResetEventSlim(false);
+                Volatile.Write(ref fixtureStall, stall);
+                stall.Wait();
+                return 0;
             }
-            return stream.ReadAsync(buffer, offset, Math.Min(count, 65537), token);
+            long offset = slot.Offset + slot.Filled;
+            if (retainedPayloadStream.Seek(offset, SeekOrigin.Begin) != offset) Fail("changed");
+            return retainedPayloadStream.Read(slot.Buffer, slot.Filled, Math.Min(slot.Length - slot.Filled, 65537));
         }
-        public static bool FixtureFragmented() => fixtureReads > 32;
-        public static bool FixtureRetained(Reader reader) => reader != null && fixtureBothStarted &&
-            reader.unjoinedPayloadRead && reader.active && reader.payloadSlots != null &&
-            reader.payloadSlots[0].Pending != null && !reader.payloadSlots[0].Pending.IsCompleted &&
-            reader.payloadSlots[1].Pending != null && !reader.payloadSlots[1].Pending.IsCompleted &&
-            reader.extraPayloadReserved && reader.extraPayloadHandle != IntPtr.Zero && reader.extraPayloadStream != null &&
-            reader.retainedPayloadStream != null && reader.retainedPayloadSafe != null && reader.extraPayloadSafe != null &&
+        public static bool FixtureFragmented() => Volatile.Read(ref fixtureReads) > 32;
+        public static bool FixtureRetained(Reader reader) => reader != null && Volatile.Read(ref fixtureStall) != null &&
+            reader.unjoinedPayloadRead && reader.active && reader.payloadWorker != null && reader.payloadWorker.IsAlive &&
+            reader.payloadWorkerHandle != IntPtr.Zero && reader.payloadWorkerReserved && reader.payloadSlots != null &&
+            reader.payloadSlots[0].Requested && !reader.payloadSlots[0].Completed &&
+            reader.payloadSlots[1].Requested && !reader.payloadSlots[1].Completed && reader.payloadQueue.Count == 1 &&
+            reader.retainedPayloadStream != null && reader.retainedPayloadSafe != null &&
             reader.payloadDigest != null && reader.readAheadBuffer != null && reader.Memory != IntPtr.Zero;
         public static void FixtureRelease(Reader reader)
         {
-            if (reader == null || fixtureStalls == null) return;
-            foreach (var stall in fixtureStalls) if (stall != null) stall.TrySetResult(0);
+            if (reader == null) return;
+            ManualResetEventSlim stall = Volatile.Read(ref fixtureStall);
+            if (stall != null) stall.Set();
+            // TEST-ONLY release of the deliberately stalled worker; production
+            // never retries a refused stop or uncertain native close.
+            if (reader.payloadWorkerCloseAttempted && reader.payloadWorkerHandle != IntPtr.Zero) Fail("worker_cleanup");
+            reader.payloadWorkerStopRefused = false;
             reader.FinishTwoReads(true);
+            if (stall != null) { stall.Dispose(); Volatile.Write(ref fixtureStall, null); }
             reader.DisposePayloadDigest();
             if (reader.readAheadBuffer != null) Array.Clear(reader.readAheadBuffer, 0, reader.readAheadBuffer.Length);
             reader.readAheadBuffer = null;
@@ -2406,10 +2413,9 @@ $rangeFields = @'
         }
 '@
 $rangeVariant = $rangeVariant.Replace('        private bool unjoinedPayloadRead;', '        private bool unjoinedPayloadRead;' + "`n" + $rangeFields)
-$rangeVariant = $rangeVariant.Replace('slot.Stream.ReadAsync(slot.Buffer, 0, length, payloadCancellation.Token)', 'FixtureRead(slot.Stream, slot.Buffer, 0, length, payloadCancellation.Token)')
-$rangeVariant = $rangeVariant.Replace('slot.Stream.ReadAsync(slot.Buffer, slot.Filled,', 'FixtureRead(slot.Stream, slot.Buffer, slot.Filled,')
+$rangeVariant = $rangeVariant.Replace('int count = ReadWorkerRange(slot);', 'int count = FixtureRead(slot);')
 # Only the stalled TEST-ONLY variant shortens its clock and aggregate join.
-$rangeVariant = $rangeVariant.Replace('                extraPayloadReserved = true;', '                fixtureRangeClock = Stopwatch.StartNew();' + "`n" + '                extraPayloadReserved = true;')
+$rangeVariant = $rangeVariant.Replace('                    payloadWorkerReserved = true;', '                fixtureRangeClock = Stopwatch.StartNew();' + "`n" + '                    payloadWorkerReserved = true;')
 $rangeVariant = $rangeVariant.Replace('double remaining = 180 - Watch.Elapsed.TotalSeconds;', 'double remaining = fixtureMode == 2 ? .2 - fixtureRangeClock.Elapsed.TotalSeconds : 180 - Watch.Elapsed.TotalSeconds;')
 $rangeVariant = $rangeVariant.Replace('5000 - Math.Min(5000, cleanup.ElapsedMilliseconds)', '50 - Math.Min(50, cleanup.ElapsedMilliseconds)')
 . ([ScriptBlock]::Create($rangeVariant))
