@@ -806,7 +806,7 @@ class ScopeTests(unittest.TestCase):
                 source = git("commit-tree", tree, data=(message + "\n").encode()).decode().strip()
                 return source, tree
 
-            ui = "crates/morpheus-app/src/main.rs"
+            ui = "crates/morpheus-app/src/account_access_ui_tests.rs"
             windows = tuple(path for path, _ in ci_scope.APPEARANCE_REUSE_WINDOWS_INPUTS)
             selectors = ci_scope.NATIVE_REUSE_SELECTORS
             workflow = b"name: controlled frozen workflow\n"
