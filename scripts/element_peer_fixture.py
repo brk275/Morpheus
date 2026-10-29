@@ -29,12 +29,12 @@ import urllib.request
 from fixture_paths import external_path, private_directory, write_private
 
 
-VERSION = "v0.28.0-rc.1"
-REVISION = "9b3c3569ecefbb79cf527ea24e3756ba50553a8f"
-SDK_REVISION = "fa4772a4ddd335a5a8bfbf8bb21df49b70f7a999"
+VERSION = "v0.28.1-rc.1"
+REVISION = "ed6a0e1341a8700980506a883749db16192dc6f7"
+SDK_REVISION = "3f05dc4d104a3dfc753c5e3549a18c74fab4b076"
 IMAGE_REPOSITORY = "ghcr.io/element-hq/element-call"
-# Published multi-platform manifest, verified by registry HTTP and OCI labels.
-IMAGE_DIGEST = "sha256:6d83fe15c425e1139edafdffe2b2073256608dcafdc554da5bf840de496891fe"
+# Official Linuxamd64 manifest, source/revision/version bound to v0.28.1-rc.1.
+IMAGE_DIGEST = "sha256:c450902cf3f0dfa20ce23c9ab3b619959c571682dfa5cce16479a0c3d842896e"
 IMAGE = f"{IMAGE_REPOSITORY}:{VERSION}@{IMAGE_DIGEST}"
 OWNER_LABEL = "io.github.brk275.morpheus.element-peer-fixture"
 STATE_FILE = "element-peer-owner.json"

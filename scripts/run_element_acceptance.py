@@ -58,6 +58,21 @@ STAGE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_STAGE ([a-z_]+)$", re.MULTILINE)
 FAILURE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_FAILURE ([a-z_]+)$", re.MULTILINE)
 
 
+def observer_profile(peer: dict) -> str:
+    profiles = {
+        ("fa4772a4ddd335a5a8bfbf8bb21df49b70f7a999", "sha256:6d83fe15c425e1139edafdffe2b2073256608dcafdc554da5bf840de496891fe"): "sdk42",
+        ("3f05dc4d104a3dfc753c5e3549a18c74fab4b076", "sha256:c450902cf3f0dfa20ce23c9ab3b619959c571682dfa5cce16479a0c3d842896e"): "sdk44",
+    }
+    if peer.get("official_image_identity_verified") is not True:
+        raise RuntimeError("evidence")
+    if not isinstance(peer.get("sdk_revision"), str) or not isinstance(peer.get("image_digest"), str):
+        raise RuntimeError("evidence")
+    selected = profiles.get((peer.get("sdk_revision"), peer.get("image_digest")))
+    if selected is None:
+        raise RuntimeError("evidence")
+    return selected
+
+
 def evidence(output: str, *, complete=False) -> dict[str, bool]:
     result = {}
     for key, value in CHECK_PATTERN.findall(output):
@@ -419,6 +434,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         media_fixtures(root)
         extra = {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture), "MORPHEUS_ELEMENT_PEER_ROOT": str(root),
                  "MORPHEUS_ELEMENT_PLAYWRIGHT_ROOT": str(tool), "MORPHEUS_ELEMENT_PEER_URL": peer["base_url"],
+                 "MORPHEUS_ELEMENT_OBSERVER_PROFILE": observer_profile(peer),
                  "MORPHEUS_ELEMENT_INTEROP_MODE": "sticky-2025", "MORPHEUS_ELEMENT_PEER_GO_FILE": str(root / "go"),
                  "MORPHEUS_ELEMENT_PEER_DONE_FILE": str(root / "done")}
         browser = runner.start(["node", "scripts/element_call_stock_peer.mjs"], extra=extra)
