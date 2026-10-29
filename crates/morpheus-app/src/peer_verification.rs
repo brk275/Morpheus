@@ -1030,7 +1030,10 @@ mod tests {
         assert_eq!(comparing.emoji.as_str(), "current comparison");
         apply_error_presentation(&mut comparing, Action::Refresh, Error::Gone);
         assert_eq!(comparing.stage, 5);
-        assert_eq!(comparing.detail.as_str(), outcome_text(Outcome::Unconfirmed));
+        assert_eq!(
+            comparing.detail.as_str(),
+            outcome_text(Outcome::Unconfirmed)
+        );
         assert!(comparing.emoji.is_empty());
     }
 
