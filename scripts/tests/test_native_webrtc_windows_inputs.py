@@ -1145,7 +1145,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $caseStage = 'source_parse'
 $inventorySite = 'unknown'
-$fixtureLineLimit = 1562
+$fixtureLineLimit = 1595
 try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
@@ -1220,6 +1220,27 @@ foreach ($bad in @($null, '', 'FILE_HASH', "private`npath token payload", ('priv
     [pscustomobject]@{ private = 'unexported' }, -1, [long]200002, [uint64]68719476737)) {
     if ((Get-HostPreflightProgressMessage $bad $bad $bad $bad) -cne
         ' work=unknown entries=0 bytes=0 managed_hashes=0') { throw 'failure_context' }
+}
+# Fixed failure-only partition schema. Valid zero-duration work remains valid;
+# no positive duration or machine-speed assertion is made.
+$costUnavailable = ' cost_model=owned-exclusive-wall-v1 cost_status=unavailable lexical_ms=0 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0'
+$costZero = ' cost_model=owned-exclusive-wall-v1 cost_status=measured lexical_ms=0 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0'
+if ((Get-HostPreflightCostMessage 'measured' 0 0 0 0 0 0) -cne $costZero -or
+    (Get-HostPreflightCostMessage 'measured' 185000 0 0 0 0 0) -cne
+        ' cost_model=owned-exclusive-wall-v1 cost_status=measured lexical_ms=185000 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0' -or
+    (Get-HostPreflightCostMessage 'measured' 1 2 3 4 5 6) -cne
+        ' cost_model=owned-exclusive-wall-v1 cost_status=measured lexical_ms=1 native_ms=2 enumeration_ms=3 read_ms=4 sha_ms=5 other_ms=6' -or
+    (Get-HostPreflightCostMessage 'measured' 185000 1 0 0 0 0) -cne $costUnavailable) { throw 'failure_context' }
+foreach ($bad in @($null, '', 'MEASURED', 'owned-other-v2', "private`npath token", [pscustomobject]@{ private = 'unexported' })) {
+    if ((Get-HostPreflightCostMessage $bad 0 0 0 0 0 0) -cne $costUnavailable) { throw 'failure_context' }
+}
+foreach ($bad in @($null, -1, 185001, [long]1, [uint64]1, '1', [pscustomobject]@{ private = 'unexported' })) {
+    if ((Get-HostPreflightCostMessage 'measured' $bad 0 0 0 0 0) -cne $costUnavailable -or
+        (Get-HostPreflightCostMessage 'measured' 0 $bad 0 0 0 0) -cne $costUnavailable -or
+        (Get-HostPreflightCostMessage 'measured' 0 0 $bad 0 0 0) -cne $costUnavailable -or
+        (Get-HostPreflightCostMessage 'measured' 0 0 0 $bad 0 0) -cne $costUnavailable -or
+        (Get-HostPreflightCostMessage 'measured' 0 0 0 0 $bad 0) -cne $costUnavailable -or
+        (Get-HostPreflightCostMessage 'measured' 0 0 0 0 0 $bad) -cne $costUnavailable) { throw 'failure_context' }
 }
 # Intrinsic PSObject selects the metadata view even when ordinary dictionary
 # keys/ETS members use the same names. Looking up metadata never runs Value.
@@ -2180,6 +2201,18 @@ try {
     if ($script:HostManagedTraversalRoots -ne 1 -or $script:HostManagedHashes -ne 2 -or
         $completeResult.files.Count -ne 2 -or $script:HostBytes -ne 5 -or
         $script:HostPreflightBudgetCause -cne 'unknown' -or $script:HostInfoBusy) { throw 'inventory' }
+    # The actual ordinary managed transaction exports six primitive, bounded,
+    # exclusive totals. All zeros are acceptable on a fast synthetic fixture.
+    if ($script:HostCostStatus -cne 'measured') { throw 'failure_context' }
+    $costTotal = 0
+    foreach ($cost in @($script:HostCostLexicalMs, $script:HostCostNativeMs, $script:HostCostEnumerationMs,
+        $script:HostCostReadMs, $script:HostCostShaMs, $script:HostCostOtherMs)) {
+        if ($cost -isnot [int] -or $cost -lt 0 -or $cost -gt 185000) { throw 'failure_context' }
+        $costTotal += $cost
+    }
+    if ($costTotal -gt 185000) { throw 'failure_context' }
+    $costLine = Get-HostPreflightCostMessage $script:HostCostStatus $script:HostCostLexicalMs $script:HostCostNativeMs $script:HostCostEnumerationMs $script:HostCostReadMs $script:HostCostShaMs $script:HostCostOtherMs
+    if ($costLine -notmatch '^ cost_model=owned-exclusive-wall-v1 cost_status=measured lexical_ms=[0-9]{1,6} native_ms=[0-9]{1,6} enumeration_ms=[0-9]{1,6} read_ms=[0-9]{1,6} sha_ms=[0-9]{1,6} other_ms=[0-9]{1,6}$') { throw 'failure_context' }
     $completeTool = @($completeResult.files | Where-Object { $_.path -eq 'tool.bin' })
     if ($completeTool.Count -ne 1 -or $completeTool[0].bytes -ne 4 -or
         $completeTool[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }

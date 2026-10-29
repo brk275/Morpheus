@@ -863,6 +863,54 @@ namespace Morpheus.OwnedTraversal20261028
         private FileStream retainedPayloadStream;
         private SafeFileHandle retainedPayloadSafe;
         private bool unjoinedPayloadRead;
+        // Closed exclusive coordinator wall-cost partition; no per-file data.
+        // 0 lexical, 1 native transaction, 2 enumeration, 3 read coordination,
+        // 4 SHA transform, 5 all remaining entered transaction work.
+        private readonly long[] costTicks = new long[6];
+        private long costStamp, costTotal, costFrequency, costLimit;
+        private int costRegion = 5;
+        private bool costRunning, costValid;
+
+        private void StartCost()
+        {
+            costFrequency = Stopwatch.Frequency;
+            // Bounds make both tick accumulation and integer conversion safe.
+            costValid = costFrequency > 0 && costFrequency <= Int64.MaxValue / 185000;
+            if (!costValid) return;
+            costLimit = costFrequency * 185;
+            costStamp = Stopwatch.GetTimestamp();
+            if (costStamp < 0) { costValid = false; return; }
+            costRunning = true;
+        }
+        private int BeginCost(int next)
+        {
+            int previous = costRegion;
+            if (costRunning && costValid)
+            {
+                long now = Stopwatch.GetTimestamp();
+                if (now < costStamp) costValid = false;
+                else
+                {
+                    long delta = now - costStamp;
+                    long accepted = Math.Min(delta, costLimit - costTotal);
+                    costTicks[costRegion] += accepted;
+                    costTotal += accepted;
+                    costStamp = now;
+                }
+            }
+            costRegion = next;
+            return previous;
+        }
+        private void EndCost(int previous) { BeginCost(previous); }
+        private void StopCost() { BeginCost(5); costRunning = false; }
+        private int CostMilliseconds(int region)
+        {
+            if (costRunning || !costValid) return 0;
+            long ticks = costTicks[region];
+            return (int)((ticks / costFrequency) * 1000 +
+                ((ticks % costFrequency) * 1000) / costFrequency);
+        }
+
 
         private sealed class Record
         {
@@ -1049,7 +1097,10 @@ namespace Morpheus.OwnedTraversal20261028
             }
             return new object[] { reader.Entries, reader.Bytes, reader.Metadata, reader.MemoUnits,
                 reader.CompletedFiles, reader.InitialReads, reader.Stage, reader.Work, reader.Cause,
-                reader.CompletedRoots, reader.lastPath, chain };
+                reader.CompletedRoots, reader.lastPath, chain,
+                reader.CostMilliseconds(0), reader.CostMilliseconds(1), reader.CostMilliseconds(2),
+                reader.CostMilliseconds(3), reader.CostMilliseconds(4), reader.CostMilliseconds(5),
+                !reader.costRunning && reader.costValid ? "measured" : "unavailable" };
         }
         public static void RetireOwned(Reader reader) { if (reader != null) reader.Retire(); }
         public static void AssertOwnerQuiescent(object ownerValue)
@@ -1107,6 +1158,8 @@ namespace Morpheus.OwnedTraversal20261028
 
         private string Canonical(string value)
         {
+            int previousCost = BeginCost(0);
+            try {
             string full;
             if (!String.IsNullOrEmpty(value) && Memo.TryGetValue(value, out full)) return full;
             if (value != null && value.Length > 1024) Fail("path_length");
@@ -1128,6 +1181,7 @@ namespace Morpheus.OwnedTraversal20261028
             if (Memo.Count < 8192 && units <= 1048576 - MemoUnits)
             { Memo.Add(value, full); MemoUnits += units; }
             return full;
+            } finally { EndCost(previousCost); }
         }
 
         private static string ValidateAsciiPath(string value)
@@ -1157,6 +1211,8 @@ namespace Morpheus.OwnedTraversal20261028
 
         private Hashtable ReadInfo(IntPtr handle, byte[] expected, bool bound, bool content)
         {
+            int previousCost = BeginCost(1);
+            try {
             if (busy || Memory == IntPtr.Zero) Fail("identity");
             busy = true;
             try
@@ -1188,10 +1244,13 @@ namespace Morpheus.OwnedTraversal20261028
                 return result;
             }
             finally { busy = false; }
+            } finally { EndCost(previousCost); }
         }
 
         private Record Open(string literal, bool directory)
         {
+            int previousCost = BeginCost(1);
+            try {
             Budget();
             string full = Canonical(literal);
             IntPtr wide = Marshal.StringToHGlobalUni(@"\\?\" + full), handle;
@@ -1214,6 +1273,7 @@ namespace Morpheus.OwnedTraversal20261028
             export.Add("initial", initial); export.Add("comparison", comparison);
             record.Public = export;
             return record;
+            } finally { EndCost(previousCost); }
         }
 
         private Record Chain(string literal)
@@ -1253,16 +1313,21 @@ namespace Morpheus.OwnedTraversal20261028
 
         private Task<int> BeginPayloadRead(FileStream stream, byte[] buffer)
         {
+            int previousCost = BeginCost(3);
+            try {
             if (pendingPayloadRead != null || payloadCancellation == null || unjoinedPayloadRead) Fail("identity");
             // Exact .NET10 ReadAsync supports cancellation of this original
             // synchronous handle through AsyncOverSyncWithIoCancellation.
             Task<int> read = stream.ReadAsync(buffer, 0, buffer.Length, payloadCancellation.Token);
             pendingPayloadRead = read;
             return read;
+            } finally { EndCost(previousCost); }
         }
 
         private int AwaitPayloadRead(Task<int> read)
         {
+            int previousCost = BeginCost(3);
+            try {
             double remaining = 180 - Watch.Elapsed.TotalSeconds;
             if (remaining <= 0) BudgetFailure("deadline");
             bool completed;
@@ -1276,10 +1341,13 @@ namespace Morpheus.OwnedTraversal20261028
                 { BudgetFailure("deadline"); throw; }
             }
             finally { if (read.IsCompleted) pendingPayloadRead = null; }
+            } finally { EndCost(previousCost); }
         }
 
         private void FinishPayloadRead(bool preservingFailure)
         {
+            int previousCost = BeginCost(3);
+            try {
             Task<int> read = pendingPayloadRead;
             bool joined = read == null || read.IsCompleted;
             Exception cancellationFailure = null;
@@ -1310,6 +1378,7 @@ namespace Morpheus.OwnedTraversal20261028
             if (cancellation != null) cancellation.Dispose();
             retainedPayloadStream = null; retainedPayloadSafe = null;
             if (cancellationFailure != null && !preservingFailure) throw cancellationFailure;
+            } finally { EndCost(previousCost); }
         }
 
         private ulong HashWithReadAhead(FileStream stream, SafeFileHandle safe, SHA256 digest, ulong expected)
@@ -1334,10 +1403,35 @@ namespace Morpheus.OwnedTraversal20261028
                 // touched by the read worker. SHA accesses a buffer only after
                 // that buffer's read Task has joined at the top of this loop.
                 read = BeginPayloadRead(stream, next);
-                digest.TransformBlock(current, 0, count, null, 0);
+                HashPayloadBlock(digest, current, count);
                 byte[] previous = current; current = next; next = previous;
             }
             return size;
+        }
+
+        private int ReadPayloadBlock(FileStream stream)
+        {
+            int previousCost = BeginCost(3);
+            try { return stream.Read(Buffer, 0, Buffer.Length); }
+            finally { EndCost(previousCost); }
+        }
+        private void HashPayloadBlock(SHA256 digest, byte[] buffer, int count)
+        {
+            int previousCost = BeginCost(4);
+            try { digest.TransformBlock(buffer, 0, count, null, 0); }
+            finally { EndCost(previousCost); }
+        }
+        private void CompletePayloadDigest(SHA256 digest)
+        {
+            int previousCost = BeginCost(4);
+            try { digest.TransformFinalBlock(new byte[0], 0, 0); }
+            finally { EndCost(previousCost); }
+        }
+        private FileAttributes EntryAttributes(string path)
+        {
+            int previousCost = BeginCost(2);
+            try { return File.GetAttributes(path); }
+            finally { EndCost(previousCost); }
         }
 
         private Hashtable FileFact(string literal, int textLimit, ulong remaining, int metadataReservation = 0)
@@ -1374,15 +1468,15 @@ namespace Morpheus.OwnedTraversal20261028
                 if (readAhead) size = HashWithReadAhead(stream, safe, digest, expected);
                 else
                 {
-                    while ((count = stream.Read(Buffer, 0, Buffer.Length)) > 0)
+                    while ((count = ReadPayloadBlock(stream)) > 0)
                     {
                         Budget(); size += (ulong)count;
                         if (size > expected) Fail("changed");
-                        digest.TransformBlock(Buffer, 0, count, null, 0);
+                        HashPayloadBlock(digest, Buffer, count);
                         if (text != null) text.Write(Buffer, 0, count);
                     }
                 }
-                digest.TransformFinalBlock(new byte[0], 0, 0);
+                CompletePayloadDigest(digest);
                 if (size != expected) Fail("changed");
                 if (CompletedFiles < 200000) CompletedFiles++;
                 Work = "file_identity";
@@ -1413,6 +1507,8 @@ namespace Morpheus.OwnedTraversal20261028
 
         private string[] Names(string directory)
         {
+            int previousCost = BeginCost(2);
+            try {
             var names = new List<string>();
             var folded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (string path in Directory.EnumerateFileSystemEntries(directory))
@@ -1426,6 +1522,7 @@ namespace Morpheus.OwnedTraversal20261028
             }
             string[] result = names.ToArray(); Array.Sort(result, StringComparer.Ordinal);
             return result;
+            } finally { EndCost(previousCost); }
         }
 
         private Hashtable Root(string literal)
@@ -1444,7 +1541,7 @@ namespace Morpheus.OwnedTraversal20261028
                 foreach (string name in names)
                 {
                     Entries++; Budget(); string path = Path.Combine(next.Path, name);
-                    Work = "entry_type"; FileAttributes attributes = File.GetAttributes(path);
+                    Work = "entry_type"; FileAttributes attributes = EntryAttributes(path);
                     if ((attributes & FileAttributes.ReparsePoint) != 0) Fail("reparse");
                     if ((attributes & FileAttributes.Directory) != 0)
                     {
@@ -1486,6 +1583,7 @@ namespace Morpheus.OwnedTraversal20261028
                     Entries != 0 || Bytes != 0 || Metadata != 0 || Memory == IntPtr.Zero || Scratch.Length != 52 || Buffer.Length != 1048576)
                     Fail("identity");
                 entered = true; active = true;
+                StartCost();
             }
         }
 
@@ -1502,6 +1600,7 @@ namespace Morpheus.OwnedTraversal20261028
             try { return Root(root); }
             finally
             {
+                StopCost();
                 if (!unjoinedPayloadRead)
                 {
                     try
@@ -1521,6 +1620,7 @@ namespace Morpheus.OwnedTraversal20261028
             try { return Toolchain(systemRoot); }
             finally
             {
+                StopCost();
                 if (!unjoinedPayloadRead)
                 {
                     try
@@ -1664,6 +1764,10 @@ function Invoke-HostOwnedTraversal($Reader, [string] $Root, [bool] $RootOnly = $
             $script:HostPreflightWork = $state[7]; $script:HostPreflightBudgetCause = $state[8]
             $script:HostManagedTraversalRoots = $state[9]
             $script:HostLastDirectoryPath = $state[10]; $script:HostLastDirectoryChain = $state[11]
+            $script:HostCostLexicalMs = $state[12]; $script:HostCostNativeMs = $state[13]
+            $script:HostCostEnumerationMs = $state[14]; $script:HostCostReadMs = $state[15]
+            $script:HostCostShaMs = $state[16]; $script:HostCostOtherMs = $state[17]
+            $script:HostCostStatus = $state[18]
         } finally { $script:HostInfoBusy = $false }
     }
     if (-not $RootOnly) {
@@ -1680,6 +1784,9 @@ function Initialize-HostReader {
     if (($null -ne $previous -and $previous.Value -ne [IntPtr]::Zero) -or
         ($null -ne $previousHandles -and $previousHandles.Value.Count -ne 0)) { throw 'identity' }
     $script:HostPreflightBudgetCause = 'unknown'
+    $script:HostCostLexicalMs = 0; $script:HostCostNativeMs = 0; $script:HostCostEnumerationMs = 0
+    $script:HostCostReadMs = 0; $script:HostCostShaMs = 0; $script:HostCostOtherMs = 0
+    $script:HostCostStatus = 'unavailable'
     $script:HostPreflightWork = 'idle'
     $script:HostManagedHashes = 0
     $script:HostManagedAdmissions = 0
@@ -2382,6 +2489,29 @@ function Get-HostPreflightProgressMessage($Work, $Entries, $Bytes, $ManagedHashe
         ' managed_hashes=' + [Convert]::ToString([int]$hashes, [Globalization.CultureInfo]::InvariantCulture)
 }
 
+# Additive failure-only v1 partition. Existing work/count fields stay exact.
+# Every argument is checked before conversion; no array/getter/string callback.
+function Get-HostPreflightCostMessage($Status, $Lexical, $Native, $Enumeration, $Read, $Sha, $Other) {
+    $valid = $Status -is [string] -and [string]::Equals($Status, 'measured', [StringComparison]::Ordinal)
+    if ($Lexical -isnot [int] -or $Lexical -lt 0 -or $Lexical -gt 185000) { $valid = $false }
+    if ($Native -isnot [int] -or $Native -lt 0 -or $Native -gt 185000) { $valid = $false }
+    if ($Enumeration -isnot [int] -or $Enumeration -lt 0 -or $Enumeration -gt 185000) { $valid = $false }
+    if ($Read -isnot [int] -or $Read -lt 0 -or $Read -gt 185000) { $valid = $false }
+    if ($Sha -isnot [int] -or $Sha -lt 0 -or $Sha -gt 185000) { $valid = $false }
+    if ($Other -isnot [int] -or $Other -lt 0 -or $Other -gt 185000) { $valid = $false }
+    if ($valid -and ($Lexical + $Native + $Enumeration + $Read + $Sha + $Other) -gt 185000) { $valid = $false }
+    if (-not $valid) {
+        return ' cost_model=owned-exclusive-wall-v1 cost_status=unavailable lexical_ms=0 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0'
+    }
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+    return ' cost_model=owned-exclusive-wall-v1 cost_status=measured lexical_ms=' + [Convert]::ToString([int]$Lexical, $culture) +
+        ' native_ms=' + [Convert]::ToString([int]$Native, $culture) +
+        ' enumeration_ms=' + [Convert]::ToString([int]$Enumeration, $culture) +
+        ' read_ms=' + [Convert]::ToString([int]$Read, $culture) +
+        ' sha_ms=' + [Convert]::ToString([int]$Sha, $culture) +
+        ' other_ms=' + [Convert]::ToString([int]$Other, $culture)
+}
+
 function Get-HostToolchainInventory {
     $script:HostPreflightStage = 'initialization'
     Initialize-HostReader
@@ -2535,6 +2665,7 @@ try {
     if ($Mode -ceq 'host-toolchain' -and $script:HostPreflightStage -cin
         @('role_binding', 'vs_inventory', 'sdk_inventory', 'final_identity', 'serialization')) {
         $message += Get-HostPreflightProgressMessage $script:HostPreflightWork $script:HostCount $script:HostBytes $script:HostManagedHashes
+        $message += Get-HostPreflightCostMessage $script:HostCostStatus $script:HostCostLexicalMs $script:HostCostNativeMs $script:HostCostEnumerationMs $script:HostCostReadMs $script:HostCostShaMs $script:HostCostOtherMs
     }
     Write-Output $message
     exit 1
