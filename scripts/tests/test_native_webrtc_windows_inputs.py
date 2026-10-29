@@ -2281,7 +2281,7 @@ try {
         param([IntPtr] $Handle)
         $script:CompleteInvokeCalls++
         return $script:CompleteNativeType.DynamicInvoke([object[]]@($Handle))
-    }
+    } -Force
     try {
         if ($null -ne (New-HostOwnedTraversal) -or $script:CompleteInvokeCalls -ne 0 -or
             $script:HostHandles.Count -ne 0) { throw 'identity' }
@@ -2296,7 +2296,7 @@ try {
     Add-Member -InputObject $script:HostBuffer -MemberType ScriptProperty -Name Length -Value {
         $script:CompleteLengthCalls++
         throw 'hash'
-    }
+    } -Force
     try {
         if ($null -ne (New-HostOwnedTraversal) -or $script:CompleteLengthCalls -ne 0 -or
             $script:HostHandles.Count -ne 0) { throw 'identity' }
