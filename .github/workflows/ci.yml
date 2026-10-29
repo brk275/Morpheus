@@ -41,7 +41,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 1e797f8fbd517b5a3d78b2aff5da222eebc68e51
+          ref: 5c8d1793abcb33ed3a1d79e7b22e8c981f8137a9
           path: candidate
           persist-credentials: false
       - name: Hold authenticated compiler inputs through the existing fixture

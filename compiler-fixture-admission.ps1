@@ -237,10 +237,12 @@ function Get-FixedFixtureFailure([string] $Text) {
     $categories = @('unexpected', 'access', 'io', 'argument', 'cast', 'member', 'invocation', 'powershell_runtime') +
         @($checks | ForEach-Object { 'check_' + $_ })
     $kinds = @('binding', 'invocation', 'runtime', 'cast', 'argument', 'argument_null',
-        'invalid_operation', 'type_load', 'ambiguous', 'unknown')
+        'invalid_operation', 'type_load', 'ambiguous', 'ps_operation', 'ps_argument',
+        'index', 'null_reference', 'invalid_program', 'unsupported', 'format', 'disposed', 'unknown')
     $pattern = '(?m)^AssertionError: (?:-?[0-9]{1,5} != 0 : )?fixed Windows host reader boundary case failed stage=(' +
         ($stages -join '|') + ') category=(' + ($categories -join '|') +
-        ')(?: line=([0-9]{1,4}) kind=(' + ($kinds -join '|') + '))?\r?$'
+        ')(?: line=([0-9]{1,4}) kind=(' + ($kinds -join '|') +
+        ')(?: site=(ordinary|managed|unknown) origin=(fn|case|unknown))?)?\r?$'
     $regex = [regex]::new($pattern, [Text.RegularExpressions.RegexOptions]::CultureInvariant, [TimeSpan]::FromMilliseconds(100))
     $matches = $regex.Matches($Text)
     $result = [ordered]@{ fixture_failure = 'fixed-existing-case-v1'; stage = 'unknown'; category = 'unexpected' }
@@ -250,7 +252,9 @@ function Get-FixedFixtureFailure([string] $Text) {
     foreach ($known in $stages) { if ($match.Groups[1].Value -ceq $known) { $result.stage = $known; break } }
     foreach ($known in $categories) { if ($match.Groups[2].Value -ceq $known) { $result.category = $known; break } }
     if ($match.Groups[3].Success) {
-        if ($result.stage -cne 'reader_initialize' -or $result.category -cne 'powershell_runtime') {
+        if ($result.stage -cnotin @('reader_initialize', 'inventory') -or
+            ($result.stage -ceq 'reader_initialize' -and $match.Groups[5].Success) -or
+            ($result.stage -ceq 'inventory' -and -not $match.Groups[5].Success)) {
             return [ordered]@{ fixture_failure = 'fixed-existing-case-v1'; stage = 'unknown'; category = 'unexpected' }
         }
         $line = [int]::Parse($match.Groups[3].Value, [Globalization.CultureInfo]::InvariantCulture)
@@ -259,6 +263,14 @@ function Get-FixedFixtureFailure([string] $Text) {
         }
         $result['line'] = $line
         foreach ($known in $kinds) { if ($match.Groups[4].Value -ceq $known) { $result['kind'] = $known; break } }
+        if ($result.stage -ceq 'inventory') {
+            foreach ($known in @('ordinary', 'managed', 'unknown')) {
+                if ($match.Groups[5].Value -ceq $known) { $result['site'] = $known; break }
+            }
+            foreach ($known in @('fn', 'case', 'unknown')) {
+                if ($match.Groups[6].Value -ceq $known) { $result['origin'] = $known; break }
+            }
+        }
     }
     return $result
 }
@@ -447,7 +459,7 @@ try {
     }
     $script:admissionStage = 'candidate_source'
     $null = Hash-AdmissionFile ([IO.Path]::Combine($candidate, 'scripts', 'native_webrtc', 'windows_preflight.ps1')) 141206 'b7de668894a4719abcbdf8ca8d61e1dc9801389612becda7e11d192809903a97'
-    $null = Hash-AdmissionFile ([IO.Path]::Combine($candidate, 'scripts', 'tests', 'test_native_webrtc_windows_inputs.py')) 167474 'c8dcd65f88156d88cf5f7d4e9d578b5fc2984a65c424a9a7e733a4c4543d154b'
+    $null = Hash-AdmissionFile ([IO.Path]::Combine($candidate, 'scripts', 'tests', 'test_native_webrtc_windows_inputs.py')) 169774 '3922d2b9f3cd9a208c002b3b8e1141c2653fa62b585c206a43960b10377bdc1b'
     $script:admissionStage = 'fixture'
     # Only metadata work uses this clock. The separately bounded existing
     # fixture child retains its original45-second PowerShell-case timeout.
@@ -462,7 +474,7 @@ try {
     foreach ($record in $records) { Budget; Same-Identity $record.handle $record.identity }
     foreach ($record in $directories.Values) { Budget; Same-Identity $record.handle $record.identity }
     $output = [ordered]@{ schema = 'morpheus-reviewed-windows-compiler-fixture-admission-v1';
-        candidate_source = '1e797f8fbd517b5a3d78b2aff5da222eebc68e51';
+        candidate_source = '5c8d1793abcb33ed3a1d79e7b22e8c981f8137a9';
         compiler_input_manifest_sha256 = $manifestSha; powershell_version = $psVersion;
         framework = $framework; compiler_tool_files = 474; fixture_passed = $true;
         fixture_compiler_invoked = $true; wrapper_compilation_invoked = $false;
