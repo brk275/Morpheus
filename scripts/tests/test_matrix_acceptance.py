@@ -507,6 +507,43 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             self.assertEqual(acceptance_module.app_timeline_diagnostics(prefix + marker + " private-token\n"),
                              {"test_entered": True, "stage": "setup"})
 
+    def test_startup_diagnostics_distinguish_common_harness_from_live_setup(self):
+        for stage in acceptance_module.APP_TIMELINE_STARTUP_STAGES:
+            output = f"MORPHEUS_TIMELINE_STARTUP {stage}\n"
+            self.assertEqual(acceptance_module.app_timeline_diagnostics(output),
+                             {"test_entered": False, "startup_stage": stage})
+            with self.assertRaises(RuntimeError):
+                acceptance_module.app_timeline_evidence(output)
+        output = ("MORPHEUS_TIMELINE_STARTUP local_task_entered\n"
+                  "MORPHEUS_UI_PHASE phase=0 elapsed_ms=1 phase_ms=1\n"
+                  "MORPHEUS_UI_PHASE phase=100 elapsed_ms=600000 phase_ms=600000\n")
+        self.assertEqual(acceptance_module.app_timeline_diagnostics(output),
+                         {"test_entered": False, "startup_stage": "local_task_entered",
+                          "account_ui_phase": 100})
+        # Neither startup nor numeric progress can replace the live assertions.
+        self.assertEqual(acceptance_module.app_timeline_evidence(self.output() + output),
+                         {name: True for name in sorted(acceptance_module.APP_TIMELINE_CHECKS)})
+
+    def test_startup_diagnostics_reject_unknown_malformed_and_unbounded_records(self):
+        marker = "MORPHEUS_TIMELINE_STARTUP test_entered\n"
+        for invalid in ("private_token", "test_entered private-token", "x" * 49):
+            output = marker + f"MORPHEUS_TIMELINE_STARTUP {invalid}\n" + marker
+            self.assertEqual(acceptance_module.app_timeline_diagnostics(output)["startup_stage"],
+                             "invalid")
+        self.assertEqual(acceptance_module.app_timeline_diagnostics(marker * 17)["startup_stage"],
+                         "invalid")
+        phase = "MORPHEUS_UI_PHASE phase=1 elapsed_ms=2 phase_ms=1\n"
+        for invalid in (
+            "phase=101 elapsed_ms=2 phase_ms=1", "phase=1 elapsed_ms=600001 phase_ms=1",
+            "phase=1 elapsed_ms=2 phase_ms=600001", "phase=-1 elapsed_ms=2 phase_ms=1",
+            "phase=1 elapsed_ms=2 phase_ms=1 private-token",
+        ):
+            output = phase + f"MORPHEUS_UI_PHASE {invalid}\n" + phase
+            self.assertEqual(acceptance_module.app_timeline_diagnostics(output)["account_ui_phase"],
+                             "invalid")
+        self.assertEqual(acceptance_module.app_timeline_diagnostics(phase * 65)["account_ui_phase"],
+                         "invalid")
+
     def test_tail_diagnostics_are_closed_bounded_and_do_not_replace_completion(self):
         prefix = "MORPHEUS_LIVE_TIMELINE_STAGE setup\nMORPHEUS_LIVE_TIMELINE_STAGE complete\n"
         for stage in acceptance_module.APP_TIMELINE_TAIL_STAGES:

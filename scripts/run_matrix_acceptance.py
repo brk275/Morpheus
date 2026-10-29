@@ -143,6 +143,14 @@ APP_TIMELINE_TAIL_STAGES = frozenset((
     "loop_returned", "runtime_owner_release", "runtime_owner_released",
 ))
 APP_TIMELINE_TAIL = re.compile(r"MORPHEUS_LIVE_TIMELINE_TAIL ([a-z_]{1,48})")
+APP_TIMELINE_STARTUP_STAGES = frozenset((
+    "test_entered", "backend_ready", "runtime_ready", "event_loop_requested",
+    "local_task_entered", "account_ui_entered", "startup_recovery_returned",
+    "account_ui_returned",
+))
+APP_TIMELINE_STARTUP = re.compile(r"MORPHEUS_TIMELINE_STARTUP ([a-z_]{1,48})")
+APP_TIMELINE_UI_PHASE = re.compile(
+    r"MORPHEUS_UI_PHASE phase=([0-9]{1,3}) elapsed_ms=([0-9]{1,6}) phase_ms=([0-9]{1,6})")
 APP_RECOVERY_CASES = frozenset((
     "observer_revocation", "interrupted_prepare", "rollback_race", "writer_transaction",
     "thread_index", "release_revocation", "write_revocation", "writer_lock_revocation",
@@ -781,6 +789,33 @@ def app_timeline_diagnostics(output: str) -> dict:
                 result["tail_stage"] = "invalid"
                 break
             result["tail_stage"] = match[1]
+    # These observations precede live `setup`; they cannot satisfy any check.
+    # Forward only closed startup names and the existing bounded numeric phase.
+    startup_records = 0
+    phase_records = 0
+    startup_invalid = False
+    phase_invalid = False
+    for line in output.splitlines():
+        if line.startswith("MORPHEUS_TIMELINE_STARTUP"):
+            startup_records += 1
+            match = APP_TIMELINE_STARTUP.fullmatch(line)
+            if (startup_records > 16 or not match
+                    or match[1] not in APP_TIMELINE_STARTUP_STAGES):
+                startup_invalid = True
+            if not startup_invalid:
+                result["startup_stage"] = match[1]
+        elif line.startswith("MORPHEUS_UI_PHASE"):
+            phase_records += 1
+            match = APP_TIMELINE_UI_PHASE.fullmatch(line)
+            if (phase_records > 64 or not match or int(match[1]) > 100
+                    or int(match[2]) > 600000 or int(match[3]) > 600000):
+                phase_invalid = True
+            if not phase_invalid:
+                result["account_ui_phase"] = int(match[1])
+    if startup_invalid:
+        result["startup_stage"] = "invalid"
+    if phase_invalid:
+        result["account_ui_phase"] = "invalid"
     return result
 
 

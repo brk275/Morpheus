@@ -2963,9 +2963,11 @@ impl AccountUiProgress {
 
 #[test]
 fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
+    eprintln!("MORPHEUS_TIMELINE_STARTUP test_entered");
     // Slint's event-loop proxy is process-global. Keep all real-window account
     // scenarios in this single test; the remaining app tests do not create UI.
     i_slint_backend_testing::init_integration_test_with_mock_time();
+    eprintln!("MORPHEUS_TIMELINE_STARTUP backend_ready");
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -2976,7 +2978,9 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     let _entered = runtime.enter();
     let runtime_handle = runtime.handle().clone();
     let runtime_owner = runtime.clone();
+    eprintln!("MORPHEUS_TIMELINE_STARTUP runtime_ready");
     slint::spawn_local(async move {
+        eprintln!("MORPHEUS_TIMELINE_STARTUP local_task_entered");
         let started = std::time::Instant::now();
         let phase = std::rc::Rc::new(AccountUiProgress::new(started));
         // This generated-window fixture grew from fourteen scenarios to 58
@@ -3004,6 +3008,7 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
             eprintln!("morpheus-ui-timeout-phase={}", phase.get());
         }
         outcome.expect("account UI scenario must finish without network or vault access");
+        eprintln!("MORPHEUS_TIMELINE_STARTUP account_ui_returned");
         // Opt-in live room/thread controller coverage shares this one event
         // loop; it returns at once unless a disposable local fixture is set.
         crate::live::timeline_controller_tests::run_if_configured(runtime_handle.clone()).await;
@@ -3015,6 +3020,7 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
         eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL quit_requested");
     })
     .unwrap();
+    eprintln!("MORPHEUS_TIMELINE_STARTUP event_loop_requested");
     slint::run_event_loop_until_quit().unwrap();
     eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL loop_returned");
     // Preserve the original local drop order, and identify whether releasing
@@ -6597,8 +6603,10 @@ async fn exercise_account_ui(
     phase: std::rc::Rc<AccountUiProgress>,
 ) {
     let runtime = runtime_owner.handle().clone();
+    eprintln!("MORPHEUS_TIMELINE_STARTUP account_ui_entered");
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
+    eprintln!("MORPHEUS_TIMELINE_STARTUP startup_recovery_returned");
     let directory = Arc::new(tempfile::tempdir().unwrap());
     let manager =
         Arc::new(morpheus_matrix::AccountManager::open(directory.path().join("profile")).unwrap());
