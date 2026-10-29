@@ -850,6 +850,9 @@ namespace Morpheus.OwnedTraversal20261028
         private readonly Func<IntPtr, uint> type;
         private readonly Func<IntPtr, IntPtr, int> info;
         private readonly ScriptBlock unicodeValidator;
+        // One private provider per entered sequential transaction. Successful
+        // TransformFinalBlock already resets its reusable CNG hash state.
+        private SHA256 payloadDigest;
 
         private sealed class Record
         {
@@ -1239,11 +1242,16 @@ namespace Morpheus.OwnedTraversal20261028
             if (textLimit > 0 && expected > (ulong)textLimit) { if (Cause == "unknown") Cause = "bytes"; Fail("text_size"); }
             if (expected > remaining) { if (Cause == "unknown") Cause = "bytes"; Fail("limit"); }
             var safe = new SafeFileHandle(record.Handle, false);
-            var stream = new FileStream(safe, FileAccess.Read, 1048576, false);
-            var digest = SHA256.Create();
-            var text = textLimit > 0 ? new MemoryStream() : null;
+            FileStream stream = null;
+            MemoryStream text = null;
             try
             {
+                // Keep stream/provider/text construction in original order,
+                // but release borrowed wrappers even if provider creation fails.
+                stream = new FileStream(safe, FileAccess.Read, 1048576, false);
+                if (payloadDigest == null) payloadDigest = SHA256.Create();
+                SHA256 digest = payloadDigest;
+                text = textLimit > 0 ? new MemoryStream() : null;
                 Work = "file_hash";
                 ulong size = 0;
                 int count;
@@ -1266,8 +1274,12 @@ namespace Morpheus.OwnedTraversal20261028
             }
             finally
             {
-                stream.Dispose(); safe.Dispose(); digest.Dispose();
-                if (text != null) text.Dispose();
+                try { if (stream != null) stream.Dispose(); }
+                finally
+                {
+                    try { safe.Dispose(); }
+                    finally { if (text != null) text.Dispose(); }
+                }
             }
         }
 
@@ -1349,12 +1361,33 @@ namespace Morpheus.OwnedTraversal20261028
             }
         }
 
+        private void DisposePayloadDigest()
+        {
+            SHA256 digest = payloadDigest;
+            payloadDigest = null;
+            if (digest != null) digest.Dispose();
+        }
+
         public Hashtable RunRoot(string root)
-        { Enter(); try { return Root(root); } finally { lock (ownerLock) { active = false; } } }
+        {
+            Enter();
+            try { return Root(root); }
+            finally
+            {
+                try { DisposePayloadDigest(); }
+                finally { lock (ownerLock) { active = false; } }
+            }
+        }
 
         public OrderedDictionary RunToolchain(string systemRoot)
         {
-            Enter(); try { return Toolchain(systemRoot); } finally { lock (ownerLock) { active = false; } }
+            Enter();
+            try { return Toolchain(systemRoot); }
+            finally
+            {
+                try { DisposePayloadDigest(); }
+                finally { lock (ownerLock) { active = false; } }
+            }
         }
 
         private OrderedDictionary Toolchain(string systemRoot)
