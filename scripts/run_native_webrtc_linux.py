@@ -1440,6 +1440,119 @@ def all_recipe_index(header, canonical):
     return archive_targets | batch_targets
 
 
+# Version7 changes only the metadata representation, never the logical files.
+LINUX_COMPACT_SCHEMA = "morpheus-native-linux-handoff-v7"
+MAX_METADATA_PATH_BYTES = 128 * 1024 * 1024
+
+
+def handoff_unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        need(key not in result)
+        result[key] = value
+    return result
+
+
+def handoff_component(value):
+    need(type(value) is str and value not in ("", ".", "..")
+         and "/" not in value and "\0" not in value)
+    return value
+
+
+def expand_handoff_metadata(value):
+    """Resolve bounded DATA references before all original restore checks."""
+    if value.get("schema") != LINUX_COMPACT_SCHEMA:
+        return value
+    facts, roots = value.get("content_facts"), value.get("roots")
+    need(type(facts) is list and 0 < len(facts) <= MAX_MEMBERS
+         and type(roots) is dict and len(roots) == 6)
+    identities = set()
+    for fact in facts:
+        need(type(fact) is list and len(fact) == 3
+             and type(fact[0]) is int and 0 <= fact[0] <= MAX_EXPANDED
+             and type(fact[1]) is str and HEX.fullmatch(fact[1])
+             and type(fact[2]) is int and fact[2] in
+             (0o400, 0o444, 0o500, 0o555, 0o600, 0o644, 0o700, 0o755))
+        identity = tuple(fact); need(identity not in identities); identities.add(identity)
+    restored, used, members, payload, path_bytes = {}, set(), 0, 0, 0
+    def account_path(path):
+        nonlocal path_bytes
+        size = len(path.encode("utf-8")); need(size <= 4096)
+        path_bytes += size; need(path_bytes <= MAX_METADATA_PATH_BYTES)
+        return path
+    for name, spec in roots.items():
+        need(type(name) is str and re.fullmatch(r"morpheus-webrtc-(?:tools|assembled|control)-[0-9a-f]{16}", name)
+             and type(spec) is dict and set(spec) == {"role", "directories", "files"}
+             and type(spec["role"]) is str and type(spec["directories"]) is list
+             and type(spec["files"]) is list and spec["directories"])
+        directories, directory_set, files, file_set = [], set(), [], set()
+        for entry in spec["directories"]:
+            members += 1; need(members <= MAX_MEMBERS)
+            need(type(entry) is list and len(entry) == 2 and type(entry[0]) is int)
+            parent, leaf = entry
+            if not directories:
+                need(parent == -1 and leaf == "."); path = "."
+            else:
+                need(0 <= parent < len(directories)); handoff_component(leaf)
+                path = leaf if directories[parent] == "." else directories[parent] + "/" + leaf
+            account_path(path); need(path not in directory_set)
+            directories.append(path); directory_set.add(path)
+        for entry in spec["files"]:
+            members += 1; need(members <= MAX_MEMBERS)
+            need(type(entry) is list and len(entry) == 3
+                 and type(entry[0]) is int and 0 <= entry[0] < len(directories)
+                 and type(entry[2]) is int and 0 <= entry[2] < len(facts))
+            parent, leaf, index = entry; handoff_component(leaf)
+            path = leaf if directories[parent] == "." else directories[parent] + "/" + leaf
+            account_path(path); need(path not in file_set and path not in directory_set)
+            file_set.add(path); used.add(index); size, digest, mode = facts[index]
+            payload += size; need(payload <= MAX_EXPANDED)
+            files.append({"path": path, "bytes": size, "sha256": digest, "mode": mode})
+        restored[name] = {"role": spec["role"], "directories": directories, "files": files}
+    need(used == set(range(len(facts))))
+    result = {key: item for key, item in value.items() if key != "content_facts"}
+    result["schema"], result["roots"] = LINUX_BATCH_MEMBERS_SCHEMA, restored
+    return result
+
+
+def encode_handoff_metadata(handoff):
+    """Intern repeated SHA facts and path prefixes within the original JSON cap."""
+    value = handoff
+    if handoff["schema"] == LINUX_BATCH_MEMBERS_SCHEMA:
+        need("content_facts" not in handoff)
+        facts, indices, roots = [], {}, {}
+        for name, spec in handoff["roots"].items():
+            need(set(spec) == {"role", "directories", "files"})
+            directory_index, directories = {}, []
+            for path in spec["directories"]:
+                if path == ".":
+                    need(not directories); entry = [-1, "."]
+                else:
+                    parent, _, leaf = path.rpartition("/"); parent = parent or "."
+                    need(parent in directory_index); entry = [directory_index[parent], leaf]
+                need(path not in directory_index)
+                directory_index[path] = len(directories); directories.append(entry)
+            files = []
+            for row in spec["files"]:
+                need(set(row) == {"path", "bytes", "sha256", "mode"})
+                parent, _, leaf = row["path"].rpartition("/"); parent = parent or "."
+                need(parent in directory_index)
+                fact = (row["bytes"], row["sha256"], row["mode"])
+                if fact not in indices:
+                    indices[fact] = len(facts); facts.append(list(fact))
+                files.append([directory_index[parent], leaf, indices[fact]])
+            roots[name] = {"role": spec["role"], "directories": directories, "files": files}
+        value = dict(handoff, schema=LINUX_COMPACT_SCHEMA, roots=roots, content_facts=facts)
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def decode_handoff_metadata(raw):
+    need(len(raw) <= MAX_JSON)
+    value = json.loads(raw, object_pairs_hook=handoff_unique_object)
+    need(type(value) is dict)
+    return expand_handoff_metadata(value)
+
+
 def pack_handoff(temp, handoff, inventories, material):
     """Pack every exact manifest; versioned lossless DATA sharing, never links."""
     global PACK_ACTIVE
@@ -1474,7 +1587,7 @@ def pack_handoff(temp, handoff, inventories, material):
                                   format=tarfile.GNU_FORMAT, **codec) as archive:
                     try:
                         pack_at("metadata_encode")
-                        raw = (json.dumps(handoff, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                        raw = encode_handoff_metadata(handoff)
                         pack_at("metadata_limit")
                         need(len(raw) <= MAX_JSON)
                         pack_at("metadata_header")
@@ -1552,7 +1665,7 @@ def stage_handoff(temp, handoff, inventories, material, *, publish_handoff):
     else:
         POST_ASSEMBLY_PHASE = "handoff_verify"
         # Preserve the original metadata bound even when there is no archive.
-        raw = (json.dumps(handoff, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        raw = encode_handoff_metadata(handoff)
         need(len(raw) <= MAX_JSON)
         output, fact = None, None
     # Original complete topology and per-file reopen/hash/identity checks apply
@@ -1993,7 +2106,7 @@ def restore(args, temp, material, *, mac_target=None):
                     block = stream.read(min(1024 * 1024, member.size - len(raw))); need(bool(block))
                     raw.extend(block)
                 need(stream.read(1) == b"" and len(raw) == member.size)
-                header = json.loads(raw)
+                header = decode_handoff_metadata(raw)
                 schemas = (("morpheus-native-linux-handoff-v1", "morpheus-native-linux-handoff-v2",
                             LINUX_XZ_SCHEMA, LINUX_GZIP_MEMBERS_SCHEMA, LINUX_XZ_MEMBERS_SCHEMA, LINUX_BATCH_MEMBERS_SCHEMA)
                            if mac_target is None else ("morpheus-native-macos-handoff-v1",))
