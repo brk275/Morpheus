@@ -3497,9 +3497,14 @@ async fn assert_appearance_workspace_and_search(
     ui.set_security_busy(false);
     settle(ui).await;
     for (index, target) in registry::SETTING_TARGETS.iter().enumerate() {
-        ui.set_manage_accounts_open(false);
+        // Only an open account dialog needs a close/focus barrier before the
+        // next destination. The revealed ID is observation-only, so clearing
+        // it does not need a separate full UI settle on every registry row.
+        if ui.get_manage_accounts_open() {
+            ui.set_manage_accounts_open(false);
+            settle(ui).await;
+        }
         ui.set_settings_revealed_id("".into());
-        settle(ui).await;
         let requested = crate::settings_search::reveal(ui, target.id);
         if !requested {
             // Fixed registry position and availability only; never emit account
