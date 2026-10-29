@@ -12180,16 +12180,12 @@ export component AppWindow inherits Window {
                                     property <length> laid-y: thread-reply.y;
                                     changed laid-y => { thread-scroll.keep-anchor(thread-reply.y); }
                                 }
-                                // The seek's reply places itself as soon as it exists, whenever it
-                                // is laid out, and at least every 16 ms (a zero-size holder carries
-                                // the condition; a Timer cannot).
+                                // Placement can end a seek and remove this conditional holder.
+                                // Use the existing frame timer after creation/layout, rather than
+                                // invalidating this holder from its own init or geometry handlers.
+                                // The outer ScrollView still captures the scroll origin at start.
                                 if root.thread-seek-id != 0 && reply.event-id != "" && reply.event-id == root.thread-seek-event : Rectangle {
                                     width: 0px; height: 0px;
-                                    property <length> top: thread-reply.shown-top;
-                                    property <length> tall: thread-reply.height;
-                                    init => { thread-scroll.place-seek(thread-reply.y, thread-reply.height); }
-                                    changed top => { thread-scroll.place-seek(thread-reply.y, thread-reply.height); }
-                                    changed tall => { thread-scroll.place-seek(thread-reply.y, thread-reply.height); }
                                     Timer {
                                         interval: 16ms;
                                         running: root.thread-seek-id != 0;
