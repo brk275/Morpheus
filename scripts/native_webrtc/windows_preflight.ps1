@@ -1463,7 +1463,8 @@ namespace Morpheus.OwnedTraversal20261028
                 };
                 if (payloadWorker == null)
                 {
-                    if (payloadWorkerReserved || payloadWorkerHandle != IntPtr.Zero || Handles.Count > 200254) Fail("identity");
+                    if (payloadWorkerReserved || payloadWorkerHandle != IntPtr.Zero) Fail("identity");
+                    if (Handles.Count > 200254) BudgetFailure("handles");
                     // Reserve the explicit cancellation handle plus the one
                     // runtime thread handle within the unchanged aggregate cap.
                     payloadWorkerReserved = true;
@@ -1607,7 +1608,7 @@ namespace Morpheus.OwnedTraversal20261028
             finally { EndCost(previousCost); }
         }
 
-        private bool ConsumePayloadRange(PayloadSlot slot, SHA256 digest, ulong expected, ref ulong size)
+        private bool ConsumePayloadRange(PayloadSlot slot, SHA256 digest, ulong expected, ref ulong size, MemoryStream text)
         {
             while (slot.Filled < slot.Length)
             {
@@ -1619,6 +1620,10 @@ namespace Morpheus.OwnedTraversal20261028
                 int previousCost = BeginCost(4);
                 try { digest.TransformBlock(slot.Buffer, slot.Filled, count, null, 0); }
                 finally { EndCost(previousCost); }
+                // Only this coordinator reads/copies completed bytes. The
+                // worker never receives the text stream or reuses this slot
+                // until the coordinator explicitly requests its next range.
+                if (text != null) text.Write(slot.Buffer, slot.Filled, count);
                 slot.Filled += count;
                 if (slot.Filled < slot.Length)
                 {
@@ -1630,7 +1635,7 @@ namespace Morpheus.OwnedTraversal20261028
             return true;
         }
 
-        private ulong HashWithTwoReads(SHA256 digest, ulong expected)
+        private ulong HashWithTwoReads(SHA256 digest, ulong expected, MemoryStream text)
         {
             ulong next = 0, size = 0;
             for (int i = 0; i < 2 && next < expected; i++)
@@ -1643,7 +1648,7 @@ namespace Morpheus.OwnedTraversal20261028
             while (payloadSlots[ordinal].Length != 0)
             {
                 PayloadSlot slot = payloadSlots[ordinal];
-                if (!ConsumePayloadRange(slot, digest, expected, ref size)) return size;
+                if (!ConsumePayloadRange(slot, digest, expected, ref size, text)) return size;
                 slot.Length = 0;
                 if (next < expected)
                 {
@@ -1692,7 +1697,10 @@ namespace Morpheus.OwnedTraversal20261028
         {
             // The original one-slot fallback has separate task ownership; never
             // clear its retention fence or dispose its buffers from this path.
-            if (payloadWorker == null && !payloadWorkerReserved && payloadWorkerHandle == IntPtr.Zero && payloadSlots == null) return;
+            // Construction may fail after borrowing wrappers but before any
+            // worker exists; those wrappers still require deterministic release.
+            if (payloadWorker == null && !payloadWorkerReserved && payloadWorkerHandle == IntPtr.Zero && payloadSlots == null &&
+                retainedPayloadStream == null && retainedPayloadSafe == null) return;
             if (payloadWorkerStopRefused) Fail("worker_cleanup");
             int previousCost = BeginCost(3);
             unjoinedPayloadRead = true;
@@ -1787,7 +1795,10 @@ namespace Morpheus.OwnedTraversal20261028
             if (metadataReservation < 0 || metadataReservation > 31457280 - Metadata)
             { if (Cause == "unknown") Cause = "metadata"; Fail("limit"); }
             bool readAhead = textLimit == 0 && expected > (ulong)Buffer.Length;
-            bool twoReads = readAhead && (payloadWorker != null || Handles.Count <= 200254);
+            // Every payload syscall, including small/text/empty-file EOF,
+            // belongs to the same cancellable physical worker. Never fall back
+            // to an uninterruptible coordinator read when handles are exhausted.
+            bool twoReads = true;
             Exception bodyFailure = null;
             var safe = new SafeFileHandle(record.Handle, false);
             if (twoReads) retainedPayloadSafe = safe;
@@ -1806,7 +1817,7 @@ namespace Morpheus.OwnedTraversal20261028
                 Work = "file_hash";
                 ulong size = 0;
                 int count;
-                if (twoReads) size = HashWithTwoReads(digest, expected);
+                if (twoReads) size = HashWithTwoReads(digest, expected, text);
                 else if (readAhead) size = HashWithReadAhead(stream, safe, digest, expected);
                 else
                 {
@@ -1831,7 +1842,15 @@ namespace Morpheus.OwnedTraversal20261028
             catch (Exception error) { bodyFailure = error; throw; }
             finally
             {
-                if (twoReads) FinishTwoReads(bodyFailure != null);
+                if (twoReads)
+                {
+                    try { FinishTwoReads(bodyFailure != null); }
+                    finally
+                    {
+                        // The worker never accesses this coordinator-only copy.
+                        if (text != null) text.Dispose();
+                    }
+                }
                 else
                 {
                     try { if (readAhead) FinishPayloadRead(bodyFailure != null); }

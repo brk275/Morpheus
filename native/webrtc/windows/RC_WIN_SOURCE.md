@@ -109,3 +109,21 @@ byte/depth/memo/buffer/time/cleanup caps remain unchanged; final actual UTF-8 JS
 still must fit 32MiB. A source-reviewed fixture compares the production bound to
 the pinned serializer with mixed escape classes and checks actual managed and
 fallback ledger commits. No hosted completion or speedup is implied.
+
+### Cancellation ownership of small and text payloads
+
+All admitted managed payload reads, including small files, empty-file EOF and
+bounded UTF-8 version text, use the same persistent physical read worker. The
+coordinator keeps the original 900-second watch and targeted cancellation joins
+that worker under the existing aggregate 5000ms cleanup bound. Handle exhaustion
+refuses admission instead of selecting an uncancellable synchronous fallback.
+Text is copied only by the coordinator from completed ranges, then decoded with
+the existing strict UTF-8 rule. No worker accesses the text stream. Borrowed
+file wrappers remain retained until reads complete or worker join is proven;
+failed cleanup keeps the original sticky ownership refusal. Construction failure
+before worker startup also releases any borrowed wrappers deterministically.
+
+The existing synthetic fixture covers blocked small/text reads and retained
+ownership through failed cleanup, plus a real positive version-text digest.
+This corrects cancellation scope; it does not attribute or promise to cure the
+separate full-inventory read-wait failure or change any resource/time cap.
