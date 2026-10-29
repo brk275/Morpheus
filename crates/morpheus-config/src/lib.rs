@@ -4635,7 +4635,11 @@ mod tests {
                 .is_ok()
         );
         let oversized = format!("# {}\n", "x".repeat(MAX_CONFIG_BYTES as usize));
-        fs::write(store.path(), oversized).unwrap();
+        // Publish complete external edits: a truncate/write can expose an
+        // intermediate empty file, which is valid TOML with default settings.
+        let editing = directory.path().join("oversized-edit.toml");
+        fs::write(&editing, oversized).unwrap();
+        fs::rename(&editing, store.path()).unwrap();
         assert!(matches!(
             updates.recv_timeout(Duration::from_secs(2)).unwrap(),
             Err(ConfigError::Input(InputError::TooLarge))
@@ -4644,7 +4648,8 @@ mod tests {
             store.load(),
             Err(ConfigError::Input(InputError::TooLarge))
         ));
-        fs::write(store.path(), &saved).unwrap();
+        fs::write(&editing, &saved).unwrap();
+        fs::rename(&editing, store.path()).unwrap();
         assert_eq!(
             updates
                 .recv_timeout(Duration::from_secs(2))
