@@ -40,6 +40,7 @@ class EvidenceTests(unittest.TestCase):
         # late third participant, same sender screen and post-rotation media.
         group = (
             "native_group_roster", "native_late_join_media", "native_group_departure", "native_key_rotation",
+            "native_same_device_rejoin",
             "browser_group_roster", "browser_group_audio", "browser_screen", "browser_group_departure",
             "browser_key_rotation", "browser_post_rotation_screen", "browser_post_rotation_audio",
         )

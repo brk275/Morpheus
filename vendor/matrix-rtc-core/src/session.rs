@@ -375,6 +375,9 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         match &mut self.encryption_manager {
             Some(manager) => {
                 manager.set_signal_handler(handler);
+                // Install with this live borrowed view while the session is
+                // exclusively held; no earlier watch/mapper view can win.
+                manager.on_membership_snapshot(&self.members);
                 true
             }
             None => false,
@@ -1141,6 +1144,11 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         }
 
         self.members = members;
+        if let Some(encryption) = &self.encryption_manager {
+            // The existing verified vector is borrowed before publishing its
+            // watch snapshot; a lagging actor cannot roll admission backwards.
+            encryption.on_membership_snapshot(&self.members);
+        }
         self.membership_snapshots_tx
             .send_replace(self.members.clone());
         self.membership_scope.notify(&self.members);
@@ -1924,6 +1932,49 @@ mod peer_renewal_tests {
             observe(&mut seen, &[peer("ordinary-peer")]),
             PeerRenewalAction::Request
         );
+    }
+
+    #[tokio::test]
+    async fn handler_install_sees_borrowed_current_members_before_watch_updates() {
+        struct Handler {
+            watched: watch::Receiver<Vec<JoinedMembership>>,
+            seen: Arc<std::sync::Mutex<Vec<(usize, Vec<String>, Vec<String>)>>>,
+        }
+        #[async_trait::async_trait]
+        impl EncryptionKeySignalHandler for Handler {
+            async fn on_new_key_material(&self, _signal: crate::KeyMaterialSignal) {}
+
+            fn on_memberships_updated(&self, members: &[JoinedMembership]) {
+                let watched = self.watched.borrow();
+                self.seen.lock().unwrap().push((
+                    members.as_ptr() as usize,
+                    members.iter().map(|member| member.member_id.clone()).collect(),
+                    watched.iter().map(|member| member.member_id.clone()).collect(),
+                ));
+            }
+        }
+        let backend = Arc::new(MockBackend::new());
+        let mut session = session(backend);
+        join(&mut session, "own-generation").await;
+        session.set_current_state([RtcMembershipEvent::Joined(peer("before"))]).await;
+        let watched = session.subscribe_membership_snapshots();
+        let early_view = watched.borrow().clone();
+        session.set_current_state([RtcMembershipEvent::Joined(peer("current"))]).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(session.set_encryption_signal_handler(Arc::new(Handler {
+            watched,
+            seen: Arc::clone(&seen),
+        })));
+        let initial = seen.lock().unwrap().clone();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].0, session.members.as_ptr() as usize);
+        assert_eq!(initial[0].1, vec!["current"]);
+        assert_eq!(early_view[0].member_id, "before");
+        session.set_current_state([RtcMembershipEvent::Joined(peer("next"))]).await;
+        let observed = seen.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[1].1, vec!["next"]);
+        assert_eq!(observed[1].2, vec!["current"]);
     }
 
     #[tokio::test]

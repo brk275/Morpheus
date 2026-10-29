@@ -33,6 +33,7 @@ CHECKS = frozenset((
     "browser_identity", "browser_presynced", "browser_roster", "browser_video", "browser_audio", "browser_leave",
     "native_presynced_baseline", "native_roster", "native_audio", "native_video", "native_departure",
     "native_group_roster", "native_late_join_media", "native_group_departure", "native_key_rotation",
+    "native_same_device_rejoin",
     "browser_group_roster", "browser_group_audio", "browser_screen", "browser_group_departure",
     "browser_key_rotation", "browser_post_rotation_screen", "browser_post_rotation_audio",
 ))
@@ -47,7 +48,7 @@ STAGES = frozenset((
     "native_test", "log_scan", "complete",
 ))
 FAILURES = frozenset(("fixture_operation", "browser_acceptance", "native_acceptance", "deadline", "evidence", "log_scan"))
-NATIVE_STAGES = ("microphone_cryptor", "late_login", "late_sync", "late_bootstrap", "late_join", "group_roster")
+NATIVE_STAGES = ("microphone_cryptor", "late_login", "late_sync", "late_bootstrap", "late_join", "group_roster", "same_device_rejoin")
 NATIVE_STAGE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_STAGE "
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILES = 128

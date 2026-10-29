@@ -18,8 +18,8 @@ use futures_util::StreamExt;
 use matrix_sdk::{Client, ruma::api::client::uiaa};
 use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
 use morpheus_rtc::{
-    AudioFrame, CallOptions, I420Buffer, InteropMode, MediaStreamKind, Publication, RtcService,
-    VideoFrame, VideoRotation,
+    AudioFrame, CallOptions, I420Buffer, InteropMode, MediaStreamKind, Publication, RemoteTrackHandle,
+    RtcService, VideoFrame, VideoRotation,
 };
 use serde::Deserialize;
 use tokio::time::{sleep, timeout};
@@ -233,6 +233,18 @@ impl NativeTone {
             .expect("Native interop microphone unpublish timed out")
             .expect("Cannot unpublish native interop microphone");
     }
+
+    async fn pause(mut self) -> Publication {
+        self.stop
+            .take()
+            .expect("Rejoin microphone stop missing")
+            .send(())
+            .expect("Rejoin microphone stopped early");
+        timeout(Duration::from_secs(5), &mut self.sender)
+            .await
+            .expect("Rejoin microphone stop timed out")
+            .expect("Rejoin microphone sender panicked")
+    }
 }
 
 impl Drop for NativeTone {
@@ -294,6 +306,18 @@ impl NativeScreen {
             .await
             .expect("Screen unpublish timed out")
             .expect("Screen unpublish failed");
+    }
+
+    async fn pause(mut self) -> Publication {
+        self.stop
+            .take()
+            .expect("Rejoin picture stop missing")
+            .send(())
+            .expect("Rejoin picture stopped early");
+        timeout(Duration::from_secs(5), &mut self.sender)
+            .await
+            .expect("Rejoin picture stop timed out")
+            .expect("Rejoin picture sender panicked")
     }
 }
 
@@ -399,6 +423,267 @@ fn exact_roster(rtc: &RtcService, room: &str, users: &[&str]) -> bool {
         .collect::<Vec<_>>();
     expected.sort();
     actual == expected
+}
+
+fn rejoin_tone(frame: &AudioFrame, frequency: f64) -> bool {
+    let channels = frame.num_channels as usize;
+    let samples = frame.samples_per_channel as usize;
+    if channels == 0
+        || samples < 240
+        || frame.sample_rate != 48_000
+        || frame.data.len() != samples * channels
+    {
+        return false;
+    }
+    let (mut sine, mut cosine, mut energy) = (0.0, 0.0, 0.0);
+    for (index, samples) in frame.data.chunks_exact(channels).enumerate() {
+        let value = f64::from(samples[0]);
+        let phase = std::f64::consts::TAU * frequency * index as f64 / 48_000.0;
+        sine += value * phase.sin();
+        cosine += value * phase.cos();
+        energy += value * value;
+    }
+    energy > samples as f64 * 10_000.0
+        && 2.0 * (sine * sine + cosine * cosine) > 0.55 * samples as f64 * energy
+}
+
+// These streams belong to the exact current member mapping. Distinct tones and
+// pictures prevent buffered pre-leave media from establishing post-rejoin use.
+async fn rejoin_media(
+    rtc: &RtcService,
+    room: &str,
+    member: &str,
+    frequency: f64,
+    white_bottom: Option<bool>,
+) -> (Arc<dyn RemoteTrackHandle>, Arc<dyn RemoteTrackHandle>) {
+    let call = rtc.call(room).expect("Rejoin receiver call missing");
+    assert!(call.session().room().e2ee_manager().enabled());
+    let audio = loop {
+        if let Some(track) = call.remote_track(member, MediaStreamKind::Microphone) {
+            break track;
+        }
+        sleep(Duration::from_millis(200)).await;
+    };
+    let video = loop {
+        if let Some(track) = call.remote_track(member, MediaStreamKind::Camera) {
+            break track;
+        }
+        sleep(Duration::from_millis(200)).await;
+    };
+    let mut audio_frames = audio.audio_frames().expect("Rejoin PCM missing");
+    let mut video_frames = video.video_frames().expect("Rejoin picture missing");
+    let sound = async {
+        while let Some(frame) = audio_frames.next().await {
+            if rejoin_tone(&frame, frequency) {
+                return true;
+            }
+        }
+        false
+    };
+    let picture = async {
+        while let Some(frame) = video_frames.next().await {
+            let b = frame.buffer;
+            let width = b.width as usize;
+            let height = b.height as usize;
+            let stride = b.stride_y as usize;
+            if width < 160 || height < 90 || stride < width || b.data_y.len() < stride * height {
+                continue;
+            }
+            let (white, black) = match white_bottom {
+                Some(bottom) => {
+                    let top = b.data_y[(height / 4) * stride + width / 2];
+                    let lower = b.data_y[(height * 3 / 4) * stride + width / 2];
+                    if bottom {
+                        (lower, top)
+                    } else {
+                        (top, lower)
+                    }
+                }
+                None => (
+                    b.data_y[(height / 2) * stride + width / 4],
+                    b.data_y[(height / 2) * stride + width * 3 / 4],
+                ),
+            };
+            if white > 190 && black < 55 {
+                return true;
+            }
+        }
+        false
+    };
+    let (sound, picture) = tokio::join!(sound, picture);
+    assert!(sound && picture, "Rejoin encrypted media did not decode");
+    (audio, video)
+}
+
+async fn same_device_rejoin(
+    rtc: &RtcService,
+    late: &mut RtcService,
+    room: &str,
+    alice: &TestAccount,
+    bob: &TestAccount,
+    carol: &TestAccount,
+) {
+    eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE same_device_rejoin");
+    // The whole additional phase shares one 45-second allowance. The original
+    // browser's 150-second group wait and outer 360-second peer limit remain.
+    timeout(Duration::from_secs(45), async {
+        let alice_membership = rtc
+            .call(room)
+            .expect("Original Alice call missing before rejoin")
+            .membership_id()
+            .to_owned();
+        let browser_membership = rtc
+            .participants(room)
+            .expect("Original browser roster missing")
+            .into_iter()
+            .find(|member| member.user_id == bob.user_id)
+            .expect("Original browser member missing")
+            .member_id;
+        let old_microphone = late
+            .publish_microphone(room, 48_000, 1, false)
+            .await
+            .expect("Rejoin baseline microphone failed");
+        let old_call = old_microphone.call_info().clone();
+        let device = old_microphone.account_device_id().to_owned();
+        assert_eq!(old_microphone.account_user_id(), carol.user_id);
+        let old_tone = NativeTone::with_frequency(old_microphone, 600.0);
+        let old_picture = NativeScreen::start(
+            late.publish_camera(room, 640, 360, false)
+                .await
+                .expect("Rejoin baseline camera failed"),
+        );
+        let (old_audio_track, old_video_track) =
+            rejoin_media(rtc, room, &old_call.membership_id, 600.0, Some(false)).await;
+        let (old_audio_sid, _) =
+            native_sender(late, room, livekit::track::TrackSource::Microphone, None)
+                .expect("Old rejoin microphone cryptor missing");
+        let (old_video_sid, _) =
+            native_sender(late, room, livekit::track::TrackSource::Camera, None)
+                .expect("Old rejoin camera cryptor missing");
+        let old_microphone = old_tone.pause().await;
+        let old_camera = old_picture.pause().await;
+        late.leave(room).await.expect("Rejoin baseline leave failed");
+        assert!(late.call(room).is_none());
+        assert!(!old_microphone.is_active() && !old_camera.is_active());
+        assert!(matches!(
+            old_microphone
+                .push_audio(native_audio_frame(0, 600.0))
+                .await,
+            Err(morpheus_rtc::MediaError::CallEnded)
+        ));
+        assert!(matches!(
+            old_camera.push_video(native_video_frame(0)),
+            Err(morpheus_rtc::MediaError::CallEnded)
+        ));
+        loop {
+            let call = rtc.call(room).expect("Remaining native call ended");
+            if exact_roster(rtc, room, &[&alice.user_id, &bob.user_id])
+                && call
+                    .remote_track(&old_call.membership_id, MediaStreamKind::Microphone)
+                    .is_none()
+                && call
+                    .remote_track(&old_call.membership_id, MediaStreamKind::Camera)
+                    .is_none()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+        // Reuse the exact client and device, without login, account recreation,
+        // new stores or a new room. Only MatrixRTC membership is fresh.
+        let new_call = late
+            .join(room, CallOptions::element_call_matrix_2_0())
+            .await
+            .expect("Same-device fresh Sticky join failed");
+        assert_eq!(new_call.room_id, old_call.room_id);
+        assert_eq!(new_call.slot_id, old_call.slot_id);
+        assert!(!new_call.membership_id.is_empty());
+        assert_ne!(new_call.membership_id, old_call.membership_id);
+        assert_eq!(new_call.local_identity, old_call.local_identity);
+        let microphone = late
+            .publish_microphone(room, 48_000, 1, false)
+            .await
+            .expect("Rejoined microphone failed");
+        assert_eq!(microphone.account_user_id(), carol.user_id);
+        assert_eq!(microphone.account_device_id(), device);
+        assert_eq!(microphone.call_info(), &new_call);
+        let tone = NativeTone::with_frequency(microphone, 1800.0);
+        let picture = NativeScreen::start(
+            late.publish_camera(room, 640, 360, false)
+                .await
+                .expect("Rejoined camera failed"),
+        );
+        picture.changed.store(true, Ordering::Release);
+        let (new_audio_sid, new_video_sid) = loop {
+            if let (Some((audio_sid, _)), Some((video_sid, _))) = (
+                native_sender(late, room, livekit::track::TrackSource::Microphone, None),
+                native_sender(late, room, livekit::track::TrackSource::Camera, None),
+            ) {
+                break (audio_sid, video_sid);
+            }
+            sleep(Duration::from_millis(200)).await;
+        };
+        assert_ne!(new_audio_sid, old_audio_sid);
+        assert_ne!(new_video_sid, old_video_sid);
+        loop {
+            let expected = [
+                alice.user_id.as_str(),
+                bob.user_id.as_str(),
+                carol.user_id.as_str(),
+            ];
+            let members = rtc.participants(room).expect("Rejoined roster missing");
+            if exact_roster(rtc, room, &expected)
+                && exact_roster(late, room, &expected)
+                && members.iter().any(|member| {
+                    member.user_id == carol.user_id && member.member_id == new_call.membership_id
+                })
+                && members.iter().any(|member| {
+                    member.user_id == bob.user_id && member.member_id == browser_membership
+                })
+                && members
+                    .iter()
+                    .all(|member| member.member_id != old_call.membership_id)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+        let alice_member = late
+            .participants(room)
+            .expect("Rejoined reverse roster missing")
+            .into_iter()
+            .find(|member| member.user_id == alice.user_id)
+            .expect("Original Alice missing after rejoin");
+        let forward = rejoin_media(rtc, room, &new_call.membership_id, 1800.0, Some(true));
+        let reverse = rejoin_media(late, room, &alice_member.member_id, 997.0, None);
+        let ((new_audio_track, new_video_track), _) = tokio::join!(forward, reverse);
+        assert!(!Arc::ptr_eq(&old_audio_track, &new_audio_track));
+        assert!(!Arc::ptr_eq(&old_video_track, &new_video_track));
+        let call = rtc.call(room).expect("Original call ended during rejoin");
+        assert_eq!(call.membership_id(), alice_membership);
+        assert!(
+            call.remote_track(&old_call.membership_id, MediaStreamKind::Microphone)
+                .is_none()
+        );
+        assert!(
+            call.remote_track(&old_call.membership_id, MediaStreamKind::Camera)
+                .is_none()
+        );
+        assert!(!old_microphone.is_active() && !old_camera.is_active());
+        assert!(matches!(
+            old_microphone.set_muted(false),
+            Err(morpheus_rtc::MediaError::CallEnded)
+        ));
+        assert!(matches!(
+            old_camera.set_muted(false),
+            Err(morpheus_rtc::MediaError::CallEnded)
+        ));
+        tone.finish().await;
+        picture.finish().await;
+    })
+    .await
+    .expect("Same-device encrypted rejoin phase timed out");
+    eprintln!("MORPHEUS_ELEMENT_CHECK native_same_device_rejoin=true");
 }
 
 async fn group_and_screen(
@@ -540,6 +825,7 @@ async fn group_and_screen(
     .await
     .expect("Late-peer decoded media timed out");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_late_join_media=true");
+    same_device_rejoin(rtc, &mut late, room, alice, bob, carol).await;
     let late_microphone = late
         .publish_microphone(room, 48_000, 1, false)
         .await

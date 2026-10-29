@@ -16,6 +16,7 @@
 // Modified by Morpheus: accepted-key sender adoption; see MORPHEUS_PATCH.md.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use matrix_rtc_call::RtcCall;
 use matrix_rtc_core::compat::MembershipFormat;
@@ -26,7 +27,7 @@ use matrix_rtc_transport::{
 };
 use tokio::sync::broadcast;
 
-use crate::engine::{CallEngine, EngineConfig, StabilityConfig};
+use crate::engine::{CallAdmission, CallEngine, EngineConfig, StabilityConfig};
 use crate::event::CallEvent;
 
 /// What [`attach_media`] needs besides the call, the transport and the key
@@ -68,9 +69,23 @@ pub enum AttachError {
     /// The call publishes on a transport this one cannot serve.
     #[error("{0}")]
     UnsupportedTransport(String),
+    /// Participant identities cannot be uniquely bound to this call.
+    #[error("the call identity/auth contract was refused")]
+    IdentityRejected,
     /// The own focus refused the connection.
     #[error(transparent)]
     Transport(#[from] TransportError),
+}
+
+/// HTTP context spelling only; it does not select an auth/identity dialect.
+/// The pre-sticky lower-case room sentinel denotes the same legacy room flow.
+pub(crate) fn token_slot_id(format: MembershipFormat, slot_id: &str) -> String {
+    let slot = format.token_slot_id(slot_id).into_owned();
+    if format == MembershipFormat::RoomState && slot == "m.call#room" {
+        "m.call#ROOM".to_owned()
+    } else {
+        slot
+    }
 }
 
 /// Attach media to `call`: install `identity_mapper` and `key_handler` on its
@@ -86,6 +101,20 @@ pub async fn attach_media<B, T>(
     transport: Arc<T>,
     key_handler: Arc<MediaKeyHandler>,
     options: AttachOptions,
+) -> Result<MediaAttachment<T::Connection>, AttachError>
+where
+    B: MatrixBackend + 'static,
+    T: OwnFocusTransport + 'static,
+{
+    attach_media_guarded(call, transport, key_handler, options, None).await
+}
+
+pub(crate) async fn attach_media_guarded<B, T>(
+    call: &RtcCall<B>,
+    transport: Arc<T>,
+    key_handler: Arc<MediaKeyHandler>,
+    options: AttachOptions,
+    admission: Option<CallAdmission>,
 ) -> Result<MediaAttachment<T::Connection>, AttachError>
 where
     B: MatrixBackend + 'static,
@@ -123,6 +152,24 @@ where
     let raised_hands = call.subscribe_raised_hands().await;
     let reactions = call.subscribe_reactions().await;
     let ended = call.subscribe_ended();
+    let own_identity = {
+        // Check and map the borrowed view without copying peer-controlled
+        // membership fields. No borrow survives into async wiring or HTTP.
+        let initial = memberships.borrow();
+        if admission
+            .as_ref()
+            .is_some_and(|guard| !(guard.check)(&initial))
+        {
+            return Err(AttachError::IdentityRejected);
+        }
+        (options.identity_mapper)(
+            &options.own_user_id,
+            &options.own_device_id,
+            &member_id,
+            Some(&initial),
+        )
+        .ok_or(AttachError::IdentityRejected)?
+    };
 
     // Mapper before handler: identities are derived at signal time, and the
     // replay below derives them too, so a handler installed first would import
@@ -142,7 +189,7 @@ where
     let ctx = ConnectionContext {
         room_id: room_id.clone(),
         // The token request names the slot as this generation spells it.
-        slot_id: options.format.token_slot_id(&slot_id).into_owned(),
+        slot_id: token_slot_id(options.format, &slot_id),
         member: OwnMemberClaims {
             member_id: member_id.clone(),
             user_id: options.own_user_id.clone(),
@@ -150,7 +197,7 @@ where
         },
     };
     let pooled: Arc<dyn MediaTransport> = transport.clone();
-    let engine = CallEngine::new(
+    let engine = CallEngine::new_guarded(
         EngineConfig {
             transports: vec![pooled],
             own_member_id: member_id.clone(),
@@ -162,6 +209,7 @@ where
             stability: options.stability,
         },
         memberships,
+        admission.clone(),
     );
     let events = engine.subscribe_events();
 
@@ -170,9 +218,17 @@ where
     // leaves the core; without it a host sees a `MissingKey` it cannot tell
     // from a key that never arrived.
     let engine_handle = engine.handle();
-    key_handler.set_key_import_listener(Box::new(move |key| {
-        engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
-    }));
+    if admission.is_some() {
+        key_handler.set_guarded_key_import_listener(Box::new(move |key, member, active| {
+            engine_handle.notify_member_key_imported(
+                key.rtc_backend_identity.clone(), member.to_owned(), key.key_index, active,
+            );
+        }));
+    } else {
+        key_handler.set_key_import_listener(Box::new(move |key| {
+            engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
+        }));
+    }
     let engine_handle = engine.handle();
     key_handler.set_key_discard_listener(Box::new(move |discarded| {
         engine_handle.notify_key_discarded(discarded);
@@ -191,16 +247,36 @@ where
         );
     }
 
-    let own_identity =
-        (options.identity_mapper)(&options.own_user_id, &options.own_device_id, &member_id);
+    if admission
+        .as_ref()
+        .is_some_and(|guard| !guard.active.load(Ordering::Acquire))
+    {
+        engine.shutdown().await;
+        return Err(AttachError::IdentityRejected);
+    }
     let own_connection = match &own_key {
         Some(own_key) => {
-            let (connection, connection_events) = transport
-                .connect_own(own_key, &ctx)
-                .await
-                .inspect_err(|error| {
-                    log::warn!("media: own focus {own_key} refused the connection: {error}");
-                })?;
+            let (connection, connection_events) = match transport.connect_own(own_key, &ctx).await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    engine.shutdown().await;
+                    if admission
+                        .as_ref()
+                        .is_some_and(|guard| !guard.active.load(Ordering::Acquire))
+                    {
+                        return Err(AttachError::IdentityRejected);
+                    }
+                    return Err(AttachError::Transport(error));
+                }
+            };
+            if admission
+                .as_ref()
+                .is_some_and(|guard| !guard.active.load(Ordering::Acquire))
+            {
+                let _ = connection.close().await;
+                engine.shutdown().await;
+                return Err(AttachError::IdentityRejected);
+            }
             engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
 
             // Move our sender onto each key we rotate to. Without this we
