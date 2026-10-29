@@ -825,6 +825,7 @@ class ScopeTests(unittest.TestCase):
                 "APPEARANCE_REUSE_NATIVE_SOURCE": native, "APPEARANCE_REUSE_NATIVE_TREE": native_tree,
                 "APPEARANCE_REUSE_WINDOWS_SOURCE": independent, "APPEARANCE_REUSE_WINDOWS_TREE": independent_tree,
                 "APPEARANCE_REUSE_WINDOWS_INPUTS": window_blobs,
+                "APPEARANCE_REUSE_INPUTS": (ui,),
                 "REVIEWED_CONTROL_WORKFLOW_SHA256": hashlib.sha256(workflow).hexdigest(),
                 "REVIEWED_CONTROL_WORKFLOW_BYTES": len(workflow),
             }

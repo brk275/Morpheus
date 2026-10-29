@@ -460,41 +460,33 @@ def qualified_vendor_main_reuse(paths, event, event_name, force_all=False):
         return False
 
 
-# One frozen product checkpoint, not a presentation path exemption. The actual
-# Rust/Slint desktop execution is B141; the composed source differs only in two
-# separately reviewed and executed Windows host-reader/helper files. Helpers
-# and the complete-history scanner still run. No artifact or release is reused.
-APPEARANCE_REUSE_SOURCE = "aadc478027b24de1219686384d3df37eb850cb98"
-APPEARANCE_REUSE_TREE = "786988124a09ede7c3c9107dbe3752ada97f36e7"
-APPEARANCE_REUSE_NATIVE_SOURCE = "b141b5c3e80ff30526fe357d8812c1915afec997"
-APPEARANCE_REUSE_NATIVE_TREE = "f78da249a6c8046d95dbaba04cdca977b77e60f9"
-APPEARANCE_REUSE_WINDOWS_SOURCE = "32c77a434a1704c0431bd96734bb9a494d95d1dd"
-APPEARANCE_REUSE_WINDOWS_TREE = "459f4a429b81e7996d4f8539153a711bfbe2a098"
-APPEARANCE_REUSE_RECEIPT = "466693c177f3a0036cda3afd5a3fd010e01ed1a9f307a198e5eb2d4c2c476532"
+# One exact reviewed UI checkpoint: all four native desktop jobs passed on F.
+# C differs from F only in the three separately checked Windows helper blobs.
+# Helpers and complete-history scanning remain on. The frozen receipt records
+# actual source/job/log identities; no artifact or release acceptance is reused.
+APPEARANCE_REUSE_SOURCE = "129770747c8a7f5c58ce9f7e83e0274eb29fd690"
+APPEARANCE_REUSE_TREE = "ee1c64a1d02e124f9828a4919136b2d9c549abff"
+APPEARANCE_REUSE_NATIVE_SOURCE = "51afad97a59ed148cef1e0604bdcca46614de771"
+APPEARANCE_REUSE_NATIVE_TREE = "d96584a69de8d2dfc0786164dfbc6bbf13dd8fef"
+APPEARANCE_REUSE_WINDOWS_SOURCE = "4bc8f829ed8d096cdb9c7e7629438ed5bf5fdb1b"
+APPEARANCE_REUSE_WINDOWS_TREE = "550006fc419ec10b6a268b74ec6f374bd55a410f"
+APPEARANCE_REUSE_RECEIPT = "758b64e61103890a89214e74d5b2163667be6f3396e69b1f67b2a433f55e1a83"
 APPEARANCE_REUSE_JOBS = (
-    ("ubuntu-24.04", 40719258169, 122926136226),
-    ("macos-15", 40719258169, 122926136364),
-    ("macos-15-intel", 40719258169, 122926136372),
-    ("windows-2025", 40719258169, 122926136713),
+    ("ubuntu-24.04", 40795707711, 123191954281),
+    ("macos-15", 40795707711, 123191954274),
+    ("macos-15-intel", 40795707711, 123191954327),
+    ("windows-2025", 40795707711, 123191954286),
 )
 APPEARANCE_REUSE_WINDOWS_INPUTS = (
-    ("scripts/native_webrtc/windows_preflight.ps1", "a80cdd00e06ad66db4c821f8bf8009b5bdfebd9f"),
-    ("scripts/tests/test_native_webrtc_windows_inputs.py", "3dbc90f8a89f7b4cc29c5e27c9ec9413d8eab835"),
+    ('.github/workflows/native-webrtc-windows-source.yml', '612e561da24ae578583f4006405a64e783d7b319'),
+    ('scripts/native_webrtc/windows_preflight.ps1', 'ea9762ca83a5047502c696e2d2504716f453f158'),
+    ('scripts/tests/test_native_webrtc_windows_inputs.py', '4091e940ebfffcae8644f0a1bb405fd94c813199'),
 )
-# These are the complete 22 product paths of the frozen composition. At least
-# one compiled Rust/Slint input must be present; a docs/control-only change does
-# not activate this checkpoint. Equality of the WHOLE remaining tree decides.
+# Only the two exact PR61 compiled UI inputs. Whole remaining-tree equality
+# and all existing fixed owner/event/workflow/source/Windows gates still decide.
 APPEARANCE_REUSE_INPUTS = (
-    "crates/morpheus-config/src/lib.rs", "crates/morpheus-config/src/registry.rs",
-    "crates/morpheus-config/tests/room_appearance.rs",
-    "themes/nocturne.toml", "themes/paper.toml", "themes/terminal.toml", "themes/contrast.toml",
-    "docs/APPEARANCE.md", "docs/CUSTOMIZATION.md",
-    "crates/morpheus-app/src/account_access_ui_tests.rs", "crates/morpheus-app/src/account_identity.rs",
-    "crates/morpheus-app/src/appearance.rs", "crates/morpheus-app/src/call_stage/presenter.rs",
-    "crates/morpheus-app/src/live.rs", "crates/morpheus-app/src/main.rs",
-    "crates/morpheus-app/src/preview_capture.rs", "crates/morpheus-app/ui/app-window.slint",
-    "crates/morpheus-app/ui/call-stage.slint", "crates/morpheus-app/ui/style-tokens.slint",
-    "README.md", "docs/FEATURE_MATRIX.md", "docs/THEME_STUDIO.md",
+    "crates/morpheus-app/src/account_access_ui_tests.rs",
+    "crates/morpheus-app/ui/app-window.slint",
 )
 APPEARANCE_REUSE_QUALIFICATION = {
     "source": APPEARANCE_REUSE_SOURCE, "tree": APPEARANCE_REUSE_TREE,
