@@ -11,6 +11,7 @@ import sys
 from unittest import mock
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts.package import package_config, preflight_deb_authors, linux_appimage, macos_update_formats
 from scripts import prepare_macos_update as mac_update
@@ -612,6 +613,53 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                 self.assertEqual(native_notices.read_files(root), contents)
             with self.assertRaises(ValueError): native_notices.write_files(root, contents)
 
+    def test_notice_reader_keeps_windows_birth_identity_and_each_api_change_time(self):
+        # Exercise the production reader with real file bytes/descriptor and
+        # genuine IDs/mode/size/mtime. Only model the authenticated CPython
+        # 3.12 split: named ctime=CreationTime, fd ctime=ChangeTime.
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary).resolve() / "event.json"
+            target.write_bytes(b'{"fixture":"owned metadata"}')
+            named_stat, handle_stat = Path.lstat, os.fstat
+            fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+            def attempt(mutation=None):
+                counts = {"named": 0, "fd": 0, "opened": 0}
+                def view(real, kind):
+                    counts[kind] += 1
+                    value = SimpleNamespace(**{key: getattr(real, key) for key in fields})
+                    value.st_birthtime_ns = 1_000_000
+                    value.st_ctime_ns = 1_000_000 if kind == "named" else 2_000_000
+                    if mutation == "missing_birth": del value.st_birthtime_ns
+                    if mutation == "invalid_birth": value.st_birthtime_ns = True
+                    if mutation == "fd_change" and kind == "fd" and counts[kind] == 2: value.st_ctime_ns += 1
+                    if mutation == "named_change" and kind == "named" and counts[kind] == 3: value.st_ctime_ns += 1
+                    if mutation == "birth_change" and kind == "fd" and counts[kind] == 2: value.st_birthtime_ns += 1
+                    if mutation == "path_replaced" and kind == "named" and counts[kind] == 3: value.st_ino += 1
+                    if mutation == "opened_replaced" and kind == "fd" and counts[kind] == 1: value.st_ino += 1
+                    if mutation == "link_change" and kind == "fd" and counts[kind] == 2: value.st_nlink += 1
+                    if mutation == "mtime_change" and kind == "fd" and counts[kind] == 2: value.st_mtime_ns += 1
+                    return value
+                def lstat(path, *args, **kwargs):
+                    real = named_stat(path, *args, **kwargs)
+                    return view(real, "named") if path == target else real
+                def opened(path):
+                    self.assertEqual(path, target)
+                    counts["opened"] += 1
+                    return os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                security = SimpleNamespace(open_read=opened)
+                windows = SimpleNamespace(name="nt", O_RDONLY=os.O_RDONLY, fdopen=os.fdopen,
+                    fstat=lambda fd: view(handle_stat(fd), "fd"))
+                with mock.patch.object(native_notices, "os", windows), \
+                        mock.patch.object(native_notices, "catalogue", return_value=SimpleNamespace(windows_security=lambda:security)), \
+                        mock.patch.object(Path, "lstat", autospec=True, side_effect=lstat):
+                    value = native_notices.read_regular(target, 1024)
+                return value, counts
+            self.assertEqual(attempt(), (target.read_bytes(), {"named":3,"fd":2,"opened":1}))
+            for mutation in ("missing_birth", "invalid_birth", "fd_change", "named_change", "birth_change",
+                             "path_replaced", "opened_replaced", "link_change", "mtime_change"):
+                with self.subTest(mutation=mutation), self.assertRaises((ValueError, AttributeError)):
+                    attempt(mutation)
+
     def test_every_locked_registry_archive_is_required_and_checksum_bound(self):
         source, files, manifest, revision, build = self.evidence(registry=True)
         value = native_notices.prepare_bytes(*build(), revision, platform="win32", version="0.1.0")
@@ -841,6 +889,9 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
             root = security.create_root(Path(temporary).resolve())
             target = root/"source.txt";target.write_bytes(b"fixed source data")
             security.path(root,directory=True,private=True)
+            # The same notice/event reader must accept the real retained
+            # Windows handle without equating CreationTime and ChangeTime.
+            self.assertEqual(native_notices.read_regular(target,1024),b"fixed source data")
             descriptor = security.open_read(target,private=True)
             with os.fdopen(descriptor,"rb") as opened:
                 self.assertEqual(opened.read(),b"fixed source data")
@@ -850,6 +901,7 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
                     target.open("wb")
             linked = root/"second-name.txt";os.link(target,linked)
             with self.assertRaises(ValueError):security.open_read(target,private=True)
+            with self.assertRaises(ValueError):native_notices.read_regular(target,1024)
             self.assertEqual(target.read_bytes(),b"fixed source data")
 
     def test_acl_rejects_unknown_ace_and_foreign_writer_but_not_read_only_trustee(self):
