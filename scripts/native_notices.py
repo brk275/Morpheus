@@ -64,14 +64,28 @@ def read_regular(path, maximum, *, allow_empty=False):
     require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
             and (0 if allow_empty else 1) <= before.st_size <= maximum
             and (os.name == "nt" or before.st_uid == os.getuid() and not before.st_mode & 0o022))
+    def stamp(info):
+        # CPython 3.12 Windows named stat exposes CreationTime as ctime,
+        # while fstat exposes ChangeTime. Birth time is the common identity;
+        # retain both APIs' own change-time stability checks separately below.
+        if os.name == "nt":
+            born = info.st_birthtime_ns
+            require(type(born) is int and born > 0)
+        else:
+            born = info.st_ctime_ns
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+                info.st_size, info.st_mtime_ns, born)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     descriptor = catalogue().windows_security().open_read(path) if os.name == "nt" else os.open(path, flags)
     with os.fdopen(descriptor, "rb") as stream:
         opened = os.fstat(stream.fileno())
+        require(stamp(before) == stamp(opened))
         data = stream.read(maximum + 1)
         after = os.fstat(stream.fileno())
-    stamp = lambda x: (x.st_dev, x.st_ino, x.st_mode, x.st_size, x.st_mtime_ns, x.st_ctime_ns)
-    require(stamp(before) == stamp(opened) == stamp(after) and len(data) == before.st_size)
+        named_after = path.lstat()
+    require(stamp(before) == stamp(opened) == stamp(after) == stamp(named_after)
+            and before.st_ctime_ns == named_after.st_ctime_ns
+            and opened.st_ctime_ns == after.st_ctime_ns and len(data) == before.st_size)
     return data
 
 

@@ -46,6 +46,38 @@ SCANNERS = {
     ("win32", "AMD64"): "17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c",
 }
 
+_NOTICE_FAILURE_PHASE = "guard"
+_NOTICE_FAILURE_PHASES = frozenset({
+    "guard", "event_file", "event_payload", "scanner_path", "scanner_hash",
+    "rustup", "cargo", "rustc", "git", "temp_parent", "private_root",
+    "owner_marker", "publish", "source", "cleanup",
+})
+
+
+def _notice_phase(phase):
+    global _NOTICE_FAILURE_PHASE
+    _NOTICE_FAILURE_PHASE = phase
+
+
+def _notice_report_failure(error):
+    # Closed tokens and bounded OS numbers only: never exception text, paths,
+    # SIDs, environment values, event contents, source data or a traceback.
+    category = "other"
+    for kind, token in ((OSError, "os_error"), (ValueError, "value_error"),
+                        (AssertionError, "assertion_error"), (KeyError, "key_error"),
+                        (TypeError, "type_error"), (RuntimeError, "runtime_error"),
+                        (KeyboardInterrupt, "interrupted"), (SystemExit, "system_exit")):
+        if isinstance(error, kind):
+            category = token
+            break
+    numbers = {}
+    for name in ("errno", "winerror"):
+        value = getattr(error, name, None) if isinstance(error, OSError) else None
+        numbers[name] = value if type(value) is int and 0 <= value <= 65535 else None
+    phase = _NOTICE_FAILURE_PHASE if _NOTICE_FAILURE_PHASE in _NOTICE_FAILURE_PHASES else "source"
+    print("MORPHEUS_NATIVE_NOTICE_FAILURE " + json.dumps({"phase": phase, "exception": category,
+          **numbers}, sort_keys=True), file=sys.stderr)
+
 
 def require(value):
     if not value:
@@ -67,6 +99,11 @@ def checked(path, *, directory=False, private=False):
     return path
 
 
+def _notice_checked(phase, path, **options):
+    _notice_phase(phase)
+    return checked(path, **options)
+
+
 def write_new(path, data):
     with Path(path).open("xb") as stream:
         if os.name != "nt": os.fchmod(stream.fileno(), 0o600)
@@ -74,6 +111,7 @@ def write_new(path, data):
 
 
 def guard(environment, system=sys.platform):
+    _notice_phase("guard")
     require(system in {"darwin", "win32"} and sys.version_info >= (3,12))
     for key, value in {"GITHUB_ACTIONS":"true", "RUNNER_ENVIRONMENT":"github-hosted",
             "GITHUB_REPOSITORY":"brk275/Morpheus", "GITHUB_REF":"refs/heads/main",
@@ -84,7 +122,11 @@ def guard(environment, system=sys.platform):
     # Windows; the plain dict no longer has os.environ's case-insensitive lookup.
     image_key = "ImageOS" if system == "darwin" else "IMAGEOS"
     require(environment.get(image_key) in ({"macos15", "macos26"} if system == "darwin" else {"win25", "win25-vs2026"}))
-    event = S.unique_json(N.read_regular(Path(environment["GITHUB_EVENT_PATH"]), 1024 * 1024))
+    _notice_phase("event_file")
+    _notice_event_bytes = N.read_regular(Path(environment["GITHUB_EVENT_PATH"]), 1024 * 1024)
+    _notice_phase("event_payload")
+    event = S.unique_json(_notice_event_bytes)
+    del _notice_event_bytes
     owner = event.get("repository", {}).get("owner", {}).get("id")
     inputs = event.get("inputs", {})
     require(type(owner) is int and owner > 0 and event.get("sender", {}).get("id") == owner
@@ -129,6 +171,7 @@ def source_inputs(files):
 
 
 def tools(environment):
+    _notice_phase("rustup")
     host = {("darwin", "arm64"):"aarch64-apple-darwin", ("darwin", "x86_64"):"x86_64-apple-darwin",
             ("win32", "AMD64"):"x86_64-pc-windows-msvc"}.get((sys.platform, platform.machine()))
     require(host is not None)
@@ -136,15 +179,16 @@ def tools(environment):
     rustup_value = environment.get("RUSTUP_HOME")
     require(bool(rustup_value) or bool(original_home))
     home = Path(rustup_value) if rustup_value else Path(original_home)/".rustup"
-    rustup = checked(home, directory=True)
+    rustup = _notice_checked("rustup", home, directory=True)
     suffix = ".exe" if os.name == "nt" else ""
     directory = rustup / ("toolchains/1.99.0-" + host) / "bin"
-    cargo, rustc = (checked(directory / (name + suffix)) for name in ("cargo", "rustc"))
+    cargo, rustc = (_notice_checked(name, directory / (name + suffix)) for name in ("cargo", "rustc"))
+    _notice_phase("git")
     if os.name == "nt":
         program = Path(environment["PROGRAMFILES"])
-        git = checked(program / "Git/cmd/git.exe")
+        git = _notice_checked("git", program / "Git/cmd/git.exe")
     else:
-        git = checked(Path("/usr/bin/git"))
+        git = _notice_checked("git", Path("/usr/bin/git"))
     return cargo, rustc, git, rustup
 
 
@@ -379,16 +423,22 @@ def fetch_export(root, files, identity):
 
 def prepare(environment, scanner):
     guard(environment)
-    scanner=checked(scanner); require(S.digest(N.read_regular(scanner,32*1024**2))==SCANNERS[(sys.platform,platform.machine())])
+    scanner=_notice_checked("scanner_path",scanner)
+    _notice_phase("scanner_hash")
+    require(S.digest(N.read_regular(scanner,32*1024**2))==SCANNERS[(sys.platform,platform.machine())])
     cargo,rustc,git,rustup=tools(environment)
-    parent=checked(Path(environment["RUNNER_TEMP"]),directory=True)
+    parent=_notice_checked("temp_parent",Path(environment["RUNNER_TEMP"]),directory=True)
+    _notice_phase("private_root")
     root = S.windows_security().create_root(parent) if os.name=="nt" else Path(tempfile.mkdtemp(prefix="morpheus-native-source-",dir=parent))
     if os.name!="nt":root.chmod(0o700)
+    _notice_phase("owner_marker")
     info=root.lstat();revision=R.expected_revision(environment)
     write_new(root/"owner.json",json.dumps({"schema":1,"device":info.st_dev,"inode":info.st_ino,"source_revision":revision}).encode()+b"\n")
     # Publish before acquisition so the always-step can scan and remove a failed
     # owned tree. No bundle/receipt consumer runs if this step fails.
+    _notice_phase("publish")
     publish_environment(root,environment)
+    _notice_phase("source")
     for name in ("home","cargo","fetch","target","temp","logs","output"):(root/name).mkdir(mode=0o700)
     controlled=environment_for_acquisition(environment,root,cargo,rustc,git,rustup)
     commands=Commands(root,controlled);success=False;scanned=False
@@ -424,6 +474,7 @@ def prepare(environment, scanner):
 
 def finish(environment, scanner):
     guard(environment)
+    _notice_phase("cleanup")
     parent=checked(Path(environment["RUNNER_TEMP"]),directory=True)
     root=checked(Path(environment["MORPHEUS_NATIVE_SOURCE_ROOT"]),directory=True,private=True)
     require(root.parent==parent and re.fullmatch(r"morpheus-native-source-[a-z0-9_]{8,32}",root.name))
@@ -436,6 +487,7 @@ def finish(environment, scanner):
         and state["distribution_ready"] is False)
     scanner=checked(scanner);require(S.digest(N.read_regular(scanner,32*1024**2))==SCANNERS[(sys.platform,platform.machine())])
     cargo,rustc,git,rustup=tools(environment)
+    _notice_phase("cleanup")
     commands=Commands(root,environment_for_acquisition(environment,root,cargo,rustc,git,rustup))
     # Never overwrite prior command logs while rescanning a retained failed tree.
     commands.sequence=max((int(p.stem) for folder in (commands.logs,root/"scanner-logs")
@@ -454,8 +506,9 @@ def main():
     parser.add_argument("--gitleaks",type=Path,required=True);args=parser.parse_args()
     try:
         (prepare if args.prepare else finish)(dict(os.environ),args.gitleaks)
-    except BaseException:
+    except BaseException as error:
         print("Native notice source preparation failed; private evidence retained.",file=sys.stderr)
+        _notice_report_failure(error)
         raise SystemExit(1) from None
 
 
