@@ -529,7 +529,7 @@ class ScopeTests(unittest.TestCase):
         # fixture/inventory gate; unrelated Rust checks must not be launched.
         # Mixed native/dependency/unknown inputs retain the full route.
         for event in ("push", "pull_request"):
-            for other in ("Cargo.lock", "crates/morpheus-rtc/src/media.rs", "scripts/unknown.py"):
+            for other in ("Cargo.lock", "crates/morpheus-rtc/src/media.rs", "unrecognized-native-input.rs"):
                 changed.return_value = (sorted(windows_producer | {other}), False)
                 selected = event_selection({}, event)
                 self.assertEqual(selected["check_route"], "all")
