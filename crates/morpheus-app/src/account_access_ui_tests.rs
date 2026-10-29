@@ -2000,6 +2000,10 @@ async fn assert_seek_policy_and_thread_keeper(
     assert_ne!(ui.get_thread_seek_id(), 0, "the bar's wheel is silent");
     replies.push(Arc::new(rich_fixture(30_061)));
     ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    // Force the matching row's actual conditional holders and geometry. Its
+    // init/layout must not end and destroy its own seek holder synchronously.
+    assert_eq!(control_bounds(ui, &replies.last().unwrap().body).len(), 1);
+    assert_ne!(ui.get_thread_seek_id(), 0, "placement waits for its frame");
     assert!(thread_seek_stopped(ui).await, "the seek ended");
     let after = at(moved);
     assert!((after[0].top - wheeled[0].top).abs() <= 1.0, "kept");
@@ -2033,6 +2037,12 @@ async fn assert_seek_policy_and_thread_keeper(
     assert_ne!(ui.get_thread_seek_id(), 0, "the bar's wheel is silent");
     replies.push(Arc::new(rich_fixture(30_062)));
     ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    assert_eq!(control_bounds(ui, &replies.last().unwrap().body).len(), 1);
+    assert_ne!(
+        ui.get_thread_seek_id(),
+        0,
+        "the recreated pane defers placement"
+    );
     assert!(thread_seek_stopped(ui).await, "the seek ended");
     let after = control_bounds(ui, "REPLIES · 62");
     assert!((after[0].top - wheeled[0].top).abs() <= 1.0, "kept");
