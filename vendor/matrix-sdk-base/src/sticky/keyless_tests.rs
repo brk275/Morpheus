@@ -119,6 +119,8 @@ async fn test_keyless_extension_decryption_keeps_actual_unverified_metadata_and_
         room.room_id(),
         PendingEvent {
             keyless_generation: generation,
+            #[cfg(feature = "e2e-encryption")]
+            pending_diagnostic: crate::sticky::PendingStickyEventState::Pending,
             meta: classify(now_ms(), &raw).unwrap(),
             event: raw.clone(),
         },
@@ -192,6 +194,8 @@ async fn test_keyless_key_before_initial_park_and_old_repark_generation_are_safe
         room.room_id(),
         PendingEvent {
             keyless_generation: generation,
+            #[cfg(feature = "e2e-encryption")]
+            pending_diagnostic: crate::sticky::PendingStickyEventState::Pending,
             meta: classify(now_ms(), &raw).unwrap(),
             event: raw.clone(),
         },
@@ -214,6 +218,8 @@ async fn test_keyless_key_before_initial_park_and_old_repark_generation_are_safe
     // Simulate an old retry re-parking after the room was left and rejoined.
     sticky.park(vec![PendingEvent {
         keyless_generation: generation,
+        #[cfg(feature = "e2e-encryption")]
+        pending_diagnostic: crate::sticky::PendingStickyEventState::Pending,
         meta: classify(now_ms(), &raw).unwrap(),
         event: raw,
     }]);

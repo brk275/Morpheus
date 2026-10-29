@@ -401,6 +401,130 @@ fn exact_roster(rtc: &RtcService, room: &str, users: &[&str]) -> bool {
     actual == expected
 }
 
+// A fixed-label view of the same in-memory roster used by exact_roster.
+// This runs only after the unchanged group deadline has already failed.
+fn roster_discriminator(rtc: &RtcService, room: &str, users: [&str; 3]) -> &'static str {
+    let Ok(members) = rtc.participants(room) else {
+        return "unavailable";
+    };
+    if members.len() > 64 {
+        return "unavailable";
+    }
+    let mut counts = [0_usize; 3];
+    for member in members {
+        let Some(index) = users
+            .iter()
+            .position(|user| member.user_id.as_str() == *user)
+        else {
+            return "unexpected_or_duplicate";
+        };
+        counts[index] += 1;
+        if counts[index] > 1 {
+            return "unexpected_or_duplicate";
+        }
+    }
+    let missing = counts.iter().filter(|count| **count == 0).count();
+    if missing == 0 {
+        "exact"
+    } else if missing > 1 {
+        "missing_multiple"
+    } else if counts[0] == 0 {
+        "missing_alice"
+    } else if counts[1] == 0 {
+        "missing_bob"
+    } else {
+        "missing_carol"
+    }
+}
+
+// Only the authenticated, already-decrypted sticky cache is sampled. IDs stay
+// in this test process; no GET, decrypt, key request or sender refresh is added.
+fn cached_bob_memberships(
+    rtc: &RtcService,
+    room: &str,
+    bob: &str,
+) -> Option<Vec<matrix_sdk::ruma::OwnedEventId>> {
+    use matrix_sdk::ruma::events::TimelineEventType;
+    let room_id = matrix_sdk::ruma::RoomId::parse(room).ok()?;
+    let joined = rtc.client().get_room(&room_id)?;
+    if joined.state() != matrix_sdk::RoomState::Joined {
+        return None;
+    }
+    let live = joined.sticky_events().live();
+    if live.len() > 64 {
+        return None;
+    }
+    let types = [
+        TimelineEventType::from("m.rtc.member"),
+        TimelineEventType::from("org.matrix.msc4143.rtc.member"),
+    ];
+    let mut events = Vec::new();
+    for event in live
+        .iter()
+        .filter(|event| {
+            event.key.sender.as_str() == bob
+                && types.contains(&event.key.event_type)
+                && event
+                    .encryption_info()
+                    .is_some_and(|info| info.sender.as_str() == bob)
+        })
+        .take(2)
+    {
+        if event.event_id.as_str().len() > 1024 {
+            return None;
+        }
+        events.push(event.event_id.clone());
+    }
+    Some(events)
+}
+
+fn group_failure_discriminator(
+    rtc: &RtcService,
+    late: &RtcService,
+    room: &str,
+    users: [&str; 3],
+    before: Option<&[matrix_sdk::ruma::OwnedEventId]>,
+) {
+    // Sample BOTH sides even when the unchanged predicate short-circuited.
+    let original_roster = roster_discriminator(rtc, room, users);
+    let late_roster = roster_discriminator(late, room, users);
+    let current = cached_bob_memberships(rtc, room, users[1]);
+    let received = cached_bob_memberships(late, room, users[1]);
+    // Event-ID continuity only: no assertion about ciphertext or key continuity.
+    let continuity_detail = match (before, current.as_deref()) {
+        (Some([before]), Some([after])) if before == after => "same_live_event",
+        (Some([_]), Some([_])) => "changed_live_event",
+        (Some(_), Some(_)) => "not_unique",
+        _ => "unknown",
+    };
+    let late_current_bob = match (current.as_deref(), received.as_deref()) {
+        (Some([current]), Some([received])) if current == received => "present",
+        (Some([_]), Some(received)) if received.len() > 1 => "ambiguous",
+        (Some([_]), Some(_)) => "missing",
+        _ => "unknown",
+    };
+    // One exact event/sender observation from the existing local pending list.
+    // This never fetches/decrypts or requests keys and runs only after failure.
+    let late_bob_pending = (|| {
+        let Some([event_id]) = current.as_deref() else {
+            return None;
+        };
+        let room_id = matrix_sdk::ruma::RoomId::parse(room).ok()?;
+        let sender = matrix_sdk::ruma::UserId::parse(users[1]).ok()?;
+        let joined = late.client().get_room(&room_id)?;
+        if joined.state() != matrix_sdk::RoomState::Joined {
+            return None;
+        }
+        let sticky = joined.sticky_events();
+        let state = sticky.pending_event_state(event_id, &sender);
+        Some(state.as_str())
+    })()
+    .unwrap_or("unknown");
+    eprintln!(
+        "MORPHEUS_ELEMENT_GROUP original_roster={original_roster} late_roster={late_roster} continuity_detail={continuity_detail} late_current_bob={late_current_bob} late_bob_pending={late_bob_pending}"
+    );
+}
+
 async fn group_and_screen(
     rtc: &mut RtcService,
     root: &std::path::Path,
@@ -422,6 +546,7 @@ async fn group_and_screen(
     // late arrival occur outside that window rather than asking a test-only
     // API to rotate keys or assuming a fast bulk join has to rotate them.
     sleep(Duration::from_secs(11)).await;
+    let bob_before = cached_bob_memberships(rtc, room, &bob.user_id);
     let profile = root.join("late-native-profile");
     fs::create_dir(&profile).expect("Cannot create fresh late-peer profile");
     #[cfg(unix)]
@@ -473,15 +598,28 @@ async fn group_and_screen(
         .await
         .expect("Late-peer join failed");
     eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE group_roster");
-    timeout(Duration::from_secs(90), async {
+    let roster = timeout(Duration::from_secs(90), async {
         while !exact_roster(rtc, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
             || !exact_roster(&late, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
         {
             sleep(Duration::from_millis(200)).await;
         }
     })
-    .await
-    .expect("Three-member native rosters did not converge");
+    .await;
+    if roster.is_err() {
+        group_failure_discriminator(
+            rtc,
+            &late,
+            room,
+            [
+                alice.user_id.as_str(),
+                bob.user_id.as_str(),
+                carol.user_id.as_str(),
+            ],
+            bob_before.as_deref(),
+        );
+    }
+    roster.expect("Three-member native rosters did not converge");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_group_roster=true");
 
     // A newly created device must actually decrypt the already-running sender,
