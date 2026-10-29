@@ -252,6 +252,49 @@ fn outcome_text(outcome: Outcome) -> &'static str {
     }
 }
 
+// A previous successful read is not a fresh identity receipt. In particular,
+// an expired retained session or failed refresh cannot leave a verified claim
+// on screen alongside an error saying that the comparison is unavailable.
+fn withdraw_failed_completion(shown: &mut PeerVerificationView, error: Error) {
+    if shown.stage == 5 || matches!(error, Error::Gone | Error::Unsupported) {
+        shown.stage = 5;
+        shown.detail = outcome_text(Outcome::Unconfirmed).into();
+        shown.emoji = "".into();
+        shown.decimals = "".into();
+    }
+}
+
+// The complete error presentation used by finish_reply after its original
+// account/view/operation admission. It changes no SDK or owner capabilities.
+fn apply_error_presentation(shown: &mut PeerVerificationView, action: Action, error: Error) {
+    withdraw_failed_completion(shown, error);
+    shown.error = fixed_error(error).into();
+    if matches!(error, Error::Unknown | Error::RequestUncertain) {
+        shown.uncertain = true;
+    }
+    if matches!(action, Action::Confirm) {
+        shown.emoji = "".into();
+        shown.decimals = "".into();
+        if error == Error::Unknown {
+            shown.stage = 4;
+        }
+    }
+    if matches!(action, Action::Accept) && error == Error::Unknown {
+        shown.stage = 2;
+    }
+    if matches!(action, Action::Cancel) && error == Error::Unknown {
+        shown.stage = 5;
+    }
+    if matches!(error, Error::Gone | Error::Unsupported) {
+        shown.stage = 5;
+        shown.emoji = "".into();
+        shown.decimals = "".into();
+    }
+    if matches!(action, Action::Request(_)) {
+        shown.stage = 0;
+    }
+}
+
 pub(crate) fn clear_presentation(ui: &AppWindow) {
     let peer = ui.global::<PeerVerification>();
     peer.set_view(PeerVerificationView::default());
@@ -744,37 +787,21 @@ impl PeerVerificationUi {
         self.lock().view.as_mut().unwrap().busy = false;
         match result {
             Err(error) => {
-                shown.error = fixed_error(error).into();
-                if matches!(error, Error::Unknown | Error::RequestUncertain) {
-                    shown.uncertain = true;
-                }
+                apply_error_presentation(&mut shown, action, error);
                 if matches!(action, Action::Confirm) {
                     self.lock().view.as_mut().unwrap().has_values = false;
-                    shown.emoji = "".into();
-                    shown.decimals = "".into();
                     global.set_compared(false);
                     // A handed-over confirm is never offered again blindly.
                     if error == Error::Unknown {
-                        shown.stage = 4;
                         self.lock().view.as_mut().unwrap().confirmed = true;
                     }
                 }
-                if matches!(action, Action::Accept) && error == Error::Unknown {
-                    shown.stage = 2;
-                }
-                if matches!(action, Action::Cancel) && error == Error::Unknown {
-                    shown.stage = 5;
-                }
                 if matches!(error, Error::Gone | Error::Unsupported) {
-                    shown.stage = 5;
-                    shown.emoji = "".into();
-                    shown.decimals = "".into();
                     global.set_compared(false);
                     self.lock().view.as_mut().unwrap().has_values = false;
                 }
                 if matches!(action, Action::Request(_)) {
                     self.lock().view.as_mut().unwrap().proposed = None;
-                    shown.stage = 0;
                 }
             }
             Ok(reply) => {
@@ -963,6 +990,50 @@ mod tests {
         drop(claimed_view_payload);
         assert_eq!(dropped.load(Ordering::Acquire), 2);
     }
+    #[test]
+    fn failed_refresh_withdraws_the_previous_verified_identity_claim() {
+        for error in [
+            Error::Gone,
+            Error::Unsupported,
+            Error::Unavailable,
+            Error::TimedOut,
+        ] {
+            let mut shown = PeerVerificationView {
+                stage: 5,
+                peer: "@casey:example.org".into(),
+                room: "!comparison:example.org".into(),
+                detail: outcome_text(Outcome::IdentityVerified).into(),
+                emoji: "old comparison".into(),
+                decimals: "1000 · 2000 · 3000".into(),
+                ..Default::default()
+            };
+            apply_error_presentation(&mut shown, Action::Refresh, error);
+            assert_eq!(shown.stage, 5);
+            assert_eq!(shown.detail.as_str(), outcome_text(Outcome::Unconfirmed));
+            assert_eq!(shown.error.as_str(), fixed_error(error));
+            assert!(shown.emoji.is_empty() && shown.decimals.is_empty());
+            // The exact person and room remain visible; only the stale claim
+            // and comparison payload are withdrawn, never another flow opened.
+            assert_eq!(shown.peer.as_str(), "@casey:example.org");
+            assert_eq!(shown.room.as_str(), "!comparison:example.org");
+        }
+        // A transient failure while comparing does not fabricate a terminal
+        // outcome. A lost or unsupported flow does withdraw those values.
+        let mut comparing = PeerVerificationView {
+            stage: 3,
+            detail: "Compare every value.".into(),
+            emoji: "current comparison".into(),
+            ..Default::default()
+        };
+        apply_error_presentation(&mut comparing, Action::Refresh, Error::TimedOut);
+        assert_eq!(comparing.stage, 3);
+        assert_eq!(comparing.emoji.as_str(), "current comparison");
+        apply_error_presentation(&mut comparing, Action::Refresh, Error::Gone);
+        assert_eq!(comparing.stage, 5);
+        assert_eq!(comparing.detail.as_str(), outcome_text(Outcome::Unconfirmed));
+        assert!(comparing.emoji.is_empty());
+    }
+
     #[test]
     fn confirmation_needs_an_actual_current_presentation_and_explicit_comparison() {
         // A checked box alone must not authorize a missing, retired or
