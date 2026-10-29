@@ -41,7 +41,7 @@ jobs:
     # The original pinned build requires VS2022; windows-2025 maps to VS2026.
     # This label selects a host family, never an SDK/toolchain admission.
     runs-on: windows-2022
-    timeout-minutes: ${{ inputs.phase == 'preflight' && 5 || 240 }}
+    timeout-minutes: ${{ inputs.phase == 'preflight' && (inputs.preflight_detail == 'host-toolchain' && 17 || 5) || 240 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         # Material profiles bind Git blob bytes; disable host CRLF conversion.

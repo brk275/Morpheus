@@ -902,9 +902,9 @@ namespace Morpheus.OwnedTraversal20261028
         {
             costFrequency = Stopwatch.Frequency;
             // Bounds make both tick accumulation and integer conversion safe.
-            costValid = costFrequency > 0 && costFrequency <= Int64.MaxValue / 185000;
+            costValid = costFrequency > 0 && costFrequency <= Int64.MaxValue / 905000;
             if (!costValid) return;
-            costLimit = costFrequency * 185;
+            costLimit = costFrequency * 905;
             costStamp = Stopwatch.GetTimestamp();
             if (costStamp < 0) { costValid = false; return; }
             costRunning = true;
@@ -1073,7 +1073,7 @@ namespace Morpheus.OwnedTraversal20261028
                 memo.Count != 1 || String.IsNullOrEmpty(systemRoot) || !memo.TryGetValue(systemRoot, out string cached) ||
                 !String.Equals(cached, systemRoot, StringComparison.Ordinal) || u != systemRoot.Length * 2) return null;
             string[] keys = { "Entries", "Handles", "FileBytes", "TotalBytes", "Depth", "JsonBytes", "MetadataBytes", "Seconds" };
-            long[] values = { 200000, 200256, 2147483648, 68719476736, 64, 33554432, 31457280, 180 };
+            long[] values = { 200000, 200256, 2147483648, 68719476736, 64, 33554432, 31457280, 900 };
             if (limits.Count != keys.Length) return null;
             for (int i = 0; i < keys.Length; i++)
             {
@@ -1189,7 +1189,7 @@ namespace Morpheus.OwnedTraversal20261028
         private void Budget()
         {
             // Same five predicates and short-circuit order as Assert-HostBudget.
-            if (Watch.Elapsed.TotalSeconds > 180) BudgetFailure("deadline");
+            if (Watch.Elapsed.TotalSeconds > 900) BudgetFailure("deadline");
             else if (Entries > 200000) BudgetFailure("entries");
             else if (Bytes > 68719476736UL) BudgetFailure("bytes");
             else if (Handles.Count > 200256 - (payloadWorkerReserved ? 2 : 0)) BudgetFailure("handles");
@@ -1368,10 +1368,10 @@ namespace Morpheus.OwnedTraversal20261028
         {
             int previousCost = BeginCost(3);
             try {
-            double remaining = 180 - Watch.Elapsed.TotalSeconds;
+            double remaining = 900 - Watch.Elapsed.TotalSeconds;
             if (remaining <= 0) BudgetFailure("deadline");
             bool completed;
-            try { completed = read.Wait((int)Math.Min(180000, Math.Ceiling(remaining * 1000))); }
+            try { completed = read.Wait((int)Math.Min(900000, Math.Ceiling(remaining * 1000))); }
             catch (AggregateException) when (read.IsCompleted) { completed = true; }
             if (!completed) BudgetFailure("deadline");
             try
@@ -1426,9 +1426,9 @@ namespace Morpheus.OwnedTraversal20261028
             if (readAheadBuffer == null) readAheadBuffer = new byte[1048576];
             retainedPayloadStream = stream; retainedPayloadSafe = safe;
             payloadCancellation = new CancellationTokenSource();
-            double remaining = 180 - Watch.Elapsed.TotalSeconds;
+            double remaining = 900 - Watch.Elapsed.TotalSeconds;
             if (remaining <= 0) BudgetFailure("deadline");
-            payloadCancellation.CancelAfter((int)Math.Min(180000, Math.Ceiling(remaining * 1000)));
+            payloadCancellation.CancelAfter((int)Math.Min(900000, Math.Ceiling(remaining * 1000)));
             byte[] current = Buffer, next = readAheadBuffer;
             Task<int> read = BeginPayloadRead(stream, current);
             ulong size = 0;
@@ -1497,9 +1497,9 @@ namespace Morpheus.OwnedTraversal20261028
 
         private int PayloadRemainingMilliseconds()
         {
-            double remaining = 180 - Watch.Elapsed.TotalSeconds;
+            double remaining = 900 - Watch.Elapsed.TotalSeconds;
             if (remaining <= 0) BudgetFailure("deadline");
-            return (int)Math.Min(180000, Math.Ceiling(remaining * 1000));
+            return (int)Math.Min(900000, Math.Ceiling(remaining * 1000));
         }
 
         private void PayloadWorkerLoop()
@@ -2028,7 +2028,8 @@ namespace Morpheus.OwnedTraversal20261028
             foreach (Record record in fileRecords) { Budget(); ReadInfo(record.Handle, record.Comparison, true, true); }
             Budget();
             return new OrderedDictionary(StringComparer.OrdinalIgnoreCase) {
-                { "schema", "morpheus-native-windows-host-toolchain-inventory-v2" },
+                { "schema", "morpheus-native-windows-host-toolchain-inventory-v3" },
+                { "inventory_policy", "complete-host-inventory-900s-v1" },
                 { "visual_studio_root", vs }, { "visual_studio_year", "2022" },
                 { "msvc_toolset_version", version }, { "windows_sdk_version", "10.0.26100.0" },
                 { "roots", new object[] { vsInventory, sdkInventory } }, { "roles", roleFacts },
@@ -2079,7 +2080,9 @@ function New-HostOwnedTraversal {
     return $reader
 }
 
-# V2 distinguishes traversal implementation from compiler/tool execution.
+# V3 binds the fixed complete-host-inventory-900s-v1 policy; this changes
+# only offline host validation time, never native product runtime limits.
+# Traversal implementation remains distinct from compiler/tool execution.
 # Even an unsupported-state fallback has invoked the bundled compiler while
 # constructing its eligibility helper; it must never emit the old false flag.
 function Set-HostInventoryImplementation([Collections.IDictionary] $Inventory, [string] $Implementation) {
@@ -2088,7 +2091,8 @@ function Set-HostInventoryImplementation([Collections.IDictionary] $Inventory, [
          -not [string]::Equals($Implementation, 'powershell-original-fallback-v1', [StringComparison]::Ordinal))) {
         throw 'receipt_provenance'
     }
-    $Inventory['schema'] = 'morpheus-native-windows-host-toolchain-inventory-v2'
+    $Inventory['schema'] = 'morpheus-native-windows-host-toolchain-inventory-v3'
+    $Inventory['inventory_policy'] = 'complete-host-inventory-900s-v1'
     $Inventory['vcvars_or_compilers_executed'] = $true
     $Inventory['preflight_implementation'] = $Implementation
     $Inventory['preflight_compiler'] = 'powershell-bundled-roslyn-in-process-v1'
@@ -2175,8 +2179,10 @@ function Initialize-HostReader {
     $script:HostCanonicalUnitLimit = 1048576
     $script:HostCanonicalPaths = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     # These are fixed source limits, never manifest-selected overrides.
+    # Fixed policy: one 900-second whole-inventory watch, plus unchanged 5s
+    # native cleanup. Never reset per root/file or accept caller overrides.
     $script:HostLimits = @{ Entries = 200000; Handles = 200256; FileBytes = 2147483648;
-        TotalBytes = 68719476736; Depth = 64; JsonBytes = 33554432; MetadataBytes = 31457280; Seconds = 180 }
+        TotalBytes = 68719476736; Depth = 64; JsonBytes = 33554432; MetadataBytes = 31457280; Seconds = 900 }
     $script:HostWatch = [Diagnostics.Stopwatch]::StartNew()
     $script:HostCount = 0; $script:HostBytes = [uint64]0; $script:HostMetadataBytes = 0
     $script:HostBuffer = [byte[]]::new(1048576)
@@ -2841,18 +2847,18 @@ function Get-HostPreflightProgressMessage($Work, $Entries, $Bytes, $ManagedHashe
 # Every argument is checked before conversion; no array/getter/string callback.
 function Get-HostPreflightCostMessage($Status, $Lexical, $Native, $Enumeration, $Read, $Sha, $Other) {
     $valid = $Status -is [string] -and [string]::Equals($Status, 'measured', [StringComparison]::Ordinal)
-    if ($Lexical -isnot [int] -or $Lexical -lt 0 -or $Lexical -gt 185000) { $valid = $false }
-    if ($Native -isnot [int] -or $Native -lt 0 -or $Native -gt 185000) { $valid = $false }
-    if ($Enumeration -isnot [int] -or $Enumeration -lt 0 -or $Enumeration -gt 185000) { $valid = $false }
-    if ($Read -isnot [int] -or $Read -lt 0 -or $Read -gt 185000) { $valid = $false }
-    if ($Sha -isnot [int] -or $Sha -lt 0 -or $Sha -gt 185000) { $valid = $false }
-    if ($Other -isnot [int] -or $Other -lt 0 -or $Other -gt 185000) { $valid = $false }
-    if ($valid -and ($Lexical + $Native + $Enumeration + $Read + $Sha + $Other) -gt 185000) { $valid = $false }
+    if ($Lexical -isnot [int] -or $Lexical -lt 0 -or $Lexical -gt 905000) { $valid = $false }
+    if ($Native -isnot [int] -or $Native -lt 0 -or $Native -gt 905000) { $valid = $false }
+    if ($Enumeration -isnot [int] -or $Enumeration -lt 0 -or $Enumeration -gt 905000) { $valid = $false }
+    if ($Read -isnot [int] -or $Read -lt 0 -or $Read -gt 905000) { $valid = $false }
+    if ($Sha -isnot [int] -or $Sha -lt 0 -or $Sha -gt 905000) { $valid = $false }
+    if ($Other -isnot [int] -or $Other -lt 0 -or $Other -gt 905000) { $valid = $false }
+    if ($valid -and ($Lexical + $Native + $Enumeration + $Read + $Sha + $Other) -gt 905000) { $valid = $false }
     if (-not $valid) {
-        return ' cost_model=owned-exclusive-wall-v1 cost_status=unavailable lexical_ms=0 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0'
+        return ' cost_model=owned-exclusive-wall-900s-v2 cost_status=unavailable lexical_ms=0 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0'
     }
     $culture = [Globalization.CultureInfo]::InvariantCulture
-    return ' cost_model=owned-exclusive-wall-v1 cost_status=measured lexical_ms=' + [Convert]::ToString([int]$Lexical, $culture) +
+    return ' cost_model=owned-exclusive-wall-900s-v2 cost_status=measured lexical_ms=' + [Convert]::ToString([int]$Lexical, $culture) +
         ' native_ms=' + [Convert]::ToString([int]$Native, $culture) +
         ' enumeration_ms=' + [Convert]::ToString([int]$Enumeration, $culture) +
         ' read_ms=' + [Convert]::ToString([int]$Read, $culture) +

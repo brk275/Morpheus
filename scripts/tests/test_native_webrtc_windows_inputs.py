@@ -21,6 +21,23 @@ SPEC.loader.exec_module(TARGET)
 
 
 class WindowsNativeInputsTests(unittest.TestCase):
+    def test_complete_host_inventory_policy_is_fixed_and_host_only(self):
+        root = PATH.parents[1]
+        producer = (root / "scripts/native_webrtc/windows_preflight.ps1").read_text()
+        workflow = (root / ".github/workflows/native-webrtc-windows-source.yml").read_text()
+        self.assertIn("MetadataBytes = 31457280; Seconds = 900 }", producer)
+        self.assertIn("31457280, 900 };", producer)
+        self.assertIn('if (Watch.Elapsed.TotalSeconds > 900) BudgetFailure("deadline");', producer)
+        self.assertEqual(producer.count("double remaining = 900 - Watch.Elapsed.TotalSeconds;"), 3)
+        self.assertEqual(producer.count("Math.Min(900000, Math.Ceiling(remaining * 1000))"), 3)
+        self.assertIn("costFrequency * 905;", producer)
+        self.assertIn("Int64.MaxValue / 905000", producer)
+        self.assertIn("complete-host-inventory-900s-v1", producer)
+        self.assertNotIn("host-toolchain-inventory-v2", producer)
+        self.assertNotIn("owned-exclusive-wall-v1", producer)
+        self.assertIn("read.Wait(5000)", producer)
+        self.assertIn("inputs.phase == 'preflight' && (inputs.preflight_detail == 'host-toolchain' && 17 || 5) || 240", workflow)
+
     def test_core_manifest_failure_subcategories_are_closed_and_fatal(self):
         # Actual bound_asset/load/core_stage/entry boundaries with synthetic
         # DATA and mocked filesystem only; no Windows tool/network is invoked.
@@ -1145,7 +1162,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $caseStage = 'source_parse'
 $inventorySite = 'unknown'
-$fixtureLineLimit = 1702
+$fixtureLineLimit = 1713
 try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
@@ -1223,18 +1240,18 @@ foreach ($bad in @($null, '', 'FILE_HASH', "private`npath token payload", ('priv
 }
 # Fixed failure-only partition schema. Valid zero-duration work remains valid;
 # no positive duration or machine-speed assertion is made.
-$costUnavailable = ' cost_model=owned-exclusive-wall-v1 cost_status=unavailable lexical_ms=0 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0'
-$costZero = ' cost_model=owned-exclusive-wall-v1 cost_status=measured lexical_ms=0 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0'
+$costUnavailable = ' cost_model=owned-exclusive-wall-900s-v2 cost_status=unavailable lexical_ms=0 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0'
+$costZero = ' cost_model=owned-exclusive-wall-900s-v2 cost_status=measured lexical_ms=0 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0'
 if ((Get-HostPreflightCostMessage 'measured' 0 0 0 0 0 0) -cne $costZero -or
-    (Get-HostPreflightCostMessage 'measured' 185000 0 0 0 0 0) -cne
-        ' cost_model=owned-exclusive-wall-v1 cost_status=measured lexical_ms=185000 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0' -or
+    (Get-HostPreflightCostMessage 'measured' 905000 0 0 0 0 0) -cne
+        ' cost_model=owned-exclusive-wall-900s-v2 cost_status=measured lexical_ms=905000 native_ms=0 enumeration_ms=0 read_ms=0 sha_ms=0 other_ms=0' -or
     (Get-HostPreflightCostMessage 'measured' 1 2 3 4 5 6) -cne
-        ' cost_model=owned-exclusive-wall-v1 cost_status=measured lexical_ms=1 native_ms=2 enumeration_ms=3 read_ms=4 sha_ms=5 other_ms=6' -or
-    (Get-HostPreflightCostMessage 'measured' 185000 1 0 0 0 0) -cne $costUnavailable) { throw 'failure_context' }
+        ' cost_model=owned-exclusive-wall-900s-v2 cost_status=measured lexical_ms=1 native_ms=2 enumeration_ms=3 read_ms=4 sha_ms=5 other_ms=6' -or
+    (Get-HostPreflightCostMessage 'measured' 905000 1 0 0 0 0) -cne $costUnavailable) { throw 'failure_context' }
 foreach ($bad in @($null, '', 'MEASURED', 'owned-other-v2', "private`npath token", [pscustomobject]@{ private = 'unexported' })) {
     if ((Get-HostPreflightCostMessage $bad 0 0 0 0 0 0) -cne $costUnavailable) { throw 'failure_context' }
 }
-foreach ($bad in @($null, -1, 185001, [long]1, [uint64]1, '1', [pscustomobject]@{ private = 'unexported' })) {
+foreach ($bad in @($null, -1, 905001, [long]1, [uint64]1, '1', [pscustomobject]@{ private = 'unexported' })) {
     if ((Get-HostPreflightCostMessage 'measured' $bad 0 0 0 0 0) -cne $costUnavailable -or
         (Get-HostPreflightCostMessage 'measured' 0 $bad 0 0 0 0) -cne $costUnavailable -or
         (Get-HostPreflightCostMessage 'measured' 0 0 $bad 0 0 0) -cne $costUnavailable -or
@@ -1428,7 +1445,7 @@ try {
     $budgetOrder = @('deadline', 'entries', 'bytes', 'handles', 'metadata')
     try {
         for ($first = 0; $first -lt $budgetOrder.Count; $first++) {
-            $values = @{ Seconds = $(if ($first -eq 0) { -1 } else { 180 }) }
+            $values = @{ Seconds = $(if ($first -eq 0) { -1 } else { 900 }) }
             if ($first -ge 1) { $values.Entries = $(if ($first -eq 1) { -1 } else { 200000 }) }
             if ($first -ge 2) { $values.TotalBytes = $(if ($first -eq 2) { 0 } else { 68719476736 }) }
             if ($first -ge 3) { $values.Handles = $(if ($first -eq 3) { -1 } else { 200256 }) }
@@ -1462,7 +1479,7 @@ try {
         try {
             $status = $ownedHashInvoker.Invoke($hashInput, $hash, $script:HostBuffer, $copied,
                 @{ initial = @{ bytes = [uint64]($payload.Length + $difference) } }, $script:HostWatch,
-                [long[]]@(180, 0, 200000, 0, 200256, 0, 31457280), [uint64]0, [uint64]68719476736, $hashSize)
+                [long[]]@(900, 0, 200000, 0, 200256, 0, 31457280), [uint64]0, [uint64]68719476736, $hashSize)
             if ($difference -eq 0) {
                 if ($status -ne 0 -or $hashSize[0] -ne $payload.Length -or
                     $hashInput.Position -ne $payload.Length -or $copied.Length -ne $payload.Length -or
@@ -1471,7 +1488,7 @@ try {
         } finally { $hashInput.Dispose(); $hash.Dispose(); $copied.Dispose() }
     }
     foreach ($first in @(1, 2, 3, 4, 5)) {
-        $budget = [long[]]@(180, 0, 200000, 0, 200256, 0, 31457280)
+        $budget = [long[]]@(900, 0, 200000, 0, 200256, 0, 31457280)
         $currentBytes = [uint64]0
         if ($first -le 1) { $budget[0] = -1 }
         if ($first -le 2) { $budget[1] = 200001 }
@@ -1628,7 +1645,7 @@ try {
         $hashSize = [uint64[]]::new(1)
         try {
             if ($ownedHashInvoker.Invoke($hashInput, $hash, $script:HostBuffer, $copied,
-                $shadowRecord, $script:HostWatch, [long[]]@(180, 0, 200000, 0, 200256, 0, 31457280),
+                $shadowRecord, $script:HostWatch, [long[]]@(900, 0, 200000, 0, 200256, 0, 31457280),
                 [uint64]0, [uint64]68719476736, $hashSize) -ne 7 -or
                 $hashInput.Position -ne 0 -or $script:HashRecordGetterCount -ne 0 -or
                 $copied.Length -ne 0 -or $hashSize[0] -ne 0 -or $null -ne $hash.Hash) { throw 'hash' }
@@ -2128,6 +2145,15 @@ try {
         if ($null -ne $denied -or $script:HostHandles.Count -ne 0 -or
             [Convert]::ToHexString($script:HostInfoScratch) -cne ('00' * 52)) { throw 'identity' }
     }
+    # The former 180-second policy and caller-expanded deadlines cannot admit
+    # this fixed policy, even with all authentic owner/native slots intact.
+    foreach ($unsupportedSeconds in @(180, 901)) {
+        $script:HostLimits.Seconds = $unsupportedSeconds
+        try {
+            if ($null -ne (New-HostOwnedTraversal) -or $script:HostHandles.Count -ne 0 -or
+                [Convert]::ToHexString($script:HostInfoScratch) -cne ('00' * 52)) { throw 'identity' }
+        } finally { $script:HostLimits.Seconds = 900 }
+    }
     $completeReader = New-HostOwnedTraversal
     if ($null -eq $completeReader) { throw 'identity' }
     # Compiler source is fixed. These are the exact production lexical checks,
@@ -2207,12 +2233,12 @@ try {
     $costTotal = 0
     foreach ($cost in @($script:HostCostLexicalMs, $script:HostCostNativeMs, $script:HostCostEnumerationMs,
         $script:HostCostReadMs, $script:HostCostShaMs, $script:HostCostOtherMs)) {
-        if ($cost -isnot [int] -or $cost -lt 0 -or $cost -gt 185000) { throw 'failure_context' }
+        if ($cost -isnot [int] -or $cost -lt 0 -or $cost -gt 905000) { throw 'failure_context' }
         $costTotal += $cost
     }
-    if ($costTotal -gt 185000) { throw 'failure_context' }
+    if ($costTotal -gt 905000) { throw 'failure_context' }
     $costLine = Get-HostPreflightCostMessage $script:HostCostStatus $script:HostCostLexicalMs $script:HostCostNativeMs $script:HostCostEnumerationMs $script:HostCostReadMs $script:HostCostShaMs $script:HostCostOtherMs
-    if ($costLine -notmatch '^ cost_model=owned-exclusive-wall-v1 cost_status=measured lexical_ms=[0-9]{1,6} native_ms=[0-9]{1,6} enumeration_ms=[0-9]{1,6} read_ms=[0-9]{1,6} sha_ms=[0-9]{1,6} other_ms=[0-9]{1,6}$') { throw 'failure_context' }
+    if ($costLine -notmatch '^ cost_model=owned-exclusive-wall-900s-v2 cost_status=measured lexical_ms=[0-9]{1,6} native_ms=[0-9]{1,6} enumeration_ms=[0-9]{1,6} read_ms=[0-9]{1,6} sha_ms=[0-9]{1,6} other_ms=[0-9]{1,6}$') { throw 'failure_context' }
     $completeTool = @($completeResult.files | Where-Object { $_.path -eq 'tool.bin' })
     if ($completeTool.Count -ne 1 -or $completeTool[0].bytes -ne 4 -or
         $completeTool[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
@@ -2221,7 +2247,8 @@ try {
     $receiptProbe = [ordered]@{ roots = @($completeResult); build_ready = $false;
         host_approval_granted = $false; distribution_ready = $false }
     $ownedReceipt = Set-HostInventoryImplementation $receiptProbe 'owned-managed-transaction-v1'
-    if ($ownedReceipt.schema -cne 'morpheus-native-windows-host-toolchain-inventory-v2' -or
+    if ($ownedReceipt.schema -cne 'morpheus-native-windows-host-toolchain-inventory-v3' -or
+        $ownedReceipt.inventory_policy -cne 'complete-host-inventory-900s-v1' -or
         $ownedReceipt.preflight_implementation -cne 'owned-managed-transaction-v1' -or
         $ownedReceipt.preflight_compiler -cne 'powershell-bundled-roslyn-in-process-v1' -or
         $ownedReceipt.vcvars_or_compilers_executed -ne $true -or
@@ -2333,9 +2360,9 @@ $variantRead = @'
             else read = stream.ReadAsync(buffer, 0, buffer.Length, payloadCancellation.Token);
 '@
 $variant = $variant.Replace('            Task<int> read = stream.ReadAsync(buffer, 0, buffer.Length, payloadCancellation.Token);', $variantRead)
-# Only this fixture variant shortens its synthetic wait. Production180seconds
-# and5000mscleanup remain fixed, and the actual normal case above uses them.
-$variant = $variant.Replace('            double remaining = 180 - Watch.Elapsed.TotalSeconds;', '            double remaining = .2 - fixtureClock.Elapsed.TotalSeconds;')
+# Only this fixture variant shortens its synthetic wait. Production 900 seconds
+# and 5000ms cleanup remain fixed, and the actual normal case above uses them.
+$variant = $variant.Replace('            double remaining = 900 - Watch.Elapsed.TotalSeconds;', '            double remaining = .2 - fixtureClock.Elapsed.TotalSeconds;')
 $variant = $variant.Replace('            if (readAheadBuffer == null) readAheadBuffer = new byte[1048576];', '            fixtureClock = Stopwatch.StartNew();' + "`n" + '            if (readAheadBuffer == null) readAheadBuffer = new byte[1048576];')
 $variant = $variant.Replace('read.Wait(5000)', 'read.Wait(50)')
 . ([ScriptBlock]::Create($variant))
@@ -2416,7 +2443,7 @@ $rangeVariant = $rangeVariant.Replace('        private bool unjoinedPayloadRead;
 $rangeVariant = $rangeVariant.Replace('int count = ReadWorkerRange(slot);', 'int count = FixtureRead(slot);')
 # Only the stalled TEST-ONLY variant shortens its clock and aggregate join.
 $rangeVariant = $rangeVariant.Replace('                    payloadWorkerReserved = true;', '                fixtureRangeClock = Stopwatch.StartNew();' + "`n" + '                    payloadWorkerReserved = true;')
-$rangeVariant = $rangeVariant.Replace('double remaining = 180 - Watch.Elapsed.TotalSeconds;', 'double remaining = fixtureMode == 2 ? .2 - fixtureRangeClock.Elapsed.TotalSeconds : 180 - Watch.Elapsed.TotalSeconds;')
+$rangeVariant = $rangeVariant.Replace('double remaining = 900 - Watch.Elapsed.TotalSeconds;', 'double remaining = fixtureMode == 2 ? .2 - fixtureRangeClock.Elapsed.TotalSeconds : 900 - Watch.Elapsed.TotalSeconds;')
 $rangeVariant = $rangeVariant.Replace('5000 - Math.Min(5000, cleanup.ElapsedMilliseconds)', '50 - Math.Min(50, cleanup.ElapsedMilliseconds)')
 . ([ScriptBlock]::Create($rangeVariant))
 $rangeReader = $null
@@ -2497,7 +2524,8 @@ try {
             $script:HostManagedTraversalRoots -ne 0) { throw 'inventory' }
         $fallbackReceipt = Set-HostInventoryImplementation ([ordered]@{ roots = @($oldResult);
             build_ready = $false; host_approval_granted = $false; distribution_ready = $false }) 'powershell-original-fallback-v1'
-        if ($fallbackReceipt.schema -cne 'morpheus-native-windows-host-toolchain-inventory-v2' -or
+        if ($fallbackReceipt.schema -cne 'morpheus-native-windows-host-toolchain-inventory-v3' -or
+            $fallbackReceipt.inventory_policy -cne 'complete-host-inventory-900s-v1' -or
             $fallbackReceipt.preflight_implementation -cne 'powershell-original-fallback-v1' -or
             $fallbackReceipt.preflight_compiler -cne 'powershell-bundled-roslyn-in-process-v1' -or
             $fallbackReceipt.vcvars_or_compilers_executed -ne $true -or
