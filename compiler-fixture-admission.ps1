@@ -474,7 +474,7 @@ try {
     foreach ($record in $records) { Budget; Same-Identity $record.handle $record.identity }
     foreach ($record in $directories.Values) { Budget; Same-Identity $record.handle $record.identity }
     $output = [ordered]@{ schema = 'morpheus-reviewed-windows-compiler-fixture-admission-v1';
-        candidate_source = '4accb00f9d8b96f2e5ef95ccece2b883670e32af';
+        candidate_source = 'b43f5f42d8498ee7c26cb53245347affb421a2f5';
         compiler_input_manifest_sha256 = $manifestSha; powershell_version = $psVersion;
         framework = $framework; compiler_tool_files = 474; fixture_passed = $true;
         fixture_compiler_invoked = $true; wrapper_compilation_invoked = $false;
