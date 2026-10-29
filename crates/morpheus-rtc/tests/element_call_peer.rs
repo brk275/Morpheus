@@ -18,8 +18,8 @@ use futures_util::StreamExt;
 use matrix_sdk::{Client, ruma::api::client::uiaa};
 use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
 use morpheus_rtc::{
-    AudioFrame, CallOptions, I420Buffer, InteropMode, MediaStreamKind, Publication, RemoteTrackHandle,
-    RtcService, VideoFrame, VideoRotation,
+    AudioFrame, CallOptions, I420Buffer, InteropMode, MediaStreamKind, Publication,
+    RemoteTrackHandle, RtcService, VideoFrame, VideoRotation,
 };
 use serde::Deserialize;
 use tokio::time::{sleep, timeout};
@@ -493,11 +493,7 @@ async fn rejoin_media(
                 Some(bottom) => {
                     let top = b.data_y[(height / 4) * stride + width / 2];
                     let lower = b.data_y[(height * 3 / 4) * stride + width / 2];
-                    if bottom {
-                        (lower, top)
-                    } else {
-                        (top, lower)
-                    }
+                    if bottom { (lower, top) } else { (top, lower) }
                 }
                 None => (
                     b.data_y[(height / 2) * stride + width / 4],
@@ -562,7 +558,9 @@ async fn same_device_rejoin(
                 .expect("Old rejoin camera cryptor missing");
         let old_microphone = old_tone.pause().await;
         let old_camera = old_picture.pause().await;
-        late.leave(room).await.expect("Rejoin baseline leave failed");
+        late.leave(room)
+            .await
+            .expect("Rejoin baseline leave failed");
         assert!(late.call(room).is_none());
         assert!(!old_microphone.is_active() && !old_camera.is_active());
         assert!(matches!(

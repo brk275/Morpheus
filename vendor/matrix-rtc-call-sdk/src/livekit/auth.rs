@@ -4,12 +4,12 @@
 //! One immutable auth contract and terminal admission latch for one call.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use matrix_rtc_core::{JoinedMembership, RtcTransport};
-use matrix_rtc_transport::{OwnMemberClaims, livekit::LiveKitAuthDialect};
 use matrix_rtc_transport::keys::KeyGeneration;
+use matrix_rtc_transport::{OwnMemberClaims, livekit::LiveKitAuthDialect};
 use tokio::sync::watch;
 
 use crate::engine::{CallAdmission, EngineHandle};
@@ -459,7 +459,11 @@ mod tests {
             guard.map("@bob:example.org", "BOB", "shared", Some(&[])),
             None
         );
-        assert!(!guard.on_core_snapshot(&[member("@mallory:example.org", Some("MALLORY"), "shared")]));
+        assert!(!guard.on_core_snapshot(&[member(
+            "@mallory:example.org",
+            Some("MALLORY"),
+            "shared"
+        )]));
         assert!(!guard.active.load(Ordering::Acquire));
         let present = self::guard();
         let replacement = member("@mallory:example.org", Some("MALLORY"), "shared");
@@ -564,7 +568,12 @@ mod tests {
         assert!(guard.member_lease(identity, "second").is_none());
         assert!(old.active.load(Ordering::Acquire));
         assert_eq!(
-            guard.map("@bob:example.org", "BOB", "second", Some(std::slice::from_ref(&second))),
+            guard.map(
+                "@bob:example.org",
+                "BOB",
+                "second",
+                Some(std::slice::from_ref(&second))
+            ),
             None
         );
         assert!(old.active.load(Ordering::Acquire));
@@ -573,8 +582,14 @@ mod tests {
         assert!(!old.active.load(Ordering::Acquire));
         tx.send(Vec::new()).unwrap();
         assert_eq!(guard.map("@bob:example.org", "BOB", "second", None), None);
-        assert_eq!(guard.map("@bob:example.org", "BOB", "second", Some(&[])), None);
-        assert_eq!(guard.map("@bob:example.org", "BOB", "first", Some(&[first])), None);
+        assert_eq!(
+            guard.map("@bob:example.org", "BOB", "second", Some(&[])),
+            None
+        );
+        assert_eq!(
+            guard.map("@bob:example.org", "BOB", "first", Some(&[first])),
+            None
+        );
         assert!(current.active.load(Ordering::Acquire));
         assert!(guard.member_lease(identity, "second").is_some());
     }
@@ -615,10 +630,19 @@ mod tests {
         assert!(Arc::ptr_eq(&old.serial, &new.serial));
         assert!(new.active.load(Ordering::Acquire));
         assert!(guard.active.load(Ordering::Acquire));
-        assert_eq!(guard.map("@bob:example.org", "BOB", "bob", Some(&[replacement])), None);
+        assert_eq!(
+            guard.map("@bob:example.org", "BOB", "bob", Some(&[replacement])),
+            None
+        );
         assert!(guard.admit(std::slice::from_ref(&bob)));
-        assert_eq!(guard.map("@bob:example.org", "BOB", "bob", Some(&[bob])), None);
-        assert_eq!(guard.map("@bob:example.org", "BOB", "replacement", Some(&[])), None);
+        assert_eq!(
+            guard.map("@bob:example.org", "BOB", "bob", Some(&[bob])),
+            None
+        );
+        assert_eq!(
+            guard.map("@bob:example.org", "BOB", "replacement", Some(&[])),
+            None
+        );
         assert!(!old.active.load(Ordering::Acquire));
         assert!(new.active.load(Ordering::Acquire));
         assert!(guard.member_lease(identity, "bob").is_none());
@@ -635,8 +659,15 @@ mod tests {
         assert!(!guard.include_member(&ghost));
         assert!(guard.on_core_snapshot(&[second, ghost.clone()]));
         assert!(!old.active.load(Ordering::Acquire));
-        assert!(guard.member_lease("@bob:example.org:BOB", "second").is_some());
-        assert_eq!(guard.map("@alice:example.org", "ALICE", "old-alice", Some(&[ghost])), None);
+        assert!(
+            guard
+                .member_lease("@bob:example.org:BOB", "second")
+                .is_some()
+        );
+        assert_eq!(
+            guard.map("@alice:example.org", "ALICE", "old-alice", Some(&[ghost])),
+            None
+        );
         assert!(guard.active.load(Ordering::Acquire));
     }
 

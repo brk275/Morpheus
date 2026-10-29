@@ -1948,18 +1948,28 @@ mod peer_renewal_tests {
                 let watched = self.watched.borrow();
                 self.seen.lock().unwrap().push((
                     members.as_ptr() as usize,
-                    members.iter().map(|member| member.member_id.clone()).collect(),
-                    watched.iter().map(|member| member.member_id.clone()).collect(),
+                    members
+                        .iter()
+                        .map(|member| member.member_id.clone())
+                        .collect(),
+                    watched
+                        .iter()
+                        .map(|member| member.member_id.clone())
+                        .collect(),
                 ));
             }
         }
         let backend = Arc::new(MockBackend::new());
         let mut session = session(backend);
         join(&mut session, "own-generation").await;
-        session.set_current_state([RtcMembershipEvent::Joined(peer("before"))]).await;
+        session
+            .set_current_state([RtcMembershipEvent::Joined(peer("before"))])
+            .await;
         let watched = session.subscribe_membership_snapshots();
         let early_view = watched.borrow().clone();
-        session.set_current_state([RtcMembershipEvent::Joined(peer("current"))]).await;
+        session
+            .set_current_state([RtcMembershipEvent::Joined(peer("current"))])
+            .await;
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         assert!(session.set_encryption_signal_handler(Arc::new(Handler {
             watched,
@@ -1970,7 +1980,9 @@ mod peer_renewal_tests {
         assert_eq!(initial[0].0, session.members.as_ptr() as usize);
         assert_eq!(initial[0].1, vec!["current"]);
         assert_eq!(early_view[0].member_id, "before");
-        session.set_current_state([RtcMembershipEvent::Joined(peer("next"))]).await;
+        session
+            .set_current_state([RtcMembershipEvent::Joined(peer("next"))])
+            .await;
         let observed = seen.lock().unwrap();
         assert_eq!(observed.len(), 2);
         assert_eq!(observed[1].1, vec!["next"]);

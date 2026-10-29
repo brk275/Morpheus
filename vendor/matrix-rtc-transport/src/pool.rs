@@ -632,7 +632,8 @@ impl MediaPool {
         key_index: u8,
         active: Arc<AtomicBool>,
     ) -> Vec<PoolEvent> {
-        self.member_pending_keys.retain(|_, (lease, _)| lease.load(Ordering::Acquire));
+        self.member_pending_keys
+            .retain(|_, (lease, _)| lease.load(Ordering::Acquire));
         if !active.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -646,10 +647,16 @@ impl MediaPool {
         }
         if self.identity_map.get(&identity) == Some(&member_id) {
             let mut events = std::mem::take(&mut self.out);
-            events.push(PoolEvent::KeyImported { member_id, identity, key_index });
+            events.push(PoolEvent::KeyImported {
+                member_id,
+                identity,
+                key_index,
+            });
             return events;
         }
-        let pending = self.member_pending_keys.entry((identity, member_id))
+        let pending = self
+            .member_pending_keys
+            .entry((identity, member_id))
             .or_insert_with(|| (Arc::clone(&active), Vec::new()));
         if !Arc::ptr_eq(&pending.0, &active) {
             *pending = (active, Vec::new());
@@ -878,14 +885,18 @@ impl MediaPool {
                 });
             }
         }
-        self.member_pending_keys.retain(|_, (lease, _)| lease.load(Ordering::Acquire));
-        if let Some((active, indices)) = self.member_pending_keys
+        self.member_pending_keys
+            .retain(|_, (lease, _)| lease.load(Ordering::Acquire));
+        if let Some((active, indices)) = self
+            .member_pending_keys
             .remove(&(identity.clone(), member_id.to_owned()))
             && active.load(Ordering::Acquire)
         {
             for key_index in indices {
                 self.out.push(PoolEvent::KeyImported {
-                    member_id: member_id.to_owned(), identity: identity.clone(), key_index,
+                    member_id: member_id.to_owned(),
+                    identity: identity.clone(),
+                    key_index,
                 });
             }
         }
@@ -900,8 +911,8 @@ impl MediaPool {
 
     fn forget_member(&mut self, member_id: &str) {
         self.known_members.remove(member_id);
-        self.member_pending_keys.retain(|(_, member), (lease, _)|
-            member != member_id && lease.load(Ordering::Acquire));
+        self.member_pending_keys
+            .retain(|(_, member), (lease, _)| member != member_id && lease.load(Ordering::Acquire));
         let identity = self.member_identities.remove(member_id);
         // A stale key index could otherwise resurface against the identity.
         if let Some(identity) = &identity {

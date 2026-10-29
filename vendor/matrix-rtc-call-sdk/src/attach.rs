@@ -221,7 +221,10 @@ where
     if admission.is_some() {
         key_handler.set_guarded_key_import_listener(Box::new(move |key, member, active| {
             engine_handle.notify_member_key_imported(
-                key.rtc_backend_identity.clone(), member.to_owned(), key.key_index, active,
+                key.rtc_backend_identity.clone(),
+                member.to_owned(),
+                key.key_index,
+                active,
             );
         }));
     } else {

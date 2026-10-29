@@ -316,7 +316,11 @@ impl MediaKeyHandler {
 
     /// The latest recorded key for a participant identity, if any.
     pub fn key_for(&self, rtc_backend_identity: &str) -> Option<ParticipantKey> {
-        if self.admission.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
+        if self
+            .admission
+            .as_ref()
+            .is_some_and(|active| !active.load(Ordering::Acquire))
+        {
             return None;
         }
         self.keys
@@ -329,7 +333,11 @@ impl MediaKeyHandler {
 
     /// A snapshot of every recorded key.
     pub fn keys(&self) -> Vec<ParticipantKey> {
-        if self.admission.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
+        if self
+            .admission
+            .as_ref()
+            .is_some_and(|active| !active.load(Ordering::Acquire))
+        {
             return Vec::new();
         }
         self.keys
@@ -436,15 +444,13 @@ impl MediaKeyHandler {
             }
         }
 
-        keys.lock()
-            .expect("key handler mutex poisoned")
-            .insert(
-                key.rtc_backend_identity.clone(),
-                StoredParticipantKey {
-                    key: key.clone(),
-                    generation: generation.map(|lease| Arc::clone(&lease.active)),
-                },
-            );
+        keys.lock().expect("key handler mutex poisoned").insert(
+            key.rtc_backend_identity.clone(),
+            StoredParticipantKey {
+                key: key.clone(),
+                generation: generation.map(|lease| Arc::clone(&lease.active)),
+            },
+        );
         if let Some(generation) = generation
             && let Some(listener) = guarded_listener
                 .lock()
@@ -567,7 +573,6 @@ impl MediaKeyHandler {
         )
         .await;
     }
-
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -694,40 +699,69 @@ mod tests {
             release: tokio::sync::Notify::new(),
             imports: Mutex::new(Vec::new()),
         });
-        let handler = Arc::new(MediaKeyHandler::with_ring(ring.clone())
-            .with_call_admission(Arc::new(AtomicBool::new(true)))
-            .with_member_admission(Arc::new(move |alias, member| {
-                let current = admitted.lock().unwrap();
-                (alias == "peer" && member == current.0).then(|| current.1.clone())
-            })));
+        let handler = Arc::new(
+            MediaKeyHandler::with_ring(ring.clone())
+                .with_call_admission(Arc::new(AtomicBool::new(true)))
+                .with_member_admission(Arc::new(move |alias, member| {
+                    let current = admitted.lock().unwrap();
+                    (alias == "peer" && member == current.0).then(|| current.1.clone())
+                })),
+        );
         let notices = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&notices);
         handler.set_guarded_key_import_listener(Box::new(move |key, member, active| {
             if active.load(Ordering::Acquire) {
-                observed.lock().unwrap().push((member.to_owned(), key.key[0]));
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((member.to_owned(), key.key[0]));
             }
         }));
         let first = Arc::clone(&handler);
         let old_import = tokio::spawn(async move {
-            first.on_new_key_material_for_member(KeyMaterialSignal {
-                key: vec![1], key_index: 0, rtc_backend_identity: "peer".into(), use_after_ms: 0,
-            }, "old").await;
+            first
+                .on_new_key_material_for_member(
+                    KeyMaterialSignal {
+                        key: vec![1],
+                        key_index: 0,
+                        rtc_backend_identity: "peer".into(),
+                        use_after_ms: 0,
+                    },
+                    "old",
+                )
+                .await;
         });
-        tokio::time::timeout(Duration::from_secs(5), ring.entered.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), ring.entered.notified())
+            .await
+            .unwrap();
         old.active.store(false, Ordering::Release);
         *current.lock().unwrap() = ("new".into(), new);
         let second = Arc::clone(&handler);
         let new_import = tokio::spawn(async move {
-            second.on_new_key_material_for_member(KeyMaterialSignal {
-                key: vec![2], key_index: 0, rtc_backend_identity: "peer".into(), use_after_ms: 0,
-            }, "new").await;
+            second
+                .on_new_key_material_for_member(
+                    KeyMaterialSignal {
+                        key: vec![2],
+                        key_index: 0,
+                        rtc_backend_identity: "peer".into(),
+                        use_after_ms: 0,
+                    },
+                    "new",
+                )
+                .await;
         });
         tokio::task::yield_now().await;
         assert!(!new_import.is_finished());
         assert!(ring.imports.lock().unwrap().is_empty());
         ring.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), old_import).await.unwrap().unwrap();
-        tokio::time::timeout(Duration::from_secs(5), new_import).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), old_import)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), new_import)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(*ring.imports.lock().unwrap(), vec![1, 2]);
         assert_eq!(handler.key_for("peer").unwrap().key, vec![2]);
         assert_eq!(*notices.lock().unwrap(), vec![("new".to_owned(), 2)]);
@@ -761,19 +795,34 @@ mod tests {
                 (alias == "peer" && member == current.0).then(|| current.1.clone())
             }));
         let signal = |byte, delay| KeyMaterialSignal {
-            key: vec![byte], key_index: 0, rtc_backend_identity: "peer".into(), use_after_ms: delay,
+            key: vec![byte],
+            key_index: 0,
+            rtc_backend_identity: "peer".into(),
+            use_after_ms: delay,
         };
-        handler.on_new_key_material_for_member(signal(1, 0), "old").await;
-        handler.on_new_key_material_for_member(signal(3, 5_000), "old").await;
+        handler
+            .on_new_key_material_for_member(signal(1, 0), "old")
+            .await;
+        handler
+            .on_new_key_material_for_member(signal(3, 5_000), "old")
+            .await;
         assert_eq!(handler.key_for("peer").unwrap().key, vec![1]);
         old.active.store(false, Ordering::Release);
-        *current.lock().unwrap() = ("new".into(), KeyGeneration {
-            active: Arc::new(AtomicBool::new(true)), serial,
-        });
+        *current.lock().unwrap() = (
+            "new".into(),
+            KeyGeneration {
+                active: Arc::new(AtomicBool::new(true)),
+                serial,
+            },
+        );
         assert!(handler.key_for("peer").is_none());
         assert!(handler.keys().is_empty());
-        handler.on_new_key_material_for_member(signal(2, 0), "new").await;
-        handler.on_new_key_material_for_member(signal(8, 0), "old").await;
+        handler
+            .on_new_key_material_for_member(signal(2, 0), "new")
+            .await;
+        handler
+            .on_new_key_material_for_member(signal(8, 0), "old")
+            .await;
         handler.on_new_key_material(signal(9, 0)).await;
         tokio::time::sleep(Duration::from_millis(5_100)).await;
         assert_eq!(*imports.lock().unwrap(), vec![1, 2]);

@@ -238,8 +238,9 @@ mod credential_policy_tests {
     #[tokio::test]
     async fn custom_slot_never_falls_through_to_legacy_room_credentials() {
         let backend = matrix_rtc_core::testing::MockBackend::new();
-        *backend.openid_response.lock().unwrap() =
-            Err(matrix_rtc_core::BackendError::new("synthetic OpenID refusal"));
+        *backend.openid_response.lock().unwrap() = Err(matrix_rtc_core::BackendError::new(
+            "synthetic OpenID refusal",
+        ));
         let mut config = LiveKitTransportConfig {
             livekit_service_url: "https://rtc.example.org".into(),
             room_id: "!test:example.org".into(),
@@ -281,8 +282,9 @@ mod credential_policy_tests {
         // The zero-call assertion proves endpoint validation precedes OpenID.
         // Own and remote transports invoke acquire_token through connect_e2ee.
         let backend = matrix_rtc_core::testing::MockBackend::new();
-        *backend.openid_response.lock().unwrap() =
-            Err(matrix_rtc_core::BackendError::new("synthetic OpenID refusal"));
+        *backend.openid_response.lock().unwrap() = Err(matrix_rtc_core::BackendError::new(
+            "synthetic OpenID refusal",
+        ));
         for service in [
             "http://remote.example.org",
             "https://user:secret@remote.example.org",

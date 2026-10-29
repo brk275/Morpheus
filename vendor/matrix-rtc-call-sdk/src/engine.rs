@@ -247,7 +247,10 @@ impl EngineHandle {
         active: Arc<AtomicBool>,
     ) {
         let _ = self.messages.send(ActorMessage::MemberKeyImported {
-            identity, member_id, key_index, active,
+            identity,
+            member_id,
+            key_index,
+            active,
         });
     }
 }
@@ -873,8 +876,15 @@ impl Actor {
                 let events = self.pool.key_imported(identity, key_index);
                 self.apply_pool_events(events);
             }
-            ActorMessage::MemberKeyImported { identity, member_id, key_index, active } => {
-                let events = self.pool.member_key_imported(identity, member_id, key_index, active);
+            ActorMessage::MemberKeyImported {
+                identity,
+                member_id,
+                key_index,
+                active,
+            } => {
+                let events = self
+                    .pool
+                    .member_key_imported(identity, member_id, key_index, active);
                 self.apply_pool_events(events);
             }
             ActorMessage::KeyDiscarded(report) => {
@@ -4061,19 +4071,31 @@ mod tests {
     #[tokio::test]
     async fn excluded_stale_own_members_never_reach_roster_or_peer_connections() {
         let active = Arc::new(AtomicBool::new(true));
-        let fx = unsubscribed_fixture_guarded(StabilityConfig::default(), Some(CallAdmission {
-            active,
-            check: Arc::new(|_| true),
-            include: Arc::new(|member| member.member_id != "old-own"),
-            bind: Arc::new(|_| {}),
-        }));
-        fx.memberships.send(vec![
-            member("own", "@alice:example.org"),
-            member_on("old-own", "@alice:example.org", PEER_FOCUS),
-        ]).unwrap();
+        let fx = unsubscribed_fixture_guarded(
+            StabilityConfig::default(),
+            Some(CallAdmission {
+                active,
+                check: Arc::new(|_| true),
+                include: Arc::new(|member| member.member_id != "old-own"),
+                bind: Arc::new(|_| {}),
+            }),
+        );
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member_on("old-own", "@alice:example.org", PEER_FOCUS),
+            ])
+            .unwrap();
         wait_until(|| fx.engine.participants().len() == 1).await;
         assert_eq!(fx.engine.participants()[0].member_id, "own");
-        assert!(!fx.state.connects.lock().unwrap().iter().any(|key| key == PEER_FOCUS));
+        assert!(
+            !fx.state
+                .connects
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|key| key == PEER_FOCUS)
+        );
         fx.engine.shutdown().await;
     }
 

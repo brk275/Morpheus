@@ -3710,8 +3710,13 @@ mod tests {
         let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
         let source = Arc::clone(&memberships);
         let mut manager = EncryptionManager::new(
-            Arc::new(NoopBackend), USER_ID.into(), DEVICE_ID.into(), MEMBER_ID.into(),
-            ROOM_ID.into(), SLOT_ID.into(), move || source.lock().unwrap().clone(),
+            Arc::new(NoopBackend),
+            USER_ID.into(),
+            DEVICE_ID.into(),
+            MEMBER_ID.into(),
+            ROOM_ID.into(),
+            SLOT_ID.into(),
+            move || source.lock().unwrap().clone(),
         );
         let handler = Arc::new(RecordingHandler::default());
         manager.set_signal_handler(handler.clone());
@@ -3730,8 +3735,14 @@ mod tests {
         key.member_id = "bob-next".into();
         manager.receive_key(key).await.unwrap();
         manager.replay_keys_to_handler().await;
-        assert_eq!(*handler.members.lock().unwrap(), vec!["bob-next", "bob-next"]);
-        assert_eq!(manager.get_inbound_keys("bob-device456-uuid")[0].key, vec![1; 32]);
+        assert_eq!(
+            *handler.members.lock().unwrap(),
+            vec!["bob-next", "bob-next"]
+        );
+        assert_eq!(
+            manager.get_inbound_keys("bob-device456-uuid")[0].key,
+            vec![1; 32]
+        );
         assert_eq!(manager.get_inbound_keys("bob-next")[0].key, vec![2; 32]);
     }
 
