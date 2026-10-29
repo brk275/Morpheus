@@ -292,6 +292,9 @@ fn apply_error_presentation(shown: &mut PeerVerificationView, action: Action, er
     }
     if matches!(action, Action::Request(_)) {
         shown.stage = 0;
+        shown.detail = "".into();
+        shown.emoji = "".into();
+        shown.decimals = "".into();
     }
 }
 
@@ -1016,6 +1019,46 @@ mod tests {
             // and comparison payload are withdrawn, never another flow opened.
             assert_eq!(shown.peer.as_str(), "@casey:example.org");
             assert_eq!(shown.room.as_str(), "!comparison:example.org");
+        }
+        // An outgoing request can fail before any comparison exists. Return
+        // to idle with the request error, never a confirmation outcome or SAS.
+        for error in [
+            Error::Gone,
+            Error::Unsupported,
+            Error::Unavailable,
+            Error::TimedOut,
+            Error::Unknown,
+            Error::RequestUncertain,
+        ] {
+            let mut requesting = PeerVerificationView {
+                stage: 6,
+                peer: "@casey:example.org".into(),
+                room: "!comparison:example.org".into(),
+                detail: "Send one SAS request to this exact person?".into(),
+                emoji: "old comparison".into(),
+                decimals: "1000 - 2000 - 3000".into(),
+                ..Default::default()
+            };
+            apply_error_presentation(&mut requesting, Action::Request(false), error);
+            assert_eq!(requesting.stage, 0);
+            assert!(requesting.detail.is_empty());
+            assert!(requesting.emoji.is_empty() && requesting.decimals.is_empty());
+            assert_eq!(requesting.error.as_str(), fixed_error(error));
+            assert_eq!(
+                requesting.uncertain,
+                matches!(error, Error::Unknown | Error::RequestUncertain)
+            );
+            assert_eq!(requesting.peer.as_str(), "@casey:example.org");
+            assert_eq!(requesting.room.as_str(), "!comparison:example.org");
+            // A retained completion cannot leak into the idle request error.
+            requesting.stage = 5;
+            requesting.detail = outcome_text(Outcome::IdentityVerified).into();
+            requesting.emoji = "old comparison".into();
+            apply_error_presentation(&mut requesting, Action::Request(false), error);
+            assert_eq!(requesting.stage, 0);
+            assert!(requesting.detail.is_empty());
+            assert!(requesting.emoji.is_empty() && requesting.decimals.is_empty());
+            assert_eq!(requesting.error.as_str(), fixed_error(error));
         }
         // A transient failure while comparing does not fabricate a terminal
         // outcome. A lost or unsupported flow does withdraw those values.
