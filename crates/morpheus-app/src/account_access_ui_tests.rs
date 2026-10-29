@@ -3497,9 +3497,14 @@ async fn assert_appearance_workspace_and_search(
     ui.set_security_busy(false);
     settle(ui).await;
     for (index, target) in registry::SETTING_TARGETS.iter().enumerate() {
-        ui.set_manage_accounts_open(false);
+        // Only an open account dialog needs a close/focus barrier before the
+        // next destination. The revealed ID is observation-only, so clearing
+        // it does not need a separate full UI settle on every registry row.
+        if ui.get_manage_accounts_open() {
+            ui.set_manage_accounts_open(false);
+            settle(ui).await;
+        }
         ui.set_settings_revealed_id("".into());
-        settle(ui).await;
         let requested = crate::settings_search::reveal(ui, target.id);
         if !requested {
             // Fixed registry position and availability only; never emit account
@@ -4108,13 +4113,11 @@ async fn assert_appearance_workspace_and_search(
     } else {
         format!(" In config.toml: {}.", last.key)
     };
-    let row = control_with_label(
-        ui,
-        &format!(
-            "{}, {}. {}{key_note}",
-            last.label, last.breadcrumb, last.description
-        ),
+    let result_label = format!(
+        "{}, {}. {}{key_note}",
+        last.label, last.breadcrumb, last.description
     );
+    let row = control_with_label(ui, &result_label);
     let top = row.map_to_window(row.geometry().origin).y;
     let bottom = top + row.geometry().size.height;
     assert!(
@@ -4130,6 +4133,66 @@ async fn assert_appearance_workspace_and_search(
         last.id.to_string()
     };
     assert_eq!(ui.get_settings_revealed_id(), expected.as_str());
+
+    // The result list is unmounted after choosing. Returning must reveal
+    // the retained eighth row without another arrow, query edit or setting edit.
+    let query_before_back = ui.get_settings_search_query();
+    let color_before_back = ui.get_color_selected_id();
+    let scope_before_back = ui.get_color_scope();
+    let file_before_back = std::fs::read_to_string(store.path()).unwrap();
+    assert!(ui.get_settings_search_dismissed());
+    click_control_once(ui, &format!("Back to the results for {query_before_back}"));
+    settle(ui).await;
+    assert!(!ui.get_settings_search_dismissed());
+    assert_eq!(ui.get_settings_search_query(), query_before_back);
+    assert_eq!(
+        ui.get_settings_search_index(),
+        registry::MAX_SEARCH_RESULTS as i32 - 1
+    );
+    assert!(focused_control_has_label(ui, "Search settings"));
+    assert_eq!(ui.get_settings_revealed_id(), expected.as_str());
+    assert_eq!(ui.get_color_selected_id(), color_before_back);
+    assert_eq!(ui.get_color_scope(), scope_before_back);
+    // Inspect the new row and its actual clipping viewport, not the retired
+    // row handle or merely the outer window's larger bounds.
+    let returned_row = control_with_label(ui, &result_label);
+    let returned_bounds = item_bounds(&returned_row);
+    let mut result_viewports = Vec::new();
+    for node in geometry_nodes(ui) {
+        if node
+            .downcast::<slint::private_unstable_api::re_exports::Flickable>()
+            .is_none()
+        {
+            continue;
+        }
+        let contains_row = node
+            .visit_descendants(|item| {
+                if item == &returned_row {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            })
+            .is_some();
+        if contains_row {
+            result_viewports.push(item_bounds(&node));
+        }
+    }
+    assert_eq!(
+        result_viewports.len(),
+        1,
+        "one actual Settings results viewport"
+    );
+    let viewport = result_viewports[0];
+    assert!(
+        returned_bounds.top >= viewport.top - 0.5
+            && returned_bounds.bottom <= viewport.bottom + 0.5,
+        "returning leaves the selected result outside its viewport: {returned_bounds:?}, {viewport:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.path()).unwrap(),
+        file_before_back
+    );
 
     ui.set_manage_accounts_open(false);
     ui.set_update_can_check(false);
