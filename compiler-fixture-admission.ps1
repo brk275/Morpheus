@@ -359,7 +359,7 @@ try {
     Write-Output '{"compiler_metadata_phase":"guards","status":"started"}'
     Need ($env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted' -and
         $env:GITHUB_REPOSITORY -ceq 'brk275/Morpheus' -and $env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch' -and
-        $env:GITHUB_REF -ceq 'refs/heads/codex/windows-owned-sequential-worker-fixture-20261029' -and
+        $env:GITHUB_REF -ceq 'refs/heads/codex/windows-complete-host-inventory-policy-fixture-20261029' -and
         $env:GITHUB_ACTOR -ceq 'brk275' -and $env:GITHUB_TRIGGERING_ACTOR -ceq 'brk275' -and
         $env:RUNNER_OS -ceq 'Windows' -and $env:RUNNER_ARCH -ceq 'X64')
     Write-Output '{"compiler_metadata_phase":"hooks","status":"started"}'
