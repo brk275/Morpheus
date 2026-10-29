@@ -16,6 +16,8 @@ import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import run_element_acceptance as target
+import modified_sender_peer as modified
+import run_matrix_acceptance as matrix
 
 
 class EvidenceTests(unittest.TestCase):
@@ -591,6 +593,191 @@ class OwnedProcessTests(unittest.TestCase):
                         if current == descendant_start:
                             os.kill(descendant, signal.SIGKILL)
 
+
+class ModifiedPeerAssetsTests(unittest.TestCase):
+    def make_assets(self, folder, *, variant="renewal44"):
+        root = Path(folder) / "modified-peer"
+        root.mkdir(mode=0o700)
+        dist = root / "dist"
+        dist.mkdir(mode=0o700)
+        (dist / "index.html").write_bytes(b"synthetic app")
+        (dist / "config.json").write_bytes(b"")
+        receipt = {"schema": 1, "classification": "MODIFIED_PEER", "variant": variant,
+                   "proposal_applied": variant == "renewal44", "element_revision": modified.ELEMENT_REVISION,
+                   "sdk_revision": modified.SDK_REVISION, "proposal_sha256": modified.PROPOSAL_SHA256,
+                   "element_lock_sha256": modified.ELEMENT_LOCK_SHA256, "builder_source_sha256": "0" * 64,
+                   "assets": [{"path": name, "bytes": (dist / name).stat().st_size,
+                               "sha256": hashlib.sha256((dist / name).read_bytes()).hexdigest()}
+                              for name in ("index.html", "config.json")]}
+        return root, receipt
+
+    def seal(self, root, receipt):
+        raw = json.dumps(receipt, sort_keys=True).encode()
+        (root / "build-receipt.json").write_bytes(raw)
+        return hashlib.sha256(raw).hexdigest()
+
+    def test_exact_receipt_and_full_owned_tree_are_required(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root, receipt = self.make_assets(folder)
+            digest = self.seal(root, receipt)
+            self.assertEqual(modified.verify_modified_assets(root, digest, variant="renewal44"), root / "dist")
+            with self.assertRaises(RuntimeError):
+                modified.verify_modified_assets(root, "f" * 64, variant="renewal44")
+            (root / "dist/index.html").write_bytes(b"changed")
+            with self.assertRaises(RuntimeError):
+                modified.verify_modified_assets(root, digest, variant="renewal44")
+
+    def test_wrong_proposal_and_path_escape_are_rejected_even_with_matching_receipt_hash(self):
+        for field in ("proposal", "path"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as folder:
+                root, receipt = self.make_assets(folder)
+                if field == "proposal":
+                    receipt["proposal_sha256"] = "f" * 64
+                else:
+                    receipt["assets"][0]["path"] = "../outside"
+                digest = self.seal(root, receipt)
+                with self.assertRaises(RuntimeError):
+                    modified.verify_modified_assets(root, digest, variant="renewal44")
+
+    def test_symlinks_hardlinks_and_unlisted_files_are_rejected(self):
+        for kind in ("symlink", "hardlink", "unlisted"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as folder:
+                root, receipt = self.make_assets(folder)
+                digest = self.seal(root, receipt)
+                path = root / "dist/index.html"
+                if kind == "unlisted":
+                    (root / "dist/unlisted").write_bytes(b"extra")
+                else:
+                    outside = Path(folder) / "outside"
+                    outside.write_bytes(path.read_bytes())
+                    path.unlink()
+                    if kind == "symlink":
+                        path.symlink_to(outside)
+                    else:
+                        os.link(outside, path)
+                with self.assertRaises(RuntimeError):
+                    modified.verify_modified_assets(root, digest, variant="renewal44")
+
+    def test_compressed_configuration_cannot_shadow_owned_loopback_configuration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root, receipt = self.make_assets(folder)
+            (root / "dist/config.json.gz").write_bytes(b"not a configuration")
+            receipt["assets"].append({"path": "config.json.gz", "bytes": 19,
+                                      "sha256": hashlib.sha256(b"not a configuration").hexdigest()})
+            digest = self.seal(root, receipt)
+            with self.assertRaises(RuntimeError):
+                modified.verify_modified_assets(root, digest, variant="renewal44")
+
+    def test_modified_labels_cannot_satisfy_official_stock_evidence(self):
+        output = "\n".join(f"MORPHEUS_MODIFIED_PEER_CHECK {name}=true" for name in target.CHECKS)
+        self.assertEqual(target.evidence(output), {})
+        with self.assertRaises(RuntimeError):
+            target.evidence(output, complete=True)
+
+    def test_both_closed_variants_require_their_own_matching_receipts(self):
+        for variant in ("baseline44", "renewal44"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as folder:
+                root, receipt = self.make_assets(folder, variant=variant)
+                digest = self.seal(root, receipt)
+                self.assertEqual(modified.verify_modified_assets(root, digest, variant=variant), root / "dist")
+                wrong = "renewal44" if variant == "baseline44" else "baseline44"
+                with self.assertRaises(RuntimeError):
+                    modified.verify_modified_assets(root, digest, variant=wrong)
+
+    def test_variant_and_applied_flag_cannot_be_forged_even_with_new_receipt_hash(self):
+        cases = (("variant", "stock44"), ("variant", None), ("variant", "baseline44"),
+                 ("proposal_applied", False), ("proposal_applied", 1),
+                 ("proposal_applied", "true"), ("proposal_applied", None))
+        for field, value in cases:
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as folder:
+                root, receipt = self.make_assets(folder)
+                receipt[field] = value
+                digest = self.seal(root, receipt)
+                with self.assertRaises(RuntimeError):
+                    modified.verify_modified_assets(root, digest, variant="renewal44")
+        with tempfile.TemporaryDirectory() as folder:
+            root, receipt = self.make_assets(folder)
+            digest = self.seal(root, receipt)
+            with self.assertRaises(RuntimeError):
+                modified.verify_modified_assets(root, digest, variant="stock44")
+
+    def test_receipt_schema_is_exact_integer_and_duplicate_fields_are_rejected(self):
+        for schema in (True, 1.0):
+            with self.subTest(schema=schema), tempfile.TemporaryDirectory() as folder:
+                root, receipt = self.make_assets(folder)
+                receipt["schema"] = schema
+                digest = self.seal(root, receipt)
+                with self.assertRaises(RuntimeError):
+                    modified.verify_modified_assets(root, digest, variant="renewal44")
+        for field in ("variant", "proposal_sha256", "schema", "asset_path"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as folder:
+                root, receipt = self.make_assets(folder)
+                raw = json.dumps(receipt, sort_keys=True)
+                if field == "asset_path":
+                    needle = '"path": "index.html"'
+                    replacement = '"path": "outside", "path": "index.html"'
+                else:
+                    needle = json.dumps(field) + ": " + json.dumps(receipt[field])
+                    replacement = needle + ", " + needle
+                self.assertEqual(raw.count(needle), 1)
+                raw = raw.replace(needle, replacement).encode()
+                (root / "build-receipt.json").write_bytes(raw)
+                digest = hashlib.sha256(raw).hexdigest()
+                with self.assertRaises(RuntimeError):
+                    modified.verify_modified_assets(root, digest, variant="renewal44")
+
+    def test_actual_default_stock_route_rejects_mixed_controlled_markers(self):
+        acceptance = matrix.Acceptance.__new__(matrix.Acceptance)
+        acceptance.suite = "element-interop"
+        acceptance.modified_sender_manifest_sha256 = None
+        acceptance.modified_sender_variant = None
+        facts = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in sorted(target.CHECKS))
+        def record(output):
+            return acceptance.validated_record(matrix.ELEMENT_LABEL, output, test=False,
+                                               ring_case=None, oauth_checks=None, element_checks=True)
+        self.assertEqual(record(facts)["element_checks"], {name: True for name in target.CHECKS})
+        for marker in ("MORPHEUS_MODIFIED_PEER_CHECK native_roster=true",
+                       "MORPHEUS_MODIFIED_PEER_RESULT official_stock_acceptance=false beta_ready=false"):
+            with self.subTest(marker=marker), self.assertRaises(RuntimeError):
+                record(facts + "\n" + marker)
+        self.assertEqual(record(facts)["element_checks"], {name: True for name in target.CHECKS})
+
+    def test_actual_modified_route_requires_exact_label_result_and_all_facts_for_both_variants(self):
+        result_marker = "MORPHEUS_MODIFIED_PEER_RESULT official_stock_acceptance=false beta_ready=false"
+        names = sorted(target.CHECKS)
+        self.assertEqual(len(names), 24)
+        facts = [f"MORPHEUS_MODIFIED_PEER_CHECK {name}=true" for name in names]
+        complete = "\n".join([*facts, result_marker])
+        for variant in ("baseline44", "renewal44"):
+            with self.subTest(variant=variant):
+                acceptance = matrix.Acceptance.__new__(matrix.Acceptance)
+                acceptance.suite = "element-interop"
+                acceptance.modified_sender_manifest_sha256 = "f" * 64
+                acceptance.modified_sender_variant = variant
+                def record(output, label=matrix.MODIFIED_ELEMENT_LABEL):
+                    return acceptance.validated_record(label, output, test=False, ring_case=None,
+                                                       oauth_checks=None, element_checks=True)
+                accepted = record(complete)
+                self.assertEqual(accepted["classification"], "MODIFIED_PEER")
+                self.assertEqual(accepted["modified_sender_variant"], variant)
+                self.assertEqual(accepted["modified_sender_manifest_sha256"], "f" * 64)
+                self.assertEqual(accepted["modified_peer_checks"], {name: True for name in names})
+                self.assertIs(accepted["official_stock_acceptance"], False)
+                self.assertIs(accepted["beta_ready"], False)
+                self.assertNotIn("element_checks", accepted)
+                rejected = (
+                    ("wrong_label", complete, matrix.ELEMENT_LABEL),
+                    ("mixed_stock", complete + "\nMORPHEUS_ELEMENT_CHECK native_roster=true", matrix.MODIFIED_ELEMENT_LABEL),
+                    ("missing_result", "\n".join(facts), matrix.MODIFIED_ELEMENT_LABEL),
+                    ("duplicate_result", complete + "\n" + result_marker, matrix.MODIFIED_ELEMENT_LABEL),
+                    ("incomplete_facts", "\n".join([*facts[1:], result_marker]), matrix.MODIFIED_ELEMENT_LABEL),
+                    ("false_fact", "\n".join([facts[0].removesuffix("true") + "false", *facts[1:], result_marker]), matrix.MODIFIED_ELEMENT_LABEL),
+                )
+                for case, output, label in rejected:
+                    with self.subTest(variant=variant, case=case), self.assertRaises(RuntimeError):
+                        record(output, label)
+                self.assertIs(record(complete)["official_stock_acceptance"], False)
+                self.assertIs(record(complete)["beta_ready"], False)
 
 if __name__ == "__main__":
     unittest.main()

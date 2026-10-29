@@ -515,7 +515,7 @@ class Runner:
                 native_output.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n"))
 
 
-def execute(root: Path, fixture: Path, gitleaks: str):
+def execute(root: Path, fixture: Path, gitleaks: str, *, modified_sender_manifest_sha256: str | None = None, modified_sender_variant: str | None = None):
     if sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_OS") != "Linux":
         raise RuntimeError("configuration")
     if "MORPHEUS_ELEMENT_DIAG_REFRESH" in os.environ:
@@ -525,6 +525,12 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     if not fixture.is_file() or fixture.stat().st_mode & 0o077:
         raise RuntimeError("configuration")
     root = private_directory(root)
+    if (modified_sender_manifest_sha256 is None) != (modified_sender_variant is None):
+        raise RuntimeError("configuration")
+    modified_assets = None
+    if modified_sender_manifest_sha256 is not None:
+        from modified_sender_peer import verify_modified_assets
+        modified_assets = verify_modified_assets(root / "modified-peer", modified_sender_manifest_sha256, variant=modified_sender_variant)
     runner = Runner(root, gitleaks)
     failure = None
     failed_stage = "configuration"
@@ -546,7 +552,9 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         built = runner.command(["cargo", "test", "--locked", "-p", "morpheus-rtc", "--features", "native-devices",
                                 "--test", "element_call_peer", "--no-run", "--message-format=json"], seconds=600)
         binary = native_executable(built)
-        peer = runner.service(lambda: up(root / "service"))
+        peer = runner.service(lambda: up(root / "service", modified_assets=modified_assets))
+        if (peer.get("modified_peer_assets") is True) is not (modified_assets is not None):
+            raise RuntimeError("evidence")
         if peer.get("official_image_identity_verified") is not True:
             raise RuntimeError("evidence")
         write_private(runner.logs / "image.log", "MORPHEUS_ELEMENT_CHECK official_image=true\n", create=True)
@@ -603,8 +611,11 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         except BaseException:
             failure = "fixture_operation"
             output, native_output, facts = "", "", {}
+    prefix = "MORPHEUS_ELEMENT_CHECK" if modified_assets is None else "MORPHEUS_MODIFIED_PEER_CHECK"
     for key, value in sorted(facts.items()):
-        print(f"MORPHEUS_ELEMENT_CHECK {key}={str(value).lower()}", flush=True)
+        print(f"{prefix} {key}={str(value).lower()}", flush=True)
+    if modified_assets is not None:
+        print("MORPHEUS_MODIFIED_PEER_RESULT official_stock_acceptance=false beta_ready=false", flush=True)
     if children_joined and cleanup_failure is None:
         if scan_complete and failure == "native_acceptance":
             if (roster := group_roster_receipt(native_output)) is not None:
@@ -625,7 +636,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         print("MORPHEUS_ELEMENT_FAILURE " + failure, flush=True)
         raise RuntimeError(failure)
     runner.mark("complete")
-    return facts
+    return facts if modified_assets is None else {"MODIFIED_PEER": True, "official_stock_acceptance": False, "checks": facts}
 
 
 def main():
@@ -633,6 +644,8 @@ def main():
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--fixture", required=True, type=Path)
     parser.add_argument("--gitleaks", required=True)
+    parser.add_argument("--modified-sender-manifest-sha256")
+    parser.add_argument("--modified-sender-variant", choices=("baseline44", "renewal44"))
     args = parser.parse_args()
     # The outer acceptance runner has a longer watchdog and also calls down.
     # A graceful cancellation still lets this process kill its owned groups.
@@ -642,7 +655,9 @@ def main():
     signal.signal(signal.SIGINT, interrupted)
     signal.signal(signal.SIGALRM, interrupted)
     signal.alarm(1_740)
-    execute(args.root, args.fixture, args.gitleaks)
+    execute(args.root, args.fixture, args.gitleaks,
+            modified_sender_manifest_sha256=args.modified_sender_manifest_sha256,
+            modified_sender_variant=args.modified_sender_variant)
 
 
 if __name__ == "__main__":

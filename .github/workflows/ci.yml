@@ -1,4 +1,4 @@
-name: Held current official Element44 interoperability
+name: Held controlled SDK44 source-build pair
 
 # TEMPORARY DIAGNOSTIC BRANCH ONLY. NEVER MERGE.
 on:
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: official-element44-${{ github.sha }}
+  group: controlled-element44-pair-${{ github.sha }}
   cancel-in-progress: false
 
 env:
@@ -24,10 +24,10 @@ env:
 
 jobs:
   compile:
-    name: Official Element44 and existing Linux call case (partial)
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'brk275/Morpheus' && github.event.repository.private == false && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.ref == 'refs/heads/codex/verify-official44-group-roster-20261029' && inputs.candidate_sha == github.sha
+    name: CONTROLLED SDK44 baseline and renewal (not stock acceptance)
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'brk275/Morpheus' && github.event.repository.private == false && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.ref == 'refs/heads/codex/diagnostic-controlled44-sender-pair-20261029' && inputs.candidate_sha == github.sha
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 360
     concurrency:
       group: native-${{ github.sha }}-ubuntu-24.04
       cancel-in-progress: false
@@ -46,7 +46,7 @@ jobs:
           root = pathlib.Path.cwd()
           assert os.environ['GITHUB_REPOSITORY'] == 'brk275/Morpheus'
           assert os.environ['GITHUB_ACTOR'] == os.environ['GITHUB_TRIGGERING_ACTOR'] == 'brk275'
-          assert os.environ['GITHUB_REF'] == 'refs/heads/codex/verify-official44-group-roster-20261029'
+          assert os.environ['GITHUB_REF'] == 'refs/heads/codex/diagnostic-controlled44-sender-pair-20261029'
           assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted' and os.environ['RUNNER_OS'] == 'Linux'
           revision = os.environ['EXPECTED_CANDIDATE']
           assert re.fullmatch('[0-9a-f]{40}', revision) and revision == os.environ['GITHUB_SHA']
@@ -58,12 +58,12 @@ jobs:
                   '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null', *args],
                   env=env, check=True, capture_output=True, timeout=90).stdout
           assert git('rev-parse', 'HEAD').decode().strip() == revision
-          control = {'.github/workflows/ci.yml', 'scripts/current-stock44-source.json'}
-          path = root / 'scripts/current-stock44-source.json'
+          control = {'.github/workflows/ci.yml', 'scripts/controlled44-source.json'}
+          path = root / 'scripts/controlled44-source.json'
           info = path.lstat()
           assert stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= 1024 * 1024
           raw = path.read_bytes()
-          assert hashlib.sha256(raw).hexdigest() == 'b644c3a40c360047f2d058012f8197aeacf20cb3c038c8afacfc8b766da9b606'
+          assert hashlib.sha256(raw).hexdigest() == '87f8af84deae6333243565e7328c23ba8bd23d3be91485b03afcfcb070a26466'
           manifest = json.loads(raw)
           assert manifest['excluded_control_paths'] == sorted(control)
           expected = manifest['tree_entries']
@@ -98,7 +98,7 @@ jobs:
                   dirs.remove('.git')
               for name in files + [name for name in dirs if (pathlib.Path(directory) / name).is_symlink()]:
                   assert str((pathlib.Path(directory) / name).relative_to(root)) in actual
-          trusted = pathlib.Path(os.environ['RUNNER_TEMP']) / 'morpheus-official44-trusted-control'
+          trusted = pathlib.Path(os.environ['RUNNER_TEMP']) / 'morpheus-controlled44-trusted-control'
           trusted.mkdir(mode=0o700)
           for name, digest in (
               ('scan_history.py', 'dcd5d9a2dfafaf50adb63f294eba982778b67dade562def4e0e32bf38941285c'),
@@ -108,7 +108,7 @@ jobs:
               with (trusted / name).open('xb') as out:
                   os.fchmod(out.fileno(), 0o600)
                   out.write(data)
-          print('OFFICIAL_STOCK44_SOURCE_BOUND beta_ready=false')
+          print('CONTROLLED44_SOURCE_BOUND beta_ready=false')
       - name: Install exact scanner and scan full committed history
         timeout-minutes: 10
         shell: bash
@@ -123,16 +123,14 @@ jobs:
           mkdir "$RUNNER_TEMP/gitleaks"
           tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
           echo "88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509  $RUNNER_TEMP/gitleaks/gitleaks" | sha256sum --check --status
-          python3 -I -B "$RUNNER_TEMP/morpheus-official44-trusted-control/scan_history.py" \
+          python3 -I -B "$RUNNER_TEMP/morpheus-controlled44-trusted-control/scan_history.py" \
             --candidate "$PWD" --scanner "$RUNNER_TEMP/gitleaks/gitleaks" \
-            --manifest "$RUNNER_TEMP/morpheus-official44-trusted-control/public-fixtures.json" \
-            --evidence "$RUNNER_TEMP/morpheus-official44-history-scan"
-      - name: Existing stock image and mandatory predicate contracts
+            --manifest "$RUNNER_TEMP/morpheus-controlled44-trusted-control/public-fixtures.json" \
+            --evidence "$RUNNER_TEMP/morpheus-controlled44-history-scan"
+      - name: Existing controlled receipt and fixed predicate contracts
         timeout-minutes: 5
         run: |
-          python3 -I -B scripts/tests/test_element_peer_fixture.py -v
-          python3 -I -B scripts/tests/test_element_acceptance.py -v EvidenceTests.test_requires_every_fixed_assertion_and_preserves_failure EvidenceTests.test_observer_profiles_are_bound_to_exact_verified_sdk_and_image EvidenceTests.test_pinned_observer_binds_sdk44_wrappers_and_retains_legacy_raw_binding EvidenceTests.test_initial_native_failure_reduction_is_source_bound_and_closed EvidenceTests.test_native_failure_facts_follow_owned_cleanup_and_successful_scan EvidenceTests.test_native_group_stages_are_closed_ordered_and_bounded EvidenceTests.test_group_roster_failure_receipt_is_fixed_bounded_and_keeps_failure
-          python3 -I -B scripts/tests/test_matrix_acceptance.py -v FocusedSuiteTests.test_element_interop_requires_its_only_case_and_cannot_claim_full_acceptance
+          python3 -I -B scripts/tests/test_element_acceptance.py -v ModifiedPeerAssetsTests EvidenceTests.test_requires_every_fixed_assertion_and_preserves_failure EvidenceTests.test_group_roster_failure_receipt_is_fixed_bounded_and_keeps_failure
       - name: Linux native dependencies
         timeout-minutes: 20
         shell: bash
@@ -204,10 +202,128 @@ jobs:
           set -euo pipefail
           python3 scripts/build_linux_native.py --variant native \
             --prefix "$RUNNER_TEMP/morpheus-native-pipewire-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --github-env
-      - name: Encrypted call and same-device rejoin against official stock44
-        timeout-minutes: 55
-        shell: bash
+      - name: Sequential controlled source-built baseline and renewal with one native binary
+        timeout-minutes: 300
+        shell: /usr/bin/python3 -I -B {0}
         run: |
-          set -euo pipefail
-          dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
-            --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" --suite element-interop
+          import hashlib, json, os, pathlib, re, stat, sys, tempfile, types
+          root = pathlib.Path.cwd()
+          source = (root / 'scripts/sender_proposal_tools.py').read_bytes()
+          assert hashlib.sha256(source).hexdigest() == '8a249395957208e2876a3c55826bf1c427257e33fdc98a0ab444731ea0f18be0'
+          tools = types.ModuleType('reviewed_sender_tools')
+          exec(compile(source, 'reviewed_sender_tools', 'exec'), tools.__dict__)
+          sys.path.insert(0, str(root / 'scripts'))
+          from run_element_acceptance import native_executable, CHECKS
+          from modified_sender_peer import unique_object
+          assert len(CHECKS) == 24
+          assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted' and os.environ['RUNNER_OS'] == 'Linux'
+          assert os.environ['RUNNER_ARCH'] == 'X64'
+          temp = pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
+          scanner = temp / 'gitleaks/gitleaks'
+          assert hashlib.sha256(tools.regular(scanner, 64 * 1024 * 1024)).hexdigest() == '88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509'
+          logs = pathlib.Path(tempfile.mkdtemp(prefix='morpheus-controlled44-pair-logs-', dir=temp))
+          os.chmod(logs, 0o700)
+          tools.write(logs / 'scanner.toml', b'[extend]\nuseDefault = true\n')
+          tools.write(logs / 'scanner.ignore', b'')
+          keys = ('PATH', 'HOME', 'RUNNER_TEMP', 'RUNNER_OS', 'RUNNER_ARCH', 'RUNNER_ENVIRONMENT', 'ImageOS',
+                  'GITHUB_ACTIONS', 'GITHUB_REPOSITORY', 'GITHUB_ACTOR', 'GITHUB_TRIGGERING_ACTOR',
+                  'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'CARGO_HOME', 'RUSTUP_HOME', 'RUSTUP_TOOLCHAIN',
+                  'CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL', 'CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG',
+                  'MORPHEUS_PIPEWIRE_CLIENT_VARIANT', 'MORPHEUS_PIPEWIRE_CLIENT_RECEIPT')
+          env = {key: os.environ[key] for key in keys if key in os.environ}
+          env.update(CI='true', TZ='UTC', LANG='C.UTF-8', RUST_BACKTRACE='0')
+          # One actual native compile. Each unchanged acceptance helper subsequently runs
+          # its normal Cargo --no-run artifact query against the same warm target directory.
+          # No native-binary override or bypass is added; verify identical bytes after both.
+          tools.checked_command('native_binary', ['cargo', 'test', '--locked', '-p', 'morpheus-rtc',
+              '--features', 'native-devices', '--test', 'element_call_peer', '--no-run', '--message-format=json'],
+              root, env, logs, scanner, 1500)
+          binary = native_executable((logs / 'native_binary/job.log').read_text())
+          binary_sha = hashlib.sha256(tools.regular(binary, 512 * 1024 * 1024)).hexdigest()
+          roots = {}
+          receipts = {}
+          for variant in ('baseline44', 'renewal44'):
+              peer = temp / ('morpheus-modified-sender-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '-' + variant)
+              assert not peer.exists()
+              tools.checked_command('build_' + variant, [sys.executable, '-I', '-B',
+                  str(root / 'scripts/build_modified_sender_peer.py'), '--root', str(peer),
+                  '--scanner', str(scanner), '--variant', variant], root, env, logs, scanner, 3900)
+              lines = (logs / ('build_' + variant) / 'job.log').read_text().splitlines()
+              result = json.loads(lines[-1], object_pairs_hook=unique_object)
+              assert set(result) == {'classification', 'variant', 'manifest_sha256', 'official_stock_acceptance', 'beta_ready'}
+              assert result['classification'] == 'MODIFIED_PEER' and result['variant'] == variant
+              assert result['official_stock_acceptance'] is False and result['beta_ready'] is False
+              digest = result['manifest_sha256']
+              assert isinstance(digest, str) and re.fullmatch('[0-9a-f]{64}', digest)
+              raw = tools.regular(peer / 'element-interop/modified-peer/build-receipt.json', 2 * 1024 * 1024)
+              assert hashlib.sha256(raw).hexdigest() == digest
+              roots[variant] = peer
+              receipts[variant] = digest
+              print(json.dumps({'controlled_peer_build': variant, 'receipt_sha256': digest,
+                                'stock_interop': False, 'beta_ready': False}), flush=True)
+          
+          cleanup = ('local_matrix_rtc-down', 'local_matrix_env-down',
+                     'verify-fixture-container-cleanup', 'verify-fixture-network-cleanup')
+          initial = {name: True for name in ('browser_audio', 'browser_identity', 'browser_presynced',
+              'browser_roster', 'browser_video', 'native_audio', 'native_presynced_baseline',
+              'native_roster', 'native_video', 'official_image')}
+          roster = {name: True for name in ('alice_available', 'alice_count_is_3', 'alice_exactly_one_alice',
+              'alice_exactly_one_bob', 'alice_exactly_one_carol', 'carol_available', 'carol_exactly_one_alice',
+              'carol_exactly_one_carol')}
+          roster.update(carol_count_is_3=False, carol_exactly_one_bob=False)
+          for variant in ('baseline44', 'renewal44'):
+              label = 'case_' + variant
+              failed = False
+              try:
+                  tools.checked_command(label, ['dbus-run-session', '--', sys.executable, '-I', '-B',
+                      str(root / 'scripts/run_matrix_acceptance.py'), '--gitleaks', str(scanner),
+                      '--suite', 'element-interop', '--modified-sender-root', str(roots[variant]),
+                      '--modified-sender-manifest-sha256', receipts[variant], '--modified-sender-variant', variant],
+                      root, env, logs, scanner, 3300)
+              except RuntimeError:
+                  failed = True
+              # checked_command scans the complete bounded log before producing its report.
+              # A deadline/setup/scanner/cleanup failure cannot satisfy these exact predicates.
+              report = tools.regular(logs / (label + '-scan.json'), 1024 * 1024)
+              assert json.loads(report, object_pairs_hook=unique_object) == []
+              text = tools.regular(logs / label / 'job.log', 8 * 1024 * 1024).decode('utf-8', errors='replace')
+              records = []
+              for line in text.splitlines():
+                  if line.startswith('{'):
+                      item = json.loads(line, object_pairs_hook=unique_object)
+                      assert type(item) is dict
+                      records.append(item)
+              for name in cleanup:
+                  matches = [item for item in records if item.get('check') == name]
+                  assert len(matches) == 1 and matches[0].get('status') == 'passed'
+              matches = [item for item in records if item.get('check') == 'MODIFIED_PEER-controlled-sdk44']
+              assert len(matches) == 1
+              record = matches[0]
+              assert record.get('classification') == 'MODIFIED_PEER'
+              assert record.get('modified_sender_variant') == variant
+              assert record.get('modified_sender_manifest_sha256') == receipts[variant]
+              assert record.get('official_stock_acceptance') is False and record.get('beta_ready') is False
+              assert 'element_checks' not in record
+              if variant == 'baseline44':
+                  assert failed and record.get('modified_peer_checks') == initial
+                  assert record.get('element_diagnostics') == {'stage': 'browser_group_roster',
+                      'failure': 'native_acceptance', 'group_roster': roster, 'native_stage': 'group_roster',
+                      'native_reason': 'group_roster_convergence', 'native_exit': 'exit_nonzero'}
+              else:
+                  assert not failed and record.get('status') == 'passed'
+                  assert record.get('modified_peer_checks') == {name: True for name in CHECKS}
+              assert hashlib.sha256(tools.regular(binary, 512 * 1024 * 1024)).hexdigest() == binary_sha
+              # The normal helper retains fresh synthetic volumes. Use its existing
+              # destroy command for only this explicitly empty-before-start hosted case,
+              # preserving diagnostic logs and avoiding account/key reuse by the next case.
+              destroy_env = env | {'MORPHEUS_MATRIX_TEST_HOME': str(roots[variant])}
+              tools.checked_command('destroy_' + variant, [sys.executable, '-I', '-B',
+                  str(root / 'scripts/local_matrix_env.py'), 'destroy'], root, destroy_env, logs, scanner, 120)
+              tools.checked_command('volumes_absent_' + variant,
+                  ['docker', 'volume', 'ls', '--format', '{{.Name}}'], root, env, logs, scanner, 30)
+              volumes = (logs / ('volumes_absent_' + variant) / 'job.log').read_text().splitlines()
+              assert not set(volumes).intersection(('morpheus-synapse-a-data', 'morpheus-synapse-b-data'))
+              print(json.dumps({'controlled_case': variant, 'native_binary_sha256': binary_sha,
+                  'baseline_failure_reproduced': variant == 'baseline44',
+                  'renewal_all24_passed': variant == 'renewal44', 'stock_interop': False, 'beta_ready': False}), flush=True)
+          print('CONTROLLED_PAIR_RESULT baseline_failure_reproduced=true renewal_all24_passed=true stock_interop=false beta_ready=false', flush=True)
