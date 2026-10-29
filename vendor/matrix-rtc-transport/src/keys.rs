@@ -28,6 +28,7 @@
 // Modified by Morpheus: accepted-key sender adoption; see MORPHEUS_PATCH.md.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -167,6 +168,9 @@ pub struct MediaKeyHandler {
     /// Our own transport identity and how to re-index our sender; `None` until
     /// the room is connected. See [`LocalKeyIndexHook`].
     local_sender: Arc<Mutex<LocalSenderState>>,
+    /// A terminal call latch, shared by all live/replay/delayed activations.
+    /// None preserves the generic record-only handler's existing contract.
+    admission: Option<Arc<AtomicBool>>,
 }
 
 impl MediaKeyHandler {
@@ -183,6 +187,13 @@ impl MediaKeyHandler {
             ring: Some(ring),
             ..Self::default()
         }
+    }
+
+    /// Bind a fresh handler to one call. This latch can only close; a later
+    /// call must create a new handler and ring rather than reopen this one.
+    pub fn with_call_admission(mut self, admission: Arc<AtomicBool>) -> Self {
+        self.admission = Some(admission);
+        self
     }
 
     /// Register a callback observing every signalled key (e.g. to surface
@@ -232,6 +243,13 @@ impl MediaKeyHandler {
             .local_sender
             .lock()
             .expect("key handler local sender mutex poisoned");
+        if self
+            .admission
+            .as_ref()
+            .is_some_and(|active| !active.load(Ordering::Acquire))
+        {
+            return;
+        }
         let applied_index = state.applied_indices.get(&own_identity).copied();
         state.sender = Some((own_identity, hook));
         if let Some(index) = applied_index
@@ -271,8 +289,12 @@ impl MediaKeyHandler {
         keys: &Mutex<HashMap<String, ParticipantKey>>,
         listener: &Mutex<Option<KeyImportListener>>,
         local_sender: &Mutex<LocalSenderState>,
+        admission: Option<&Arc<AtomicBool>>,
         key: ParticipantKey,
     ) {
+        if admission.is_some_and(|active| !active.load(Ordering::Acquire)) {
+            return;
+        }
         // Whether the key ring refused this index. Our sender must not be moved
         // onto an index it holds no key for — that would make our media
         // undecryptable for everyone, rather than for the one peer whose key
@@ -310,6 +332,9 @@ impl MediaKeyHandler {
                 );
             }
         }
+        if admission.is_some_and(|active| !active.load(Ordering::Acquire)) {
+            return;
+        }
         // Our own key: also move the sender onto the new index. `set_key` alone
         // only fills the ring, so without this we would advertise the rotation
         // and keep stamping the previous index.
@@ -317,6 +342,9 @@ impl MediaKeyHandler {
             let mut state = local_sender
                 .lock()
                 .expect("key handler local sender mutex poisoned");
+            if admission.is_some_and(|active| !active.load(Ordering::Acquire)) {
+                return;
+            }
             state
                 .applied_indices
                 .insert(key.rtc_backend_identity.clone(), key.key_index);
@@ -361,6 +389,13 @@ impl EncryptionKeySignalHandler for MediaKeyHandler {
     /// `EncryptionConfig::delay_before_use_ms`, so keys signalled in index order
     /// get deadlines in the same order.
     async fn on_new_key_material(&self, signal: KeyMaterialSignal) {
+        if self
+            .admission
+            .as_ref()
+            .is_some_and(|active| !active.load(Ordering::Acquire))
+        {
+            return;
+        }
         let use_after_ms = signal.use_after_ms;
         let key = ParticipantKey::from(signal);
 
@@ -388,11 +423,26 @@ impl EncryptionKeySignalHandler for MediaKeyHandler {
             let listener = Arc::clone(&self.listener);
             let local_sender = Arc::clone(&self.local_sender);
             let switch_listener = Arc::clone(&self.switch_listener);
+            let admission = self.admission.clone();
             // Dropping the handle detaches the task; the delayed application
             // must survive the signalling call.
             rt::spawn(async move {
                 rt::sleep(Duration::from_millis(use_after_ms)).await;
-                Self::apply(ring.as_ref(), &keys, &listener, &local_sender, key).await;
+                Self::apply(
+                    ring.as_ref(),
+                    &keys,
+                    &listener,
+                    &local_sender,
+                    admission.as_ref(),
+                    key,
+                )
+                .await;
+                if admission
+                    .as_ref()
+                    .is_some_and(|active| !active.load(Ordering::Acquire))
+                {
+                    return;
+                }
 
                 // The window the core asked us to wait out has just closed, and this
                 // task is the only thing that knew when that would be. A rotation may
@@ -418,6 +468,7 @@ impl EncryptionKeySignalHandler for MediaKeyHandler {
             &self.keys,
             &self.listener,
             &self.local_sender,
+            self.admission.as_ref(),
             key,
         )
         .await;
@@ -474,6 +525,62 @@ mod tests {
             vec![0, 1],
             "the sender should follow every key of ours, in order"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retired_call_cannot_activate_delayed_keys_or_a_fresh_sender() {
+        struct Ring(Arc<Mutex<Vec<u8>>>);
+        #[async_trait]
+        impl FrameKeyRing for Ring {
+            fn ring_size(&self) -> u16 {
+                256
+            }
+            async fn set_key(&self, _identity: &str, index: u8, _key: Vec<u8>) -> bool {
+                self.0.lock().unwrap().push(index);
+                true
+            }
+        }
+        let active = Arc::new(AtomicBool::new(true));
+        let retired_imports = Arc::new(Mutex::new(Vec::new()));
+        let retired_switches = Arc::new(Mutex::new(Vec::new()));
+        let handler = MediaKeyHandler::with_ring(Arc::new(Ring(Arc::clone(&retired_imports))))
+            .with_call_admission(Arc::clone(&active));
+        let switches = Arc::clone(&retired_switches);
+        handler.set_local_sender(
+            "me",
+            Box::new(move |index| switches.lock().unwrap().push(index)),
+        );
+        handler
+            .on_new_key_material(KeyMaterialSignal {
+                key: vec![1; 4],
+                key_index: 2,
+                rtc_backend_identity: "me".into(),
+                use_after_ms: 5_000,
+            })
+            .await;
+        active.store(false, Ordering::Release);
+        let fresh_imports = Arc::new(Mutex::new(Vec::new()));
+        let fresh_switches = Arc::new(Mutex::new(Vec::new()));
+        let fresh = MediaKeyHandler::with_ring(Arc::new(Ring(Arc::clone(&fresh_imports))))
+            .with_call_admission(Arc::new(AtomicBool::new(true)));
+        let switches = Arc::clone(&fresh_switches);
+        fresh.set_local_sender(
+            "me",
+            Box::new(move |index| switches.lock().unwrap().push(index)),
+        );
+        fresh
+            .on_new_key_material(KeyMaterialSignal {
+                key: vec![3; 4],
+                key_index: 3,
+                rtc_backend_identity: "me".into(),
+                use_after_ms: 0,
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(5_100)).await;
+        assert!(retired_imports.lock().unwrap().is_empty());
+        assert!(retired_switches.lock().unwrap().is_empty());
+        assert_eq!(*fresh_imports.lock().unwrap(), vec![3]);
+        assert_eq!(*fresh_switches.lock().unwrap(), vec![3]);
     }
 
     /// A peer's key belongs in the ring so we can *decrypt* them; it says nothing

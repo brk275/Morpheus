@@ -87,6 +87,12 @@ impl RawRtcTransport {
     pub fn into_typed(self) -> RtcTransport {
         match self.transport_type.as_str() {
             "livekit" => {
+                if self.extra_fields.contains_key("url") {
+                    return RtcTransport::Unsupported(UnsupportedTransport {
+                        transport_type: self.transport_type,
+                        extra_fields: self.extra_fields,
+                    });
+                }
                 let url = self
                     .extra_fields
                     .get("livekit_service_url")
@@ -110,5 +116,33 @@ impl RawRtcTransport {
                 extra_fields: self.extra_fields,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn csapi_locator_and_mixed_dialects_never_become_openid_services() {
+        for value in [
+            json!({"type": "livekit", "url": "https://sfu.example.org"}),
+            json!({"type": "livekit", "url": "https://sfu.example.org", "livekit_service_url": "https://auth.example.org"}),
+            json!({"type": "livekit", "url": null, "livekit_service_url": "https://auth.example.org"}),
+        ] {
+            let raw: RawRtcTransport = serde_json::from_value(value).unwrap();
+            assert!(matches!(raw.into_typed(), RtcTransport::Unsupported(_)));
+        }
+        let raw: RawRtcTransport = serde_json::from_value(json!({
+            "type": "livekit", "livekit_service_url": "https://auth.example.org"
+        }))
+        .unwrap();
+        assert_eq!(
+            raw.into_typed(),
+            RtcTransport::LiveKit(LiveKitTransport {
+                livekit_service_url: "https://auth.example.org".into(),
+            })
+        );
     }
 }

@@ -537,6 +537,9 @@ jobs:
             pool::tests::first_poll_panic_remains_failed_but_later_real_intent_can_settle
             keys::tests::sender_registration_adopts_only_an_accepted_own_index
             keys::tests::registration_and_in_flight_acceptance_share_one_sender_order
+            keys::tests::retired_call_cannot_activate_delayed_keys_or_a_fresh_sender
+            livekit::auth_dialect_tests::legacy_auth_and_identity_are_one_contract
+            livekit::auth_dialect_tests::custom_slot_retains_explicit_direct_draft_contract
             pool::tests::a_member_returning_under_the_same_member_id_gets_their_media_back
             pool::tests::parked_media_is_not_restored_after_its_track_or_connection_retires
             pool::tests::retired_generation_events_cannot_refill_parked_media
