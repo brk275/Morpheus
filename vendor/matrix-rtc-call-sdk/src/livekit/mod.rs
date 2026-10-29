@@ -13,6 +13,7 @@
 //! two meet.
 
 mod attach;
+mod auth;
 #[cfg(feature = "matrix-sdk")]
 mod call;
 
