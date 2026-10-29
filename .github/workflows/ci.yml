@@ -215,6 +215,17 @@ jobs:
           sys.path.insert(0, str(root / 'scripts'))
           from run_element_acceptance import native_executable, CHECKS
           from modified_sender_peer import unique_object
+          # Isolated Python excludes script-directory imports. Add only this
+          # fully source-verified checkout's fixed scripts directory; keep -I.
+          bootstrap = (
+              "import pathlib,runpy,sys;directory=pathlib.Path(" + repr(str(root / 'scripts')) + ");"
+              "assert directory.is_absolute() and directory.resolve(strict=True)==directory;"
+              "entry=pathlib.Path(sys.argv[1]);"
+              "assert entry.parent==directory and entry.name in ('run_matrix_acceptance.py','local_matrix_env.py');"
+              "assert entry.is_file() and not entry.is_symlink();"
+              "sys.path.insert(0,str(directory));sys.argv=sys.argv[1:];"
+              "runpy.run_path(str(entry),run_name='__main__')"
+          )
           assert len(CHECKS) == 24
           assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted' and os.environ['RUNNER_OS'] == 'Linux'
           assert os.environ['RUNNER_ARCH'] == 'X64'
@@ -275,7 +286,7 @@ jobs:
               label = 'case_' + variant
               failed = False
               try:
-                  tools.checked_command(label, ['dbus-run-session', '--', sys.executable, '-I', '-B',
+                  tools.checked_command(label, ['dbus-run-session', '--', sys.executable, '-I', '-B', '-c', bootstrap,
                       str(root / 'scripts/run_matrix_acceptance.py'), '--gitleaks', str(scanner),
                       '--suite', 'element-interop', '--modified-sender-root', str(roots[variant]),
                       '--modified-sender-manifest-sha256', receipts[variant], '--modified-sender-variant', variant],
@@ -317,7 +328,7 @@ jobs:
               # destroy command for only this explicitly empty-before-start hosted case,
               # preserving diagnostic logs and avoiding account/key reuse by the next case.
               destroy_env = env | {'MORPHEUS_MATRIX_TEST_HOME': str(roots[variant])}
-              tools.checked_command('destroy_' + variant, [sys.executable, '-I', '-B',
+              tools.checked_command('destroy_' + variant, [sys.executable, '-I', '-B', '-c', bootstrap,
                   str(root / 'scripts/local_matrix_env.py'), 'destroy'], root, destroy_env, logs, scanner, 120)
               tools.checked_command('volumes_absent_' + variant,
                   ['docker', 'volume', 'ls', '--format', '{{.Name}}'], root, env, logs, scanner, 30)
