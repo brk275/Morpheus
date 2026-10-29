@@ -166,6 +166,84 @@ _PIPELINE_SPEC.loader.exec_module(_PIPELINE)
 
 
 class NativeLinuxStageConsumerTests(unittest.TestCase):
+    def compact_metadata_fixture(self):
+        roles = ("assembled", "core", "linux", "python", "instrumented", "control")
+        roots = {}
+        for index, role in enumerate(roles):
+            name = "morpheus-webrtc-" + (role if role in ("assembled", "control") else "tools") + "-" + f"{index:016x}"
+            rows = [{"path": "shared/deep/prefix/file-" + str(number), "bytes": 7,
+                     "sha256": "a" * 64, "mode": 0o600 if number % 2 else 0o755}
+                    for number in range(50)]
+            # A literal POSIX backslash is present in both code-pinned Linux sysroots.
+            rows.append({"path": r"lib/systemd/system/system-systemd\x2dcryptsetup.slice",
+                         "bytes": 7, "sha256": "a" * 64, "mode": 0o600})
+            roots[name] = {"role": role, "directories": [".", "lib", "lib/systemd", "lib/systemd/system",
+                                                        "shared", "shared/deep", "shared/deep/prefix"],
+                           "files": rows}
+        return {"schema": _PIPELINE.LINUX_BATCH_MEMBERS_SCHEMA, "roots": roots,
+                "pipeline_plan_sha256": "b" * 64, "source_commit": "c" * 40,
+                "source_run_id": "123", "source_run_attempt": "1", "gzip_members": [],
+                "xz_members": [], "batch_members": [], "build_admission_granted": False,
+                "native_sources_complete": False, "build_ready": False, "distribution_ready": False}
+
+    def test_compact_linux_metadata_fits_original_bound_and_restores_every_fact(self):
+        header = self.compact_metadata_fixture()
+        raw = _PIPELINE.encode_handoff_metadata(header)
+        verbose = (json.dumps(header, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        self.assertLess(len(raw), len(verbose) // 2)
+        wire = json.loads(raw)
+        self.assertEqual(wire["schema"], _PIPELINE.LINUX_COMPACT_SCHEMA)
+        self.assertEqual(len(wire["content_facts"]), 2)  # Exact mode remains part of each fact.
+        with mock.patch.object(_PIPELINE, "MAX_JSON", len(raw)):
+            self.assertEqual(_PIPELINE.decode_handoff_metadata(raw), header)
+            self.assertGreater(len(verbose), _PIPELINE.MAX_JSON)
+        with mock.patch.object(_PIPELINE, "MAX_JSON", len(raw) - 1):
+            with self.assertRaises(_PIPELINE.Refused):
+                _PIPELINE.decode_handoff_metadata(raw)
+        # All existing schemas retain their exact wire form, including Mac.
+        for schema in ("morpheus-native-linux-handoff-v1", _PIPELINE.LINUX_XZ_MEMBERS_SCHEMA,
+                       "morpheus-native-macos-handoff-v1"):
+            legacy = dict(header, schema=schema)
+            encoded = _PIPELINE.encode_handoff_metadata(legacy)
+            self.assertEqual(json.loads(encoded), legacy)
+            self.assertEqual(_PIPELINE.decode_handoff_metadata(encoded), legacy)
+
+    def test_compact_linux_metadata_refuses_malformed_references_and_resource_bombs(self):
+        raw = _PIPELINE.encode_handoff_metadata(self.compact_metadata_fixture())
+        original = json.loads(raw)
+        key = next(iter(original["roots"]))
+        for fault in ("forward_directory", "directory_bool", "directory_traversal", "directory_duplicate",
+                      "file_traversal", "file_duplicate", "file_directory", "file_parent", "fact_index", "fact_bool",
+                      "fact_hash", "fact_mode", "fact_duplicate", "fact_unused", "extra_root_field"):
+            wire = json.loads(raw); spec = wire["roots"][key]
+            if fault == "forward_directory": spec["directories"][1][0] = 1
+            elif fault == "directory_bool": spec["directories"][1][0] = True
+            elif fault == "directory_traversal": spec["directories"][1][1] = ".."
+            elif fault == "directory_duplicate": spec["directories"].append([0, "shared"])
+            elif fault == "file_traversal": spec["files"][0][1] = "../escape"
+            elif fault == "file_duplicate": spec["files"].append(spec["files"][0])
+            elif fault == "file_directory": spec["files"][0][:2] = [0, "shared"]
+            elif fault == "file_parent": spec["files"][0][0] = len(spec["directories"])
+            elif fault == "fact_index": spec["files"][0][2] = len(wire["content_facts"])
+            elif fault == "fact_bool": spec["files"][0][2] = True
+            elif fault == "fact_hash": wire["content_facts"][0][1] = "g" * 64
+            elif fault == "fact_mode": wire["content_facts"][0][2] = 0o777
+            elif fault == "fact_duplicate": wire["content_facts"].append(wire["content_facts"][0])
+            elif fault == "fact_unused": wire["content_facts"].append([0, "d" * 64, 0o600])
+            elif fault == "extra_root_field": spec["unexpected"] = 0
+            with self.subTest(fault=fault), self.assertRaises(_PIPELINE.Refused):
+                _PIPELINE.decode_handoff_metadata(json.dumps(wire).encode())
+        with self.assertRaises(_PIPELINE.Refused):
+            _PIPELINE.decode_handoff_metadata(raw.replace(b'"content_facts":', b'"content_facts":[],"content_facts":', 1))
+        for limit, maximum in (("MAX_MEMBERS", 10), ("MAX_EXPANDED", 10), ("MAX_METADATA_PATH_BYTES", 10)):
+            with self.subTest(limit=limit), mock.patch.object(_PIPELINE, limit, maximum), \
+                    self.assertRaises(_PIPELINE.Refused):
+                _PIPELINE.decode_handoff_metadata(raw)
+        wire = json.loads(raw)
+        wire["roots"][key]["directories"][1][1] = "x" * 4097
+        with self.assertRaises(_PIPELINE.Refused):
+            _PIPELINE.decode_handoff_metadata(json.dumps(wire).encode())
+
     @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA profiles")
     def test_actual_selected_linux_profile_passes_the_actual_stager_consumer(self):
         # Read the actual checked-in cohort and invoke only its DATA validator.
@@ -950,7 +1028,13 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
                 opaque_pack = b"PACK\0opaque original object-store DATA"
                 (provision / "objects").mkdir(mode=0o700)
                 (provision / "objects/001.git").mkdir(mode=0o700)
+                # Exact pinned POSIX spelling must survive v7 metadata and full restore.
+                for directory in ("lib", "lib/systemd", "lib/systemd/system"):
+                    (folders["linux"] / directory).mkdir(mode=0o700)
+                systemd_path = folders["linux"] / r"lib/systemd/system/system-systemd\x2dcryptsetup.slice"
+                systemd_body = b"synthetic systemd unit\n"
                 for path, body, mode in (
+                        (systemd_path, systemd_body, 0o644),
                         (provision / "checkout/source.data", checkout_body, 0o755),
                         (provision / "checkout/patched.data", postpatch_body, 0o600),
                         (provision / "objects/001.git/source.pack", opaque_pack, 0o600),
@@ -1054,7 +1138,9 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
                                for member in source]
                 self.assertEqual({row.name for row, _ in entries if row.isfile()},
                                  {"HANDOFF.json"} | (set(canonical.values()) - {canonical[value] for value in targets}))
-                restore_v5(packed)  # Same exact mode/inode/full-file assertions, now for v6 roots.
+                self.assertEqual(expected_files[systemd_path.relative_to(root).as_posix()],
+                                 (systemd_body, 0o644))
+                restore_v5(packed)  # Same exact mode/inode/full-file assertions, now for v7 wire metadata.
                 with self.assertRaises(_PIPELINE.Refused):
                     restore_v5(packed, mac_target="mac-arm64")
                 with self.assertRaises(_PIPELINE.Refused):

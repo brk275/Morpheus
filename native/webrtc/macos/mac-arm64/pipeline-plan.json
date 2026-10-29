@@ -160,7 +160,7 @@
     "path": "native/webrtc/macos/patch-manifest.json",
     "sha256": "b2ca5cb477a68c18f273b66ea310b387976a85305f667bc531ccb35a0950ed79"
   },
-  "pipeline_sha256": "4aa34ee2ce7d9439aed227e15943f38e92c95744b30f5ddeb39c902ffc51ecfc",
+  "pipeline_sha256": "4d6c1915aad2635d1e596bc86adb03b491153e3fe99f0e48e2c4ce33e58f33a6",
   "production_targets": [
     ":default",
     "api/audio_codecs:builtin_audio_decoder_factory",
