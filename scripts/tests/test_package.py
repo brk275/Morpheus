@@ -884,8 +884,11 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "actual Windows owned file/ACL primitive")
     def test_private_inherited_root_and_opened_handle_reject_hardlinks_and_live_writers(self):
         from scripts import native_notice_windows as windows
-        with tempfile.TemporaryDirectory() as temporary:
-            security = windows.security()
+        security = windows.security()
+        # The shared hosted TEMP ancestor can permit foreign writers. Exercise
+        # the real primitive beneath a parent accepted by its unchanged policy.
+        parent = security.path(Path.home().resolve(), directory=True)
+        with tempfile.TemporaryDirectory(dir=parent) as temporary:
             root = security.create_root(Path(temporary).resolve())
             target = root/"source.txt";target.write_bytes(b"fixed source data")
             security.path(root,directory=True,private=True)
