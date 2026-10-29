@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-// Morpheus modification: regress the production plain/simulcast encoding contract.
+// Morpheus modifications: preserve plain/simulcast encoding and serialize sender key activation.
 
 //! [`MediaTransport`] implementation for the MSC4195 LiveKit transport.
 //!
@@ -267,6 +267,24 @@ pub struct LiveKitTransportConnection {
     local_key_index: Arc<Mutex<Option<u8>>>,
 }
 
+// Select/update the cached index and apply it in one synchronous critical
+// section. Publication reassertion must not replay an old snapshot after a
+// concurrent delayed key activation has selected and applied its successor.
+fn apply_selected_local_key_index(
+    selected: &Mutex<Option<u8>>,
+    replacement: Option<u8>,
+    apply: impl FnOnce(u8),
+) {
+    let mut current = selected.lock().expect("local key index mutex poisoned");
+    if let Some(index) = replacement {
+        *current = Some(index);
+    }
+    if let Some(index) = *current {
+        apply(index);
+    }
+    drop(current);
+}
+
 impl LiveKitTransportConnection {
     /// The underlying session, for the `LiveKitCall` facade's transition-period raw
     /// accessors.
@@ -277,13 +295,9 @@ impl LiveKitTransportConnection {
     /// Re-assert the current index on our senders, for a track published after a
     /// rotation: its cryptor is new, and new cryptors start at index 0.
     fn reassert_local_key_index(&self) {
-        let current = *self
-            .local_key_index
-            .lock()
-            .expect("local key index mutex poisoned");
-        if let Some(key_index) = current {
+        apply_selected_local_key_index(&self.local_key_index, None, |key_index| {
             self.apply_local_key_index(key_index);
-        }
+        });
     }
 
     fn apply_local_key_index(&self, key_index: u8) {
@@ -317,11 +331,9 @@ impl TransportConnection for LiveKitTransportConnection {
     /// `set_key` only fills the key *ring*; the index a sender stamps lives on
     /// its frame cryptor and changes only here.
     fn set_local_key_index(&self, key_index: u8) {
-        *self
-            .local_key_index
-            .lock()
-            .expect("local key index mutex poisoned") = Some(key_index);
-        self.apply_local_key_index(key_index);
+        apply_selected_local_key_index(&self.local_key_index, Some(key_index), |key_index| {
+            self.apply_local_key_index(key_index);
+        });
     }
 
     async fn publish(
@@ -989,6 +1001,65 @@ fn copy_plane(
 
 #[cfg(test)]
 mod encoding_tests {
+    use super::apply_selected_local_key_index;
+
+    use std::sync::{Arc, Mutex, TryLockError, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn local_key_index_publish_reassertion_cannot_overwrite_a_concurrent_key_activation() {
+        let selected = Arc::new(Mutex::new(Some(4)));
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let reassert_selected = Arc::clone(&selected);
+        let reassert_applied = Arc::clone(&applied);
+        let reassert = thread::spawn(move || {
+            apply_selected_local_key_index(&reassert_selected, None, |index| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                reassert_applied.lock().unwrap().push(index);
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The actual application callback is paused. Its selected index must
+        // still be locked, so an activation cannot apply then be overwritten.
+        assert!(matches!(selected.try_lock(), Err(TryLockError::WouldBlock)));
+        let activate_selected = Arc::clone(&selected);
+        let activate_applied = Arc::clone(&applied);
+        let activate = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            apply_selected_local_key_index(&activate_selected, Some(5), |index| {
+                activate_applied.lock().unwrap().push(index);
+            });
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        reassert.join().unwrap();
+        activate.join().unwrap();
+        assert_eq!(*applied.lock().unwrap(), vec![4, 5]);
+        assert_eq!(*selected.lock().unwrap(), Some(5));
+    }
+
+    #[test]
+    fn local_key_index_without_an_activated_key_is_not_reasserted() {
+        let selected = Mutex::new(None);
+        apply_selected_local_key_index(&selected, None, |_| {
+            panic!("An uninitialized sender must not select a key");
+        });
+        let mut applied = Vec::new();
+        apply_selected_local_key_index(&selected, Some(7), |index| applied.push(index));
+        apply_selected_local_key_index(&selected, None, |index| applied.push(index));
+        assert_eq!(applied, vec![7, 7]);
+        assert_eq!(*selected.lock().unwrap(), Some(7));
+    }
+
     use livekit::options::{
         TrackPublishOptions, compute_video_encodings, video_layers_from_encodings,
     };
