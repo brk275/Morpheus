@@ -851,6 +851,7 @@ namespace Morpheus.OwnedTraversal20261028
         private readonly Func<IntPtr, uint, uint, IntPtr, uint, uint, IntPtr, IntPtr> open;
         private readonly Func<IntPtr, uint> type;
         private readonly Func<IntPtr, IntPtr, int> info;
+        private readonly Func<IntPtr, int> close;
         private readonly ScriptBlock unicodeValidator;
         // One private provider per entered sequential transaction. Successful
         // TransformFinalBlock already resets its reusable CNG hash state.
@@ -863,6 +864,19 @@ namespace Morpheus.OwnedTraversal20261028
         private FileStream retainedPayloadStream;
         private SafeFileHandle retainedPayloadSafe;
         private bool unjoinedPayloadRead;
+        // Two range reads of this same held file only; never future files.
+        private sealed class PayloadSlot
+        {
+            public FileStream Stream;
+            public byte[] Buffer;
+            public Task<int> Pending;
+            public int Length, Filled;
+        }
+        private PayloadSlot[] payloadSlots;
+        private FileStream extraPayloadStream;
+        private SafeFileHandle extraPayloadSafe;
+        private IntPtr extraPayloadHandle;
+        private bool extraPayloadReserved;
         // Closed exclusive coordinator wall-cost partition; no per-file data.
         // 0 lexical, 1 native transaction, 2 enumeration, 3 read coordination,
         // 4 SHA transform, 5 all remaining entered transaction work.
@@ -936,7 +950,7 @@ namespace Morpheus.OwnedTraversal20261028
         private Reader(List<IntPtr> handles, Dictionary<string, object> directories,
             List<object> records, Dictionary<string, string> memo, int units,
             Stopwatch watch, byte[] scratch, byte[] buffer, IntPtr memory,
-            Delegate openCall, Delegate typeCall, Delegate infoCall, Hashtable limits, ScriptBlock unicodeSource)
+            Delegate openCall, Delegate typeCall, Delegate infoCall, Delegate closeCall, Hashtable limits, ScriptBlock unicodeSource)
         {
             Handles = handles; Directories = directories; FileRecords = records;
             Memo = memo; MemoUnits = units; Watch = watch; Scratch = scratch;
@@ -944,6 +958,7 @@ namespace Morpheus.OwnedTraversal20261028
             open = Bind<Func<IntPtr, uint, uint, IntPtr, uint, uint, IntPtr, IntPtr>>(openCall);
             type = Bind<Func<IntPtr, uint>>(typeCall);
             info = Bind<Func<IntPtr, IntPtr, int>>(infoCall);
+            close = Bind<Func<IntPtr, int>>(closeCall);
         }
 
         private static bool Property(object value, string name)
@@ -1064,7 +1079,7 @@ namespace Morpheus.OwnedTraversal20261028
                     owner.Memory != memory || owner.Kernel != kernel) return null;
                 if (ownedReaders.TryGetValue(handles, out Reader existing)) return null;
                 var reader = new Reader(handles, directories, records, memo, u, watch, scratch, buffer, memory,
-                (Delegate)current[11], (Delegate)current[12], (Delegate)current[13], limits, (ScriptBlock)current[1]);
+                (Delegate)current[11], (Delegate)current[12], (Delegate)current[13], (Delegate)current[14], limits, (ScriptBlock)current[1]);
                 ownedReaders.Add(handles, reader);
                 return reader;
             }
@@ -1075,7 +1090,9 @@ namespace Morpheus.OwnedTraversal20261028
             lock (ownerLock)
             {
                 if (active || busy || unjoinedPayloadRead || pendingPayloadRead != null ||
-                    payloadCancellation != null || retainedPayloadStream != null || retainedPayloadSafe != null) Fail("identity");
+                    payloadCancellation != null || retainedPayloadStream != null || retainedPayloadSafe != null ||
+                    payloadSlots != null || extraPayloadReserved || extraPayloadHandle != IntPtr.Zero ||
+                    extraPayloadStream != null || extraPayloadSafe != null) Fail("identity");
                 if (owners.TryGetValue(Handles, out Ownership owner))
                 { owner.Closed = true; owner.Memory = IntPtr.Zero; owner.Kernel = IntPtr.Zero; }
                 retired = true; Memory = IntPtr.Zero; lastPath = null;
@@ -1110,7 +1127,9 @@ namespace Morpheus.OwnedTraversal20261028
             {
                 if (ownedReaders.TryGetValue(handles, out Reader reader) &&
                     (reader.active || reader.busy || reader.unjoinedPayloadRead || reader.pendingPayloadRead != null ||
-                     reader.payloadCancellation != null || reader.retainedPayloadStream != null || reader.retainedPayloadSafe != null)) Fail("identity");
+                     reader.payloadCancellation != null || reader.retainedPayloadStream != null || reader.retainedPayloadSafe != null ||
+                     reader.payloadSlots != null || reader.extraPayloadReserved || reader.extraPayloadHandle != IntPtr.Zero ||
+                     reader.extraPayloadStream != null || reader.extraPayloadSafe != null)) Fail("identity");
             }
         }
         public static void RetireOwner(object ownerValue)
@@ -1152,7 +1171,7 @@ namespace Morpheus.OwnedTraversal20261028
             if (Watch.Elapsed.TotalSeconds > 180) BudgetFailure("deadline");
             else if (Entries > 200000) BudgetFailure("entries");
             else if (Bytes > 68719476736UL) BudgetFailure("bytes");
-            else if (Handles.Count > 200256) BudgetFailure("handles");
+            else if (Handles.Count > 200256 - (extraPayloadReserved ? 1 : 0)) BudgetFailure("handles");
             else if (Metadata > 31457280) BudgetFailure("metadata");
         }
 
@@ -1409,6 +1428,199 @@ namespace Morpheus.OwnedTraversal20261028
             return size;
         }
 
+        private void PrepareTwoReads(Record record, FileStream stream, SafeFileHandle safe)
+        {
+            int previousCost = BeginCost(1);
+            try
+            {
+                if (extraPayloadReserved || extraPayloadHandle != IntPtr.Zero || payloadSlots != null ||
+                    pendingPayloadRead != null || payloadCancellation != null || unjoinedPayloadRead || Handles.Count >= 200256) Fail("identity");
+                // Reserve one temporary native handle inside the original cap.
+                // All original file/entry/byte/row admission has already passed.
+                extraPayloadReserved = true;
+                Budget();
+                IntPtr wide = Marshal.StringToHGlobalUni(@"\\?\" + record.Path), handle;
+                try { handle = open(wide, 2147483648U, 1U, IntPtr.Zero, 3U, 0x08200000U, IntPtr.Zero); }
+                finally { Marshal.FreeHGlobal(wide); }
+                if (handle == new IntPtr(-1)) { extraPayloadReserved = false; Fail("open"); }
+                extraPayloadHandle = handle;
+                // Independent CreateFile object, same original held file:
+                // full identity/content fields, type and reparse check, before IO.
+                ReadInfo(handle, record.Comparison, true, true);
+                extraPayloadSafe = new SafeFileHandle(handle, false);
+                extraPayloadStream = new FileStream(extraPayloadSafe, FileAccess.Read, 1, false);
+                if (readAheadBuffer == null) readAheadBuffer = new byte[1048576];
+                payloadSlots = new[] {
+                    new PayloadSlot { Stream = stream, Buffer = Buffer },
+                    new PayloadSlot { Stream = extraPayloadStream, Buffer = readAheadBuffer }
+                };
+                payloadCancellation = new CancellationTokenSource();
+                double remaining = 180 - Watch.Elapsed.TotalSeconds;
+                if (remaining <= 0) BudgetFailure("deadline");
+                payloadCancellation.CancelAfter((int)Math.Min(180000, Math.Ceiling(remaining * 1000)));
+            }
+            finally { EndCost(previousCost); }
+        }
+
+        private void BeginPayloadRange(PayloadSlot slot, long offset, int length, ulong expected, bool eof = false)
+        {
+            int previousCost = BeginCost(3);
+            try
+            {
+                if (slot.Pending != null || payloadCancellation == null || unjoinedPayloadRead ||
+                    offset < 0 || length <= 0 || length > slot.Buffer.Length ||
+                    (eof ? ((ulong)offset != expected || length != 1) :
+                        ((ulong)offset >= expected || (ulong)length > expected - (ulong)offset))) Fail("identity");
+                // One pending read per independent file object. BufferSize1
+                // prevents FileStream from reading across the assigned range.
+                if (slot.Stream.Seek(offset, SeekOrigin.Begin) != offset) Fail("changed");
+                slot.Length = length; slot.Filled = 0;
+                slot.Pending = slot.Stream.ReadAsync(slot.Buffer, 0, length, payloadCancellation.Token);
+            }
+            finally { EndCost(previousCost); }
+        }
+
+        private int AwaitPayloadRange(PayloadSlot slot)
+        {
+            int previousCost = BeginCost(3);
+            try
+            {
+                Task<int> read = slot.Pending;
+                if (read == null) Fail("identity");
+                double remaining = 180 - Watch.Elapsed.TotalSeconds;
+                if (remaining <= 0) BudgetFailure("deadline");
+                bool completed;
+                try { completed = read.Wait((int)Math.Min(180000, Math.Ceiling(remaining * 1000))); }
+                catch (AggregateException) when (read.IsCompleted) { completed = true; }
+                if (!completed) BudgetFailure("deadline");
+                try
+                {
+                    try { return read.GetAwaiter().GetResult(); }
+                    catch (OperationCanceledException) when (payloadCancellation.IsCancellationRequested)
+                    { BudgetFailure("deadline"); throw; }
+                }
+                finally { if (read.IsCompleted) slot.Pending = null; }
+            }
+            finally { EndCost(previousCost); }
+        }
+
+        private bool ConsumePayloadRange(PayloadSlot slot, SHA256 digest, ulong expected, ref ulong size)
+        {
+            while (slot.Filled < slot.Length)
+            {
+                int count = AwaitPayloadRange(slot);
+                if (count < 0 || count > slot.Length - slot.Filled) Fail("changed");
+                if (count == 0) return false;
+                Budget(); size += (ulong)count;
+                if (size > expected) Fail("changed");
+                int previousCost = BeginCost(4);
+                try { digest.TransformBlock(slot.Buffer, slot.Filled, count, null, 0); }
+                finally { EndCost(previousCost); }
+                slot.Filled += count;
+                if (slot.Filled < slot.Length)
+                {
+                    previousCost = BeginCost(3);
+                    try { slot.Pending = slot.Stream.ReadAsync(slot.Buffer, slot.Filled,
+                        slot.Length - slot.Filled, payloadCancellation.Token); }
+                    finally { EndCost(previousCost); }
+                }
+            }
+            return true;
+        }
+
+        private ulong HashWithTwoReads(SHA256 digest, ulong expected)
+        {
+            ulong next = 0, size = 0;
+            for (int i = 0; i < 2 && next < expected; i++)
+            {
+                int length = (int)Math.Min((ulong)Buffer.Length, expected - next);
+                BeginPayloadRange(payloadSlots[i], (long)next, length, expected);
+                next += (ulong)length;
+            }
+            int ordinal = 0;
+            while (payloadSlots[ordinal].Length != 0)
+            {
+                PayloadSlot slot = payloadSlots[ordinal];
+                // Observe and hash logical ranges in byte order even if the
+                // other read completes/faults first. Every positive partial
+                // read gets the original budget/size-before-hash checks.
+                if (!ConsumePayloadRange(slot, digest, expected, ref size)) return size;
+                slot.Length = 0;
+                if (next < expected)
+                {
+                    int length = (int)Math.Min((ulong)Buffer.Length, expected - next);
+                    BeginPayloadRange(slot, (long)next, length, expected);
+                    next += (ulong)length;
+                }
+                ordinal = 1 - ordinal;
+            }
+            // Full initial length is not proof of EOF. Detect any extra byte
+            // before the original TransformFinalBlock/length/final-identity.
+            PayloadSlot end = payloadSlots[0];
+            BeginPayloadRange(end, (long)expected, 1, expected, true);
+            int beyond = AwaitPayloadRange(end);
+            if (beyond < 0 || beyond > 1) Fail("changed");
+            if (beyond > 0) { Budget(); size += (ulong)beyond; if (size > expected) Fail("changed"); }
+            end.Length = 0;
+            return size;
+        }
+
+        private void FinishTwoReads(bool preservingFailure)
+        {
+            int previousCost = BeginCost(3);
+            // Any unexpected cleanup failure must retain the owner too; only
+            // proved joins, wrapper disposal and native close release this fence.
+            unjoinedPayloadRead = true;
+            try
+            {
+                var tasks = new List<Task>(2);
+                if (payloadSlots != null) foreach (PayloadSlot slot in payloadSlots)
+                    if (slot.Pending != null) tasks.Add(slot.Pending);
+                bool joined = true;
+                foreach (Task task in tasks) if (!task.IsCompleted) joined = false;
+                Exception cancellationFailure = null;
+                try
+                {
+                    if (!joined)
+                    {
+                        Stopwatch cleanup = Stopwatch.StartNew();
+                        try { payloadCancellation.Cancel(); }
+                        catch (Exception error) { cancellationFailure = error; }
+                        int wait = (int)Math.Max(0, 5000 - Math.Min(5000, cleanup.ElapsedMilliseconds));
+                        try { Task.WaitAll(tasks.ToArray(), wait); }
+                        catch (AggregateException) { }
+                        joined = true;
+                        foreach (Task task in tasks) if (!task.IsCompleted) joined = false;
+                        if (!joined) Fail("worker_cleanup");
+                    }
+                }
+                finally { if (!joined) unjoinedPayloadRead = true; }
+                // No stream, handle, provider, buffer or scratch is retired
+                // while either read's join remains unproved.
+                foreach (Task task in tasks) if (task.IsFaulted) { _ = task.Exception; }
+                try
+                {
+                    if (payloadCancellation != null) payloadCancellation.Dispose();
+                    if (extraPayloadStream != null) extraPayloadStream.Dispose();
+                    if (extraPayloadSafe != null) extraPayloadSafe.Dispose();
+                    if (retainedPayloadStream != null) retainedPayloadStream.Dispose();
+                    if (retainedPayloadSafe != null) retainedPayloadSafe.Dispose();
+                    if (extraPayloadHandle != IntPtr.Zero)
+                    {
+                        if (close(extraPayloadHandle) == 0) Fail("worker_cleanup");
+                        extraPayloadHandle = IntPtr.Zero;
+                    }
+                }
+                catch { unjoinedPayloadRead = true; throw; }
+                payloadCancellation = null; payloadSlots = null;
+                extraPayloadStream = null; extraPayloadSafe = null; extraPayloadReserved = false;
+                retainedPayloadStream = null; retainedPayloadSafe = null;
+                unjoinedPayloadRead = false;
+                if (cancellationFailure != null && !preservingFailure) throw cancellationFailure;
+            }
+            finally { EndCost(previousCost); }
+        }
+
         private int ReadPayloadBlock(FileStream stream)
         {
             int previousCost = BeginCost(3);
@@ -1436,6 +1648,7 @@ namespace Morpheus.OwnedTraversal20261028
 
         private Hashtable FileFact(string literal, int textLimit, ulong remaining, int metadataReservation = 0)
         {
+            if (payloadSlots != null || extraPayloadReserved || extraPayloadHandle != IntPtr.Zero) Fail("identity");
             Work = "file_open";
             string full = Canonical(literal);
             Chain(Path.GetDirectoryName(full));
@@ -1450,22 +1663,27 @@ namespace Morpheus.OwnedTraversal20261028
             if (metadataReservation < 0 || metadataReservation > 31457280 - Metadata)
             { if (Cause == "unknown") Cause = "metadata"; Fail("limit"); }
             bool readAhead = textLimit == 0 && expected > (ulong)Buffer.Length;
+            bool twoReads = readAhead && Handles.Count < 200256;
             Exception bodyFailure = null;
             var safe = new SafeFileHandle(record.Handle, false);
+            if (twoReads) retainedPayloadSafe = safe;
             FileStream stream = null;
             MemoryStream text = null;
             try
             {
                 // Keep stream/provider/text construction in original order,
                 // but release borrowed wrappers even if provider creation fails.
-                stream = new FileStream(safe, FileAccess.Read, 1048576, false);
+                stream = new FileStream(safe, FileAccess.Read, twoReads ? 1 : 1048576, false);
+                if (twoReads) retainedPayloadStream = stream;
                 if (payloadDigest == null) payloadDigest = SHA256.Create();
                 SHA256 digest = payloadDigest;
                 text = textLimit > 0 ? new MemoryStream() : null;
+                if (twoReads) PrepareTwoReads(record, stream, safe);
                 Work = "file_hash";
                 ulong size = 0;
                 int count;
-                if (readAhead) size = HashWithReadAhead(stream, safe, digest, expected);
+                if (twoReads) size = HashWithTwoReads(digest, expected);
+                else if (readAhead) size = HashWithReadAhead(stream, safe, digest, expected);
                 else
                 {
                     while ((count = ReadPayloadBlock(stream)) > 0)
@@ -1481,6 +1699,7 @@ namespace Morpheus.OwnedTraversal20261028
                 if (CompletedFiles < 200000) CompletedFiles++;
                 Work = "file_identity";
                 ReadInfo(record.Handle, record.Comparison, true, true);
+                if (twoReads) ReadInfo(extraPayloadHandle, record.Comparison, true, true);
                 var fact = Table(2);
                 fact.Add("bytes", size); fact.Add("sha256", Convert.ToHexString(digest.Hash).ToLowerInvariant());
                 if (text != null) fact["text"] = new UTF8Encoding(false, true).GetString(text.ToArray());
@@ -1489,16 +1708,20 @@ namespace Morpheus.OwnedTraversal20261028
             catch (Exception error) { bodyFailure = error; throw; }
             finally
             {
-                try { if (readAhead) FinishPayloadRead(bodyFailure != null); }
-                finally
+                if (twoReads) FinishTwoReads(bodyFailure != null);
+                else
                 {
-                    if (!unjoinedPayloadRead)
+                    try { if (readAhead) FinishPayloadRead(bodyFailure != null); }
+                    finally
                     {
-                        try { if (stream != null) stream.Dispose(); }
-                        finally
+                        if (!unjoinedPayloadRead)
                         {
-                            try { safe.Dispose(); }
-                            finally { if (text != null) text.Dispose(); }
+                            try { if (stream != null) stream.Dispose(); }
+                            finally
+                            {
+                                try { safe.Dispose(); }
+                                finally { if (text != null) text.Dispose(); }
+                            }
                         }
                     }
                 }
