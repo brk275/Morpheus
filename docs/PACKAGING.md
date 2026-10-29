@@ -241,10 +241,11 @@ acceptance.
 The manual [`package-qa.yml`](../.github/workflows/package-qa.yml) workflow runs
 only on public `main` using standard hosted runners. It requires an explicit
 platform choice (`linux`, `windows`, `macos`, or `all`), defaulting to Linux.
-Shared release candidates require `all` and `linux_formats=both`; a Linux-only
-packaging edit selects only Linux. The additional `linux_formats` choice
-(`both`, `appimage`, or `deb`) permits a focused check of one Linux format.
-Results name the formats actually tested; a partial run cannot satisfy the
+For a shared candidate, select `all` and `linux_formats=appimage` to validate
+both Mac architectures, Windows and the current Linux AppImage. A Linux-only
+packaging edit selects only Linux. Although the input lists `both` and `deb`,
+the workflow currently rejects them while Debian packaging is deferred.
+Results name the formats actually tested; AppImage QA does not satisfy the
 complete Linux release gate. It pins Rust 1.99.0 and Cargo Packager 0.11.8. To dispatch an
 appropriate check after confirming no equivalent run is active:
 
@@ -257,7 +258,7 @@ maintainer email. Use AppImage for current Linux checks; this leaves the Debian
 release gate open.
 
 The workflow builds DMGs on both native Mac architectures, NSIS on Windows,
-and DEB/AppImage on Ubuntu 24.04. It installs, inspects, briefly launches, and
+and AppImage on Ubuntu 24.04. It installs, inspects, briefly launches, and
 removes these packages using [`scripts/package_smoke.py`](../scripts/package_smoke.py).
 Installers stay on the ephemeral runner: there is no artifact upload or release publication. Public
 source and logs do not imply tested, signed installers. Native CI and packaging
@@ -266,11 +267,12 @@ check active and completed runs before dispatching equivalent work.
 All hosted jobs are gated off while the repository is private; paid runs require
 separate owner authorization.
 
-For a local package, use `python3 scripts/package.py --formats deb,appimage`,
-`--formats dmg`, or `--formats nsis` on the relevant platform. Run
-`python3 scripts/package.py --check` to validate configuration without building.
-Direct `cargo packager` calls bypass the Linux overlay and are not the supported
-packaging entry point.
+Use `scripts/package.py` as the packaging entry point. Linux AppImage QA requires
+its reviewed scanner; Mac and Windows packaging require the candidate-bound
+source archive and receipt described below. The hosted workflow supplies these
+inputs. `python3 scripts/package.py --check` validates configuration without
+building. Direct `cargo packager` calls bypass the platform wrapper and are not
+the supported packaging entry point.
 
 ### Automated installed-package checks
 
