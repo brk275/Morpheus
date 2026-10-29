@@ -888,9 +888,13 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
         # The shared hosted TEMP ancestor can permit foreign writers. Exercise
         # the real primitive beneath a parent accepted by its unchanged policy.
         parent = security.path(Path.home().resolve(), directory=True)
-        with tempfile.TemporaryDirectory(dir=parent) as temporary:
-            root = security.create_root(Path(temporary).resolve())
-            target = root/"source.txt";target.write_bytes(b"fixed source data")
+        # Create the sole fixture directory with the primitive's protected
+        # DACL atomically; an inherited stdlib temporary parent is not private.
+        root = security.create_root(parent)
+        identity = root.lstat()
+        target, linked = root/"source.txt", root/"second-name.txt"
+        try:
+            target.write_bytes(b"fixed source data")
             security.path(root,directory=True,private=True)
             # The same notice/event reader must accept the real retained
             # Windows handle without equating CreationTime and ChangeTime.
@@ -902,10 +906,22 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
                 # rather than claiming fstat/hash alone prevents that race.
                 with self.assertRaises(OSError):
                     target.open("wb")
-            linked = root/"second-name.txt";os.link(target,linked)
+            os.link(target,linked)
             with self.assertRaises(ValueError):security.open_read(target,private=True)
             with self.assertRaises(ValueError):native_notices.read_regular(target,1024)
             self.assertEqual(target.read_bytes(),b"fixed source data")
+        finally:
+            security.path(root,directory=True,private=True)
+            current = root.lstat()
+            self.assertEqual((current.st_dev,current.st_ino),(identity.st_dev,identity.st_ino))
+            # Only these two synthetic leaf names are ours; never recurse or
+            # remove the validated parent. Unexpected content makes rmdir fail.
+            for name in ("second-name.txt", "source.txt"):
+                (root/name).unlink(missing_ok=True)
+            security.path(root,directory=True,private=True)
+            current = root.lstat()
+            self.assertEqual((current.st_dev,current.st_ino),(identity.st_dev,identity.st_ino))
+            root.rmdir()
 
     def test_acl_rejects_unknown_ace_and_foreign_writer_but_not_read_only_trustee(self):
         import ctypes

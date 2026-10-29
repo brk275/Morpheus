@@ -47,7 +47,7 @@ jobs:
           assert actual == revision
           files = {
             'scripts/native_notices.py': '2120751417996efaa7017ba6d98acb8fb87b84f64a1c9cd48321e4721099bb2f',
-            'scripts/tests/test_package.py': '765efa036c6dfdccdc24d475f0e8a8285749d4487312037bfb5bf19ce966a7f5',
+            'scripts/tests/test_package.py': 'd139d82b2071db65cf656f9f5aaf0cf86160bfde95201cb940bcdd67adb75145',
           }
           for name, digest in files.items():
               path = root / name
