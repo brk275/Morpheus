@@ -90,3 +90,22 @@ byte, depth, metadata, JSON, buffer, native provenance, full hashing and final
 identity requirements are unchanged. This policy does not authorize toolchain
 admission or distribution. It is not a speed improvement or evidence that 900s
 is sufficient; a further failure requires diagnosis, not another time increase.
+
+### Receipt row representation budget
+
+The unchanged 30MiB metadata ledger bounds receipt JSON rows, not total managed
+heap memory. Each file row retains the 160-byte fixed-field allowance, charging
+its path by a conservative JSON escaping upper bound: six bytes per control,
+non-ASCII, quote or HTML-sensitive UTF-16 unit; two per slash/backslash; one per
+remaining printable ASCII unit. Both surrogate halves receive their own six-byte
+allowance. Managed traversal reserves this exact bound before starting payload
+reads and commits it once after hashing, as before. Original fallback commits
+the same bound in its existing position. No file is omitted or truncated.
+
+This avoids treating every ordinary ASCII path character as a Unicode escape.
+The full selected VS2022 root and Windows Kits10 root, every digest and final
+retained-handle identity check remain required. All metadata/JSON/entry/handle/
+byte/depth/memo/buffer/time/cleanup caps remain unchanged; final actual UTF-8 JSON
+still must fit 32MiB. A source-reviewed fixture compares the production bound to
+the pinned serializer with mixed escape classes and checks actual managed and
+fallback ledger commits. No hosted completion or speedup is implied.

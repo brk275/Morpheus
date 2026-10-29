@@ -1162,7 +1162,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $caseStage = 'source_parse'
 $inventorySite = 'unknown'
-$fixtureLineLimit = 1713
+$fixtureLineLimit = 1738
 try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
@@ -2239,6 +2239,29 @@ try {
     if ($costTotal -gt 905000) { throw 'failure_context' }
     $costLine = Get-HostPreflightCostMessage $script:HostCostStatus $script:HostCostLexicalMs $script:HostCostNativeMs $script:HostCostEnumerationMs $script:HostCostReadMs $script:HostCostShaMs $script:HostCostOtherMs
     if ($costLine -notmatch '^ cost_model=owned-exclusive-wall-900s-v2 cost_status=measured lexical_ms=[0-9]{1,6} native_ms=[0-9]{1,6} enumeration_ms=[0-9]{1,6} read_ms=[0-9]{1,6} sha_ms=[0-9]{1,6} other_ms=[0-9]{1,6}$') { throw 'failure_context' }
+    # The actual managed transaction charges each output path once. Ordinary
+    # ASCII rows use their representation bound, not six bytes per character.
+    $expectedMetadata = 0
+    foreach ($row in $completeResult.files) { $expectedMetadata += 160 + $row.path.Length + ($row.path.Length - $row.path.Replace('/', '').Length) }
+    if ($script:HostMetadataBytes -ne $expectedMetadata -or
+        [Text.Encoding]::UTF8.GetByteCount(($completeResult.files | ConvertTo-Json -Depth 10 -Compress)) -gt $expectedMetadata) { throw 'metadata' }
+    # Compare the actual pinned serializer against the production pure bound.
+    # These DATA strings need not be legal Windows filenames: escaping itself
+    # must remain bounded for controls, quotes, HTML and UTF-16 surrogate units.
+    foreach ($pathProbe in @('plain-ASCII_123.bin', ('quote' + [char]34 + 'slash\/'),
+        ('html<>&' + [char]39), ('control' + [char]0 + [char]9 + [char]10 + [char]31),
+        ('nonascii' + [char]0xe9 + [char]0x2028),
+        ('surrogate' + [char]0xd83d + [char]0xde00 + [char]0xd800))) {
+        $rowProbe = @{ path = $pathProbe; bytes = [uint64]2147483648; sha256 = ('f' * 64) }
+        $charged = [Morpheus.OwnedTraversal20261028.Reader]::RowMetadataBytes($pathProbe)
+        $serialized = [Text.Encoding]::UTF8.GetByteCount(($rowProbe | ConvertTo-Json -Depth 10 -Compress))
+        if ($charged -gt (160 + 6 * $pathProbe.Length) -or $serialized -gt $charged) { throw 'metadata' }
+        foreach ($escaping in @('Default', 'EscapeHtml', 'EscapeNonAscii')) {
+            $serialized = [Text.Encoding]::UTF8.GetByteCount(($rowProbe | ConvertTo-Json -Depth 10 -Compress -EscapeHandling $escaping))
+            if ($serialized -gt $charged) { throw 'metadata' }
+        }
+    }
+    Must-Refuse { [Morpheus.OwnedTraversal20261028.Reader]::RowMetadataBytes(('a' * 1025)) }
     $completeTool = @($completeResult.files | Where-Object { $_.path -eq 'tool.bin' })
     if ($completeTool.Count -ne 1 -or $completeTool[0].bytes -ne 4 -or
         $completeTool[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
@@ -2504,6 +2527,7 @@ try {
     if ($script:HostManagedTraversalRoots -ne 1 -or $script:HostManagedHashes -ne 1 -or
         $unicodeResult.files.Count -ne 1 -or $unicodeResult.files[0].path -cne $unicodeName -or
         $unicodeResult.files[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
+    if ($script:HostMetadataBytes -ne (160 + $unicodeName.Length + 5)) { throw 'metadata' }
 } finally { Close-HostReader }
 # A replaced complete per-file helper must also choose the original route.
 Initialize-HostReader
@@ -2522,6 +2546,7 @@ try {
         $oldResult = Get-HostRootInventory $good
         if ($oldResult.files.Count -ne 2 -or $script:CompleteFileFactCalls -ne 2 -or
             $script:HostManagedTraversalRoots -ne 0) { throw 'inventory' }
+        if ($script:HostMetadataBytes -ne $expectedMetadata) { throw 'metadata' }
         $fallbackReceipt = Set-HostInventoryImplementation ([ordered]@{ roots = @($oldResult);
             build_ready = $false; host_approval_granted = $false; distribution_ready = $false }) 'powershell-original-fallback-v1'
         if ($fallbackReceipt.schema -cne 'morpheus-native-windows-host-toolchain-inventory-v3' -or

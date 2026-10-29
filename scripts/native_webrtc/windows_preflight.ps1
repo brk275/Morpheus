@@ -1871,6 +1871,25 @@ namespace Morpheus.OwnedTraversal20261028
             } finally { EndCost(previousCost); }
         }
 
+        // A bounded JSON row reservation, not a managed-memory estimate.
+        // Six bytes cover any UTF-16 unit requiring a Unicode escape (including
+        // both halves of a surrogate pair); HTML/quote escaping is conservative.
+        // Slash/backslash may require two bytes. Remaining printable ASCII is
+        // emitted verbatim by the pinned serializer. Fixed fields fit in 160.
+        public static int RowMetadataBytes(string path)
+        {
+            if (path == null || path.Length > 1024) Fail("path_length");
+            int bytes = 160;
+            foreach (char unit in path)
+            {
+                if (unit < 32 || unit >= 127 || unit == '"' || unit == '\'' ||
+                    unit == '<' || unit == '>' || unit == '&') bytes += 6;
+                else if (unit == '\\' || unit == '/') bytes += 2;
+                else bytes++;
+            }
+            return bytes;
+        }
+
         private Hashtable Root(string literal)
         {
             string root = Canonical(literal);
@@ -1897,9 +1916,10 @@ namespace Morpheus.OwnedTraversal20261028
                     else
                     {
                         string relative = Path.GetRelativePath(root, path).Replace('\\', '/');
-                        Hashtable fact = FileFact(path, 0, 68719476736UL - Bytes, 160 + 6 * relative.Length);
+                        int metadataReservation = RowMetadataBytes(relative);
+                        Hashtable fact = FileFact(path, 0, 68719476736UL - Bytes, metadataReservation);
                         Work = "receipt_row"; Bytes += (ulong)fact["bytes"]; Budget();
-                        Metadata += 160 + 6 * relative.Length; Budget();
+                        Metadata += metadataReservation; Budget();
                         var row = Table(3); row.Add("path", relative); row.Add("bytes", fact["bytes"]); row.Add("sha256", fact["sha256"]);
                         files.Add(row);
                     }
@@ -2693,9 +2713,18 @@ function Get-HostRootInventory([string] $LiteralRoot) {
                 $script:HostPreflightWork = 'receipt_row'
                 $script:HostBytes += $fact.bytes; Assert-HostBudget
                 $relative = [IO.Path]::GetRelativePath($root, $path).Replace('\', '/')
-                # JSON upper bound before adding a row, including worst-case
-                # escaping. Leave 2MiB for fixed roots/roles and top-level data.
-                $script:HostMetadataBytes += 160 + 6 * $relative.Length
+                # Same bounded JSON upper bound as managed RowMetadataBytes;
+                # keep 2MiB for fixed roots/roles/top-level data. Do not multiply
+                # ordinary ASCII by six as if every unit needed a Unicode escape.
+                $metadataReservation = 160
+                for ($index = 0; $index -lt $relative.Length; $index++) {
+                    $unit = [int][char]$relative[$index]
+                    if ($unit -lt 32 -or $unit -ge 127 -or $unit -in @(34, 39, 60, 62, 38)) {
+                        $metadataReservation += 6
+                    } elseif ($unit -eq 92 -or $unit -eq 47) { $metadataReservation += 2 }
+                    else { $metadataReservation++ }
+                }
+                $script:HostMetadataBytes += $metadataReservation
                 Assert-HostBudget
                 $files.Add(@{ path = $relative; bytes = $fact.bytes; sha256 = $fact.sha256 })
             }
