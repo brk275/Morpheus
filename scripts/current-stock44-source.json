@@ -3916,8 +3916,8 @@
       "type": "blob"
     },
     "scripts/tests/test_element_acceptance.py": {
-      "blob": "f02674a5eb77419ba0ed7a81082f5fd234e33a19",
-      "bytes": 31375,
+      "blob": "40a19934bba97dd1e56465ef8a178cfaed740813",
+      "bytes": 31393,
       "mode": "100644",
       "type": "blob"
     },

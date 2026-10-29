@@ -36,7 +36,7 @@ class EvidenceTests(unittest.TestCase):
         # Execute only the exact observer function with disposable JS objects.
         # No browser, network, SDK import, media source, or package install.
         source = (target.REPO / "scripts/element_call_stock_peer.mjs").read_text()
-        installer = source.split("// BEGIN pinned SDK44 public-wrapper observer.", 1)[1].split(
+        installer = source.split("// BEGIN pinned SDK44 public-wrapper observer.", 1)[1].split("\n", 1)[1].split(
             "// END pinned SDK44 public-wrapper observer.", 1)[0]
         legacy = source.split("async function observeAudio(", 1)[1].split("const binding = () => {", 1)[1].split(
             "\n        };", 1)[0]
