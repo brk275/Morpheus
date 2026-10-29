@@ -676,6 +676,47 @@ impl MediaPool {
         }
     }
 
+    /// Irreversibly retire this call's routes, including the adopted own
+    /// connection and successful connects still queued in the actor inbox.
+    /// The caller must close every returned connection; the inbox cannot reopen.
+    pub fn retire(
+        &mut self,
+        inbox: &mut mpsc::UnboundedReceiver<PoolMessage>,
+    ) -> Vec<Arc<dyn TransportConnection>> {
+        inbox.close();
+        let mut connections = Vec::new();
+        while let Ok(PoolMessage(message)) = inbox.try_recv() {
+            if let Message::ConnectFinished { result: Ok((connection, _events)), .. } = message {
+                connections.push(Arc::from(connection));
+            }
+        }
+        self.constraints.clear();
+        self.pending_tracks.clear();
+        self.pending_keys.clear();
+        self.tracks.lock().expect("track map mutex poisoned").clear();
+        self.members_snapshot.clear();
+        self.known_members.clear();
+        self.identity_map.clear();
+        self.member_identities.clear();
+        self.degraded_keys.clear();
+        self.out.clear();
+        for (_, entry) in self.pool.drain() {
+            if let ConnState::Up { connection, .. } = entry.state {
+                connections.push(connection);
+            }
+        }
+        connections
+    }
+
+    /// Close a completed connection consumed after its call was refused.
+    pub fn discard_retired(message: PoolMessage) {
+        if let PoolMessage(Message::ConnectFinished {
+            result: Ok((connection, _events)), ..
+        }) = message {
+            rt::spawn(async move { let _ = connection.close().await; });
+        }
+    }
+
     /// Process one message from the inbox.
     pub fn handle(&mut self, PoolMessage(message): PoolMessage) -> Vec<PoolEvent> {
         match message {
@@ -1067,11 +1108,17 @@ impl MediaPool {
         let key = key.to_owned();
         rt::spawn(async move {
             let result = backend.connect(&key, &ctx).await;
-            let _ = messages.send(PoolMessage(Message::ConnectFinished {
+            if let Err(error) = messages.send(PoolMessage(Message::ConnectFinished {
                 connection_key: key,
                 attempt,
                 result,
-            }));
+            })) {
+                if let PoolMessage(Message::ConnectFinished {
+                    result: Ok((connection, _events)), ..
+                }) = error.0 {
+                    let _ = connection.close().await;
+                }
+            }
         });
     }
 

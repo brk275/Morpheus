@@ -63,6 +63,8 @@ pub enum EndedReason {
     Left,
     /// The slot was closed, which ended our participation without us asking.
     SlotClosed,
+    /// The call identity/auth contract became ambiguous; never auto-rejoin.
+    IdentityRejected,
     /// The connection to our own focus (the one we publish on) closed and
     /// will not be re-established. Peer-focus connections closing do not end
     /// the call — they reconnect.

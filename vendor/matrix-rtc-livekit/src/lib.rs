@@ -31,7 +31,9 @@
 // lives in `matrix_rtc_transport::livekit`, which the web binding shares; this crate
 // re-exports it under the paths it always had.
 pub use matrix_rtc_transport::livekit::identity;
-pub use matrix_rtc_transport::livekit::{LiveKitTransportConfig, TokenEndpoint, identity_mapper};
+pub use matrix_rtc_transport::livekit::{
+    LiveKitAuthDialect, LiveKitTransportConfig, TokenEndpoint, identity_mapper,
+};
 
 pub mod keys;
 // Audio helpers. Recording a subscribed track and writing WAVs is shipped API
@@ -75,11 +77,30 @@ async fn acquire_token(
     http: &reqwest::Client,
     config: &LiveKitTransportConfig,
     backend: &dyn MatrixBackend,
+    admission: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<SfuToken, Error> {
+    use std::sync::atomic::Ordering;
+    if admission.is_some_and(|active| !active.load(Ordering::Acquire)) {
+        return Err(Error::IdentityRejected);
+    }
     // Both own and remote focus connections pass through this boundary.
     livekit_api::connection_policy::authorization_url(&config.livekit_service_url)
         .map_err(|_| Error::UnsafeEndpoint)?;
+    let dialect = match config.token_endpoint {
+        TokenEndpoint::Msc4195 => LiveKitAuthDialect::DirectDraft,
+        TokenEndpoint::LegacyElementCall => LiveKitAuthDialect::LegacyService,
+    };
+    dialect.validate_slot(&config.slot_id).map_err(|_| Error::UnsupportedAuthDialect)?;
+    if config.member.id.is_empty()
+        || config.member.claimed_user_id.is_empty()
+        || config.member.claimed_device_id.is_empty()
+    {
+        return Err(Error::UnsupportedAuthDialect);
+    }
     let openid_token = backend.openid_token().await?;
+    if admission.is_some_and(|active| !active.load(Ordering::Acquire)) {
+        return Err(Error::IdentityRejected);
+    }
     match config.token_endpoint {
         TokenEndpoint::Msc4195 => {
             token::get_token(
@@ -119,7 +140,7 @@ pub async fn connect(
     config: &LiveKitTransportConfig,
     backend: &dyn MatrixBackend,
 ) -> Result<LiveKitConnection, Error> {
-    let sfu_token = acquire_token(http, config, backend).await?;
+    let sfu_token = acquire_token(http, config, backend, None).await?;
     LiveKitSession::connect(&sfu_token).await
 }
 
@@ -141,10 +162,25 @@ pub async fn connect_e2ee(
     key_provider: livekit::e2ee::key_provider::KeyProvider,
     auto_subscribe: bool,
 ) -> Result<LiveKitConnection, Error> {
+    connect_e2ee_guarded(http, config, backend, key_provider, auto_subscribe, None).await
+}
+
+async fn connect_e2ee_guarded(
+    http: &reqwest::Client,
+    config: &LiveKitTransportConfig,
+    backend: &dyn MatrixBackend,
+    key_provider: livekit::e2ee::key_provider::KeyProvider,
+    auto_subscribe: bool,
+    admission: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<LiveKitConnection, Error> {
     use livekit::RoomOptions;
     use livekit::e2ee::{E2eeOptions, EncryptionType};
+    use std::sync::atomic::Ordering;
 
-    let sfu_token = acquire_token(http, config, backend).await?;
+    let sfu_token = acquire_token(http, config, backend, admission).await?;
+    if admission.is_some_and(|active| !active.load(Ordering::Acquire)) {
+        return Err(Error::IdentityRejected);
+    }
 
     // RoomOptions is #[non_exhaustive]; mutate a default instance.
     let mut options = RoomOptions::default();
@@ -164,6 +200,10 @@ pub async fn connect_e2ee(
 pub enum Error {
     #[error("unsafe MatrixRTC credential transport endpoint")]
     UnsafeEndpoint,
+    #[error("unsupported or inconsistent LiveKit auth/slot contract")]
+    UnsupportedAuthDialect,
+    #[error("call identity contract refused")]
+    IdentityRejected,
     #[error("LiveKit authorization network request failed")]
     Network,
     #[error("LiveKit authorization service returned HTTP {0}")]
@@ -193,6 +233,31 @@ mod credential_policy_tests {
     use super::*;
 
     #[tokio::test]
+    async fn custom_slot_never_falls_through_to_legacy_room_credentials() {
+        let backend = matrix_rtc_core::testing::MockBackend::new();
+        let mut config = LiveKitTransportConfig {
+            livekit_service_url: "https://rtc.example.org".into(),
+            room_id: "!test:example.org".into(),
+            slot_id: "m.call#custom".into(),
+            member: token::MemberClaims {
+                id: "member".into(),
+                claimed_user_id: "@test:example.org".into(),
+                claimed_device_id: "DEVICE".into(),
+            },
+            token_endpoint: TokenEndpoint::LegacyElementCall,
+        };
+        let http = reqwest::Client::new();
+        let error = acquire_token(&http, &config, &backend, None).await.err().unwrap();
+        assert!(matches!(error, Error::UnsupportedAuthDialect));
+        config.token_endpoint = TokenEndpoint::Msc4195;
+        let error = acquire_token(&http, &config, &backend, None).await.err().unwrap();
+        assert!(matches!(error, Error::OpenIdToken(_)));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let error = acquire_token(&http, &config, &backend, Some(&active)).await.err().unwrap();
+        assert!(matches!(error, Error::IdentityRejected));
+    }
+
+    #[tokio::test]
     async fn invalid_focus_fails_before_requesting_openid() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         // MockBackend does not implement OpenID. Getting UnsafeEndpoint rather
@@ -216,7 +281,7 @@ mod credential_policy_tests {
                     },
                     token_endpoint,
                 };
-                let error = acquire_token(&reqwest::Client::new(), &config, &backend)
+                let error = acquire_token(&reqwest::Client::new(), &config, &backend, None)
                     .await
                     .err()
                     .unwrap();

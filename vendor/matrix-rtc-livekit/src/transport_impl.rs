@@ -60,7 +60,7 @@ use matrix_rtc_transport::{
 use crate::identity::pseudonymous_identity;
 use crate::session::LiveKitSession;
 use crate::token::MemberClaims;
-use crate::{LiveKitTransportConfig, TokenEndpoint, connect_e2ee};
+use crate::{LiveKitTransportConfig, TokenEndpoint};
 
 /// Sample rate remote audio is resampled to before crossing the transport
 /// boundary, matching what the recording helpers in [`crate::media`] use.
@@ -89,6 +89,7 @@ pub struct LiveKitMediaTransport {
     /// Which authorisation-service dialect to speak. MSC4195 `/get_token` by
     /// default.
     token_endpoint: TokenEndpoint,
+    admission: Option<Arc<AtomicBool>>,
 }
 
 impl LiveKitMediaTransport {
@@ -104,8 +105,11 @@ impl LiveKitMediaTransport {
             backend,
             key_provider,
             auto_subscribe: true,
-            identity_mapper: Arc::new(pseudonymous_identity),
+            identity_mapper: Arc::new(|user, device, member, _snapshot| {
+                Some(pseudonymous_identity(user, device, member))
+            }),
             token_endpoint: TokenEndpoint::default(),
+            admission: None,
         }
     }
 
@@ -114,6 +118,21 @@ impl LiveKitMediaTransport {
     /// See [`crate::connect_e2ee`].
     pub fn with_auto_subscribe(mut self, auto_subscribe: bool) -> Self {
         self.auto_subscribe = auto_subscribe;
+        self
+    }
+
+    /// Set auth and identity together, before sharing the checked mapper with
+    /// the core. A CSAPI SFU locator is never an OpenID service URL.
+    pub fn with_auth_dialect(mut self, dialect: crate::LiveKitAuthDialect) -> Self {
+        self.token_endpoint = dialect.token_endpoint();
+        self.identity_mapper = Arc::new(move |user, device, member, _snapshot| {
+            dialect.identity(user, device, member)
+        });
+        self
+    }
+
+    pub fn with_call_admission(mut self, admission: Arc<AtomicBool>) -> Self {
+        self.admission = Some(admission);
         self
     }
 
@@ -154,6 +173,12 @@ impl OwnFocusTransport for LiveKitMediaTransport {
         ),
         TransportError,
     > {
+        if self.admission.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
+            return Err(TransportError::Closed("call identity contract refused".into()));
+        }
+        let own_identity = (self.identity_mapper)(
+            &ctx.member.user_id, &ctx.member.device_id, &ctx.member.member_id, None,
+        ).ok_or_else(|| TransportError::Closed("call identity contract refused".into()))?;
         let config = LiveKitTransportConfig {
             livekit_service_url: livekit_service_url.to_owned(),
             room_id: ctx.room_id.clone(),
@@ -165,15 +190,27 @@ impl OwnFocusTransport for LiveKitMediaTransport {
             },
             token_endpoint: self.token_endpoint,
         };
-        let connection = connect_e2ee(
+        let connection = crate::connect_e2ee_guarded(
             &self.http,
             &config,
             self.backend.as_ref(),
             self.key_provider.clone(),
             self.auto_subscribe,
+            self.admission.as_ref(),
         )
         .await
         .map_err(|error| TransportError::Connect(error.to_string()))?;
+
+        // The SFU authenticated this participant; do not decode an unverified
+        // JWT or try another identity to make the media/key mapping fit.
+        if connection.session.room().local_participant().identity().as_str() != own_identity
+            || self.admission.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
+            if let Some(active) = &self.admission {
+                active.store(false, Ordering::Release);
+            }
+            let _ = connection.session.room().close().await;
+            return Err(TransportError::Closed("call identity contract refused".into()));
+        }
 
         // The receiver returned by the room connect carries events from the
         // very beginning (nothing can be missed); hand it to the translator.
@@ -184,12 +221,9 @@ impl OwnFocusTransport for LiveKitMediaTransport {
             LiveKitTransportConnection {
                 connection_key: livekit_service_url.to_owned(),
                 session: Arc::new(connection.session),
-                own_identity: (self.identity_mapper)(
-                    &ctx.member.user_id,
-                    &ctx.member.device_id,
-                    &ctx.member.member_id,
-                ),
+                own_identity,
                 local_key_index: Arc::new(Mutex::new(None)),
+                admission: self.admission.clone(),
             },
             events_rx,
         ))
@@ -226,11 +260,12 @@ impl MediaTransport for LiveKitMediaTransport {
         // Through the mapper rather than `pseudonymous_identity` directly, so a
         // legacy call derives peer identities exactly as it derives its own.
         let device_id = member.origin.sender_device_id()?;
-        Some((self.identity_mapper)(
+        (self.identity_mapper)(
             &member.sender,
             device_id,
             &member.member_id,
-        ))
+            None,
+        )
     }
 
     async fn connect(
@@ -265,6 +300,7 @@ pub struct LiveKitTransportConnection {
     /// index 0: a track published after a rotation would otherwise be stamped
     /// with an index no peer holds a key for.
     local_key_index: Arc<Mutex<Option<u8>>>,
+    admission: Option<Arc<AtomicBool>>,
 }
 
 // Select/update the cached index and apply it in one synchronous critical
@@ -273,9 +309,13 @@ pub struct LiveKitTransportConnection {
 fn apply_selected_local_key_index(
     selected: &Mutex<Option<u8>>,
     replacement: Option<u8>,
+    admission: Option<&AtomicBool>,
     apply: impl FnOnce(u8),
 ) {
     let mut current = selected.lock().expect("local key index mutex poisoned");
+    if admission.is_some_and(|active| !active.load(Ordering::Acquire)) {
+        return;
+    }
     if let Some(index) = replacement {
         *current = Some(index);
     }
@@ -295,15 +335,21 @@ impl LiveKitTransportConnection {
     /// Re-assert the current index on our senders, for a track published after a
     /// rotation: its cryptor is new, and new cryptors start at index 0.
     fn reassert_local_key_index(&self) {
-        apply_selected_local_key_index(&self.local_key_index, None, |key_index| {
-            self.apply_local_key_index(key_index);
-        });
+        apply_selected_local_key_index(
+            &self.local_key_index,
+            None,
+            self.admission.as_deref(),
+            |key_index| self.apply_local_key_index(key_index),
+        );
     }
 
     fn apply_local_key_index(&self, key_index: u8) {
         let mut switched = 0usize;
         for ((identity, _track_sid), cryptor) in self.session.room().e2ee_manager().frame_cryptors()
         {
+            if self.admission.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
+                return;
+            }
             if identity.as_str() == self.own_identity {
                 cryptor.set_key_index(i32::from(key_index));
                 switched += 1;
@@ -331,15 +377,21 @@ impl TransportConnection for LiveKitTransportConnection {
     /// `set_key` only fills the key *ring*; the index a sender stamps lives on
     /// its frame cryptor and changes only here.
     fn set_local_key_index(&self, key_index: u8) {
-        apply_selected_local_key_index(&self.local_key_index, Some(key_index), |key_index| {
-            self.apply_local_key_index(key_index);
-        });
+        apply_selected_local_key_index(
+            &self.local_key_index,
+            Some(key_index),
+            self.admission.as_deref(),
+            |key_index| self.apply_local_key_index(key_index),
+        );
     }
 
     async fn publish(
         &self,
         options: PublishOptions,
     ) -> Result<Arc<dyn LocalTrackHandle>, TransportError> {
+        if self.admission.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
+            return Err(TransportError::Closed("call identity contract refused".into()));
+        }
         let kind = options.kind;
         let source_kind = livekit_track_source(kind);
         // Muted before publishing, not after: livekit puts `track.is_muted()`
@@ -376,6 +428,10 @@ impl TransportConnection for LiveKitTransportConnection {
                     )
                     .await
                     .map_err(|error| TransportError::Connect(error.to_string()))?;
+                if self.admission.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
+                    let _ = self.session.room().close().await;
+                    return Err(TransportError::Closed("call identity contract refused".into()));
+                }
                 // A frame cryptor is created per published track, at index 0.
                 // If we have already rotated, this one must be moved onto the
                 // current index or its frames carry a key nobody holds.
@@ -387,6 +443,7 @@ impl TransportConnection for LiveKitTransportConnection {
                     session: Arc::clone(&self.session),
                     closed: AtomicBool::new(false),
                     retraction_failed: AtomicBool::new(false),
+                    admission: self.admission.clone(),
                 }))
             }
             MediaStreamKind::Camera | MediaStreamKind::ScreenShare => {
@@ -427,6 +484,10 @@ impl TransportConnection for LiveKitTransportConnection {
                     )
                     .await
                     .map_err(|error| TransportError::Connect(error.to_string()))?;
+                if self.admission.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
+                    let _ = self.session.room().close().await;
+                    return Err(TransportError::Closed("call identity contract refused".into()));
+                }
                 self.reassert_local_key_index();
                 Ok(Arc::new(LiveKitLocalTrack {
                     kind,
@@ -435,6 +496,7 @@ impl TransportConnection for LiveKitTransportConnection {
                     session: Arc::clone(&self.session),
                     closed: AtomicBool::new(false),
                     retraction_failed: AtomicBool::new(false),
+                    admission: self.admission.clone(),
                 }))
             }
             MediaStreamKind::Data => Err(TransportError::Unsupported(
@@ -552,6 +614,7 @@ struct LiveKitLocalTrack {
     /// must not be mistaken for the benign already-retracted case, because
     /// the track may still be live at the SFU.
     retraction_failed: AtomicBool,
+    admission: Option<Arc<AtomicBool>>,
 }
 
 #[async_trait]
@@ -561,6 +624,9 @@ impl LocalTrackHandle for LiveKitLocalTrack {
     }
 
     fn set_muted(&self, muted: bool) -> Result<(), TransportError> {
+        if !muted && self.admission.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
+            return Err(TransportError::Closed("call identity contract refused".into()));
+        }
         match (&self.track, muted) {
             (LocalTrack::Audio(track), true) => track.mute(),
             (LocalTrack::Audio(track), false) => track.unmute(),
@@ -606,6 +672,9 @@ impl LocalTrackHandle for LiveKitLocalTrack {
     }
 
     async fn capture_audio(&self, frame: AudioFrame) -> Result<(), TransportError> {
+        if self.admission.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
+            return Err(TransportError::Closed("call identity contract refused".into()));
+        }
         if self.closed.load(Ordering::Acquire) {
             return Err(TransportError::Closed(
                 "this publication was unpublished".into(),
@@ -629,6 +698,9 @@ impl LocalTrackHandle for LiveKitLocalTrack {
     }
 
     fn capture_video(&self, frame: VideoFrame) -> Result<(), TransportError> {
+        if self.admission.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
+            return Err(TransportError::Closed("call identity contract refused".into()));
+        }
         if self.closed.load(Ordering::Acquire) {
             return Err(TransportError::Closed(
                 "this publication was unpublished".into(),
@@ -1008,6 +1080,19 @@ mod encoding_tests {
     use std::time::Duration;
 
     #[test]
+    fn retired_call_does_not_store_or_apply_sender_index() {
+        let selected = Mutex::new(Some(4));
+        let active = std::sync::atomic::AtomicBool::new(false);
+        apply_selected_local_key_index(&selected, Some(7), Some(&active), |_| {
+            panic!("retired sender must not activate");
+        });
+        apply_selected_local_key_index(&selected, None, Some(&active), |_| {
+            panic!("retired sender must not reassert");
+        });
+        assert_eq!(*selected.lock().unwrap(), Some(4));
+    }
+
+    #[test]
     fn local_key_index_publish_reassertion_cannot_overwrite_a_concurrent_key_activation() {
         let selected = Arc::new(Mutex::new(Some(4)));
         let applied = Arc::new(Mutex::new(Vec::new()));
@@ -1018,7 +1103,7 @@ mod encoding_tests {
         let reassert_selected = Arc::clone(&selected);
         let reassert_applied = Arc::clone(&applied);
         let reassert = thread::spawn(move || {
-            apply_selected_local_key_index(&reassert_selected, None, |index| {
+            apply_selected_local_key_index(&reassert_selected, None, None, |index| {
                 entered_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 reassert_applied.lock().unwrap().push(index);
@@ -1032,7 +1117,7 @@ mod encoding_tests {
         let activate_applied = Arc::clone(&applied);
         let activate = thread::spawn(move || {
             started_tx.send(()).unwrap();
-            apply_selected_local_key_index(&activate_selected, Some(5), |index| {
+            apply_selected_local_key_index(&activate_selected, Some(5), None, |index| {
                 activate_applied.lock().unwrap().push(index);
             });
             done_tx.send(()).unwrap();
@@ -1050,12 +1135,12 @@ mod encoding_tests {
     #[test]
     fn local_key_index_without_an_activated_key_is_not_reasserted() {
         let selected = Mutex::new(None);
-        apply_selected_local_key_index(&selected, None, |_| {
+        apply_selected_local_key_index(&selected, None, None, |_| {
             panic!("An uninitialized sender must not select a key");
         });
         let mut applied = Vec::new();
-        apply_selected_local_key_index(&selected, Some(7), |index| applied.push(index));
-        apply_selected_local_key_index(&selected, None, |index| applied.push(index));
+        apply_selected_local_key_index(&selected, Some(7), None, |index| applied.push(index));
+        apply_selected_local_key_index(&selected, None, None, |index| applied.push(index));
         assert_eq!(applied, vec![7, 7]);
         assert_eq!(*selected.lock().unwrap(), Some(7));
     }

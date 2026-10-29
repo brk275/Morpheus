@@ -64,6 +64,7 @@ async fn run_call(
         room.backend().clone(),
         LiveKitAttachOptions {
             format: Default::default(), // must match RoomOptions::format
+            auth_dialect: matrix_rtc_transport::livekit::LiveKitAuthDialect::DirectDraft,
             http: None,
             auto_subscribe: true,
             stability: Default::default(),

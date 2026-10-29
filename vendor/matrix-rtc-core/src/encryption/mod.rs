@@ -341,7 +341,13 @@ impl DiscardedKey {
 /// identity) injects the derivation via [`EncryptionManager::set_identity_mapper`].
 /// When no mapper is set, the manager falls back to its default identity
 /// (`user_id:device_id` for the own key, `member_id` for inbound keys).
-pub type RtcIdentityMapper = Arc<dyn Fn(&str, &str, &str) -> String + Send + Sync>;
+/// The core supplies its authoritative current membership snapshot; transport
+/// callers may pass `None` and use their subscribed view. Callbacks must not
+/// retain the borrowed snapshot. `None` refuses a signal without inventing an
+/// empty identity; authenticated pending material remains stored by member id.
+pub type RtcIdentityMapper = Arc<
+    dyn Fn(&str, &str, &str, Option<&[JoinedMembership]>) -> Option<String> + Send + Sync,
+>;
 
 /// The EncryptionManager manages encryption keys for an RTC session.
 ///
@@ -596,12 +602,26 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         };
 
         let mut signals: Vec<KeyMaterialSignal> = Vec::new();
+        let memberships = {
+            let guard = self.get_memberships.lock().unwrap();
+            guard()
+        };
 
         // Our own outbound key, under the same identity `signal_key_to_app`
         // would use.
         if let Some(outbound) = self.get_outbound_key() {
             let rtc_backend_identity = match &self.identity_mapper {
-                Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
+                Some(mapper) => {
+                    let Some(identity) = mapper(
+                        &self.own_user_id,
+                        &self.own_device_id,
+                        &self.own_member_id,
+                        Some(&memberships),
+                    ) else {
+                        return;
+                    };
+                    identity
+                }
                 None => self.get_own_rtc_backend_identity(),
             };
             // Replay with whatever is *left* of this key's `delayBeforeUse`,
@@ -636,10 +656,6 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
         // Peer keys, under the identity derived from their membership — the
         // same derivation `add_key_to_participant` performs.
-        let memberships = {
-            let guard = self.get_memberships.lock().unwrap();
-            guard()
-        };
         for (member_id, keys) in self.get_all_inbound_keys() {
             let Some(membership) = memberships
                 .iter()
@@ -651,11 +667,17 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 continue;
             };
             let rtc_backend_identity = match &self.identity_mapper {
-                Some(mapper) => mapper(
-                    &membership.sender,
-                    membership.origin.sender_device_id().unwrap_or(""),
-                    &membership.member_id,
-                ),
+                Some(mapper) => {
+                    let Some(identity) = mapper(
+                        &membership.sender,
+                        membership.origin.sender_device_id().unwrap_or(""),
+                        &membership.member_id,
+                        Some(&memberships),
+                    ) else {
+                        continue;
+                    };
+                    identity
+                }
                 None => membership.member_id.clone(),
             };
             for key in keys {
@@ -1781,8 +1803,22 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// eagerly so the transport is listening.
     async fn signal_key_to_app(&self, key: &OutboundEncryptionKey, use_after_ms: u64) {
         if let Some(handler) = &self.signal_handler {
+            let memberships = {
+                let guard = self.get_memberships.lock().unwrap();
+                guard()
+            };
             let rtc_backend_id = match &self.identity_mapper {
-                Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
+                Some(mapper) => {
+                    let Some(identity) = mapper(
+                        &self.own_user_id,
+                        &self.own_device_id,
+                        &self.own_member_id,
+                        Some(&memberships),
+                    ) else {
+                        return;
+                    };
+                    identity
+                }
                 None => self.get_own_rtc_backend_identity(),
             };
             let signal = KeyMaterialSignal {
@@ -2063,13 +2099,18 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         // installed (e.g. the LiveKit transport's MSC4195 pseudonymous identity),
         // derive it from the membership's user/device/member triple; otherwise
         // fall back to the raw member_id (or `sender:device`).
+        let memberships = {
+            let guard = self.get_memberships.lock().unwrap();
+            guard()
+        };
         let rtc_backend_id = match &self.identity_mapper {
             Some(mapper) => mapper(
                 &membership.sender,
                 membership.origin.sender_device_id().unwrap_or(""),
                 &membership.member_id,
+                Some(&memberships),
             ),
-            None => membership.member_id.clone(),
+            None => Some(membership.member_id.clone()),
         };
 
         // Store the key: at most one entry per index, holding the newest material
@@ -2121,8 +2162,12 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             }
         }
 
-        // Signal to application
-        self.signal_inbound_key_to_app(key, rtc_backend_id).await;
+        // Retain authenticated pending material by member id even if the media
+        // contract cannot currently address it. Never install it under a made-up
+        // identity; a later valid replay performs the same admission again.
+        if let Some(rtc_backend_id) = rtc_backend_id {
+            self.signal_inbound_key_to_app(key, rtc_backend_id).await;
+        }
     }
 
     /// Signals an inbound key to the application layer.
@@ -3085,8 +3130,8 @@ mod tests {
         let handler = Arc::new(RecordingHandler::default());
         manager.set_signal_handler(handler.clone());
         manager.set_identity_mapper(Arc::new(
-            |user_id: &str, device_id: &str, member_id: &str| {
-                format!("mapped:{user_id}/{device_id}/{member_id}")
+            |user_id: &str, device_id: &str, member_id: &str, _memberships| {
+                Some(format!("mapped:{user_id}/{device_id}/{member_id}"))
             },
         ));
 
@@ -3617,6 +3662,39 @@ mod tests {
         let keys = manager.get_inbound_keys("bob-device456-uuid");
         assert_eq!(keys.len(), 1, "only the genuine key should survive");
         assert_eq!(keys[0].key, vec![1u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn fallible_mapper_preserves_pending_material_without_empty_identity_signals() {
+        let memberships = Arc::new(Mutex::new(Vec::new()));
+        let source = Arc::clone(&memberships);
+        let mut manager = EncryptionManager::new(
+            Arc::new(NoopBackend), USER_ID.into(), DEVICE_ID.into(), MEMBER_ID.into(),
+            ROOM_ID.into(), SLOT_ID.into(), move || source.lock().unwrap().clone(),
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        manager.set_identity_mapper(Arc::new(|user, device, member, snapshot| {
+            let present = snapshot?.iter().any(|entry| entry.sender == user
+                && entry.member_id == member
+                && entry.origin.sender_device_id() == Some(device));
+            present.then(|| format!("{user}:{device}"))
+        }));
+        manager.receive_key(bob_key(vec![7; 32], 0)).await.unwrap();
+        assert!(handler.identities().is_empty());
+        assert!(manager.get_inbound_keys("bob-device456-uuid").is_empty());
+        *memberships.lock().unwrap() = vec![bob_membership()];
+        manager.on_memberships_update().await.unwrap();
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
+        assert_eq!(handler.identities(), vec!["@bob:example.org:device456"]);
+        handler.signals.lock().unwrap().clear();
+        manager.replay_keys_to_handler().await;
+        assert_eq!(handler.identities(), vec!["@bob:example.org:device456"]);
+        manager.set_identity_mapper(Arc::new(|_, _, _, _| None));
+        handler.signals.lock().unwrap().clear();
+        manager.replay_keys_to_handler().await;
+        assert!(handler.identities().is_empty());
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
     }
 
     /// A discarded key must not occupy its (member, index) slot in the
