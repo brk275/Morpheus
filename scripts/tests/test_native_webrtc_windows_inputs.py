@@ -1145,7 +1145,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $caseStage = 'source_parse'
 $inventorySite = 'unknown'
-$fixtureLineLimit = 1420
+$fixtureLineLimit = 1444
 try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
@@ -2285,9 +2285,33 @@ try {
     try {
         if ($null -ne (New-HostOwnedTraversal) -or $script:CompleteInvokeCalls -ne 0 -or
             $script:HostHandles.Count -ne 0) { throw 'identity' }
-        $oldResult = Get-HostRootInventory $good
+        # Observe and forward the real CreateFileW boundary only after the
+        # native-Invoke admission refusal above has independently been proved.
+        $script:SequentialOpenOriginal = $script:HostOpen
+        $script:SequentialFileOpens = 0; $script:SequentialDirectoryOpens = 0
+        $openHintProbe = [pscustomobject]@{}
+        $openHintProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
+            param([IntPtr] $Wide, [uint32] $Access, [uint32] $Share,
+                [IntPtr] $Security, [uint32] $Creation, [uint32] $Flags, [IntPtr] $Template)
+            if ($Share -ne 1 -or $Security -ne [IntPtr]::Zero -or $Creation -ne 3 -or
+                $Template -ne [IntPtr]::Zero) { throw 'identity' }
+            if ($Access -eq [uint32]128) {
+                if ($Flags -ne [uint32]0x02200000) { throw 'identity' }
+                $script:SequentialDirectoryOpens++
+            } elseif ($Access -eq [uint32]2147483648) {
+                if ($Flags -ne [uint32]0x08200000) { throw 'identity' }
+                $script:SequentialFileOpens++
+            } else { throw 'identity' }
+            return $script:SequentialOpenOriginal.DynamicInvoke([object[]]@(
+                $Wide, $Access, $Share, $Security, $Creation, $Flags, $Template))
+        }
+        try {
+            $script:HostOpen = $openHintProbe
+            $oldResult = Get-HostRootInventory $good
+        } finally { $script:HostOpen = $script:SequentialOpenOriginal }
         if ($oldResult.files.Count -ne 2 -or $script:CompleteInvokeCalls -le 0 -or
             $script:HostManagedTraversalRoots -ne 0) { throw 'inventory' }
+        if ($script:SequentialFileOpens -ne 2 -or $script:SequentialDirectoryOpens -le 0) { throw 'identity' }
     } finally { $script:HostType.PSObject.Members.Remove('Invoke') }
 } finally { Close-HostReader }
 Initialize-HostReader

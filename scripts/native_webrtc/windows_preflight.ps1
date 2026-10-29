@@ -1173,8 +1173,10 @@ namespace Morpheus.OwnedTraversal20261028
             IntPtr wide = Marshal.StringToHGlobalUni(@"\\?\" + full), handle;
             try
             {
+                // Full forward payload reads use the Windows cache hint while
+                // retaining no-follow and the original directory flags.
                 handle = open(wide, directory ? 128U : 2147483648U, 1U,
-                    IntPtr.Zero, 3U, directory ? 0x02200000U : 0x00200000U, IntPtr.Zero);
+                    IntPtr.Zero, 3U, directory ? 0x02200000U : 0x08200000U, IntPtr.Zero);
             }
             finally { Marshal.FreeHGlobal(wide); }
             if (handle == new IntPtr(-1)) Fail("open");
@@ -1785,7 +1787,8 @@ function Open-HostReadHandle([string] $LiteralPath, [bool] $Directory) {
         # opens. Share READ only prevents original opened files being written,
         # renamed or deleted until the complete snapshot has been checked.
         $access = if ($Directory) { [uint32]128 } else { [uint32]2147483648 }
-        $flags = if ($Directory) { [uint32]0x02200000 } else { [uint32]0x00200000 }
+        # Full forward payload reads: cache hint only; no-follow stays set.
+        $flags = if ($Directory) { [uint32]0x02200000 } else { [uint32]0x08200000 }
         $handle = $script:HostOpen.Invoke($wide, $access, [uint32]1, [IntPtr]::Zero, [uint32]3, $flags, [IntPtr]::Zero)
     } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($wide) }
     if ($handle -eq [IntPtr]::new(-1)) { throw 'open' }
