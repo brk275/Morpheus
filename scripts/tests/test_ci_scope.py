@@ -493,17 +493,21 @@ class ScopeTests(unittest.TestCase):
                 'scripts/build_native_webrtc_unix.py',
                 'scripts/native_webrtc/macos_materials.py',
                 'scripts/native_webrtc/source_importer.py',
+                'scripts/native_webrtc/windows_preflight.ps1',
                 'scripts/run_native_webrtc_linux.py',
                 'scripts/run_native_webrtc_macos.py',
                 'scripts/tests/test_native_webrtc_unix_inputs.py',
+                'scripts/tests/test_native_webrtc_windows_inputs.py',
             ))
         self.assertEqual(ci_scope.AUTOMATIC_DESKTOP_INPUTS, app)
         self.assertEqual(ci_scope.AUTOMATIC_PRODUCER_INPUTS, producer)
         pack = {"native/webrtc/linux/pipeline-plan.json", "native/webrtc/macos/mac-arm64/pipeline-plan.json",
                 "native/webrtc/macos/mac-x64/pipeline-plan.json", "scripts/run_native_webrtc_linux.py",
                 "scripts/run_native_webrtc_macos.py", "scripts/tests/test_native_webrtc_unix_inputs.py"}
+        windows_producer = {"scripts/native_webrtc/windows_preflight.ps1",
+                            "scripts/tests/test_native_webrtc_windows_inputs.py"}
         batches = [(set(), "all"), (app, "desktop"), (app | pack, "desktop"),
-                   (app | producer, "desktop"), (producer, "helpers")]
+                   (app | producer, "desktop"), (producer, "helpers"), (windows_producer, "helpers")]
         # The generated-UI regression and exact markup change retain the
         # complete desktop matrix without unrelated protocol/device binaries.
         batches += [({"crates/morpheus-app/ui/app-window.slint",
@@ -521,6 +525,17 @@ class ScopeTests(unittest.TestCase):
                     if route != "all":
                         self.assertEqual(selected["native_matrix"], {"os": list(PLATFORMS) if route == "desktop" else []})
                         self.assertFalse(selected["config"] or selected["wayland"])
+        # Windows DATA producers still need the separate real Windows
+        # fixture/inventory gate; unrelated Rust checks must not be launched.
+        # Mixed native/dependency/unknown inputs retain the full route.
+        for event in ("push", "pull_request"):
+            for other in ("Cargo.lock", "crates/morpheus-rtc/src/media.rs", "scripts/unknown.py"):
+                changed.return_value = (sorted(windows_producer | {other}), False)
+                selected = event_selection({}, event)
+                self.assertEqual(selected["check_route"], "all")
+                self.assertEqual(selected["native_matrix"]["os"], list(PLATFORMS))
+            changed.return_value = (sorted(windows_producer), True)
+            self.assertEqual(event_selection({}, event)["check_route"], "all")
         for dependency in ("Cargo.lock", "Cargo.toml", "crates/morpheus-app/Cargo.toml",
                            "crates/morpheus-app/src/main.rs", "crates/morpheus-app/src/live.rs",
                            "crates/morpheus-app/src/appearance_editor.rs", "crates/morpheus-config/src/lib.rs",

@@ -216,9 +216,11 @@ AUTOMATIC_PRODUCER_INPUTS = frozenset((
                 'scripts/build_native_webrtc_unix.py',
                 'scripts/native_webrtc/macos_materials.py',
                 'scripts/native_webrtc/source_importer.py',
+                'scripts/native_webrtc/windows_preflight.ps1',
                 'scripts/run_native_webrtc_linux.py',
                 'scripts/run_native_webrtc_macos.py',
                 'scripts/tests/test_native_webrtc_unix_inputs.py',
+                'scripts/tests/test_native_webrtc_windows_inputs.py',
             ))
 
 
