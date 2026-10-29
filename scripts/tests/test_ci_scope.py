@@ -474,6 +474,7 @@ class ScopeTests(unittest.TestCase):
     def test_exact_automatic_appearance_and_producer_batches_select_existing_routes(self, changed):
         app = set((
                 'crates/morpheus-app/src/account_access_ui_tests.rs',
+                'crates/morpheus-app/src/peer_verification.rs',
                 'crates/morpheus-app/ui/app-window.slint',
                 'crates/morpheus-app/src/theme_studio/mod.rs',
                 'crates/morpheus-app/src/theme_studio/session.rs',
@@ -540,6 +541,8 @@ class ScopeTests(unittest.TestCase):
                            "crates/morpheus-app/src/main.rs", "crates/morpheus-app/src/live.rs",
                            "crates/morpheus-app/src/appearance_editor.rs", "crates/morpheus-config/src/lib.rs",
                            "crates/morpheus-app/src/settings_search.rs", "crates/morpheus-app/src/account_access.rs",
+                           "crates/morpheus-app/src/verification.rs", "crates/morpheus-app/src/verification_work.rs",
+                           "crates/morpheus-matrix/src/peer_verification.rs", "crates/morpheus-matrix/src/own_verification.rs",
                            "crates/morpheus-app/ui/unknown.slint", "crates/morpheus-app/ui/call-bar.slint",
                            "crates/morpheus-app/build.rs", "crates/morpheus-ui-check/build.rs",
                            "crates/morpheus-app/src/theme_studio/scope.rs", "crates/morpheus-app/src/theme_studio/fonts.rs",

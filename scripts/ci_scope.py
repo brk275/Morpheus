@@ -195,6 +195,7 @@ MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-re
 # Maintainer source review may always require wider checks for semantic impact.
 AUTOMATIC_DESKTOP_INPUTS = frozenset((
                 'crates/morpheus-app/src/account_access_ui_tests.rs',
+                'crates/morpheus-app/src/peer_verification.rs',
                 'crates/morpheus-app/ui/app-window.slint',
                 'crates/morpheus-app/src/theme_studio/mod.rs',
                 'crates/morpheus-app/src/theme_studio/session.rs',
