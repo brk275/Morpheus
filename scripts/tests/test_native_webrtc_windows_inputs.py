@@ -1145,7 +1145,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $caseStage = 'source_parse'
 $inventorySite = 'unknown'
-$fixtureLineLimit = 1444
+$fixtureLineLimit = 1473
 try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
@@ -2205,6 +2205,35 @@ try {
 if ($null -ne $script:HostTraversalReader -or $null -ne $script:HostTraversalOwners -or
     $completeReader.Memory -ne [IntPtr]::Zero) { throw 'identity' }
 Must-Refuse { [Morpheus.OwnedTraversal20261028.Reader]::RunOwnedRoot($completeReader, $good) }
+# A fresh actual owned transaction hashes nonempty/empty/different/repeated
+# payloads in ordinal order. Each row must be an independent complete digest;
+# no previous file state may leak through the private reusable provider.
+$resetRoot = Join-Path $root 'owned-hash-reset'
+[IO.Directory]::CreateDirectory($resetRoot) | Out-Null
+[IO.File]::WriteAllBytes((Join-Path $resetRoot 'a.bin'), [byte[]]@(1,2,3,4))
+[IO.File]::WriteAllBytes((Join-Path $resetRoot 'b-empty.bin'), [byte[]]::new(0))
+[IO.File]::WriteAllBytes((Join-Path $resetRoot 'c.bin'), [byte[]]@(5))
+[IO.File]::WriteAllBytes((Join-Path $resetRoot 'd.bin'), [byte[]]@(1,2,3,4))
+Initialize-HostReader
+$resetReader = $null
+try {
+    $resetReader = New-HostOwnedTraversal
+    if ($null -eq $resetReader) { throw 'identity' }
+    $resetResult = Invoke-HostOwnedTraversal $resetReader $resetRoot $true
+    if ($script:HostManagedTraversalRoots -ne 1 -or $script:HostManagedHashes -ne 4 -or
+        $script:HostBytes -ne 9 -or $resetResult.files.Count -ne 4) { throw 'inventory' }
+    $resetExpected = @{
+        'a.bin' = '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a'
+        'b-empty.bin' = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+        'c.bin' = 'e77b9a9ae9e30b0dbdb6f510a264ef9de781501d7b6b92ae89eb059c5ab743db'
+        'd.bin' = '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a'
+    }
+    foreach ($row in $resetResult.files) {
+        if (-not $resetExpected.ContainsKey($row.path) -or $row.sha256 -cne $resetExpected[$row.path]) { throw 'hash' }
+    }
+} finally { Close-HostReader }
+if ($resetReader.Memory -ne [IntPtr]::Zero -or $script:HostInfoMemory -ne [IntPtr]::Zero -or
+    $script:HostHandles.Count -ne 0) { throw 'identity' }
 # Exercise the original non-ASCII lexical helper within the actual complete
 # native transaction, not merely through the pure lexical comparison above.
 $unicodeRoot = Join-Path $root 'owned-unicode'
