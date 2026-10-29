@@ -1,5 +1,5 @@
 param([string] $ExpectedManifest, [string] $CandidateRoot)
-# Temporary admission wrapper: parent reads/holds inputs; reviewed child invokes the compiler.
+# Reviewed standalone DATA probe. No checkout/import/Add-Type/tool execution.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -258,7 +258,7 @@ function Get-FixedFixtureFailure([string] $Text) {
             return [ordered]@{ fixture_failure = 'fixed-existing-case-v1'; stage = 'unknown'; category = 'unexpected' }
         }
         $line = [int]::Parse($match.Groups[3].Value, [Globalization.CultureInfo]::InvariantCulture)
-        if ($line -gt 2358) {
+        if ($line -gt 2361) {
             return [ordered]@{ fixture_failure = 'fixed-existing-case-v1'; stage = 'unknown'; category = 'unexpected' }
         }
         $result['line'] = $line
@@ -458,8 +458,8 @@ try {
         Need ($actual.bytes -eq $fact.bytes -and $actual.sha256 -ceq $fact.sha256)
     }
     $script:admissionStage = 'candidate_source'
-    $null = Hash-AdmissionFile ([IO.Path]::Combine($candidate, 'scripts', 'native_webrtc', 'windows_preflight.ps1')) 141206 'b7de668894a4719abcbdf8ca8d61e1dc9801389612becda7e11d192809903a97'
-    $null = Hash-AdmissionFile ([IO.Path]::Combine($candidate, 'scripts', 'tests', 'test_native_webrtc_windows_inputs.py')) 169788 '5f4f5d01d2946aed2885b835579a3839ca1215d643d2aed6a501316eade3ecdd'
+    $null = Hash-AdmissionFile ([IO.Path]::Combine($candidate, 'scripts', 'native_webrtc', 'windows_preflight.ps1')) 141434 '94a02a282da49fff11a0a0ca3be9b1e7ef781eef0b9280aed4c5dca1fdf9cff2'
+    $null = Hash-AdmissionFile ([IO.Path]::Combine($candidate, 'scripts', 'tests', 'test_native_webrtc_windows_inputs.py')) 171317 'e354cefddfa2d251260326878183e23c724df0c7aee5bd91c42b47c87acd0084'
     $script:admissionStage = 'fixture'
     # Only metadata work uses this clock. The separately bounded existing
     # fixture child retains its original45-second PowerShell-case timeout.
@@ -474,7 +474,7 @@ try {
     foreach ($record in $records) { Budget; Same-Identity $record.handle $record.identity }
     foreach ($record in $directories.Values) { Budget; Same-Identity $record.handle $record.identity }
     $output = [ordered]@{ schema = 'morpheus-reviewed-windows-compiler-fixture-admission-v1';
-        candidate_source = '3043ad76abf8ecd36c9439793d34f4825d718401';
+        candidate_source = 'bf2905f9f6b61cc0e0ad015e6d8f023e7622602e';
         compiler_input_manifest_sha256 = $manifestSha; powershell_version = $psVersion;
         framework = $framework; compiler_tool_files = 474; fixture_passed = $true;
         fixture_compiler_invoked = $true; wrapper_compilation_invoked = $false;

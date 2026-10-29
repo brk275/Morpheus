@@ -32,7 +32,7 @@ jobs:
           sparse-checkout: |
             /compiler-fixture-admission.ps1
             /compiler-host-inputs.json
-      - name: Get the exact reviewed PR65 source
+      - name: Get the exact reviewed Windows reader source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         env:
           GIT_CONFIG_COUNT: '2'
@@ -41,7 +41,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 3043ad76abf8ecd36c9439793d34f4825d718401
+          ref: bf2905f9f6b61cc0e0ad015e6d8f023e7622602e
           path: candidate
           persist-credentials: false
       - name: Hold authenticated compiler inputs through the existing fixture
