@@ -500,8 +500,8 @@ impl Call {
             Arc::new(move || clock.now())
         });
         manager.set_signal_handler(media.clone());
-        manager.set_identity_mapper(Arc::new(|user_id, device_id, _member_id| {
-            identity_of(user_id, device_id)
+        manager.set_identity_mapper(Arc::new(|user_id, device_id, _member_id, _memberships| {
+            Some(identity_of(user_id, device_id))
         }));
         manager.join().await.expect("join should succeed");
 
