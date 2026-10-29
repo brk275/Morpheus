@@ -1006,9 +1006,16 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
                     self.assertFalse(_PIPELINE.PACK_ACTIVE)
                     self.assertEqual(_PIPELINE.pack_frame(), {"pack_failure": "refused", "pack_operation": operation})
                 bad = json.loads(json.dumps(header))
-                overlap = min(excluded, key=lambda value: value[1])
-                self.assertLessEqual(overlap[1], bad["batch_members"][0]["bytes"])
-                bad["batch_members"][0]["members"] = [{"offset": 0, "sha256": overlap[0], "bytes": overlap[1]}]
+                # Reverse the collision: the retained batch source is smaller
+                # than archive-derived content, so derive its existing nonzero
+                # target from a valid archive extent without changing any bound.
+                overlap = (hashlib.sha256(checkout_body).hexdigest(), len(checkout_body))
+                self.assertIn(overlap, batch_targets)
+                group = max(bad["xz_members"], key=lambda value: value["expanded_bytes"])
+                self.assertLessEqual(overlap[1], group["expanded_bytes"])
+                group["members"] = [{"offset": 0, "sha256": overlap[0], "bytes": overlap[1]}]
+                self.assertIn(overlap, _PIPELINE.archive_recipe_index(bad, canonical))
+                self.assertEqual(_PIPELINE.batch_recipe_index(bad, canonical), batch_targets)
                 with self.assertRaises(_PIPELINE.Refused):
                     _PIPELINE.pack_handoff(root, bad, inventories, _MATERIAL)
                 self.assertEqual(_PIPELINE.pack_frame(),
