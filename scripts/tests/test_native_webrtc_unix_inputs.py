@@ -316,6 +316,38 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
                                      {"helper": "unknown", "phase": "unknown", "lines": []})
 
 
+    def test_owned_git_stderr_context_is_bounded_closed_and_never_follows_links(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(); root.chmod(0o700)
+            owned = root / ("morpheus-webrtc-original-" + "0" * 16); owned.mkdir(mode=0o700)
+            logs = owned / "private-logs"; logs.mkdir(mode=0o700)
+            path = logs / "0002.stderr"
+            private = b"PRIVATE https://private.invalid/token=SECRET /private/owner"
+            path.write_bytes(b"error: RPC failed; " + private + b"\nfatal: early EOF\n"); path.chmod(0o600)
+            older = logs / "0001.stderr"; older.write_bytes(b"fatal: couldn't find remote ref SECRET\n"); older.chmod(0o600)
+            with mock.patch.dict(_PIPELINE.os.environ, {"RUNNER_TEMP": str(root)}):
+                self.assertEqual(_PIPELINE.git_stderr_conditions(owned), ["rpc", "early_eof"])
+                helper = _PIPELINE.module("git_source_stager.py")
+                context = _PIPELINE.helper_failure_context(helper, ValueError("SECRET"), owned)
+                self.assertEqual(context["git_stderr_conditions"], ["rpc", "early_eof"])
+                for secret in ("PRIVATE", "SECRET", "private.invalid", "/private/owner", ".stderr"):
+                    self.assertNotIn(secret, json.dumps(context))
+                with mock.patch.dict(helper.__dict__, {"UNRETIRED_COMMAND": object()}):
+                    self.assertNotIn("git_stderr_conditions", _PIPELINE.helper_failure_context(helper, ValueError(), owned))
+                path.write_bytes(b"x" * 65536 + b"\nfatal: early EOF\n"); path.chmod(0o600)
+                self.assertEqual(_PIPELINE.git_stderr_conditions(owned), ["early_eof"])
+                path.write_bytes(private); path.chmod(0o600)
+                self.assertEqual(_PIPELINE.git_stderr_conditions(owned), ["unclassified"])
+                path.chmod(0o644)
+                self.assertEqual(_PIPELINE.git_stderr_conditions(owned), ["unavailable"])
+                path.unlink(); path.symlink_to(older)
+                self.assertEqual(_PIPELINE.git_stderr_conditions(owned), ["unavailable"])
+                path.unlink(); os.link(older, path)
+                self.assertEqual(_PIPELINE.git_stderr_conditions(owned), ["unavailable"])
+                path.unlink(); logs.chmod(0o755)
+                self.assertEqual(_PIPELINE.git_stderr_conditions(owned), ["unavailable"])
+                self.assertEqual(_PIPELINE.git_stderr_conditions(root / "unrelated"), ["unavailable"])
+
     def test_postassembly_failure_context_is_fixed_and_remains_fatal(self):
         expected = frozenset(("post_assembly_scan", "alias_validation", "material_projection",
                               "final_inventory", "handoff_pack", "handoff_verify", "handoff_emit"))

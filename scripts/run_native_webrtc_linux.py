@@ -246,7 +246,90 @@ _HELPER_PHASES = {
 }
 
 
-def helper_failure_context(value, error):
+def git_stderr_conditions(root):
+    """Read bounded owned failure DATA; export only fixed observed conditions."""
+    unavailable = ["unavailable"]
+    if type(root) is not type(Path()) or not root.is_absolute():
+        return unavailable
+    temporary = os.environ.get("RUNNER_TEMP")
+    if (type(temporary) is not str or root.parent != Path(temporary)
+            or re.fullmatch(r"morpheus-webrtc-original-[0-9a-f]{16}", root.name) is None):
+        return unavailable
+    descriptors = []
+    def identity(value):
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    def directory(descriptor):
+        value = os.fstat(descriptor)
+        need(stat.S_ISDIR(value.st_mode) and value.st_uid == os.geteuid()
+             and stat.S_IMODE(value.st_mode) == 0o700)
+        return value
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        parent = os.open(root.parent, flags); descriptors.append(parent)
+        owned = os.open(root.name, flags, dir_fd=parent); descriptors.append(owned)
+        owned_before = directory(owned)
+        logs = os.open("private-logs", flags, dir_fd=owned); descriptors.append(logs)
+        logs_before = directory(logs)
+        selected, ordinal = None, -1
+        with os.scandir(logs) as entries:
+            for count, entry in enumerate(entries, 1):
+                need(count <= 8192)
+                if re.fullmatch(r"[0-9]{4,6}\.stderr", entry.name):
+                    current = int(entry.name[:-7])
+                    if current > ordinal: selected, ordinal = entry.name, current
+        need(selected is not None)
+        before = os.stat(selected, dir_fd=logs, follow_symlinks=False)
+        need(stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid()
+             and before.st_nlink == 1 and stat.S_IMODE(before.st_mode) == 0o600
+             and 0 <= before.st_size <= 256 * 1024 * 1024)
+        fd = os.open(selected, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=logs)
+        descriptors.append(fd)
+        need(identity(os.fstat(fd)) == identity(before))
+        offset = max(0, before.st_size - 65536)
+        need(os.lseek(fd, offset, os.SEEK_SET) == offset)
+        raw = bytearray()
+        while len(raw) < before.st_size - offset:
+            block = os.read(fd, min(8192, before.st_size - offset - len(raw)))
+            need(bool(block)); raw.extend(block)
+        need(os.read(fd, 1) == b"" and identity(os.fstat(fd)) == identity(before)
+             == identity(os.stat(selected, dir_fd=logs, follow_symlinks=False))
+             and identity(directory(logs)) == identity(logs_before)
+             == identity(os.stat("private-logs", dir_fd=owned, follow_symlinks=False))
+             and identity(directory(owned)) == identity(owned_before)
+             == identity(os.stat(root.name, dir_fd=parent, follow_symlinks=False)))
+        # The first tail line can be truncated; never match that partial line.
+        if offset: raw = raw[raw.find(b"\n") + 1:] if b"\n" in raw else bytearray()
+        observed = set()
+        for line in raw.split(b"\n"):
+            if line.endswith(b"\r"): line = line[:-1]
+            if len(line) > 8192: continue
+            if line.startswith(b"error: RPC failed;"): observed.add("rpc")
+            access = line.startswith(b"fatal: unable to access ")
+            if access and any(line.endswith(b"The requested URL returned error: " + status)
+                              for status in (b"401", b"403", b"404", b"408", b"429", b"500", b"502", b"503", b"504")):
+                observed.add("http")
+            if access and (b"SSL certificate problem" in line or b"server certificate verification failed" in line):
+                observed.add("tls")
+            if line == b"fatal: early EOF": observed.add("early_eof")
+            if line == b"fetch-pack: unexpected disconnect while reading sideband packet": observed.add("remote_disconnect")
+            if line == b"fatal: fetch-pack: invalid index-pack output": observed.add("index_pack")
+            if line.startswith((b"fatal:", b"error:")) and b"No space left on device" in line:
+                observed.add("disk_full")
+            if line.startswith(b"fatal: bad object ") or (line.startswith(b"fatal: loose object ") and line.endswith(b" is corrupt")):
+                observed.add("object")
+            if line.startswith(b"fatal: couldn't find remote ref "): observed.add("remote_ref")
+        return [label for label in ("rpc", "http", "tls", "early_eof", "remote_disconnect",
+                                   "index_pack", "disk_full", "object", "remote_ref") if label in observed] or ["unclassified"]
+    except (OSError, ValueError, Refused):
+        return unavailable
+    finally:
+        for descriptor in reversed(descriptors):
+            try: os.close(descriptor)
+            except OSError: pass  # Read-only diagnostics cannot replace refusal.
+
+
+def helper_failure_context(value, error, failure_root=None):
     helper, phase, lines = "unknown", "unknown", []
     if type(value) is types.ModuleType:
         namespace = value.__dict__
@@ -271,10 +354,14 @@ def helper_failure_context(value, error):
                 if frame is not None:
                     lines = []
                 break
-    return {"helper": helper, "phase": phase, "lines": lines}
+    result = {"helper": helper, "phase": phase, "lines": lines}
+    if (helper == "git_source_stager.py" and failure_root is not None
+            and "UNRETIRED_COMMAND" in namespace and namespace["UNRETIRED_COMMAND"] is None):
+        result["git_stderr_conditions"] = git_stderr_conditions(failure_root)
+    return result
 
 
-def cli(value, argv):
+def cli(value, argv, *, failure_root=None):
     original = sys.argv
     sys.argv = [value.__file__, *argv]
     try:
@@ -285,7 +372,7 @@ def cli(value, argv):
         # Emit bounded code context only, then preserve the original failure and traceback.
         try:
             print("MORPHEUS_NATIVE_HELPER_FAILED " + json.dumps(
-                helper_failure_context(value, error), sort_keys=True, separators=(",", ":")), file=sys.stderr)
+                helper_failure_context(value, error, failure_root), sort_keys=True, separators=(",", ":")), file=sys.stderr)
         except BaseException:
             pass  # Diagnostic output must never replace the original helper failure.
         raise
@@ -1689,7 +1776,7 @@ def stage(args, plan, temp, material):
     source_fact = material.write_json(relocated_source, source_plan)
     original = temp / ("morpheus-webrtc-original-" + args.plan_sha256[:16])
     cli(module("git_source_stager.py"), ["--plan", str(relocated_source), "--plan-sha256",
-        source_fact["sha256"], "--output-root", str(original)])
+        source_fact["sha256"], "--output-root", str(original)], failure_root=original)
     original_files, original_dirs = scan_tree(material, original)
     original_inventory = control / "original-tree-inventory.json"
     original_fact = material.write_json(original_inventory, {
