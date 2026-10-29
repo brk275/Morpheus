@@ -444,6 +444,33 @@ class ScopeTests(unittest.TestCase):
 
 
     @patch("scripts.ci_scope.changed_paths")
+    def test_exact_sender_index_input_selects_full_native_vendor_route_only(self, changed):
+        transport = "vendor/matrix-rtc-livekit/src/transport_impl.rs"
+        self.assertEqual(ci_scope.AUTOMATIC_VENDOR_INPUTS, {transport})
+        for event in ("push", "pull_request"):
+            changed.return_value = ([transport], False)
+            selected = event_selection({"inputs": {"platform": "linux", "checks": "helpers"}}, event)
+            self.assertEqual(selected, {
+                "native": True, "native_matrix": {"os": list(PLATFORMS)},
+                "config": False, "wayland": False, "manual": False,
+                "manual_platform": "all", "check_route": "vendor", "matrix_suite": "full",
+            })
+            for other in ("Cargo.lock", "vendor/matrix-rtc-livekit/Cargo.toml",
+                          "vendor/matrix-rtc-livekit/src/connection.rs", "vendor/matrix-rtc-core/src/keys.rs",
+                          "crates/morpheus-app/ui/app-window.slint", "scripts/ci_scope.py",
+                          ".github/workflows/ci.yml", "scripts/unknown.py", "README.md"):
+                changed.return_value = ([transport, other], False)
+                selected = event_selection({}, event)
+                self.assertEqual(selected["check_route"], "all", other)
+                self.assertEqual(selected["native_matrix"]["os"], list(PLATFORMS), other)
+            changed.return_value = ([transport], True)
+            self.assertEqual(event_selection({}, event)["check_route"], "all")
+        for raw in ("./" + transport, transport + "/../other.rs", transport.upper(), None):
+            self.assertEqual(ci_scope.automatic_route([raw]), "all")
+        self.assertEqual(event_selection({}, "workflow_dispatch")["check_route"], "all")
+        self.assertTrue(event_selection({}, "workflow_dispatch")["wayland"])
+
+    @patch("scripts.ci_scope.changed_paths")
     def test_exact_automatic_appearance_and_producer_batches_select_existing_routes(self, changed):
         app = set((
                 'crates/morpheus-app/src/account_access_ui_tests.rs',
@@ -531,9 +558,9 @@ class ScopeTests(unittest.TestCase):
         # comparisons with owned fixture bytes under test-only pins, so a
         # future different workflow can safely fall back all without requiring
         # its execution layout to be admitted by this exemption.
-        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 65769)
+        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 65800)
         self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
-                         "2b0422f336ee633146a69212a68ab6e87bd666c337c5dab1583b76a82c0f9b2d")
+                         "8098da9e123c94d429d8cee052d923fc5e2b729f19ac92b4f963080ee29e93b3")
         import hashlib
         with patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_BYTES", len(workflow)), \
                 patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_SHA256", hashlib.sha256(workflow).hexdigest()):

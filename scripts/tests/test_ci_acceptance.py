@@ -146,8 +146,8 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_automatic_desktop_and_producer_routes_require_exact_jobs_and_full_app_matrix(self):
         for event in ("push", "pull_request"):
-            for route in ("desktop", "helpers"):
-                value = snapshot(route == "desktop")
+            for route in ("desktop", "vendor", "helpers"):
+                value = snapshot(route != "helpers")
                 value["scope"]["outputs"]["check_route"] = route
                 self.assertIsNone(acceptance_error(value, event))
                 for job in ("scope", "helpers", "config", "compile"):
@@ -161,9 +161,10 @@ class AcceptanceTests(unittest.TestCase):
                     self.assertIsNotNone(acceptance_error(changed, event))
             for count in range(len(PLATFORMS)):
                 for subset in itertools.combinations(PLATFORMS, count):
-                    value = snapshot(bool(subset), platforms=subset)
-                    value["scope"]["outputs"]["check_route"] = "desktop"
-                    self.assertIsNotNone(acceptance_error(value, event))
+                    for route in ("desktop", "vendor"):
+                        value = snapshot(bool(subset), platforms=subset)
+                        value["scope"]["outputs"]["check_route"] = route
+                        self.assertIsNotNone(acceptance_error(value, event))
             value = snapshot(True)
             value["scope"]["outputs"]["check_route"] = "helpers"
             self.assertIsNotNone(acceptance_error(value, event))
