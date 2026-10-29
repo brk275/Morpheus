@@ -795,6 +795,8 @@ using System.Management.Automation.Runspaces;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Win32.SafeHandles;
@@ -853,6 +855,14 @@ namespace Morpheus.OwnedTraversal20261028
         // One private provider per entered sequential transaction. Successful
         // TransformFinalBlock already resets its reusable CNG hash state.
         private SHA256 payloadDigest;
+        // At most one read-ahead operation overlaps coordinator-only SHA work.
+        // These references remain strong if cancellation/join cannot be proved.
+        private byte[] readAheadBuffer;
+        private Task<int> pendingPayloadRead;
+        private CancellationTokenSource payloadCancellation;
+        private FileStream retainedPayloadStream;
+        private SafeFileHandle retainedPayloadSafe;
+        private bool unjoinedPayloadRead;
 
         private sealed class Record
         {
@@ -1016,7 +1026,8 @@ namespace Morpheus.OwnedTraversal20261028
         {
             lock (ownerLock)
             {
-                if (active || busy) Fail("identity");
+                if (active || busy || unjoinedPayloadRead || pendingPayloadRead != null ||
+                    payloadCancellation != null || retainedPayloadStream != null || retainedPayloadSafe != null) Fail("identity");
                 if (owners.TryGetValue(Handles, out Ownership owner))
                 { owner.Closed = true; owner.Memory = IntPtr.Zero; owner.Kernel = IntPtr.Zero; }
                 retired = true; Memory = IntPtr.Zero; lastPath = null;
@@ -1041,6 +1052,16 @@ namespace Morpheus.OwnedTraversal20261028
                 reader.CompletedRoots, reader.lastPath, chain };
         }
         public static void RetireOwned(Reader reader) { if (reader != null) reader.Retire(); }
+        public static void AssertOwnerQuiescent(object ownerValue)
+        {
+            if (!(ownerValue is object[] owners) || owners.Length != 42 || !(owners[16] is List<IntPtr> handles)) return;
+            lock (ownerLock)
+            {
+                if (ownedReaders.TryGetValue(handles, out Reader reader) &&
+                    (reader.active || reader.busy || reader.unjoinedPayloadRead || reader.pendingPayloadRead != null ||
+                     reader.payloadCancellation != null || reader.retainedPayloadStream != null || reader.retainedPayloadSafe != null)) Fail("identity");
+            }
+        }
         public static void RetireOwner(object ownerValue)
         {
             if (!(ownerValue is object[] owners) || owners.Length != 42 || !(owners[16] is List<IntPtr> handles)) return;
@@ -1230,7 +1251,96 @@ namespace Morpheus.OwnedTraversal20261028
             return directoryRecords[full];
         }
 
-        private Hashtable FileFact(string literal, int textLimit, ulong remaining)
+        private Task<int> BeginPayloadRead(FileStream stream, byte[] buffer)
+        {
+            if (pendingPayloadRead != null || payloadCancellation == null || unjoinedPayloadRead) Fail("identity");
+            // Exact .NET10 ReadAsync supports cancellation of this original
+            // synchronous handle through AsyncOverSyncWithIoCancellation.
+            Task<int> read = stream.ReadAsync(buffer, 0, buffer.Length, payloadCancellation.Token);
+            pendingPayloadRead = read;
+            return read;
+        }
+
+        private int AwaitPayloadRead(Task<int> read)
+        {
+            double remaining = 180 - Watch.Elapsed.TotalSeconds;
+            if (remaining <= 0) BudgetFailure("deadline");
+            bool completed;
+            try { completed = read.Wait((int)Math.Min(180000, Math.Ceiling(remaining * 1000))); }
+            catch (AggregateException) when (read.IsCompleted) { completed = true; }
+            if (!completed) BudgetFailure("deadline");
+            try
+            {
+                try { return read.GetAwaiter().GetResult(); }
+                catch (OperationCanceledException) when (payloadCancellation.IsCancellationRequested)
+                { BudgetFailure("deadline"); throw; }
+            }
+            finally { if (read.IsCompleted) pendingPayloadRead = null; }
+        }
+
+        private void FinishPayloadRead(bool preservingFailure)
+        {
+            Task<int> read = pendingPayloadRead;
+            bool joined = read == null || read.IsCompleted;
+            Exception cancellationFailure = null;
+            try
+            {
+                if (!joined)
+                {
+                    try { payloadCancellation.Cancel(); }
+                    catch (Exception error) { cancellationFailure = error; }
+                    try { read.Wait(5000); }
+                    catch (AggregateException) when (read.IsCompleted) { }
+                    joined = read.IsCompleted;
+                    if (!joined) Fail("worker_cleanup");
+                }
+            }
+            finally
+            {
+                // Even an exception while canceling/waiting must latch retained
+                // ownership BEFORE any enclosing finally can dispose/free it.
+                if (!joined) unjoinedPayloadRead = true;
+            }
+            // A secondary read fault must not become an unobserved Task error
+            // after the coordinator's earlier hash/budget failure wins.
+            if (preservingFailure && read != null && read.IsFaulted) { _ = read.Exception; }
+            pendingPayloadRead = null;
+            CancellationTokenSource cancellation = payloadCancellation;
+            payloadCancellation = null;
+            if (cancellation != null) cancellation.Dispose();
+            retainedPayloadStream = null; retainedPayloadSafe = null;
+            if (cancellationFailure != null && !preservingFailure) throw cancellationFailure;
+        }
+
+        private ulong HashWithReadAhead(FileStream stream, SafeFileHandle safe, SHA256 digest, ulong expected)
+        {
+            if (readAheadBuffer == null) readAheadBuffer = new byte[1048576];
+            retainedPayloadStream = stream; retainedPayloadSafe = safe;
+            payloadCancellation = new CancellationTokenSource();
+            double remaining = 180 - Watch.Elapsed.TotalSeconds;
+            if (remaining <= 0) BudgetFailure("deadline");
+            payloadCancellation.CancelAfter((int)Math.Min(180000, Math.Ceiling(remaining * 1000)));
+            byte[] current = Buffer, next = readAheadBuffer;
+            Task<int> read = BeginPayloadRead(stream, current);
+            ulong size = 0;
+            while (true)
+            {
+                int count = AwaitPayloadRead(read);
+                if (count == 0) break;
+                Budget(); size += (ulong)count;
+                if (size > expected) Fail("changed");
+                // The next OS read may overlap this coordinator-only hash.
+                // No provider, metadata scratch, native identity or counter is
+                // touched by the read worker. SHA accesses a buffer only after
+                // that buffer's read Task has joined at the top of this loop.
+                read = BeginPayloadRead(stream, next);
+                digest.TransformBlock(current, 0, count, null, 0);
+                byte[] previous = current; current = next; next = previous;
+            }
+            return size;
+        }
+
+        private Hashtable FileFact(string literal, int textLimit, ulong remaining, int metadataReservation = 0)
         {
             Work = "file_open";
             string full = Canonical(literal);
@@ -1241,6 +1351,12 @@ namespace Morpheus.OwnedTraversal20261028
             if (expected > 2147483648UL) { if (Cause == "unknown") Cause = "bytes"; Fail("file_size"); }
             if (textLimit > 0 && expected > (ulong)textLimit) { if (Cause == "unknown") Cause = "bytes"; Fail("text_size"); }
             if (expected > remaining) { if (Cause == "unknown") Cause = "bytes"; Fail("limit"); }
+            // Reserve this file's full row budget before starting any worker.
+            // The unchanged actual metadata commit/check still follows hashing.
+            if (metadataReservation < 0 || metadataReservation > 31457280 - Metadata)
+            { if (Cause == "unknown") Cause = "metadata"; Fail("limit"); }
+            bool readAhead = textLimit == 0 && expected > (ulong)Buffer.Length;
+            Exception bodyFailure = null;
             var safe = new SafeFileHandle(record.Handle, false);
             FileStream stream = null;
             MemoryStream text = null;
@@ -1255,12 +1371,16 @@ namespace Morpheus.OwnedTraversal20261028
                 Work = "file_hash";
                 ulong size = 0;
                 int count;
-                while ((count = stream.Read(Buffer, 0, Buffer.Length)) > 0)
+                if (readAhead) size = HashWithReadAhead(stream, safe, digest, expected);
+                else
                 {
-                    Budget(); size += (ulong)count;
-                    if (size > expected) Fail("changed");
-                    digest.TransformBlock(Buffer, 0, count, null, 0);
-                    if (text != null) text.Write(Buffer, 0, count);
+                    while ((count = stream.Read(Buffer, 0, Buffer.Length)) > 0)
+                    {
+                        Budget(); size += (ulong)count;
+                        if (size > expected) Fail("changed");
+                        digest.TransformBlock(Buffer, 0, count, null, 0);
+                        if (text != null) text.Write(Buffer, 0, count);
+                    }
                 }
                 digest.TransformFinalBlock(new byte[0], 0, 0);
                 if (size != expected) Fail("changed");
@@ -1272,13 +1392,21 @@ namespace Morpheus.OwnedTraversal20261028
                 if (text != null) fact["text"] = new UTF8Encoding(false, true).GetString(text.ToArray());
                 return fact;
             }
+            catch (Exception error) { bodyFailure = error; throw; }
             finally
             {
-                try { if (stream != null) stream.Dispose(); }
+                try { if (readAhead) FinishPayloadRead(bodyFailure != null); }
                 finally
                 {
-                    try { safe.Dispose(); }
-                    finally { if (text != null) text.Dispose(); }
+                    if (!unjoinedPayloadRead)
+                    {
+                        try { if (stream != null) stream.Dispose(); }
+                        finally
+                        {
+                            try { safe.Dispose(); }
+                            finally { if (text != null) text.Dispose(); }
+                        }
+                    }
                 }
             }
         }
@@ -1325,9 +1453,9 @@ namespace Morpheus.OwnedTraversal20261028
                     }
                     else
                     {
-                        Hashtable fact = FileFact(path, 0, 68719476736UL - Bytes);
-                        Work = "receipt_row"; Bytes += (ulong)fact["bytes"]; Budget();
                         string relative = Path.GetRelativePath(root, path).Replace('\\', '/');
+                        Hashtable fact = FileFact(path, 0, 68719476736UL - Bytes, 160 + 6 * relative.Length);
+                        Work = "receipt_row"; Bytes += (ulong)fact["bytes"]; Budget();
                         Metadata += 160 + 6 * relative.Length; Budget();
                         var row = Table(3); row.Add("path", relative); row.Add("bytes", fact["bytes"]); row.Add("sha256", fact["sha256"]);
                         files.Add(row);
@@ -1374,8 +1502,16 @@ namespace Morpheus.OwnedTraversal20261028
             try { return Root(root); }
             finally
             {
-                try { DisposePayloadDigest(); }
-                finally { lock (ownerLock) { active = false; } }
+                if (!unjoinedPayloadRead)
+                {
+                    try
+                    {
+                        if (readAheadBuffer != null) Array.Clear(readAheadBuffer, 0, readAheadBuffer.Length);
+                        readAheadBuffer = null;
+                        DisposePayloadDigest();
+                    }
+                    finally { lock (ownerLock) { active = false; } }
+                }
             }
         }
 
@@ -1385,8 +1521,16 @@ namespace Morpheus.OwnedTraversal20261028
             try { return Toolchain(systemRoot); }
             finally
             {
-                try { DisposePayloadDigest(); }
-                finally { lock (ownerLock) { active = false; } }
+                if (!unjoinedPayloadRead)
+                {
+                    try
+                    {
+                        if (readAheadBuffer != null) Array.Clear(readAheadBuffer, 0, readAheadBuffer.Length);
+                        readAheadBuffer = null;
+                        DisposePayloadDigest();
+                    }
+                    finally { lock (ownerLock) { active = false; } }
+                }
             }
         }
 
@@ -2112,6 +2256,9 @@ function Close-HostReader {
     # Refuse an active borrowed reader before closing any handle or freeing
     # scratch. Retirement latches this owner closed against new admissions.
     if ($script:HostTraversalCompilerReady) {
+        # Both quiescence/retirement refusals MUST remain outside cleanup's
+        # try/finally: unjoined workers retain their native owner and scratch.
+        [Morpheus.OwnedTraversal20261028.Reader]::AssertOwnerQuiescent($script:HostTraversalOwners)
         [Morpheus.OwnedTraversal20261028.Reader]::RetireOwner($script:HostTraversalOwners)
     }
     $good = $true

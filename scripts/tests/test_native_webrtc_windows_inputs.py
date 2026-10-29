@@ -1145,7 +1145,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $caseStage = 'source_parse'
 $inventorySite = 'unknown'
-$fixtureLineLimit = 1473
+$fixtureLineLimit = 1562
 try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
@@ -2233,6 +2233,95 @@ try {
     }
 } finally { Close-HostReader }
 if ($resetReader.Memory -ne [IntPtr]::Zero -or $script:HostInfoMemory -ne [IntPtr]::Zero -or
+    $script:HostHandles.Count -ne 0) { throw 'identity' }
+# Actual admitted production pipeline: two full blocks plus a partial block,
+# then an independent repeated file/empty file. No provider/buffer state leaks.
+$pipelineRoot = Join-Path $root 'owned-read-ahead'
+[IO.Directory]::CreateDirectory($pipelineRoot) | Out-Null
+$pipelineBytes = [byte[]]::new(2097169)
+[Array]::Fill[byte]($pipelineBytes, [byte]123)
+[IO.File]::WriteAllBytes((Join-Path $pipelineRoot 'large.bin'), $pipelineBytes)
+[IO.File]::WriteAllBytes((Join-Path $pipelineRoot 'repeat.bin'), $pipelineBytes)
+[IO.File]::WriteAllBytes((Join-Path $pipelineRoot 'zero.bin'), [byte[]]::new(0))
+Initialize-HostReader
+try {
+    $pipelineReader = New-HostOwnedTraversal
+    if ($null -eq $pipelineReader) { throw 'identity' }
+    $pipelineResult = Invoke-HostOwnedTraversal $pipelineReader $pipelineRoot $true
+    if ($script:HostManagedTraversalRoots -ne 1 -or $script:HostManagedHashes -ne 3 -or
+        $script:HostBytes -ne 4194338 -or $pipelineResult.files.Count -ne 3) { throw 'inventory' }
+    foreach ($row in $pipelineResult.files) {
+        if ($row.path -ceq 'zero.bin') {
+            if ($row.bytes -ne 0 -or $row.sha256 -cne 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855') { throw 'hash' }
+        } elseif ($row.path -cin @('large.bin', 'repeat.bin')) {
+            if ($row.bytes -ne 2097169 -or $row.sha256 -cne '427959fef902a6a8705092d97373fc0f88c5f90f24494045c521302d50482a81') { throw 'hash' }
+        } else { throw 'inventory' }
+    }
+} finally { Close-HostReader }
+if ($pipelineReader.Memory -ne [IntPtr]::Zero -or $script:HostInfoMemory -ne [IntPtr]::Zero) { throw 'identity' }
+# Deterministic lifetime oracle is a separately named TEST-ONLY class compiled
+# from the bound production definitions. No test hooks exist in production.
+$variant = $definitionText.Replace('Morpheus.OwnedTraversal20261028', 'Morpheus.OwnedTraversalPipelineFixture20261029')
+$variantFields = @'
+        private static TaskCompletionSource<int> fixtureStall;
+        private int fixtureReadIndex;
+        private Stopwatch fixtureClock;
+        public static bool FixtureRetained(Reader reader) => reader != null && reader.unjoinedPayloadRead && reader.active &&
+            reader.pendingPayloadRead != null && !reader.pendingPayloadRead.IsCompleted && reader.payloadDigest != null &&
+            reader.readAheadBuffer != null && reader.retainedPayloadStream != null && reader.retainedPayloadSafe != null && reader.Memory != IntPtr.Zero;
+        public static void FixtureRelease(Reader reader)
+        {
+            if (reader == null || fixtureStall == null) return;
+            FileStream stream = reader.retainedPayloadStream;
+            SafeFileHandle safe = reader.retainedPayloadSafe;
+            fixtureStall.TrySetResult(0);
+            reader.pendingPayloadRead.GetAwaiter().GetResult();
+            reader.FinishPayloadRead(true);
+            if (stream != null) stream.Dispose();
+            if (safe != null) safe.Dispose();
+            reader.DisposePayloadDigest();
+            if (reader.readAheadBuffer != null) Array.Clear(reader.readAheadBuffer, 0, reader.readAheadBuffer.Length);
+            reader.readAheadBuffer = null;
+            reader.unjoinedPayloadRead = false;
+            lock (ownerLock) { reader.active = false; }
+        }
+'@
+$variant = $variant.Replace('        private bool unjoinedPayloadRead;', '        private bool unjoinedPayloadRead;' + "`n" + $variantFields)
+$variantRead = @'
+            Task<int> read;
+            if (++fixtureReadIndex == 2)
+            {
+                fixtureStall = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+                read = fixtureStall.Task;
+            }
+            else read = stream.ReadAsync(buffer, 0, buffer.Length, payloadCancellation.Token);
+'@
+$variant = $variant.Replace('            Task<int> read = stream.ReadAsync(buffer, 0, buffer.Length, payloadCancellation.Token);', $variantRead)
+# Only this fixture variant shortens its synthetic wait. Production180seconds
+# and5000mscleanup remain fixed, and the actual normal case above uses them.
+$variant = $variant.Replace('            double remaining = 180 - Watch.Elapsed.TotalSeconds;', '            double remaining = .2 - fixtureClock.Elapsed.TotalSeconds;')
+$variant = $variant.Replace('            if (readAheadBuffer == null) readAheadBuffer = new byte[1048576];', '            fixtureClock = Stopwatch.StartNew();' + "`n" + '            if (readAheadBuffer == null) readAheadBuffer = new byte[1048576];')
+$variant = $variant.Replace('read.Wait(5000)', 'read.Wait(50)')
+. ([ScriptBlock]::Create($variant))
+$stalledReader = $null
+try {
+    Initialize-HostReader
+    $stalledReader = New-HostOwnedTraversal
+    if ($null -eq $stalledReader) { throw 'identity' }
+    Must-Refuse { Invoke-HostOwnedTraversal $stalledReader $pipelineRoot $true }
+    if (-not [Morpheus.OwnedTraversalPipelineFixture20261029.Reader]::FixtureRetained($stalledReader)) { throw 'identity' }
+    $retainedMemory = $script:HostInfoMemory; $retainedHandles = $script:HostHandles.Count
+    Must-Refuse { Close-HostReader }
+    if ($retainedMemory -eq [IntPtr]::Zero -or $script:HostInfoMemory -ne $retainedMemory -or
+        $stalledReader.Memory -ne $retainedMemory -or $script:HostHandles.Count -ne $retainedHandles) { throw 'identity' }
+    Must-Refuse { [IO.File]::WriteAllBytes((Join-Path $pipelineRoot 'large.bin'), [byte[]]@(9)) }
+} finally {
+    try {
+        [Morpheus.OwnedTraversalPipelineFixture20261029.Reader]::FixtureRelease($stalledReader)
+        Close-HostReader
+    } finally { . ([ScriptBlock]::Create($definitionText)) }
+}
+if ($stalledReader.Memory -ne [IntPtr]::Zero -or $script:HostInfoMemory -ne [IntPtr]::Zero -or
     $script:HostHandles.Count -ne 0) { throw 'identity' }
 # Exercise the original non-ASCII lexical helper within the actual complete
 # native transaction, not merely through the pure lexical comparison above.
