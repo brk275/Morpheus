@@ -24,6 +24,116 @@ async function poll(callback, message, milliseconds = 90_000) {
   throw new Error(message);
 }
 
+// BEGIN pinned SDK44 public-wrapper observer. No peer methods are replaced.
+function installStock44Observer() {
+  const own = (object, key) => object && Object.getOwnPropertyDescriptor(object, key)?.value;
+  const identitiesMatch = (member, owner) => {
+    const values = member?.backendIdentities;
+    return Array.isArray(values) && values.length > 0 && values.length <= 2 &&
+      values.every((value) => typeof value === "string" && value.length > 0 && value.length <= 1_024) &&
+      new Set(values).size === values.length && values.includes(owner.identity) &&
+      member.userId === owner.user_id && member.deviceId === owner.device_id && member.memberId === owner.member_id;
+  };
+  window.__morpheusStock44Binding = async ({ owner, expectedMembers, kind, deadline }) => {
+    if (!["audio", "video"].includes(kind) || !Number.isFinite(deadline) || deadline <= Date.now()) return null;
+    if (kind === "video" && (typeof owner.track_sid !== "string" || !owner.track_sid.length || owner.track_sid.length > 1_024)) return null;
+    const source = kind === "audio" ? "microphone" : "screenShare";
+    const client = window.matrixclient;
+    const session = window.rtcSession;
+    const managed = client?.matrixRTC.roomSessions.get(owner.room_id);
+    if (!managed || managed !== session || session.room?.roomId !== owner.room_id ||
+        client.getDeviceId() === owner.device_id || session.memberships.length !== expectedMembers ||
+        session.memberships.filter((member) => identitiesMatch(member, owner)).length !== 1) return null;
+    const elements = [...document.querySelectorAll(kind === "audio" ? "audio" : 'video[data-source="screenShare"]')];
+    if (elements.length > 32) throw new Error("Media element bound exceeded");
+    const candidates = [];
+    const inspect = (element) => {
+      const keys = Object.keys(element).filter((key) => key.startsWith("__reactFiber$"));
+      if (keys.length !== 1) return null;
+      let fiber = own(element, keys[0]);
+      const wrappers = new Set();
+      const members = new Set();
+      const audioOwners = new Set();
+      for (let depth = 0; fiber && depth < 32; depth++) {
+        const props = own(fiber, "memoizedProps");
+        const wrapper = own(props, kind === "audio" ? "track" : "video");
+        if (wrapper) wrappers.add(wrapper);
+        const tracks = own(props, "tracks$");
+        if (tracks) audioOwners.add(tracks);
+        // InCallView's actual CallViewModel exposes the participation's same
+        // remoteMembers$ Behavior. Do not read transport.resolved$ or tokens.
+        const vm = own(props, "vm");
+        const remote = own(vm, "remoteMembers$")?.value;
+        if (remote !== undefined) {
+          if (!Array.isArray(remote) || remote.length > 32) return null;
+          for (const member of remote) if (member?.local === false && identitiesMatch(member, owner)) members.add(member);
+        }
+        fiber = own(fiber, "return");
+      }
+      if (members.size !== 1) return null;
+      const member = [...members][0];
+      const tracks = member.tracks$?.value;
+      if (!Array.isArray(tracks) || tracks.length > 32 || (kind === "audio" && !audioOwners.has(member.tracks$))) return null;
+      const matching = [...wrappers].filter((wrapper) => tracks.filter((track) => track === wrapper).length === 1 &&
+        wrapper.kind === kind && wrapper.source === source && wrapper.encrypted === true &&
+        wrapper.muted$?.value === false && typeof wrapper.id === "string" && wrapper.id.length > 0 &&
+        wrapper.id.length <= 1_024 && (!owner.track_sid || wrapper.id === owner.track_sid) &&
+        typeof wrapper.stats$ === "function");
+      if (matching.length !== 1) return null;
+      const track = matching[0];
+      const stream = element.srcObject;
+      if (!(stream instanceof MediaStream)) return null;
+      const decoded = kind === "audio" ? stream.getAudioTracks() : stream.getVideoTracks();
+      if (decoded.length !== 1) return null;
+      const media = decoded[0];
+      if (media.kind !== kind || media.readyState !== "live" || !media.enabled ||
+          typeof media.id !== "string" || !media.id.length || media.id.length > 1_024 ||
+          (kind === "audio" && (element.paused || element.muted || element.volume === 0))) return null;
+      return { element, track, media, member };
+    };
+    for (const element of elements) {
+      const candidate = inspect(element);
+      if (candidate) candidates.push(candidate);
+    }
+    if (candidates.length !== 1) return null;
+    const selected = candidates[0];
+    // The pinned SDK reads the current publication's RemoteTrack stats. A
+    // dictionary-only wrapper or an unrelated attached MediaStream cannot
+    // establish this exact decoded trackIdentifier binding.
+    const stats = await new Promise((resolve) => {
+      let subscription;
+      let finished = false;
+      const finish = (value) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        subscription?.unsubscribe();
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish(null), Math.max(0, Math.min(1_000, deadline - Date.now())));
+      try {
+        subscription = selected.track.stats$(1_000).subscribe({ next: finish, error: () => finish(null), complete: () => finish(null) });
+        if (finished) subscription.unsubscribe();
+      } catch { finish(null); }
+    });
+    if (!stats || stats.type !== "inbound-rtp" || stats.kind !== kind ||
+        typeof stats.trackIdentifier !== "string" || !stats.trackIdentifier.length ||
+        stats.trackIdentifier.length > 1_024 || stats.trackIdentifier !== selected.media.id ||
+        !Number.isFinite(stats.bytesReceived) || stats.bytesReceived <= 0 ||
+        !Number.isFinite(stats.packetsReceived) || stats.packetsReceived <= 0 || Date.now() >= deadline) return null;
+    const currentElements = [...document.querySelectorAll(kind === "audio" ? "audio" : 'video[data-source="screenShare"]')];
+    if (currentElements.length > 32) return null;
+    const currentMatches = currentElements.map(inspect).filter(Boolean);
+    const current = currentMatches.length === 1 ? currentMatches[0] : null;
+    if (!current || ["element", "track", "media", "member"].some((key) => current[key] !== selected[key]) ||
+        window.matrixclient !== client || window.rtcSession !== session || client.matrixRTC.roomSessions.get(owner.room_id) !== session ||
+        session.memberships.length !== expectedMembers ||
+        session.memberships.filter((member) => identitiesMatch(member, owner)).length !== 1) return null;
+    return selected;
+  };
+}
+// END pinned SDK44 public-wrapper observer.
+
 async function main() {
   // Even an inherited diagnostic flag invalidates stock-client evidence.
   if (process.env.MORPHEUS_ELEMENT_DIAG_REFRESH !== undefined)
@@ -33,6 +143,8 @@ async function main() {
     if (!value) throw new Error("Missing private fixture setting");
     return value;
   };
+  const observerProfile = required("MORPHEUS_ELEMENT_OBSERVER_PROFILE");
+  if (!["sdk42", "sdk44"].includes(observerProfile)) throw new Error("Unsupported observer profile");
   const root = required("MORPHEUS_ELEMENT_PEER_ROOT");
   const tool = required("MORPHEUS_ELEMENT_PLAYWRIGHT_ROOT");
   const base = new URL(required("MORPHEUS_ELEMENT_PEER_URL"));
@@ -245,14 +357,16 @@ async function main() {
       return decodedSamples >= 3;
     }, "Browser did not decode native video");
     check("browser_video");
+    if (observerProfile === "sdk44") await page.evaluate(installStock44Observer);
     mark("browser_receive_audio");
     async function observeAudio(owner, frequency, expectedMembers, original = false) {
-      await page.evaluate(async ({ owner, frequency, expectedMembers, original }) => {
+      await page.evaluate(async ({ owner, frequency, expectedMembers, original, observerProfile }) => {
         // Read-only inspection of the pinned RC's React AudioTrack binding.
         // MatrixAudioRenderer -> AudioTrackWithAudioNodes -> AudioTrack supplies
         // trackRef. Never patch the stock peer, its SDK, or capture APIs. An
         // absent/changed binding fails closed instead of selecting any audio.
         const binding = () => {
+          if (observerProfile === "sdk44") return window.__morpheusStock44Binding({ owner, expectedMembers, kind: "audio", deadline });
           const client = window.matrixclient;
           const session = window.rtcSession;
           const managed = client?.matrixRTC.roomSessions.get(owner.room_id);
@@ -303,7 +417,7 @@ async function main() {
         };
         const deadline = Date.now() + 45_000;
         let selected;
-        while (!(selected = binding())) {
+        while (!(selected = await binding())) {
           if (Date.now() >= deadline) throw new Error("Native remote microphone binding missing");
           await new Promise((resolve) => setTimeout(resolve, 200));
         }
@@ -312,7 +426,7 @@ async function main() {
           if (!state || state.invalid || state.session !== window.rtcSession)
             throw new Error("Original microphone key owner changed");
           if (!state.audio) state.audio = selected;
-          if (["track", "media", "publication", "participant"].some((key) => state.audio[key] !== selected[key]))
+          if (["track", "media", "publication", "participant", "member"].some((key) => state.audio[key] !== selected[key]))
             throw new Error("Original microphone binding changed");
         }
         const context = new AudioContext();
@@ -345,10 +459,10 @@ async function main() {
           const binHz = context.sampleRate / analyser.fftSize;
           let consecutive = 0;
           while (Date.now() < deadline) {
-            const current = binding();
+            const current = await binding();
             if (!current || current.element !== selected.element || current.track !== selected.track ||
                 current.media !== selected.media || current.participant !== selected.participant ||
-                current.publication !== selected.publication || context.state !== "running")
+                current.publication !== selected.publication || current.member !== selected.member || context.state !== "running")
               throw new Error("Native remote microphone ownership changed");
             analyser.getFloatTimeDomainData(samples);
             analyser.getFloatFrequencyData(spectrum);
@@ -378,7 +492,7 @@ async function main() {
           clone?.stop();
           await context.close();
         }
-      }, { owner, frequency, expectedMembers, original });
+      }, { owner, frequency, expectedMembers, original, observerProfile });
     }
     await observeAudio(owner, 997, 2, true);
     check("browser_audio");
@@ -413,8 +527,9 @@ async function main() {
     check("browser_group_audio");
 
     async function observeScreen(changed, expectedMembers) {
-      await page.evaluate(async ({ owner, changed, expectedMembers }) => {
+      await page.evaluate(async ({ owner, changed, expectedMembers, observerProfile }) => {
         const binding = () => {
+          if (observerProfile === "sdk44") return window.__morpheusStock44Binding({ owner, expectedMembers, kind: "video", deadline });
           const session = window.rtcSession;
           const managed = window.matrixclient?.matrixRTC.roomSessions.get(owner.room_id);
           if (!session || session !== managed || session.memberships.length !== expectedMembers ||
@@ -461,10 +576,10 @@ async function main() {
         const deadline = Date.now() + 45_000;
         let consecutive = 0;
         while (Date.now() < deadline) {
-          const current = binding();
+          const current = await binding();
           if (current) {
             if (!state.screen) state.screen = current;
-            if (["track", "media", "publication", "participant"].some((key) => state.screen[key] !== current[key]))
+            if (["track", "media", "publication", "participant", "member"].some((key) => state.screen[key] !== current[key]))
               throw new Error("Original screen binding changed");
             const video = current.element;
             if (video.readyState >= 2 && video.videoWidth >= 160 && video.videoHeight >= 90) {
@@ -486,7 +601,7 @@ async function main() {
           await new Promise((resolve) => setTimeout(resolve, 200));
         }
         throw new Error("Exact encrypted screen picture did not decode");
-      }, { owner: screenOwner, changed, expectedMembers });
+      }, { owner: screenOwner, changed, expectedMembers, observerProfile });
     }
     mark("browser_receive_screen");
     await observeScreen(false, 3);

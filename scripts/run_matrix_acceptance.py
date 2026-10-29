@@ -584,7 +584,7 @@ CHAT_CHECKS = (*CHAT_TESTS, "search_local-classic")
 OAUTH_LABELS = tuple("oauth-local-" + phase.replace("_", "-") for phase in OAUTH_PHASES)
 RING_LABELS = tuple(f"outgoing-ring-{mode}-{target}" for mode, target in RING_CASES)
 RTC_LABELS = ("local_rtc", "local_rtc-late-join", "local_rtc-sticky-2025-late-join")
-ELEMENT_LABEL = "element-call-rc-sticky2025-presynced"
+ELEMENT_LABEL = "element-call-current44-sticky2025-presynced"
 # Setup/build/browser-install stages never prove that a peer check entered.
 ELEMENT_TEST_STAGES = frozenset((
     "browser_login", "browser_identity", "browser_room_sync", "native_join_wait",
@@ -1808,7 +1808,7 @@ class Acceptance:
         fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-group-fixture"), self.root)
         root = self.root / "element-interop"
         try:
-            self.run("element-call-rc-sticky2025-presynced", [
+            self.run("element-call-current44-sticky2025-presynced", [
                 sys.executable, "scripts/run_element_acceptance.py", "--root", str(root),
                 "--fixture", str(fixture), "--gitleaks", self.gitleaks,
             ], element_checks=True, seconds=1800, pid_namespace=True)
