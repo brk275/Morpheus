@@ -1144,6 +1144,8 @@ try {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $caseStage = 'source_parse'
+$inventorySite = 'unknown'
+$fixtureLineLimit = 1420
 try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
@@ -1475,6 +1477,7 @@ try {
             [uint64]68719476737, [uint64]68719476736, $hashSize) -ne 0) { throw 'hash' }
     } finally { $hashInput.Dispose(); $hash.Dispose() }
     $caseStage = 'inventory'
+    $inventorySite = 'ordinary'
     $result = Get-HostRootInventory $good
     if ($script:HostManagedHashes -lt 2 -or $script:HostManagedAdmissions -lt 2 -or
         $script:HostManagedInitialInfos -lt 2) { throw 'hash' }
@@ -2172,6 +2175,7 @@ try {
         foreach ($priorData in $priorStringData) { Microsoft.PowerShell.Utility\Update-TypeData -TypeData $priorData -Force }
     }
     $caseStage = 'inventory'
+    $inventorySite = 'managed'
     $completeResult = Invoke-HostOwnedTraversal $completeReader $good $true
     if ($script:HostManagedTraversalRoots -ne 1 -or $script:HostManagedHashes -ne 2 -or
         $completeResult.files.Count -ne 2 -or $script:HostBytes -ne 5 -or
@@ -2510,7 +2514,7 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
         }
     }
     $construction = ''
-    if ($caseStage -ceq 'reader_initialize') {
+    if ($caseStage -cin @('reader_initialize', 'inventory')) {
         $failure = $_
         # Closed runtime kind and a line in our joined, reviewed function text.
         # Never render InvocationInfo, exception text, a path, or unknown types.
@@ -2524,15 +2528,34 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
             'System.InvalidOperationException' { 'invalid_operation'; break }
             'System.TypeLoadException' { 'type_load'; break }
             'System.Reflection.AmbiguousMatchException' { 'ambiguous'; break }
+            'System.Management.Automation.PSInvalidOperationException' { 'ps_operation'; break }
+            'System.Management.Automation.PSArgumentException' { 'ps_argument'; break }
+            'System.IndexOutOfRangeException' { 'index'; break }
+            'System.NullReferenceException' { 'null_reference'; break }
+            'System.InvalidProgramException' { 'invalid_program'; break }
+            'System.NotSupportedException' { 'unsupported'; break }
+            'System.FormatException' { 'format'; break }
+            'System.ObjectDisposedException' { 'disposed'; break }
             default { 'unknown' }
         }
         $line = 0
+        $origin = 'unknown'
         $invocation = $failure.InvocationInfo
         if ($null -ne $invocation -and [string]::IsNullOrEmpty($invocation.ScriptName) -and
             $invocation.ScriptLineNumber -gt 0 -and $invocation.ScriptLineNumber -le $definitionLineLimit) {
             $line = [int]$invocation.ScriptLineNumber
+            $origin = 'fn'
+        } elseif ($null -ne $invocation -and $caseStage -ceq 'inventory' -and
+            [string]::Equals($invocation.ScriptName, $PSCommandPath, [StringComparison]::OrdinalIgnoreCase) -and
+            $invocation.ScriptLineNumber -gt 0 -and $invocation.ScriptLineNumber -le $fixtureLineLimit) {
+            $line = [int]$invocation.ScriptLineNumber
+            $origin = 'case'
         }
         $construction = ' line=' + $line.ToString([Globalization.CultureInfo]::InvariantCulture) + ' kind=' + $kind
+        if ($caseStage -ceq 'inventory') {
+            $site = if ($inventorySite -cin @('ordinary', 'managed')) { $inventorySite } else { 'unknown' }
+            $construction += ' site=' + $site + ' origin=' + $origin
+        }
     }
     Write-Output ('MORPHEUS_HOST_READER_BOUNDARY_FAILED stage=' + $caseStage + ' category=' + $category + $construction)
     exit 1
@@ -2571,7 +2594,8 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
             if len(result.stdout) <= 160:
                 observed = result.stdout.strip()
                 kinds = ("binding", "invocation", "runtime", "cast", "argument", "argument_null",
-                         "invalid_operation", "type_load", "ambiguous", "unknown")
+                         "invalid_operation", "type_load", "ambiguous", "ps_operation", "ps_argument",
+                         "index", "null_reference", "invalid_program", "unsupported", "format", "disposed", "unknown")
                 # Joined non-nested function extents cannot exceed the source's
                 # line count. PowerShell additionally requires an empty filename.
                 line_limit = len(source.read_text(encoding="utf-8").splitlines())
@@ -2581,13 +2605,24 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
                                     + " category=" + category)
                         if observed == expected:
                             diagnostic = "stage=" + stage + " category=" + category
-                        elif stage == "reader_initialize" and observed.startswith(expected + " line="):
+                        elif stage in ("reader_initialize", "inventory") and observed.startswith(expected + " line="):
                             suffix = observed[len(expected + " line="):]
-                            line, separator, kind = suffix.partition(" kind=")
+                            line, separator, tail = suffix.partition(" kind=")
+                            kind = tail
+                            site = origin = ""
+                            if stage == "inventory":
+                                kind, site_separator, tail = tail.partition(" site=")
+                                site, origin_separator, origin = tail.partition(" origin=")
+                                if (not site_separator or not origin_separator or
+                                        site not in ("ordinary", "managed", "unknown") or
+                                        origin not in ("fn", "case", "unknown")):
+                                    continue
                             if (separator and 0 < len(line) <= 4 and line.isascii() and line.isdecimal()
                                     and int(line) <= line_limit and kind in kinds):
                                 diagnostic = ("stage=" + stage + " category=" + category
                                               + " line=" + line + " kind=" + kind)
+                                if stage == "inventory":
+                                    diagnostic += " site=" + site + " origin=" + origin
             self.assertEqual(result.returncode, 0,
                              "fixed Windows host reader boundary case failed " + diagnostic)
             self.assertTrue(result.stdout.strip() == "MORPHEUS_HOST_READER_BOUNDARIES_OK",
