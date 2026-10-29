@@ -2352,6 +2352,11 @@ component SettingsSearchBar inherits VerticalLayout {
         spacing: 2px; alignment: start;
         for result[i] in root.results : ActionRect {
             property <bool> highlighted: i == root.index;
+            // Reopening recreates the list with its previous highlight. A
+            // mounted true value does not trigger changed highlighted.
+            init => {
+                if self.highlighted { results-scroll.reveal-row(self.y, self.height); }
+            }
             changed highlighted => {
                 if self.highlighted { results-scroll.reveal-row(self.y, self.height); }
             }
