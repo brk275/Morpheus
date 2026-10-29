@@ -1162,7 +1162,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $caseStage = 'source_parse'
 $inventorySite = 'unknown'
-$fixtureLineLimit = 1738
+$fixtureLineLimit = 1793
 try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
@@ -2347,7 +2347,7 @@ if ($pipelineReader.Memory -ne [IntPtr]::Zero -or $script:HostInfoMemory -ne [In
 # Deterministic lifetime oracle is a separately named TEST-ONLY class compiled
 # from the bound production definitions. No test hooks exist in production.
 $variant = $definitionText.Replace('Morpheus.OwnedTraversal20261028', 'Morpheus.OwnedTraversalPipelineFixture20261029')
-$variant = $variant.Replace('            bool twoReads = readAhead && (payloadWorker != null || Handles.Count <= 200254);', '            bool twoReads = false;')
+$variant = $variant.Replace('            bool twoReads = true;', '            bool twoReads = false;')
 $variantFields = @'
         private static TaskCompletionSource<int> fixtureStall;
         private int fixtureReadIndex;
@@ -2426,7 +2426,7 @@ $rangeFields = @'
         {
             int ordinal = Interlocked.Increment(ref fixtureReads);
             if (fixtureMode == 3 && ordinal == 1) return 0;
-            if (fixtureMode == 2 && ordinal == 1)
+            if ((fixtureMode == 2 || fixtureMode == 4 || fixtureMode == 5) && ordinal == 1)
             {
                 var stall = new ManualResetEventSlim(false);
                 Volatile.Write(ref fixtureStall, stall);
@@ -2445,6 +2445,13 @@ $rangeFields = @'
             reader.payloadSlots[1].Requested && !reader.payloadSlots[1].Completed && reader.payloadQueue.Count == 1 &&
             reader.retainedPayloadStream != null && reader.retainedPayloadSafe != null &&
             reader.payloadDigest != null && reader.readAheadBuffer != null && reader.Memory != IntPtr.Zero;
+        public static bool FixtureSingleRetained(Reader reader) => reader != null && Volatile.Read(ref fixtureStall) != null &&
+            reader.unjoinedPayloadRead && reader.active && reader.payloadWorker != null && reader.payloadWorker.IsAlive &&
+            reader.payloadWorkerHandle != IntPtr.Zero && reader.payloadWorkerReserved && reader.payloadSlots != null &&
+            reader.payloadSlots[0].Requested && !reader.payloadSlots[0].Completed &&
+            !reader.payloadSlots[1].Requested && reader.payloadSlots[1].Length == 0 && reader.payloadQueue.Count == 0 &&
+            reader.retainedPayloadStream != null && reader.retainedPayloadSafe != null && reader.payloadDigest != null &&
+            reader.readAheadBuffer != null && reader.Memory != IntPtr.Zero;
         public static void FixtureRelease(Reader reader)
         {
             if (reader == null) return;
@@ -2464,9 +2471,13 @@ $rangeFields = @'
 '@
 $rangeVariant = $rangeVariant.Replace('        private bool unjoinedPayloadRead;', '        private bool unjoinedPayloadRead;' + "`n" + $rangeFields)
 $rangeVariant = $rangeVariant.Replace('int count = ReadWorkerRange(slot);', 'int count = FixtureRead(slot);')
+# TEST-ONLY dispatch to the actual text FileFact used by the production version
+# role, with the existing RunRoot entry/cleanup lifecycle and real temp file.
+$rangeVariant = $rangeVariant.Replace('            string root = Canonical(literal);',
+    '            if (fixtureMode == 5 || fixtureMode == 6) return FileFact(literal, 256, UInt64.MaxValue);' + "`n" + '            string root = Canonical(literal);')
 # Only the stalled TEST-ONLY variant shortens its clock and aggregate join.
 $rangeVariant = $rangeVariant.Replace('                    payloadWorkerReserved = true;', '                fixtureRangeClock = Stopwatch.StartNew();' + "`n" + '                    payloadWorkerReserved = true;')
-$rangeVariant = $rangeVariant.Replace('double remaining = 900 - Watch.Elapsed.TotalSeconds;', 'double remaining = fixtureMode == 2 ? .2 - fixtureRangeClock.Elapsed.TotalSeconds : 900 - Watch.Elapsed.TotalSeconds;')
+$rangeVariant = $rangeVariant.Replace('double remaining = 900 - Watch.Elapsed.TotalSeconds;', 'double remaining = (fixtureMode == 2 || fixtureMode == 4 || fixtureMode == 5) ? .2 - fixtureRangeClock.Elapsed.TotalSeconds : 900 - Watch.Elapsed.TotalSeconds;')
 $rangeVariant = $rangeVariant.Replace('5000 - Math.Min(5000, cleanup.ElapsedMilliseconds)', '50 - Math.Min(50, cleanup.ElapsedMilliseconds)')
 . ([ScriptBlock]::Create($rangeVariant))
 $rangeReader = $null
@@ -2505,6 +2516,50 @@ try {
     if ($retainedMemory -eq [IntPtr]::Zero -or $script:HostInfoMemory -ne $retainedMemory -or
         $rangeReader.Memory -ne $retainedMemory -or $script:HostHandles.Count -ne $retainedHandles) { throw 'identity' }
     Must-Refuse { [IO.File]::WriteAllBytes((Join-Path $pipelineRoot 'large.bin'), [byte[]]@(9)) }
+    [Morpheus.OwnedTraversalRangeFixture20261029.Reader]::FixtureRelease($rangeReader)
+    Close-HostReader
+    # A small read and a text-role read block on the same owned physical worker;
+    # deadline and failed cleanup retain the stream/handle/buffers until release.
+    $textPath = Join-Path $root 'owned-version.txt'
+    $versionText = "14.44.35207`n"
+    [IO.File]::WriteAllBytes($textPath, [Text.Encoding]::UTF8.GetBytes($versionText))
+    foreach ($mode in @(4, 5)) {
+        Initialize-HostReader
+        [Morpheus.OwnedTraversalRangeFixture20261029.Reader]::FixtureMode($mode)
+        $rangeReader = New-HostOwnedTraversal
+        if ($null -eq $rangeReader) { throw 'identity' }
+        $blockedPath = if ($mode -eq 5) { $textPath } else { $good }
+        Must-Refuse { Invoke-HostOwnedTraversal $rangeReader $blockedPath $true }
+        if ($script:HostPreflightBudgetCause -cne 'deadline' -or $script:HostManagedHashes -ne 0 -or
+            -not [Morpheus.OwnedTraversalRangeFixture20261029.Reader]::FixtureSingleRetained($rangeReader)) { throw 'identity' }
+        $retainedMemory = $script:HostInfoMemory; $retainedHandles = $script:HostHandles.Count
+        Must-Refuse { Close-HostReader }
+        if ($script:HostInfoMemory -ne $retainedMemory -or $retainedMemory -eq [IntPtr]::Zero -or
+            $script:HostHandles.Count -ne $retainedHandles -or $rangeReader.Memory -ne $retainedMemory) { throw 'identity' }
+        $heldFile = if ($mode -eq 5) { $textPath } else { Join-Path $good 'tool.bin' }
+        Must-Refuse { [IO.File]::WriteAllBytes($heldFile, [byte[]]@(9)) }
+        [Morpheus.OwnedTraversalRangeFixture20261029.Reader]::FixtureRelease($rangeReader)
+        Close-HostReader
+        if ($rangeReader.Memory -ne [IntPtr]::Zero -or $script:HostHandles.Count -ne 0) { throw 'identity' }
+    }
+    # Positive real text conversion still consumes the entire exact byte stream.
+    Initialize-HostReader
+    [Morpheus.OwnedTraversalRangeFixture20261029.Reader]::FixtureMode(6)
+    $rangeReader = New-HostOwnedTraversal
+    if ($null -eq $rangeReader) { throw 'identity' }
+    $textFact = Invoke-HostOwnedTraversal $rangeReader $textPath $true
+    if ($textFact.text -cne $versionText -or $textFact.bytes -ne 12 -or
+        $textFact.sha256 -cne '262ae45c22661180e410b262636e6003c3f1c5c6558655cf8fcb1499cc491ee3' -or $script:HostManagedHashes -ne 1) { throw 'hash' }
+    Close-HostReader
+    # Invalid UTF-8 is still rejected only after the complete byte digest.
+    [IO.File]::WriteAllBytes($textPath, [byte[]]@(0xc3, 0x28))
+    Initialize-HostReader
+    [Morpheus.OwnedTraversalRangeFixture20261029.Reader]::FixtureMode(6)
+    $rangeReader = New-HostOwnedTraversal
+    if ($null -eq $rangeReader) { throw 'identity' }
+    Must-Refuse { Invoke-HostOwnedTraversal $rangeReader $textPath $true }
+    if ($script:HostManagedHashes -ne 1) { throw 'hash' }
+    Close-HostReader
 } finally {
     try {
         if ($null -ne $rangeReader) { [Morpheus.OwnedTraversalRangeFixture20261029.Reader]::FixtureRelease($rangeReader) }
