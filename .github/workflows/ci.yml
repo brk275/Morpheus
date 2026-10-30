@@ -755,6 +755,15 @@ jobs:
         env:
           SLINT_EMIT_DEBUG_INFO: "1"
         run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app --no-run
+      - name: Compile received video UI test before live fixture deadlines
+        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite == 'rtc-ui-video'
+        # Match the coordinator's exact release instrumentation before its work budget starts.
+        # It still rebuilds for JSON artifact re-admission inside the contained driver.
+        env:
+          MORPHEUS_TIMELINE_ACCEPTANCE_BUILD: "1"
+          SLINT_EMIT_DEBUG_INFO: "1"
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
+        run: cargo test --release --locked -p morpheus-app --features native-calls --bin morpheus-app --target-dir "$GITHUB_WORKSPACE/target" --no-run
       - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
         id: matrix-tests
         if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'matrix')

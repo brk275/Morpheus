@@ -581,5 +581,51 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertIs(ast.literal_eval(keywords["pid_namespace"]), True)
 
 
+    def test_received_video_prebuild_matches_real_release_artifact_before_fixture_budget(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        start = "      - name: Compile received video UI test before live fixture deadlines\n"
+        end = "      - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC\n"
+        self.assertEqual(source.count(start), 1)
+        step = source.split(start, 1)[1].split(end, 1)[0]
+        self.assertIn("        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite == 'rtc-ui-video'\n", step)
+        self.assertNotIn("continue-on-error:", step)
+        self.assertNotIn("timeout-minutes:", step)
+        self.assertLess(source.index("      - name: Prepare the pinned owned native PipeWire client\n"), source.index(start))
+        self.assertLess(source.index(start), source.index(end))
+        matrix = ast.parse((WORKFLOW.parents[2] / "scripts/run_matrix_acceptance.py").read_text())
+        acceptance = next(node for node in matrix.body if isinstance(node, ast.ClassDef) and node.name == "Acceptance")
+        case = next(node for node in acceptance.body if isinstance(node, ast.FunctionDef) and node.name == "rtc_ui_video_case")
+        compiled = next(node for node in ast.walk(case) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+                        and isinstance(node.args[0], ast.Constant) and node.args[0].value == "rtc-ui-video-app-test-compile")
+        args = compiled.args[1].elts
+        prefix = [ast.literal_eval(node) for node in args[:11]]
+        target = ast.parse('str(REPO / "target")', mode="eval").body
+        self.assertEqual(ast.dump(args[11]), ast.dump(target))
+        self.assertEqual([ast.literal_eval(node) for node in args[12:]], ["--no-run", "--message-format=json"])
+        self.assertIn("        run: " + " ".join(prefix) + ' "$GITHUB_WORKSPACE/target" --no-run\n', step)
+        build = next(node.value for node in case.body if isinstance(node, ast.Assign)
+                     and any(isinstance(name, ast.Name) and name.id == "build" for name in node.targets))
+        metadata = ast.literal_eval(build)
+        self.assertEqual(set(metadata), {"MORPHEUS_TIMELINE_ACCEPTANCE_BUILD", "SLINT_EMIT_DEBUG_INFO", "CARGO_PROFILE_RELEASE_DEBUG"})
+        for name, value in metadata.items():
+            self.assertIn(f'          {name}: "{value}"\n', step)
+        self.assertEqual(ast.dump(next(node.value for node in matrix.body if isinstance(node, ast.Assign)
+                                     and any(isinstance(name, ast.Name) and name.id == "REPO" for name in node.targets))),
+                         ast.dump(ast.parse("Path(__file__).resolve().parent.parent", mode="eval").body))
+        keywords = {node.arg: node.value for node in compiled.keywords}
+        self.assertEqual(ast.dump(keywords["extra"]), ast.dump(ast.Name(id="build", ctx=ast.Load())))
+        self.assertNotIn("seconds", keywords)
+        runner = next(node for node in acceptance.body if isinstance(node, ast.FunctionDef) and node.name == "run")
+        defaults = dict(zip((arg.arg for arg in runner.args.kwonlyargs), runner.args.kw_defaults))
+        self.assertEqual(ast.literal_eval(defaults["seconds"]), 900)
+        live = next(node for node in ast.walk(case) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+                    and isinstance(node.args[0], ast.Name) and node.args[0].id == "RTC_UI_LABEL")
+        self.assertEqual(ast.literal_eval(next(node.value for node in live.keywords if node.arg == "seconds")), 540)
+        self.assertLess(compiled.lineno, min(node.lineno for node in ast.walk(case) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute) and node.func.attr == "script"))
+
+
 if __name__ == "__main__":
     unittest.main()
