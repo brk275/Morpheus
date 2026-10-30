@@ -738,7 +738,7 @@ impl AppImageSession {
     }
 
     fn acknowledge(&mut self, running: &PackageMetadata) -> Result<(), UpdateError> {
-        let Some(id) = self.trial.take() else {
+        let Some(id) = self.trial.as_deref() else {
             return Ok(());
         };
         let mut journal = self.journal()?.ok_or(UpdateError::RecoveryRequired)?;
@@ -751,6 +751,8 @@ impl AppImageSession {
         }
         journal.phase = Phase::Committed;
         self.save(&journal)?;
+        // Only a durable commit consumes the in-memory trial authority.
+        self.trial = None;
         // Keep marker and backup until the supervisor observes the commit.
         // The marker also prevents rollback after a power loss at this point.
         Ok(())

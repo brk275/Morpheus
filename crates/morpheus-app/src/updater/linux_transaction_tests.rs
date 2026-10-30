@@ -135,6 +135,8 @@ fn committed_pre_store_acknowledgement_never_allows_later_binary_rollback() {
     session.apply(&mut journal).unwrap();
     session.trial = Some(journal.id.clone());
     session.acknowledge(&fixture.next_metadata).unwrap();
+    assert!(session.trial.is_none());
+    session.acknowledge(&fixture.next_metadata).unwrap();
     // Model the exact open-file-description alias inherited by an unrelated
     // concurrent fork, without scheduling a process or weakening zero-wait
     // acquisition. Closing only the original descriptor cannot release it.
@@ -235,11 +237,22 @@ fn corrupt_new_image_cannot_acknowledge_and_durable_old_image_is_retained() {
     let mut session = fixture.prepared();
     let mut journal = session.journal().unwrap().unwrap();
     session.apply(&mut journal).unwrap();
-    session.trial = Some(journal.id);
+    session.trial = Some(journal.id.clone());
     fs::write(&fixture.installed, b"disk corruption").unwrap();
     assert_eq!(
         session.acknowledge(&fixture.next_metadata),
         Err(UpdateError::RecoveryRequired)
+    );
+    assert_eq!(session.trial.as_deref(), Some(journal.id.as_str()));
+    // The rejected image must not turn the next check into a no-trial success.
+    assert_eq!(
+        session.acknowledge(&fixture.next_metadata),
+        Err(UpdateError::RecoveryRequired)
+    );
+    assert_eq!(session.trial.as_deref(), Some(journal.id.as_str()));
+    assert_eq!(
+        session.journal().unwrap().unwrap().phase,
+        Phase::AwaitingHealth
     );
     assert_eq!(
         fs::read(session.state.join("previous.AppImage")).unwrap(),
