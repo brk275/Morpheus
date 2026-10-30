@@ -17,7 +17,7 @@ on:
         description: Existing check route (focused results are partial evidence)
         type: choice
         default: all
-        options: [all, native, models, desktop, desktop-video, devices, vendor, sdk, matrix, wayland, config, helpers]
+        options: [all, native, native-libraries, models, desktop, desktop-video, devices, vendor, sdk, matrix, wayland, config, helpers]
       matrix_suite:
         description: Existing Matrix suite (non-full requires Linux and matrix)
         type: choice
@@ -244,7 +244,7 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path vendor/cpal/Cargo.toml -- --check
       - name: Prepare the pinned owned native PipeWire client
-        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'wayland' || (needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite != 'drafts-only' && needs.scope.outputs.matrix_suite != 'timeline-failures' && needs.scope.outputs.matrix_suite != 'media-only' && needs.scope.outputs.matrix_suite != 'oauth-only'))
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'native-libraries' || needs.scope.outputs.check_route == 'wayland' || (needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite != 'drafts-only' && needs.scope.outputs.matrix_suite != 'timeline-failures' && needs.scope.outputs.matrix_suite != 'media-only' && needs.scope.outputs.matrix_suite != 'oauth-only'))
         timeout-minutes: 20
         shell: bash
         run: |
@@ -490,22 +490,28 @@ jobs:
         timeout-minutes: 15
         run: python3 scripts/run_wayland_acceptance.py
       - name: Test vendored security fixes
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'vendor')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'native-libraries')
         id: vendor-tests
         # Keep independent SDK and live checks on the already-built app.
         # The final gate still rejects any failed vendor regression command.
         continue-on-error: true
         shell: bash
         run: |
+          set -euo pipefail
+          # Run the original retained receiver tests in their owning SDK library.
+          # The call facade is gated by matrix-sdk, not livekit alone.
+          # Co-select the already-required adapter library so its Windows
+          # dev dependency retains the application bundled SQLite policy.
           rtc_retained_event_tests=(
-            held_events::tests::buffered_events_reach_one_first_subscriber_and_later_subscribers_start_fresh
-            held_events::tests::retained_receiver_preserves_original_lag_instead_of_resubscribing
-            held_events::tests::separate_calls_keep_their_own_receiver_and_drop_unclaimed_history
+            livekit::call::held_events::tests::buffered_events_reach_one_first_subscriber_and_later_subscribers_start_fresh
+            livekit::call::held_events::tests::retained_receiver_preserves_original_lag_instead_of_resubscribing
+            livekit::call::held_events::tests::separate_calls_keep_their_own_receiver_and_drop_unclaimed_history
           )
-          cargo test --locked -p morpheus-app --features native-calls --test rtc_retained_events -- --list > "$RUNNER_TEMP/morpheus-rtc-retained-event-tests.txt"
+          cargo test --locked -p matrix-rtc-call-sdk -p matrix-rtc-matrix-sdk --features matrix-rtc-call-sdk/matrix-sdk --lib livekit::call::held_events::tests:: -- --list > "$RUNNER_TEMP/morpheus-rtc-retained-event-tests.txt"
+          test "$(grep -Ec '^livekit::call::held_events::tests::[^ ]+: test$' "$RUNNER_TEMP/morpheus-rtc-retained-event-tests.txt")" = 3
           for rtc_retained_event_test in "${rtc_retained_event_tests[@]}"; do
             test "$(grep -Fxc -- "$rtc_retained_event_test: test" "$RUNNER_TEMP/morpheus-rtc-retained-event-tests.txt")" = 1
-            cargo test --locked -p morpheus-app --features native-calls --test rtc_retained_events "$rtc_retained_event_test" -- --exact | tee "$RUNNER_TEMP/morpheus-rtc-retained-event-result.txt"
+            cargo test --locked -p matrix-rtc-call-sdk -p matrix-rtc-matrix-sdk --features matrix-rtc-call-sdk/matrix-sdk --lib "$rtc_retained_event_test" -- --exact | tee "$RUNNER_TEMP/morpheus-rtc-retained-event-result.txt"
             test "$(grep -Fxc -- "test $rtc_retained_event_test ... ok" "$RUNNER_TEMP/morpheus-rtc-retained-event-result.txt")" = 1
             test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-rtc-retained-event-result.txt")" = 1
           done
@@ -513,10 +519,16 @@ jobs:
             config_preference::tests::known_transparency_outranks_samples_in_both_native_orders
             config_preference::tests::unknown_opaque_fallbacks_and_sample_ties_preserve_order
           )
-          cargo test --locked -p morpheus-app --features native-calls --test gl_config_preference -- --list > "$RUNNER_TEMP/morpheus-gl-config-tests.txt"
+          # This existing wrapper imports only the original pure-std GL reducer.
+          # Avoid Cargo's unrelated GUI binary build for this standalone harness.
+          gl_config_binary="$RUNNER_TEMP/morpheus-gl-config-tests"
+          if [ "$RUNNER_OS" = "Windows" ]; then gl_config_binary="$gl_config_binary.exe"; fi
+          rustc +1.99.0 --test --edition=2024 -C opt-level=0 -C debuginfo=0 crates/morpheus-app/tests/gl_config_preference.rs -o "$gl_config_binary"
+          "$gl_config_binary" --list > "$RUNNER_TEMP/morpheus-gl-config-tests.txt"
+          test "$(grep -Ec '^config_preference::tests::[^ ]+: test$' "$RUNNER_TEMP/morpheus-gl-config-tests.txt")" = 2
           for gl_config_test in "${gl_config_tests[@]}"; do
             test "$(grep -Fxc -- "$gl_config_test: test" "$RUNNER_TEMP/morpheus-gl-config-tests.txt")" = 1
-            cargo test --locked -p morpheus-app --features native-calls --test gl_config_preference "$gl_config_test" -- --exact | tee "$RUNNER_TEMP/morpheus-gl-config-result.txt"
+            "$gl_config_binary" "$gl_config_test" --exact | tee "$RUNNER_TEMP/morpheus-gl-config-result.txt"
             test "$(grep -Fxc -- "test $gl_config_test ... ok" "$RUNNER_TEMP/morpheus-gl-config-result.txt")" = 1
             test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-gl-config-result.txt")" = 1
           done
@@ -721,7 +733,7 @@ jobs:
           fi
       - name: Test synthetic native video source ownership
         id: video-source-tests
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'desktop-video')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'native-libraries' || needs.scope.outputs.check_route == 'desktop-video')
         continue-on-error: true
         shell: bash
         run: |
@@ -743,7 +755,7 @@ jobs:
             test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-libwebrtc-source-result.txt")" = 1
           done
       - name: Test pinned SDK sticky receipt and redaction regressions
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'sdk')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'sdk' || needs.scope.outputs.check_route == 'native-libraries')
         id: sdk-receipt-tests
         # Keep collecting the independently built app's live acceptance. The
         # final outcome gate still rejects failed SDK unit regressions.
@@ -868,7 +880,7 @@ jobs:
               return selected
 
           def native_check_error(route, runner, wayland, outcomes):
-              routes = {"all", "native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "matrix", "wayland"}
+              routes = {"all", "native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "native-libraries", "matrix", "wayland"}
               if (not isinstance(route, str) or route not in routes or runner not in ("Linux", "Windows", "macOS")
                       or wayland not in ("true", "false") or not isinstance(outcomes, dict)):
                   return "Native check selection is missing or malformed."
@@ -883,9 +895,9 @@ jobs:
                   "device-tests": route in ("all", "native", "devices"),
                   "windows-capture-tests": runner == "Windows" and route in ("all", "native", "devices"),
                   "wayland-tests": runner == "Linux" and wayland == "true",
-                  "vendor-tests": route in ("all", "native", "vendor"),
-                  "video-source-tests": route in ("all", "native", "vendor", "desktop-video"),
-                  "sdk-receipt-tests": route in ("all", "native", "sdk"),
+                  "vendor-tests": route in ("all", "native", "vendor", "native-libraries"),
+                  "video-source-tests": route in ("all", "native", "vendor", "desktop-video", "native-libraries"),
+                  "sdk-receipt-tests": route in ("all", "native", "sdk", "native-libraries"),
                   "matrix-tests": runner == "Linux" and route in ("all", "matrix"),
               }
               for name, required in selected.items():
@@ -978,7 +990,7 @@ jobs:
               choices = {"all": ["macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025"],
                          "linux": ["ubuntu-24.04"], "windows": ["windows-2025"],
                          "macos-arm": ["macos-15"], "macos-intel": ["macos-15-intel"]}
-              routes = {"all", "native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "matrix", "wayland", "config", "helpers"}
+              routes = {"all", "native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "native-libraries", "matrix", "wayland", "config", "helpers"}
               suites = {"full", "draft-recovery", "drafts-only", "timeline-reads", "timeline-failures",
                         "media-only", "app-timeline", "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop", "rtc-ui-video"}
               if (event_name not in ("push", "pull_request", "workflow_dispatch")

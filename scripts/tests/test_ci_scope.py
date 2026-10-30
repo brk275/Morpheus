@@ -350,7 +350,7 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual((result["check_route"], result["matrix_suite"]), ("all", "full"))
 
     def test_manual_routes_are_exact_existing_checks_and_matrix_suites(self):
-        self.assertEqual(MANUAL_CHECKS, {"all", "native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk",
+        self.assertEqual(MANUAL_CHECKS, {"all", "native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "native-libraries",
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
                                          "timeline-failures", "media-only", "app-timeline",
@@ -385,6 +385,22 @@ class ScopeTests(unittest.TestCase):
                 with self.subTest(platform=platform, suite=suite), self.assertRaises(ValueError):
                     event_selection({"inputs": {"platform": platform, "checks": "native",
                                                 "matrix_suite": suite}}, "workflow_dispatch")
+
+    def test_native_libraries_batches_existing_library_gates_on_fixed_platforms(self):
+        for platform, platforms in MANUAL_PLATFORMS.items():
+            selected = event_selection({"inputs": {"platform": platform, "checks": "native-libraries"}},
+                                       "workflow_dispatch")
+            self.assertEqual(selected, {
+                "native": True, "native_matrix": {"os": list(platforms)}, "config": False,
+                "wayland": False, "manual": True, "manual_platform": platform,
+                "check_route": "native-libraries", "matrix_suite": "full",
+            })
+            for suite in MATRIX_SUITES - {"full"}:
+                with self.subTest(platform=platform, suite=suite), self.assertRaises(ValueError):
+                    event_selection({"inputs": {"platform": platform, "checks": "native-libraries",
+                                                "matrix_suite": suite}}, "workflow_dispatch")
+        for event in ("push", "pull_request"):
+            self.assertEqual(event_selection({"inputs": {"checks": "native-libraries"}}, event)["check_route"], "all")
 
     def test_desktop_video_batches_only_affected_checks_on_fixed_native_platforms(self):
         for platform, platforms in MANUAL_PLATFORMS.items():
@@ -588,9 +604,9 @@ class ScopeTests(unittest.TestCase):
         # comparisons with owned fixture bytes under test-only pins, so a
         # future different workflow can safely fall back all without requiring
         # its execution layout to be admitted by this exemption.
-        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 65948)
+        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 71746)
         self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
-                         "50be2e2a563e5b61e97e2b294499707ee9b194e2d508901bdcf9866d304dfd1f")
+                         "702f44b0cd1b3c28426f9fb770280e1e32452550bb5322069217790d7371246e")
         import hashlib
         with patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_BYTES", len(workflow)), \
                 patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_SHA256", hashlib.sha256(workflow).hexdigest()):

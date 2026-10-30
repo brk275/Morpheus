@@ -177,7 +177,7 @@ MANUAL_PLATFORMS = {
     "macos-arm": ("macos-15",),
     "macos-intel": ("macos-15-intel",),
 }
-MANUAL_CHECKS = frozenset({"all", "native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk",
+MANUAL_CHECKS = frozenset({"all", "native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "native-libraries",
                            "matrix", "wayland", "config", "helpers"})
 # Exact existing suites from run_matrix_acceptance.py; no new test composition.
 MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-reads",
@@ -252,8 +252,8 @@ AUTOMATIC_CONTROL_INPUTS = frozenset((
     "scripts/ci_scope.py", "scripts/tests/test_ci_scope.py",
     ".github/workflows/ci.yml", "scripts/tests/test_ci_acceptance.py",
 ))
-REVIEWED_CONTROL_WORKFLOW_SHA256 = "50be2e2a563e5b61e97e2b294499707ee9b194e2d508901bdcf9866d304dfd1f"
-REVIEWED_CONTROL_WORKFLOW_BYTES = 65948
+REVIEWED_CONTROL_WORKFLOW_SHA256 = "702f44b0cd1b3c28426f9fb770280e1e32452550bb5322069217790d7371246e"
+REVIEWED_CONTROL_WORKFLOW_BYTES = 71746
 
 
 def reviewed_control_only(paths, event, event_name, force_all=False):

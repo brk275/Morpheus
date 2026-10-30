@@ -128,7 +128,8 @@ class AcceptanceTests(unittest.TestCase):
                                 ("macos-arm","native"), ("macos-intel","native"),
                                 ("all","desktop-video"), ("linux","desktop-video"),
                                 ("windows","desktop-video"), ("macos-arm","desktop-video"),
-                                ("macos-intel","desktop-video")):
+                                ("macos-intel","desktop-video"),
+                                *((platform, "native-libraries") for platform in platforms)):
             native = [] if route in {"helpers","config"} else platforms[platform]
             value = snapshot(bool(native),config=route=="config",platforms=native,wayland=route=="wayland")
             value["scope"]["outputs"].update(manual="true",manual_platform=platform,check_route=route)
@@ -158,7 +159,7 @@ class AcceptanceTests(unittest.TestCase):
                         changed = json.loads(json.dumps(value)); changed[job]["result"] = bad
                         self.assertIsNotNone(acceptance_error(changed, event))
                 for key, bad in (("manual", "true"), ("manual_platform", "linux"), ("matrix_suite", "oauth-only"),
-                                 ("check_route", "models"), ("check_route", "native"), ("check_route", "devices"), ("wayland", "true"), ("config", "true")):
+                                 ("check_route", "models"), ("check_route", "native"), ("check_route", "native-libraries"), ("check_route", "devices"), ("wayland", "true"), ("config", "true")):
                     changed = json.loads(json.dumps(value)); changed["scope"]["outputs"][key] = bad
                     self.assertIsNotNone(acceptance_error(changed, event))
             for count in range(len(PLATFORMS)):
@@ -336,14 +337,14 @@ class NativeRouteWorkflowTests(unittest.TestCase):
     def test_selected_steps_must_pass_and_unselected_steps_must_be_skipped(self):
         validate = load_native_validator()
         for runner in ("Linux","Windows","macOS"):
-            for route in ("all","native","models","desktop","desktop-video","devices","vendor","sdk","matrix","wayland"):
+            for route in ("all","native","models","desktop","desktop-video","devices","vendor","sdk","native-libraries","matrix","wayland"):
                 if route in ("matrix","wayland") and runner!="Linux":
                     continue
                 wayland = "true" if runner=="Linux" and route in ("all","wayland") else "false"
                 selected = {"model-tests":route in ("all","native","models"), "desktop-tests":route in ("all","native","desktop","desktop-video"),
-                            "device-tests":route in ("all","native","devices"), "vendor-tests":route in ("all","native","vendor"),
-                            "video-source-tests":route in ("all","native","vendor","desktop-video"),
-                            "sdk-receipt-tests":route in ("all","native","sdk"),
+                            "device-tests":route in ("all","native","devices"), "vendor-tests":route in ("all","native","vendor","native-libraries"),
+                            "video-source-tests":route in ("all","native","vendor","desktop-video","native-libraries"),
+                            "sdk-receipt-tests":route in ("all","native","sdk","native-libraries"),
                             "windows-capture-tests":runner=="Windows" and route in ("all","native","devices"),
                             "wayland-tests":wayland=="true", "matrix-tests":runner=="Linux" and route in ("all","matrix")}
                 outcomes={name:{"outcome":"success" if yes else "skipped"} for name,yes in selected.items()}
@@ -381,7 +382,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
             outcomes["windows-capture-tests"] = {"outcome": "success" if runner == "Windows" else "skipped"}
             self.assertIsNone(validate("all", runner, project("all", runner, "true"), outcomes))
             self.assertIsNotNone(validate("all", runner, "true", outcomes))
-            for route in ("native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "matrix", "wayland", "foreign"):
+            for route in ("native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "native-libraries", "matrix", "wayland", "foreign"):
                 # Only the legitimate whole-matrix route may project true.
                 # Invalid route/global-Wayland pairs must stay fail-closed.
                 self.assertEqual(project(route, runner, "true"), "true")
@@ -410,7 +411,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertEqual(source.count(start), 1)
         step = source.split(start, 1)[1].split(end, 1)[0]
         self.assertIn("        id: video-source-tests\n", step)
-        self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'desktop-video')", step)
+        self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'native-libraries' || needs.scope.outputs.check_route == 'desktop-video')", step)
         cases = (
             "imp::video_source::tests::unused_source_drop_before_first_poll_releases_native_owner",
             "imp::video_source::tests::last_source_clone_drop_while_warmup_pending_releases_native_owner",
@@ -426,6 +427,86 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertIn('grep -Fxc -- "test $libwebrtc_source_test ... ok"', step)
         self.assertIn("VIDEO_SOURCE_OUTCOME: ${{ steps.video-source-tests.outcome }}", source)
         self.assertIn('("video-source-tests", "VIDEO_SOURCE_OUTCOME")', source)
+
+    def test_native_libraries_routes_only_existing_union_and_required_linux_client(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        selected = []
+        for section in source.split("      - name: ")[1:]:
+            name = section.split("\n", 1)[0]
+            condition = next((line.strip() for line in section.splitlines() if line.startswith("        if:")), "")
+            if "needs.scope.outputs.check_route == 'native-libraries'" in condition:
+                selected.append(name)
+        self.assertEqual(selected, [
+            "Prepare the pinned owned native PipeWire client", "Test vendored security fixes",
+            "Test synthetic native video source ownership", "Test pinned SDK sticky receipt and redaction regressions",
+        ])
+        self.assertIn("options: [all, native, native-libraries, models,", source)
+        self.assertIn("github.actor == github.repository_owner", source)
+        self.assertIn("github.triggering_actor == github.repository_owner", source)
+        self.assertIn("'Focused CI acceptance (partial)' || 'CI acceptance'", source)
+
+    def test_pure_vendor_regressions_keep_exact_original_tests_without_app_rebuild(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        step = source.split("      - name: Test vendored security fixes\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("          set -euo pipefail\n", step)
+        self.assertNotIn("cargo test --locked -p morpheus-app", step)
+        rtc = (
+            "livekit::call::held_events::tests::buffered_events_reach_one_first_subscriber_and_later_subscribers_start_fresh",
+            "livekit::call::held_events::tests::retained_receiver_preserves_original_lag_instead_of_resubscribing",
+            "livekit::call::held_events::tests::separate_calls_keep_their_own_receiver_and_drop_unclaimed_history",
+        )
+        gl = (
+            "config_preference::tests::known_transparency_outranks_samples_in_both_native_orders",
+            "config_preference::tests::unknown_opaque_fallbacks_and_sample_ties_preserve_order",
+        )
+        for array, expected in (("rtc_retained_event_tests", rtc), ("gl_config_tests", gl)):
+            selected = step.split("          " + array + "=(\n", 1)[1].split("          )\n", 1)[0]
+            self.assertEqual(tuple(line.strip() for line in selected.splitlines() if line.strip()), expected)
+        self.assertIn('cargo test --locked -p matrix-rtc-call-sdk -p matrix-rtc-matrix-sdk --features matrix-rtc-call-sdk/matrix-sdk --lib livekit::call::held_events::tests:: -- --list', step)
+        self.assertIn('cargo test --locked -p matrix-rtc-call-sdk -p matrix-rtc-matrix-sdk --features matrix-rtc-call-sdk/matrix-sdk --lib "$rtc_retained_event_test" -- --exact', step)
+        self.assertIn('rustc +1.99.0 --test --edition=2024 -C opt-level=0 -C debuginfo=0 crates/morpheus-app/tests/gl_config_preference.rs -o "$gl_config_binary"', step)
+        self.assertIn('if [ "$RUNNER_OS" = "Windows" ]; then gl_config_binary="$gl_config_binary.exe"; fi', step)
+        self.assertIn('"$gl_config_binary" --list > "$RUNNER_TEMP/morpheus-gl-config-tests.txt"', step)
+        self.assertIn('"$gl_config_binary" "$gl_config_test" --exact | tee', step)
+        for variable, prefix, count in (("rtc-retained-event", "livekit::call::held_events", 3),
+                                        ("gl-config", "config_preference", 2)):
+            self.assertIn("grep -Ec '^" + prefix + "::tests::[^ ]+: test$'", step)
+            listing = "$RUNNER_TEMP/morpheus-" + variable + "-tests.txt"
+            self.assertIn('"' + listing + '")" = ' + str(count), step)
+        for variable in ("rtc_retained_event_test", "gl_config_test"):
+            self.assertIn('grep -Fxc -- "$' + variable + ': test"', step)
+            self.assertIn('grep -Fxc -- "test $' + variable + ' ... ok"', step)
+        for result in ("rtc-retained-event", "gl-config"):
+            self.assertIn("grep -Ec '^test result: ok\\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' \"$RUNNER_TEMP/morpheus-" + result + '-result.txt")" = 1', step)
+        # The wrappers still name the production source, and the owning SDK
+        # actually exposes the retained events only with matrix-sdk enabled.
+        root = WORKFLOW.parents[2]
+        sdk = root / "vendor/matrix-rtc-call-sdk/src/livekit"
+        self.assertIn('#[cfg(feature = "matrix-sdk")]\nmod call;', (sdk / "mod.rs").read_text())
+        self.assertIn("mod held_events;", (sdk / "call.rs").read_text())
+        self.assertIn("held_events::take_or_subscribe(&self.first_events", (sdk / "call.rs").read_text())
+        for wrapper, original, cases in (
+            ("rtc_retained_events", "vendor/matrix-rtc-call-sdk/src/livekit/call/held_events.rs", rtc),
+            ("gl_config_preference", "vendor/i-slint-backend-winit/renderer/femtovg/glcontext/config_preference.rs", gl),
+        ):
+            wrapper_source = (root / "crates/morpheus-app/tests" / (wrapper + ".rs")).read_text()
+            self.assertIn('#[path = "../../../' + original + '"]', wrapper_source)
+            original_source = (root / original).read_text()
+            for case in cases:
+                self.assertIn("fn " + case.rsplit("::", 1)[1] + "()", original_source)
+        build = source.split("      - name: Build desktop with native call and device adapters\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("run: cargo build --locked -p morpheus-app --features native-calls\n", build)
+        self.assertNotIn("--tests", build)
+        self.assertNotIn("--test ", build)
+        # Keep the twelve exact AuthGuard cases, their nonzero pass result,
+        # and the example's compilation-only boundary independently required.
+        auth = step.split("          sdk_auth_tests=(\n", 1)[1].split("          )\n", 1)[0]
+        self.assertEqual(len([line for line in auth.splitlines() if line.strip()]), 12)
+        self.assertIn('cargo test --locked -p matrix-rtc-call-sdk --features livekit --lib livekit::auth::tests:: -- --list', step)
+        self.assertIn('cargo test --locked -p matrix-rtc-call-sdk --features livekit --lib livekit::auth::tests:: -- --test-threads=1', step)
+        self.assertIn("12 passed; 0 failed; 0 ignored; 0 measured;", step)
+        self.assertIn("cargo check --locked -p matrix-rtc-call-sdk --example publish_video --features matrix-sdk\n", step)
+        self.assertNotIn("cargo run", step)
 
     def test_transport_key_acceptance_regressions_are_explicit_in_vendor_gate(self):
         source = WORKFLOW.read_text(encoding="utf-8")
