@@ -122,11 +122,26 @@ def guard(environment, system=sys.platform):
     # Windows; the plain dict no longer has os.environ's case-insensitive lookup.
     image_key = "ImageOS" if system == "darwin" else "IMAGEOS"
     require(environment.get(image_key) in ({"macos15", "macos26"} if system == "darwin" else {"win25", "win25-vs2026"}))
-    _notice_phase("event_file")
-    _notice_event_bytes = N.read_regular(Path(environment["GITHUB_EVENT_PATH"]), 1024 * 1024)
     _notice_phase("event_payload")
-    event = S.unique_json(_notice_event_bytes)
-    del _notice_event_bytes
+    # This control metadata comes from the immutable main workflow's GitHub
+    # context, not a source/archive file or the shared hosted TEMP event file.
+    # Only declared nonsecret selectors and numeric owner/sender IDs are passed.
+    raw = environment.get("MORPHEUS_NATIVE_PACKAGE_CONTEXT")
+    require(type(raw) is str and 0 < len(raw) <= 1024 * 1024 and raw.isascii())
+    context = S.unique_json(raw.encode("ascii"))
+    require(type(context) is dict and set(context) == {"owner_id", "sender_id", "private", "inputs"}
+            and type(context["sender_id"]) is int and context["sender_id"] > 0
+            and type(context["private"]) is bool and type(context["inputs"]) is dict)
+    selected_inputs = context["inputs"]
+    require(set(selected_inputs) == {"source_revision", "platform", "linux_formats", "appimage_updates",
+                "appimage_capture", "source_bundle", "native_updates"}
+            and all(type(selected_inputs[name]) is str for name in ("source_revision", "platform", "linux_formats"))
+            and all(type(selected_inputs[name]) is bool for name in
+                    ("appimage_updates", "appimage_capture", "source_bundle", "native_updates"))
+            and selected_inputs["source_revision"] == R.expected_revision(environment))
+    # Retain the original origin and matrix policy against the same typed facts.
+    event = {"repository": {"owner": {"id": context["owner_id"]}, "private": context["private"]},
+             "sender": {"id": context["sender_id"]}, "inputs": selected_inputs}
     owner = event.get("repository", {}).get("owner", {}).get("id")
     inputs = event.get("inputs", {})
     require(type(owner) is int and owner > 0 and event.get("sender", {}).get("id") == owner

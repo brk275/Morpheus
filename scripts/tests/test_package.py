@@ -772,25 +772,61 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
         from scripts import native_notice_source as acquisition
         # dict(os.environ) on Windows contains uppercase keys, unlike the old
         # mixed-case mock. Use the real guard and allowlist with that exact shape.
-        event = {"repository":{"owner":{"id":42},"private":False},"sender":{"id":42},
-                 "inputs":{"platform":"windows","linux_formats":"appimage",
-                           "appimage_updates":"false","appimage_capture":"false",
-                           "source_bundle":"false","native_updates":"false"}}
+        context = {"owner_id":42,"sender_id":42,"private":False,
+                   "inputs":{"source_revision":"a"*40,"platform":"windows","linux_formats":"appimage",
+                             "appimage_updates":False,"appimage_capture":False,
+                             "source_bundle":False,"native_updates":False}}
         inherited = {"GITHUB_ACTIONS":"true","RUNNER_ENVIRONMENT":"github-hosted",
             "GITHUB_REPOSITORY":"brk275/Morpheus","GITHUB_REF":"refs/heads/main",
             "GITHUB_EVENT_NAME":"workflow_dispatch","GITHUB_ACTOR":"brk275",
             "GITHUB_TRIGGERING_ACTOR":"brk275","RUNNER_OS":"Windows","IMAGEOS":"win25",
-            "GITHUB_EVENT_PATH":"/fixture/event.json","SYSTEMROOT":"/windows","WINDIR":"/windows",
+            "GITHUB_EVENT_PATH":"/unsafe/shared/event.json","SYSTEMROOT":"/windows","WINDIR":"/windows",
+            "GITHUB_SHA":"b"*40,"MORPHEUS_PACKAGE_SOURCE_REVISION":"a"*40,
+            "MORPHEUS_NATIVE_PACKAGE_CONTEXT":json.dumps(context),
             "RUNNER_TEMP":"/runner/temp","PROGRAMFILES":"/programs","USERPROFILE":"/old/profile",
             "GITHUB_TOKEN":"private","HTTPS_PROXY":"private","RUSTFLAGS":"--cfg injected"}
         with mock.patch.object(acquisition.platform,"machine",return_value="AMD64"), \
-                mock.patch.object(acquisition.N,"read_regular",return_value=json.dumps(event).encode()):
+                mock.patch.object(acquisition.N,"read_regular",side_effect=AssertionError("unsafe event file opened")) as read_event:
             acquisition.guard(inherited,system="win32")
             for image in ("win22",None):
                 rejected = dict(inherited)
                 if image is None: rejected.pop("IMAGEOS")
                 else: rejected["IMAGEOS"] = image
                 with self.assertRaises(ValueError): acquisition.guard(rejected,system="win32")
+            malformed = [None, "not-json", "[]", json.dumps(context)+" "*(1024*1024+1), "é",
+                         json.dumps(context)[:-1]+',"owner_id":42}',
+                         json.dumps(context).replace('"native_updates": false', '"native_updates": false,"native_updates": false')]
+            for field,value in (("owner_id",True),("owner_id","42"),("owner_id",0),("owner_id",-1),("sender_id",True),
+                                ("sender_id",43),("sender_id",42.0),("private",True),("private","false"),("inputs",[])):
+                changed=json.loads(json.dumps(context));changed[field]=value;malformed.append(json.dumps(changed))
+            for field,value in (("platform","unknown"),("platform",42),("linux_formats","unknown"),
+                                ("source_revision","b"*40),("native_updates","false"),("appimage_updates",0),("source_bundle",True)):
+                changed=json.loads(json.dumps(context));changed["inputs"][field]=value;malformed.append(json.dumps(changed))
+            for nested in (False,True):
+                changed=json.loads(json.dumps(context));(changed["inputs"] if nested else changed)["unknown"]=False
+                malformed.append(json.dumps(changed))
+                changed=json.loads(json.dumps(context));(changed["inputs"] if nested else changed).pop("platform" if nested else "owner_id")
+                malformed.append(json.dumps(changed))
+            for index,value in enumerate(malformed):
+                rejected=dict(inherited)
+                if value is None: rejected.pop("MORPHEUS_NATIVE_PACKAGE_CONTEXT")
+                else: rejected["MORPHEUS_NATIVE_PACKAGE_CONTEXT"]=value
+                with self.subTest(case=index), self.assertRaises((ValueError, acquisition.S.SourceFailure)):
+                    acquisition.guard(rejected,system="win32")
+            read_event.assert_not_called()
+            # Check the actual prepare/finish caller templates, preserving JSON
+            # booleans and IDs rather than interpolating anything into a shell.
+            workflow=(Path(__file__).resolve().parents[2]/".github/workflows/package-qa.yml").read_text()
+            templates=re.findall(r"MORPHEUS_NATIVE_PACKAGE_CONTEXT: >-\n +([^\n]+)",workflow)
+            self.assertEqual(len(templates),2);self.assertEqual(templates[0],templates[1])
+            values={"github.event.repository.owner.id":42,"github.event.sender.id":42,
+                    "github.event.repository.private":False,"needs.scope.outputs.source_revision":"a"*40,
+                    **{"inputs."+key:value for key,value in context["inputs"].items() if key!="source_revision"}}
+            for template in templates:
+                rendered=re.sub(r"\$\{\{ toJSON\(([^)]+)\) \}\}",lambda match:json.dumps(values[match[1]]),template)
+                self.assertNotIn("${{",rendered);self.assertEqual(json.loads(rendered),context)
+                acquisition.guard({**inherited,"MORPHEUS_NATIVE_PACKAGE_CONTEXT":rendered},system="win32")
+            read_event.assert_not_called()
         with mock.patch.object(acquisition,"os",type("Windows",(),{"name":"nt","pathsep":";"})()), \
                 mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)) as checked:
             root = Path("/private/source")
@@ -803,26 +839,29 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
         self.assertEqual(selected["PATH"],";".join(str(Path(value)) for value in
             ("/pinned/bin","/programs/Git/cmd","/windows/System32")))
         self.assertEqual(selected["USERPROFILE"],str(root/"home"))
-        for name in ("SystemRoot","ImageOS","PROGRAMFILES","GITHUB_TOKEN","HTTPS_PROXY","RUSTFLAGS"):
+        for name in ("SystemRoot","ImageOS","PROGRAMFILES","GITHUB_TOKEN","HTTPS_PROXY","RUSTFLAGS","MORPHEUS_NATIVE_PACKAGE_CONTEXT"):
             self.assertNotIn(name,selected)
 
     def test_unix_host_environment_keeps_case_sensitive_image_and_system_names(self):
         from scripts import native_notice_source as acquisition
-        event = {"repository":{"owner":{"id":42},"private":False},"sender":{"id":42},
-                 "inputs":{"platform":"macos","linux_formats":"appimage",
-                           "appimage_updates":"false","appimage_capture":"false",
-                           "source_bundle":"false","native_updates":"false"}}
+        context = {"owner_id":42,"sender_id":42,"private":False,
+                   "inputs":{"source_revision":"a"*40,"platform":"macos","linux_formats":"appimage",
+                             "appimage_updates":False,"appimage_capture":False,
+                             "source_bundle":False,"native_updates":False}}
         inherited = {"GITHUB_ACTIONS":"true","RUNNER_ENVIRONMENT":"github-hosted",
             "GITHUB_REPOSITORY":"brk275/Morpheus","GITHUB_REF":"refs/heads/main",
             "GITHUB_EVENT_NAME":"workflow_dispatch","GITHUB_ACTOR":"brk275",
             "GITHUB_TRIGGERING_ACTOR":"brk275","RUNNER_OS":"macOS","ImageOS":"macos15",
-            "GITHUB_EVENT_PATH":"/fixture/event.json","SystemRoot":"/original-system",
+            "GITHUB_EVENT_PATH":"/unsafe/shared/event.json","SystemRoot":"/original-system",
+            "GITHUB_SHA":"b"*40,"MORPHEUS_PACKAGE_SOURCE_REVISION":"a"*40,
+            "MORPHEUS_NATIVE_PACKAGE_CONTEXT":json.dumps(context),
             "SYSTEMROOT":"/foreign-system","IMAGEOS":"win25"}
         with mock.patch.object(acquisition.platform,"machine",return_value="x86_64"), \
-                mock.patch.object(acquisition.N,"read_regular",return_value=json.dumps(event).encode()):
+                mock.patch.object(acquisition.N,"read_regular",side_effect=AssertionError("unsafe event file opened")) as read_event:
             acquisition.guard(inherited,system="darwin")
             with self.assertRaises(ValueError):
                 acquisition.guard({key:value for key,value in inherited.items() if key != "ImageOS"},system="darwin")
+            read_event.assert_not_called()
         with mock.patch.object(acquisition,"os",type("Unix",(),{"name":"posix","pathsep":":"})()):
             selected = acquisition.environment_for_acquisition(inherited,Path("/private/source"),Path("/pinned/bin/cargo"),
                 Path("/pinned/bin/rustc"),Path("/usr/bin/git"),Path("/pinned/rustup"))
