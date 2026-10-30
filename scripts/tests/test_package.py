@@ -883,6 +883,99 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
         with self.assertRaises(ValueError):acquisition.source_inputs(foreign)
 
 
+    def test_source_parent_keeps_windows_owned_home_and_unix_existing_temp_policy(self):
+        from scripts import native_notice_source as acquisition
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            other = home/"provider-shared-temp"
+            with mock.patch.object(acquisition, "os", SimpleNamespace(name="nt")), \
+                    mock.patch.object(acquisition.Path, "home", return_value=home), \
+                    mock.patch.object(acquisition, "checked", side_effect=lambda value,**kwargs:value) as check:
+                self.assertEqual(acquisition.source_parent({"RUNNER_TEMP":str(other)}), home)
+                check.assert_called_once_with(home, directory=True)
+            with mock.patch.object(acquisition, "os", SimpleNamespace(name="posix")), \
+                    mock.patch.object(acquisition, "checked", side_effect=lambda value,**kwargs:value) as check:
+                self.assertEqual(acquisition.source_parent({"RUNNER_TEMP":str(other)}), other)
+                check.assert_called_once_with(other, directory=True)
+
+    def test_reserved_source_root_binds_all_paths_revision_and_exact_directory_identity(self):
+        from scripts import native_notice_source as acquisition
+        with tempfile.TemporaryDirectory() as temporary:
+            parent=Path(temporary).resolve();root=parent/("morpheus-native-source-"+"a"*32);root.mkdir(mode=0o700)
+            info=root.lstat();marker={"schema":1,"device":info.st_dev,"inode":info.st_ino,"source_revision":"a"*40}
+            environment={"MORPHEUS_PACKAGE_SOURCE_REVISION":"a"*40,"GITHUB_SHA":"b"*40,
+                "MORPHEUS_NATIVE_SOURCE_ROOT":str(root),
+                "MORPHEUS_NATIVE_SOURCE_BUNDLE":str(root/"output"/acquisition.S.BUNDLE_NAME),
+                "MORPHEUS_NATIVE_SOURCE_RECEIPT":str(root/"receipt.json")}
+            owner=root/"owner.json"
+            with mock.patch.object(acquisition,"source_parent",return_value=parent), \
+                    mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)), \
+                    mock.patch.object(acquisition.S,"read_owned",side_effect=lambda path,*args,**kwargs:path.read_bytes()):
+                owner.write_text(json.dumps(marker))
+                self.assertEqual(acquisition.owned_source_root(environment),root)
+                for key in ("MORPHEUS_NATIVE_SOURCE_BUNDLE","MORPHEUS_NATIVE_SOURCE_RECEIPT"):
+                    with self.subTest(export=key),self.assertRaises(ValueError):
+                        acquisition.owned_source_root({**environment,key:str(parent/"unrelated")})
+                for key,value in (("schema",True),("device",True),("inode",info.st_ino+1),
+                                  ("source_revision","b"*40),("unexpected",False)):
+                    owner.write_text(json.dumps({**marker,key:value}))
+                    with self.subTest(marker=key),self.assertRaises(ValueError):acquisition.owned_source_root(environment)
+                owner.write_text(json.dumps(marker))
+                with mock.patch.object(acquisition,"source_parent",return_value=parent/"different"),self.assertRaises(ValueError):
+                    acquisition.owned_source_root(environment)
+                with self.assertRaises(ValueError):
+                    acquisition.owned_source_root({**environment,"MORPHEUS_NATIVE_SOURCE_ROOT":str(parent/"wrong-prefix")})
+                self.assertEqual(acquisition.owned_source_root(environment),root)
+
+    def test_cleanup_distinguishes_unused_reservation_from_unreceipted_acquisition(self):
+        from scripts import native_notice_source as acquisition
+        for extra in (None,"acquisition-started.json","unexpected-child"):
+            with self.subTest(extra=extra),tempfile.TemporaryDirectory() as temporary:
+                parent=Path(temporary).resolve();root=parent/("morpheus-native-source-"+"a"*32);root.mkdir(mode=0o700)
+                info=root.lstat();(root/"owner.json").write_text(json.dumps({"schema":1,"device":info.st_dev,
+                    "inode":info.st_ino,"source_revision":"a"*40}))
+                environment={"MORPHEUS_PACKAGE_SOURCE_REVISION":"a"*40,"GITHUB_SHA":"b"*40,
+                    "MORPHEUS_NATIVE_SOURCE_ROOT":str(root),
+                    "MORPHEUS_NATIVE_SOURCE_BUNDLE":str(root/"output"/acquisition.S.BUNDLE_NAME),
+                    "MORPHEUS_NATIVE_SOURCE_RECEIPT":str(root/"receipt.json")}
+                if extra:(root/extra).write_bytes(b"phase marker, not a stop or scan receipt")
+                with mock.patch.object(acquisition,"guard"),mock.patch.object(acquisition,"source_parent",return_value=parent), \
+                        mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)), \
+                        mock.patch.object(acquisition.S,"read_owned",side_effect=lambda path,*args,**kwargs:path.read_bytes()), \
+                        mock.patch.object(acquisition,"tools",side_effect=AssertionError("no acquisition receipt")) as tools, \
+                        mock.patch.object(acquisition.shutil,"rmtree") as remove, mock.patch("sys.stdout",new_callable=io.StringIO) as output:
+                    if extra:
+                        with self.assertRaises(OSError):acquisition.finish(environment,parent/"scanner")
+                        self.assertTrue(root.exists());self.assertEqual(output.getvalue(),"")
+                    else:
+                        acquisition.finish(environment,parent/"scanner")
+                        self.assertFalse(root.exists())
+                        self.assertEqual(json.loads(output.getvalue()),{"check":"native_notice_source_reservation_removed",
+                            "passed":True,"distribution_ready":False})
+                    tools.assert_not_called();remove.assert_not_called()
+
+    def test_prepare_records_acquisition_start_before_admitting_commands(self):
+        from scripts import native_notice_source as acquisition
+        with tempfile.TemporaryDirectory() as temporary:
+            parent=Path(temporary).resolve();root=parent/("morpheus-native-source-"+"a"*32);root.mkdir(mode=0o700)
+            (root/"owner.json").write_bytes(b"reservation marker")
+            def commands(*args):
+                self.assertEqual(json.loads((root/"acquisition-started.json").read_text()),
+                                 {"schema":1,"source_revision":"a"*40})
+                self.assertTrue((root/"logs").is_dir())
+                raise RuntimeError("stop at command admission without starting any child")
+            with mock.patch.object(acquisition,"guard"),mock.patch.object(acquisition,"owned_source_root",return_value=root), \
+                    mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)), \
+                    mock.patch.object(acquisition.N,"read_regular",return_value=b"scanner"), \
+                    mock.patch.object(acquisition,"SCANNERS",{(sys.platform,acquisition.platform.machine()):hashlib.sha256(b"scanner").hexdigest()}), \
+                    mock.patch.object(acquisition,"tools",return_value=(parent/"cargo",parent/"rustc",parent/"git",parent/"rustup")), \
+                    mock.patch.object(acquisition,"environment_for_acquisition",return_value={}), \
+                    mock.patch.object(acquisition,"Commands",side_effect=commands):
+                with self.assertRaises(RuntimeError):
+                    acquisition.prepare({"MORPHEUS_PACKAGE_SOURCE_REVISION":"a"*40,"GITHUB_SHA":"b"*40},parent/"scanner")
+            self.assertFalse((root/"state.json").exists())
+
+
 class NativeNoticeCommandOwnershipTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform in {"darwin","win32"},"native retained command route")
     def test_separate_raw_streams_and_output_overrun_stop_before_observation(self):
