@@ -885,7 +885,11 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
         let old = fx.adopt();
         let bob = member_on("bob", OWN_FOCUS);
         fx.state.identity_blocked.store(true, Ordering::SeqCst);
-        assert!(fx.pool.apply_snapshot(std::slice::from_ref(&bob)).is_empty());
+        assert!(
+            fx.pool
+                .apply_snapshot(std::slice::from_ref(&bob))
+                .is_empty()
+        );
         let old_track: Arc<dyn RemoteTrackHandle> =
             Arc::new(FakeTrack(MediaStreamKind::Microphone));
         let old_weak = Arc::downgrade(&old_track);
@@ -897,7 +901,11 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
         .unwrap();
         assert!(fx.drain().await.is_empty());
         // Retrying a refused identity cannot expose any pending track.
-        assert!(fx.pool.apply_snapshot(std::slice::from_ref(&bob)).is_empty());
+        assert!(
+            fx.pool
+                .apply_snapshot(std::slice::from_ref(&bob))
+                .is_empty()
+        );
         assert!(fx.pool.known_members.contains("bob"));
         assert!(!fx.pool.member_identities.contains_key("bob"));
         let tracks = fx.pool.remote_tracks();
@@ -923,7 +931,11 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
 
         // The member returns under the same ID while its checked mapper still
         // refuses. Only a fresh handle on the current connection may survive.
-        assert!(fx.pool.apply_snapshot(std::slice::from_ref(&bob)).is_empty());
+        assert!(
+            fx.pool
+                .apply_snapshot(std::slice::from_ref(&bob))
+                .is_empty()
+        );
         let fresh: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Microphone));
         current
             .send(ConnectionEvent::TrackAdded {
@@ -949,7 +961,11 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
         let attempts = fx.state.identity_attempts.load(Ordering::SeqCst);
         // An existing accepted mapping must not be retargeted on every update.
         fx.state.identity_blocked.store(true, Ordering::SeqCst);
-        assert!(fx.pool.apply_snapshot(std::slice::from_ref(&bob)).is_empty());
+        assert!(
+            fx.pool
+                .apply_snapshot(std::slice::from_ref(&bob))
+                .is_empty()
+        );
         assert_eq!(fx.state.identity_attempts.load(Ordering::SeqCst), attempts);
         fx.pool.apply_snapshot(&[]);
         assert!(!fx.pool.known_members.contains("bob"));
