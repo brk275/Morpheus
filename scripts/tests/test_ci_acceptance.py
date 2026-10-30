@@ -124,6 +124,8 @@ class AcceptanceTests(unittest.TestCase):
             self.assertIsNotNone(acceptance_error(value,"push"))
         for platform, route in (("all","helpers"), ("linux","config"), ("linux","matrix"), ("linux","wayland"),
                                 ("windows","devices"), ("macos-arm","vendor"), ("macos-intel","sdk"),
+                                ("all","native"), ("linux","native"), ("windows","native"),
+                                ("macos-arm","native"), ("macos-intel","native"),
                                 ("all","desktop-video"), ("linux","desktop-video"),
                                 ("windows","desktop-video"), ("macos-arm","desktop-video"),
                                 ("macos-intel","desktop-video")):
@@ -156,7 +158,7 @@ class AcceptanceTests(unittest.TestCase):
                         changed = json.loads(json.dumps(value)); changed[job]["result"] = bad
                         self.assertIsNotNone(acceptance_error(changed, event))
                 for key, bad in (("manual", "true"), ("manual_platform", "linux"), ("matrix_suite", "oauth-only"),
-                                 ("check_route", "models"), ("check_route", "devices"), ("wayland", "true"), ("config", "true")):
+                                 ("check_route", "models"), ("check_route", "native"), ("check_route", "devices"), ("wayland", "true"), ("config", "true")):
                     changed = json.loads(json.dumps(value)); changed["scope"]["outputs"][key] = bad
                     self.assertIsNotNone(acceptance_error(changed, event))
             for count in range(len(PLATFORMS)):
@@ -293,7 +295,7 @@ class WaylandWorkflowTests(unittest.TestCase):
         route = "runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))"
         capture = source.split("      - name: Capture actual native preview screens\n", 1)[1].split("      - name:", 1)[0]
         upload = source.split("      - name: Upload native preview PNGs and provenance only\n", 1)[1].split("      - name:", 1)[0]
-        app_route = "(needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')"
+        app_route = "(needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')"
         build = source.split("      - name: Build desktop with native call and device adapters\n", 1)[1].split("      - name:", 1)[0]
         # Bind capture to the actual app-producing step, rather than a vendor
         # library test that can leave the binary absent or stale in the cache.
@@ -334,15 +336,15 @@ class NativeRouteWorkflowTests(unittest.TestCase):
     def test_selected_steps_must_pass_and_unselected_steps_must_be_skipped(self):
         validate = load_native_validator()
         for runner in ("Linux","Windows","macOS"):
-            for route in ("all","models","desktop","desktop-video","devices","vendor","sdk","matrix","wayland"):
+            for route in ("all","native","models","desktop","desktop-video","devices","vendor","sdk","matrix","wayland"):
                 if route in ("matrix","wayland") and runner!="Linux":
                     continue
                 wayland = "true" if runner=="Linux" and route in ("all","wayland") else "false"
-                selected = {"model-tests":route in ("all","models"), "desktop-tests":route in ("all","desktop","desktop-video"),
-                            "device-tests":route in ("all","devices"), "vendor-tests":route in ("all","vendor"),
-                            "video-source-tests":route in ("all","vendor","desktop-video"),
-                            "sdk-receipt-tests":route in ("all","sdk"),
-                            "windows-capture-tests":runner=="Windows" and route in ("all","devices"),
+                selected = {"model-tests":route in ("all","native","models"), "desktop-tests":route in ("all","native","desktop","desktop-video"),
+                            "device-tests":route in ("all","native","devices"), "vendor-tests":route in ("all","native","vendor"),
+                            "video-source-tests":route in ("all","native","vendor","desktop-video"),
+                            "sdk-receipt-tests":route in ("all","native","sdk"),
+                            "windows-capture-tests":runner=="Windows" and route in ("all","native","devices"),
                             "wayland-tests":wayland=="true", "matrix-tests":runner=="Linux" and route in ("all","matrix")}
                 outcomes={name:{"outcome":"success" if yes else "skipped"} for name,yes in selected.items()}
                 outcomes.update({name:{"outcome":"skipped"} for name in ("preview-capture","preview-upload")})
@@ -379,7 +381,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
             outcomes["windows-capture-tests"] = {"outcome": "success" if runner == "Windows" else "skipped"}
             self.assertIsNone(validate("all", runner, project("all", runner, "true"), outcomes))
             self.assertIsNotNone(validate("all", runner, "true", outcomes))
-            for route in ("models", "desktop", "desktop-video", "devices", "vendor", "sdk", "matrix", "wayland", "foreign"):
+            for route in ("native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "matrix", "wayland", "foreign"):
                 # Only the legitimate whole-matrix route may project true.
                 # Invalid route/global-Wayland pairs must stay fail-closed.
                 self.assertEqual(project(route, runner, "true"), "true")
@@ -408,7 +410,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertEqual(source.count(start), 1)
         step = source.split(start, 1)[1].split(end, 1)[0]
         self.assertIn("        id: video-source-tests\n", step)
-        self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'desktop-video')", step)
+        self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'desktop-video')", step)
         cases = (
             "imp::video_source::tests::unused_source_drop_before_first_poll_releases_native_owner",
             "imp::video_source::tests::last_source_clone_drop_while_warmup_pending_releases_native_owner",

@@ -350,7 +350,7 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual((result["check_route"], result["matrix_suite"]), ("all", "full"))
 
     def test_manual_routes_are_exact_existing_checks_and_matrix_suites(self):
-        self.assertEqual(MANUAL_CHECKS, {"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk",
+        self.assertEqual(MANUAL_CHECKS, {"all", "native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk",
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
                                          "timeline-failures", "media-only", "app-timeline",
@@ -373,6 +373,18 @@ class ScopeTests(unittest.TestCase):
             self.assertEqual(selected["matrix_suite"], suite)
             self.assertEqual(selected["native_matrix"], {"os": ["ubuntu-24.04"]})
             self.assertFalse(selected["wayland"])
+
+    def test_manual_native_batches_units_without_admitting_live_or_automatic_scope(self):
+        for platform, platforms in MANUAL_PLATFORMS.items():
+            selected = event_selection({"inputs": {"platform": platform, "checks": "native"}},
+                                       "workflow_dispatch")
+            self.assertEqual(selected["native_matrix"], {"os": list(platforms)})
+            self.assertEqual((selected["check_route"], selected["matrix_suite"], selected["wayland"]),
+                             ("native", "full", False))
+            for suite in MATRIX_SUITES - {"full"}:
+                with self.subTest(platform=platform, suite=suite), self.assertRaises(ValueError):
+                    event_selection({"inputs": {"platform": platform, "checks": "native",
+                                                "matrix_suite": suite}}, "workflow_dispatch")
 
     def test_desktop_video_batches_only_affected_checks_on_fixed_native_platforms(self):
         for platform, platforms in MANUAL_PLATFORMS.items():

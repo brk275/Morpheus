@@ -177,7 +177,7 @@ MANUAL_PLATFORMS = {
     "macos-arm": ("macos-15",),
     "macos-intel": ("macos-15-intel",),
 }
-MANUAL_CHECKS = frozenset({"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk",
+MANUAL_CHECKS = frozenset({"all", "native", "models", "desktop", "desktop-video", "devices", "vendor", "sdk",
                            "matrix", "wayland", "config", "helpers"})
 # Exact existing suites from run_matrix_acceptance.py; no new test composition.
 MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-reads",
