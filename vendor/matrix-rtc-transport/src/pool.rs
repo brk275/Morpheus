@@ -562,7 +562,13 @@ impl MediaPool {
             self.forget_member(&member_id);
         }
         for member in snapshot {
-            if self.known_members.insert(member.member_id.clone()) {
+            let first_seen = self.known_members.insert(member.member_id.clone());
+            // A checked mapper can temporarily refuse an observed member (for
+            // example, its authoritative lease advanced beyond this actor's
+            // earlier view). Knowing the member must not cache that refusal
+            // forever. Retry only an absent mapping, through the same checked
+            // backend; never retarget an already mapped member or infer an ID.
+            if first_seen || !self.member_identities.contains_key(&member.member_id) {
                 self.map_member(member);
             }
         }
@@ -840,7 +846,7 @@ impl MediaPool {
             .find_map(|backend| backend.remote_identity(member));
         let Some(identity) = identity else {
             // Their media arrives under an identity nothing maps back, so it
-            // will be buffered forever rather than surfacing as their stream.
+            // stays buffered until a later checked mapping can attribute it.
             log::warn!(
                 "member {} ({}) has no transport identity; their media cannot be attributed",
                 member.member_id,

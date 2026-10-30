@@ -143,6 +143,9 @@ APP_TIMELINE_TAIL_STAGES = frozenset((
     "loop_returned", "runtime_owner_release", "runtime_owner_released",
 ))
 APP_TIMELINE_TAIL = re.compile(r"MORPHEUS_LIVE_TIMELINE_TAIL ([a-z_]{1,48})")
+APP_TIMELINE_UI_PHASE = re.compile(
+    r"MORPHEUS_UI_PHASE phase=(0|[1-9][0-9]{0,2}) "
+    r"elapsed_ms=(0|[1-9][0-9]{0,5}) phase_ms=(0|[1-9][0-9]{0,5})")
 APP_RECOVERY_CASES = frozenset((
     "observer_revocation", "interrupted_prepare", "rollback_race", "writer_transaction",
     "thread_index", "release_revocation", "write_revocation", "writer_lock_revocation",
@@ -784,6 +787,36 @@ def app_timeline_diagnostics(output: str) -> dict:
                 break
             result["tail_stage"] = match[1]
     return result
+
+
+def app_timeline_failure_progress(output: str) -> dict:
+    """Failure-only observations; neither test completion nor the active phase."""
+    if type(output) is not str:
+        return {"invalid": True}
+    result = {"native_harness_entered": ran_native_test(output)}
+    observations = 0
+    last = None
+    previous_elapsed = -1
+    for line in output.splitlines():
+        if not line.startswith("MORPHEUS_UI_PHASE"):
+            continue
+        observations += 1
+        match = APP_TIMELINE_UI_PHASE.fullmatch(line) if len(line) <= 80 else None
+        if observations > 64 or match is None:
+            return result | {"common_ui_progress": {"invalid": True}}
+        phase, elapsed, phase_ms = map(int, match.groups())
+        if (phase > 100 or elapsed > 600000 or phase_ms > 600000
+                or phase_ms > elapsed or elapsed < previous_elapsed):
+            return result | {"common_ui_progress": {"invalid": True}}
+        previous_elapsed = elapsed
+        last = {"last_observed_phase": phase, "elapsed_ms": elapsed, "phase_ms": phase_ms}
+    progress = {"records": observations, "observation_cap_reached": observations == 64}
+    if last is not None:
+        # observe() logs before set(next), and again after the common outcome.
+        # Repeated phase values are legitimate; count every record, not unique
+        # values. At64 observations later progress may no longer be emitted.
+        progress.update(last)
+    return result | {"common_ui_progress": progress}
 
 
 def app_timeline_evidence(output: str) -> dict[str, bool]:
@@ -1456,6 +1489,7 @@ class Acceptance:
                 evidence["app_recovery_diagnostics"] = app_recovery_diagnostics(output)
             if label == APP_TIMELINE_LABEL:
                 evidence["app_timeline_diagnostics"] = app_timeline_diagnostics(output)
+                evidence["app_timeline_failure_progress"] = app_timeline_failure_progress(output)
             if fixture_diagnostics := matrix_fixture_diagnostics(output):
                 if timed_out:
                     fixture_diagnostics["failure"] = "deadline"

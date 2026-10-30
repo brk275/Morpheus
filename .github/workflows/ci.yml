@@ -748,6 +748,16 @@ jobs:
               cargo test --locked -p matrix-sdk --features testing,e2e-encryption --lib "$key_case" -- --exact
             done
           fi
+      - name: Test checked media remapping and transport generations before live fixtures
+        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite == 'copy-element'
+        shell: bash
+        run: |
+          set -euo pipefail
+          required='pool::tests::a_member_returning_under_the_same_member_id_gets_their_media_back'
+          cargo test --locked -p matrix-rtc-transport --lib -- --list > "$RUNNER_TEMP/morpheus-pool-retry-tests.txt"
+          grep -Fqx -- "$required: test" "$RUNNER_TEMP/morpheus-pool-retry-tests.txt"
+          cargo test --locked -p matrix-rtc-transport --lib | tee "$RUNNER_TEMP/morpheus-pool-retry-result.txt"
+          grep -Fqx -- "test $required ... ok" "$RUNNER_TEMP/morpheus-pool-retry-result.txt"
       - name: Compile focused app timeline test before live fixture deadlines
         if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads' || needs.scope.outputs.matrix_suite == 'copy-element')
         # Same target/features and Slint metadata as Acceptance.app_timeline.
