@@ -38,6 +38,11 @@ use super::{
     *,
 };
 
+#[cfg(morpheus_timeline_acceptance)]
+mod ui;
+#[cfg(morpheus_timeline_acceptance)]
+pub(crate) use ui::run_if_configured as run_received_video_ui_if_configured;
+
 const BARRIER: &str = "Morpheus owned SFU recovery sync barrier";
 const CASE_WORK: Duration = Duration::from_secs(420);
 

@@ -2452,15 +2452,16 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
         binary.command.side_effect = lambda selector, *flags: [str(binary.path), selector, *flags]
         return binary
 
-    def artifact_fixture(self, folder):
+    def artifact_fixture(self, folder, *, release_ui=False):
         repo = Path(folder) / "checkout"
         package = repo / "crates/morpheus-app"
         package.mkdir(parents=True)
-        binary = repo / "target/debug/deps/morpheus_app-0123456789abcdef"
+        target = repo / ("target/release" if release_ui else "target/debug")
+        binary = target / "deps/morpheus_app-0123456789abcdef"
         binary.parent.mkdir(parents=True)
         binary.write_bytes(b"disposable non-executed artifact bytes")
         binary.chmod(0o755)
-        native = repo / "target/debug/build/native-fixture/out"
+        native = target / "build/native-fixture/out"
         native.mkdir(parents=True)
         rust = Path(folder) / "toolchain/lib/rustlib/x86_64-unknown-linux-gnu/lib"
         rust.mkdir(parents=True)
@@ -2469,14 +2470,138 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
             "manifest_path": str(package / "Cargo.toml"),
             "target": {"name": "morpheus-app", "kind": ["bin"], "crate_types": ["bin"],
                        "edition": "2024", "src_path": str(package / "src/main.rs"), "test": True},
-            "profile": {"test": True, "opt_level": "0", "debuginfo": 0,
-                        "debug_assertions": True, "overflow_checks": True},
+            "profile": {"test": True, "opt_level": "3" if release_ui else "0", "debuginfo": 0,
+                        "debug_assertions": not release_ui, "overflow_checks": not release_ui},
             "features": ["default", "native-calls"], "filenames": [str(binary)],
             "executable": str(binary), "fresh": False,
         }
         linked = {"reason": "build-script-executed", "linked_paths": ["native=" + str(native), "native=/outside/not-added"]}
         output = "\n".join(map(json.dumps, [linked, artifact, {"reason": "build-finished", "success": True}]))
         return repo, binary, rust, native, artifact, output
+
+    def test_release_ui_artifact_requires_exact_instrumented_profile_and_retained_file(self):
+        env = {"MORPHEUS_TIMELINE_ACCEPTANCE_BUILD": "1", "CARGO_PROFILE_RELEASE_DEBUG": "0"}
+        with tempfile.TemporaryDirectory() as folder:
+            repo, path, rust, native, artifact, output = self.artifact_fixture(folder, release_ui=True)
+            binary = acceptance_module.RecoveryTestBinary(output, str(rust) + "\n", env,
+                                                          repo=repo, release_ui=True)
+            try:
+                self.assertEqual(binary.command(acceptance_module.APP_TIMELINE_CASE, "--exact"),
+                                 [str(path), acceptance_module.APP_TIMELINE_CASE, "--exact"])
+                self.assertEqual(binary.extra["LD_LIBRARY_PATH"].split(os.pathsep),
+                                 [str(native), str(repo / "target/release"), str(path.parent), str(rust)])
+                path.unlink()
+                path.write_bytes(b"replacement not executed")
+                path.chmod(0o755)
+                with self.assertRaises(RuntimeError):
+                    binary.command(acceptance_module.APP_TIMELINE_CASE)
+            finally:
+                binary.close()
+        for changes in ({}, {"MORPHEUS_TIMELINE_ACCEPTANCE_BUILD": "0"},
+                        {"CARGO_PROFILE_RELEASE_DEBUG": "1"}):
+            with tempfile.TemporaryDirectory() as folder:
+                repo, _, rust, _, _, output = self.artifact_fixture(folder, release_ui=True)
+                selected = {} if not changes else env | changes
+                with self.assertRaises(RuntimeError):
+                    acceptance_module.RecoveryTestBinary(output, str(rust) + "\n", selected,
+                                                        repo=repo, release_ui=True)
+        for release in (False, 1, "true"):
+            with tempfile.TemporaryDirectory() as folder:
+                repo, _, rust, _, _, output = self.artifact_fixture(folder, release_ui=True)
+                with self.assertRaises(RuntimeError):
+                    acceptance_module.RecoveryTestBinary(output, str(rust) + "\n", env,
+                                                        repo=repo, release_ui=release)
+        with tempfile.TemporaryDirectory() as folder:
+            repo, _, rust, _, _, output = self.artifact_fixture(folder)
+            with self.assertRaises(RuntimeError):
+                acceptance_module.RecoveryTestBinary(output, str(rust) + "\n", env,
+                                                    repo=repo, release_ui=True)
+
+    @staticmethod
+    def ui_output():
+        proof = "\n".join("MORPHEUS_RTC_UI_CHECK " + name + "=true"
+                          for name in acceptance_module.RTC_UI_CHECKS)
+        return AppTimelineEvidenceTests.output() + proof + "\nMORPHEUS_RTC_UI_RESULT passed=true\n"
+
+    def test_received_ui_requires_original23_and_exact_ordered_six_receipts(self):
+        output = self.ui_output()
+        self.assertEqual(acceptance_module.rtc_ui_evidence(output),
+                         {name: True for name in acceptance_module.RTC_UI_CHECKS})
+        invalid = ["", output + "MORPHEUS_RTC_UI_RESULT passed=true\n",
+                   output.replace("passed=true", "passed=false"), output.replace("1 passed", "0 passed"),
+                   output + "Skipped optional UI fixture\n",
+                   output.replace("MORPHEUS_LIVE_TIMELINE_CHECK room_delivery=true", ""),
+                   output + "MORPHEUS_RTC_UI_CHECK unknown=true\n",
+                   output.replace("MORPHEUS_RTC_UI_CHECK cleanup=true", "quoted MORPHEUS_RTC_UI_CHECK cleanup=true")]
+        for name in acceptance_module.RTC_UI_CHECKS:
+            marker = "MORPHEUS_RTC_UI_CHECK " + name + "=true\n"
+            invalid += [output.replace(marker, ""), output.replace(marker, marker * 2),
+                        output.replace(marker, marker.replace("=true", "=false"))]
+        first, second = acceptance_module.RTC_UI_CHECKS[:2]
+        invalid.append(output.replace(first, "SWAP").replace(second, first).replace("SWAP", second))
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                acceptance_module.rtc_ui_evidence(value)
+        for value in (None, True, 1, b"private"):
+            with self.assertRaises(RuntimeError):
+                acceptance_module.rtc_ui_evidence(value)
+
+    def test_received_ui_invokes_one_existing_window_with_both_owned_fixtures(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+            root = Path(folder)
+            timeline = root / "accounts.json"
+            timeline.write_text("{}")
+            timeline.chmod(0o600)
+            rtc = root / "rtc/accounts.json"
+            rtc.parent.mkdir()
+            rtc.write_text("{}")
+            rtc.chmod(0o600)
+            runner = Acceptance(root, "scanner", suite="rtc-ui-video")
+            runner.containment_verified = True
+            binary = self.binary()
+            binary.path = Path("/synthetic/target/release/deps/morpheus_app-0123456789abcdef")
+            binary.extra["LD_LIBRARY_PATH"] = "/synthetic/target/release/deps"
+            def run(label, *args, **kwargs):
+                if label == "rtc-ui-video-rust-target-libdir":
+                    return "/toolchain/lib/rustlib/x86_64-unknown-linux-gnu/lib\n"
+                if label == "rtc-ui-video-exact-test-list":
+                    return acceptance_module.APP_TIMELINE_CASE + ": test\n"
+                return "compiled"
+            def script(name, command):
+                return str(rtc) + "\n" if command == "rtc-group-fixture" else ""
+            with (patch.object(runner, "run", side_effect=run) as called,
+                  patch.object(runner, "script", side_effect=script) as services,
+                  patch.object(acceptance_module, "RecoveryTestBinary", return_value=binary) as admitted):
+                runner.rtc_ui_video_case()
+            self.assertTrue(admitted.call_args.kwargs["release_ui"])
+            self.assertEqual(admitted.call_args.args[2]["MORPHEUS_TIMELINE_ACCEPTANCE_BUILD"], "1")
+            self.assertEqual(called.call_args_list[1].args[1][:3], ["cargo", "test", "--release"])
+            self.assertEqual(services.call_args_list, [unittest.mock.call("local_matrix_env", "up"),
+                unittest.mock.call("local_matrix_rtc", "up"), unittest.mock.call("local_matrix_rtc", "probe"),
+                unittest.mock.call("local_matrix_rtc", "rtc-group-fixture")])
+            invocation = called.call_args_list[-1]
+            self.assertEqual(invocation.args[0], acceptance_module.RTC_UI_LABEL)
+            self.assertEqual(invocation.args[1][1:], [acceptance_module.APP_TIMELINE_CASE,
+                                                    "--exact", "--nocapture", "--test-threads=1"])
+            self.assertEqual(invocation.kwargs["seconds"], 540)
+            self.assertTrue(invocation.kwargs["native_binary"] and invocation.kwargs["pid_namespace"])
+            self.assertEqual(invocation.kwargs["extra"]["MORPHEUS_MATRIX_TEST_ACCOUNTS"], str(timeline.resolve()))
+            self.assertEqual(invocation.kwargs["extra"]["MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS"], str(rtc.resolve()))
+            self.assertEqual(invocation.kwargs["extra"]["MORPHEUS_RTC_OUTAGE_TARGET"], "room")
+            self.assertEqual(invocation.kwargs["extra"]["MORPHEUS_CALL_AUDIO_ROOT"],
+                             str(root / "rtc-playback-room"))
+            self.assertEqual(invocation.kwargs["extra"]["ALSA_CONFIG_PATH"],
+                             str(root / "rtc-playback-room/alsa.conf"))
+            binary.close.assert_called_once()
+            with self.assertRaises(RuntimeError):
+                runner.run(acceptance_module.RTC_UI_LABEL, ["not executed"], test=True)
+            record = runner.validated_record(acceptance_module.RTC_UI_LABEL, self.ui_output(), test=True,
+                                            ring_case=None, oauth_checks=(), element_checks=False)
+            self.assertEqual(len(record["app_timeline_checks"]), 23)
+            self.assertEqual(len(record["rtc_ui_video_checks"]), 6)
+            with self.assertRaises(RuntimeError):
+                runner.validated_record(acceptance_module.RTC_UI_LABEL, self.ui_output(), test=False,
+                                        ring_case=None, oauth_checks=(), element_checks=False)
 
     def test_compiler_artifact_retains_one_exact_native_file_and_cargo_loader_paths(self):
         with tempfile.TemporaryDirectory() as folder:

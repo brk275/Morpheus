@@ -33,6 +33,9 @@ use crate::local_video::CaptureStop;
 #[cfg(test)]
 mod live_tests;
 
+#[cfg(all(test, target_os = "linux", morpheus_timeline_acceptance))]
+pub(crate) use live_tests::run_received_video_ui_if_configured;
+
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const RETRACTION_TIMEOUT: Duration = Duration::from_secs(3);

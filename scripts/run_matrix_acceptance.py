@@ -268,6 +268,14 @@ OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_accep
 OAUTH_STAGE = re.compile(r"^MORPHEUS_OAUTH_STAGE ([a-z_]+)$", re.MULTILINE)
 OAUTH_FAILURE = re.compile(r"^MORPHEUS_OAUTH_FAILURE ([a-z_]+)$", re.MULTILINE)
 OUTAGE_TEST = "outgoing_ring::live_tests::outage_tests::current_call_recovers_from_owned_sfu_restart"
+RTC_UI_LABEL = "rtc-ui-video-current-room"
+RTC_UI_CHECKS = (
+    "decoded_camera_and_screen_in_slint", "leave_clears_received_images",
+    "new_epoch_replaces_both_images", "retired_account_stays_empty",
+    "presenter_owners_released", "cleanup",
+)
+RTC_UI_CHECK = re.compile(r"MORPHEUS_RTC_UI_CHECK ([a-z_]{1,64})=(true|false)")
+RTC_UI_RESULT = re.compile(r"MORPHEUS_RTC_UI_RESULT passed=(true|false)")
 OUTAGE_LABELS = ("rtc-recovery-current-dm", "rtc-recovery-current-room")
 OUTAGE_HELPER_TESTS = (
     ("rtc-recovery-stage-readiness", "video_render::tests::hidden_stage_pauses_every_remote_stream_and_drops_pictures"),
@@ -392,6 +400,34 @@ def outage_evidence(output: str, target: str) -> dict[str, bool]:
             or len(named) != 1 or len(RESULT.findall(output)) != 1 or passed_tests(output) != 1):
         raise RuntimeError("Owned SFU outage evidence is incomplete")
     return checks
+
+
+def rtc_ui_evidence(output: str) -> dict[str, bool]:
+    """One existing global UI case: original23 proof and real received media."""
+    if type(output) is not str:
+        raise RuntimeError("Received video UI evidence is invalid")
+    observed = []
+    complete = False
+    for line in output.splitlines():
+        if "MORPHEUS_RTC_UI_" not in line:
+            continue
+        check = RTC_UI_CHECK.fullmatch(line)
+        result = RTC_UI_RESULT.fullmatch(line)
+        if (check and not complete and len(observed) < len(RTC_UI_CHECKS)
+                and check[1] == RTC_UI_CHECKS[len(observed)] and check[2] == "true"):
+            observed.append(check[1])
+        elif (result and result[1] == "true" and not complete
+              and tuple(observed) == RTC_UI_CHECKS):
+            complete = True
+        else:
+            raise RuntimeError("Received video UI evidence is invalid")
+    if (not complete or tuple(observed) != RTC_UI_CHECKS
+            or RESULT.findall(output) != [("1", "0", "0")]
+            or passed_tests(output) != 1):
+        raise RuntimeError("Received video UI evidence is incomplete")
+    # The same global test still runs all original timeline assertions first.
+    app_timeline_evidence(output)
+    return {name: True for name in observed}
 
 
 def outage_diagnostics(output: str) -> dict:
@@ -617,7 +653,8 @@ SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
           "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS,
           "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS), "oauth-only": OAUTH_LABELS,
-          "rtc-recovery": OUTAGE_LABELS, "element-interop": (ELEMENT_LABEL,)}
+          "rtc-recovery": OUTAGE_LABELS, "element-interop": (ELEMENT_LABEL,),
+          "rtc-ui-video": (RTC_UI_LABEL,)}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -631,7 +668,7 @@ class CheckFailure(RuntimeError):
     """Only a scanned test failure after verified process containment/cleanup."""
 
     def __init__(self, label: str, reason: str):
-        if label not in (*PLANNED_CHECKS, *OUTAGE_LABELS) or reason not in ("test_failed", "deadline", "evidence_incomplete"):
+        if label not in (*PLANNED_CHECKS, *OUTAGE_LABELS, RTC_UI_LABEL) or reason not in ("test_failed", "deadline", "evidence_incomplete"):
             raise RuntimeError("Invalid acceptance failure classification")
         self.label, self.reason = label, reason
         super().__init__(f"Acceptance check failed: {label} ({reason})")
@@ -1129,15 +1166,19 @@ class RecoveryTestBinary:
             if not stat.S_ISDIR(part.lstat().st_mode):
                 raise ValueError("non-directory output ancestor")
 
-    def __init__(self, output: str, rust_libdir: str, env: dict[str, str], *, repo=None):
+    def __init__(self, output: str, rust_libdir: str, env: dict[str, str], *, repo=None, release_ui=False):
         self.fd = None
         repo = REPO if repo is None else repo
         self.cwd = repo / "crates/morpheus-app"
-        root = repo / "target/debug"
+        root = repo / ("target/release" if release_ui else "target/debug")
         manifest = str(self.cwd / "Cargo.toml")
         package = "path+" + self.cwd.as_uri() + "#0.1.0"
         artifacts, finished, linked = [], False, set()
         try:
+            if (type(release_ui) is not bool or (release_ui and (
+                    env.get("MORPHEUS_TIMELINE_ACCEPTANCE_BUILD") != "1"
+                    or env.get("CARGO_PROFILE_RELEASE_DEBUG") != "0"))):
+                raise ValueError("unselected release UI variant")
             if len(output) > self.MAX_OUTPUT:
                 raise ValueError("oversized artifact stream")
             for line in output.splitlines():
@@ -1175,15 +1216,15 @@ class RecoveryTestBinary:
                     # Build-script executables are not the requested test binary.
                     if target.get("kind") == ["custom-build"] and profile.get("test") is False:
                         continue
-                    debug = env.get("CARGO_PROFILE_TEST_DEBUG", "2")
+                    debug = "0" if release_ui else env.get("CARGO_PROFILE_TEST_DEBUG", "2")
                     if (value.get("package_id") != package or value.get("manifest_path") != manifest
                             or target.get("name") != "morpheus-app" or target.get("kind") != ["bin"]
                             or target.get("crate_types") != ["bin"] or target.get("edition") != "2024"
                             or target.get("src_path") != str(self.cwd / "src/main.rs")
                             or target.get("test") is not True
-                            or profile.get("test") is not True or profile.get("opt_level") != "0"
-                            or profile.get("debug_assertions") is not True
-                            or profile.get("overflow_checks") is not True
+                            or profile.get("test") is not True or profile.get("opt_level") != ("3" if release_ui else "0")
+                            or profile.get("debug_assertions") is not (False if release_ui else True)
+                            or profile.get("overflow_checks") is not (False if release_ui else True)
                             or debug not in ("0", "1", "2")
                             or type(profile.get("debuginfo")) is not int
                             or profile["debuginfo"] != int(debug)
@@ -1299,7 +1340,7 @@ class Acceptance:
             "XDG_CACHE_HOME": str(private_directory(root / "desktop-cache")),
             "RUST_BACKTRACE": "0",
         })
-        if suite == "rtc-recovery":
+        if suite in ("rtc-recovery", "rtc-ui-video"):
             if self.env.get("GITHUB_REPOSITORY") != "brk275/Morpheus":
                 raise RuntimeError("Owned SFU outage requires the public project fixture")
             self.env["MORPHEUS_MATRIX_SFU_RUN_ID"] = secrets.token_hex(16)
@@ -1363,6 +1404,9 @@ class Acceptance:
             raise RuntimeError("Invalid owned SFU outage command")
         if native_binary and not pid_namespace:
             raise RuntimeError("Native recovery binaries require owned process containment")
+        if label == RTC_UI_LABEL and (self.suite != "rtc-ui-video" or not test
+                                      or not native_binary or not pid_namespace):
+            raise RuntimeError("Received video UI requires its owned native route")
         remaining = self.available(cleanup=cleanup)
         if remaining <= 0:
             if cleanup or self.finalizing:
@@ -1413,8 +1457,9 @@ class Acceptance:
                         stop_owned(process)
                     except (OSError, RuntimeError, subprocess.SubprocessError):
                         raise RuntimeError("Acceptance owned process cleanup failed") from None
-        if label in ("rtc-recovery-rust-target-libdir", "rtc-recovery-app-test-compile"):
-            limit = 4096 if label == "rtc-recovery-rust-target-libdir" else RecoveryTestBinary.MAX_OUTPUT
+        if label in ("rtc-recovery-rust-target-libdir", "rtc-recovery-app-test-compile",
+                     "rtc-ui-video-rust-target-libdir", "rtc-ui-video-app-test-compile"):
+            limit = 4096 if label.endswith("rust-target-libdir") else RecoveryTestBinary.MAX_OUTPUT
             if log.stat().st_size > limit:
                 raise RuntimeError("Owned SFU recovery compiler metadata is oversized")
             try:
@@ -1449,6 +1494,9 @@ class Acceptance:
         if outage_target is not None and any(value == "false" for name, value in OUTAGE_CHECK.findall(output)
                                                if name == "cleanup"):
             raise RuntimeError("Owned SFU outage cleanup failed")
+        if label == RTC_UI_LABEL and any(value == "false" for name, value in RTC_UI_CHECK.findall(output)
+                                        if name in ("cleanup", "presenter_owners_released")):
+            raise RuntimeError("Received video UI ownership cleanup failed")
         recoverable = pid_namespace and (
             ((test or ring_case is not None or outage_target is not None) and ran_native_test(output))
             or (element_checks and element_diagnostics(output).get("stage") in ELEMENT_TEST_STAGES)
@@ -1485,7 +1533,7 @@ class Acceptance:
                     evidence["sticker_diagnostics"] = diagnostics
             if label == APP_RECOVERY_LABEL:
                 evidence["app_recovery_diagnostics"] = app_recovery_diagnostics(output)
-            if label == APP_TIMELINE_LABEL:
+            if label in (APP_TIMELINE_LABEL, RTC_UI_LABEL):
                 evidence["app_timeline_diagnostics"] = app_timeline_diagnostics(output)
                 evidence["app_timeline_failure_progress"] = app_timeline_failure_progress(output)
             if fixture_diagnostics := matrix_fixture_diagnostics(output):
@@ -1540,6 +1588,14 @@ class Acceptance:
 
     def validated_record(self, label, output, *, test, ring_case, oauth_checks, element_checks, outage_target=None):
         record = {"check": label}
+        if label == RTC_UI_LABEL:
+            if self.suite != "rtc-ui-video" or test is not True:
+                raise RuntimeError("Received video UI requires its explicit native test suite")
+            record["rtc_ui_video_checks"] = rtc_ui_evidence(output)
+            record["app_timeline_checks"] = app_timeline_evidence(output)
+            record["passed"] = 1
+            record["scope"] = "Linux synthetic received media in generated UI; not installed GPU/device qualification"
+            return record
         if label in OUTAGE_LABELS and (self.suite != "rtc-recovery" or outage_target not in OUTAGE_TARGET
                                       or label != f"rtc-recovery-current-{outage_target}"):
             raise RuntimeError("Owned SFU outage record requires its exact target")
@@ -1748,6 +1804,49 @@ class Acceptance:
                 )
             self.group((label,), case)
 
+    def rtc_ui_video_case(self):
+        if self.suite != "rtc-ui-video" or "MORPHEUS_MATRIX_SFU_RUN_ID" not in self.env:
+            raise RuntimeError("Received video UI suite is not selected")
+        if self.env.get("CARGO_BUILD_TARGET") or self.env.get("RUSTC"):
+            raise RuntimeError("Received video UI requires the current native Rust toolchain")
+        self.require_containment()
+        rust_libdir = self.run("rtc-ui-video-rust-target-libdir",
+                              ["rustc", "--print", "target-libdir"], seconds=60)
+        build = {"MORPHEUS_TIMELINE_ACCEPTANCE_BUILD": "1", "SLINT_EMIT_DEBUG_INFO": "1",
+                 "CARGO_PROFILE_RELEASE_DEBUG": "0"}
+        compiled = self.run("rtc-ui-video-app-test-compile",
+            ["cargo", "test", "--release", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+             "--bin", "morpheus-app", "--target-dir", str(REPO / "target"),
+             "--no-run", "--message-format=json"], extra=build)
+        binary = RecoveryTestBinary(compiled, rust_libdir, self.env | build, release_ui=True)
+        try:
+            write_private(self.root / "rtc-ui-video-test-artifact.json", json.dumps({
+                "executable": str(binary.path), "sha256": binary.sha256,
+                "device": binary.identity[0], "inode": binary.identity[1], "bytes": binary.identity[3],
+                "package": "morpheus-app@0.1.0", "profile": "release-instrumented-ui", "target": "bin",
+                "case": APP_TIMELINE_CASE,
+            }, sort_keys=True) + "\n")
+            listing = self.run("rtc-ui-video-exact-test-list",
+                binary.command(APP_TIMELINE_CASE, "--list", "--exact"), extra=binary.extra,
+                seconds=60, native_binary=True, pid_namespace=True, cwd=binary.cwd)
+            if [line for line in listing.splitlines() if line.endswith(": test")] != [APP_TIMELINE_CASE + ": test"]:
+                raise RuntimeError("Received video UI exact generated test is unavailable")
+            # Compile before acquiring services/accounts, as in existing prebuilds.
+            self.script("local_matrix_env", "up")
+            timeline = fixture_from_output(str(self.root / "accounts.json"), self.root)
+            self.script("local_matrix_rtc", "up")
+            self.script("local_matrix_rtc", "probe")
+            rtc = fixture_from_output(self.script("local_matrix_rtc", "rtc-group-fixture"), self.root)
+            self.run(RTC_UI_LABEL,
+                binary.command(APP_TIMELINE_CASE, "--exact", "--nocapture", "--test-threads=1"),
+                extra=binary.extra | {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(timeline),
+                    "MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(rtc), "MORPHEUS_RTC_OUTAGE_TARGET": "room",
+                    "MORPHEUS_CALL_AUDIO_ROOT": str(self.root / "rtc-playback-room"),
+                    "ALSA_CONFIG_PATH": str(self.root / "rtc-playback-room" / "alsa.conf")},
+                seconds=540, test=True, native_binary=True, pid_namespace=True, cwd=binary.cwd)
+        finally:
+            binary.close()
+
     def rtc_recovery_cases(self):
         if self.suite != "rtc-recovery" or "MORPHEUS_MATRIX_SFU_RUN_ID" not in self.env:
             raise RuntimeError("Owned SFU outage suite is not selected")
@@ -1918,6 +2017,10 @@ class Acceptance:
                                  "and complete bounded notification history "
                                  "after a real sync barrier. This is not Sticky/Element, incoming-app automatic rejoin, "
                                  "physical audio/video, installed-package or whole-beta acceptance.\n\n")
+                elif self.suite == "rtc-ui-video":
+                    output.write("Focused Linux received-video UI check: one existing generated-window test, "
+                                 "original timeline assertions and synthetic received camera/screen pixels. "
+                                 "Not installed GPU, physical device, stock Element or beta acceptance.\n\n")
                 elif self.suite == "element-interop":
                     output.write("Focused stock Element interoperability: only the existing Element peer case ran "
                                  "with disposable Matrix and RTC services. "
@@ -2040,6 +2143,10 @@ def main():
             # services are a prerequisite. The same outer cleanup/inventory/scan
             # remains unconditional, including on incomplete evidence or failure.
             acceptance.group(OAUTH_LABELS, acceptance.oauth_cases)
+            acceptance.finish_checks()
+            return
+        if args.suite == "rtc-ui-video":
+            acceptance.group((RTC_UI_LABEL,), acceptance.rtc_ui_video_case)
             acceptance.finish_checks()
             return
         acceptance.script("local_matrix_env", "up")
