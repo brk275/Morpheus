@@ -11,7 +11,7 @@ use matrix_rtc_call_sdk::{
     LiveKitCall, LiveKitCallOptions, Participant, close_slot, open_slot, open_slot_with_admission,
 };
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption, compat::MembershipFormat};
-use matrix_rtc_transport::MediaStreamKind;
+use matrix_rtc_transport::{MediaStreamKind, livekit::LiveKitAuthDialect};
 use matrix_sdk::{
     Client,
     ruma::{
@@ -52,6 +52,10 @@ impl From<InteropMode> for MembershipFormat {
 pub struct CallOptions {
     pub slot_id: String,
     pub interop_mode: InteropMode,
+    /// Explicit verified service contract, independent of membership carrier.
+    /// None keeps the selected interop profile's default. Set LegacyService
+    /// for newer service-based sticky peers; no endpoint fallback is attempted.
+    pub auth_dialect: Option<LiveKitAuthDialect>,
 }
 
 impl Default for CallOptions {
@@ -60,6 +64,7 @@ impl Default for CallOptions {
             // The pinned RTC core's current room-wide slot sentinel.
             slot_id: "m.call#room".to_owned(),
             interop_mode: InteropMode::Current,
+            auth_dialect: None,
         }
     }
 }
@@ -73,6 +78,7 @@ impl CallOptions {
         Self {
             slot_id: "m.call#room".to_owned(),
             interop_mode: InteropMode::Sticky2025,
+            auth_dialect: None,
         }
     }
 
@@ -91,6 +97,7 @@ impl CallOptions {
         Self {
             slot_id: "m.call#room".to_owned(),
             interop_mode: InteropMode::RoomState,
+            auth_dialect: None,
         }
     }
 }
@@ -435,6 +442,7 @@ impl RtcService {
         let call_options = LiveKitCallOptions {
             slot_id: options.slot_id.clone(),
             format: options.interop_mode.into(),
+            auth_dialect: options.auth_dialect,
             livekit_transport: Some(LiveKitTransport {
                 livekit_service_url: service_url,
             }),
@@ -881,6 +889,14 @@ mod tests {
         for options in [
             CallOptions::default(),
             CallOptions::element_call_matrix_2_0(),
+            CallOptions {
+                auth_dialect: Some(LiveKitAuthDialect::LegacyService),
+                ..CallOptions::element_call_matrix_2_0()
+            },
+            CallOptions {
+                auth_dialect: Some(LiveKitAuthDialect::DirectDraft),
+                ..CallOptions::element_call_matrix_2_0()
+            },
         ] {
             assert!(matches!(
                 options.validate_encryption(false),

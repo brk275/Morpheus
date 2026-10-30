@@ -65,9 +65,9 @@ GROUP_ROSTER_FIELDS = (
 NATIVE_STAGE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_STAGE "
 NATIVE_FAILURE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_FAILURE "
 NATIVE_FAILURE_SOURCE = "crates/morpheus-rtc/tests/element_call_peer.rs"
-# The unchanged reviewed Rust test has exactly this many source lines. A
+# The reviewed Rust test has exactly this many source lines. A
 # receipt cannot name another path, arbitrary text or an unbounded location.
-NATIVE_FAILURE_MAX_LINE = 1416
+NATIVE_FAILURE_MAX_LINE = 1417
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILES = 128
 MAX_LOG_ENTRIES = 65_536

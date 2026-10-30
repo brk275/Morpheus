@@ -64,19 +64,27 @@ class EvidenceTests(unittest.TestCase):
         self.assertIsNone(target.native_panic_location("embedded " + valid))
         for raw in (valid + "\n" + valid, valid + " opaque-fixture-password",
                     valid.replace(source, "/private/opaque-fixture-password"),
-                    valid.replace(":1308:", ":0:"), valid.replace(":1308:", ":1417:"),
+                    valid.replace(":1308:", ":0:"),
+                    valid.replace(":1308:", f":{target.NATIVE_FAILURE_MAX_LINE + 1}:"),
                     valid.replace(":1308:", ":01308:"), valid.replace(":1308:", ":1.0:"),
                     valid.replace(":6:", ":0:"), valid.replace(":6:", ":4097:"),
                     name + " x" * 256):
             with self.subTest(raw=raw[:40]):
                 self.assertEqual(target.native_panic_location(raw), "invalid")
-        # Bind this diagnostic's line cap to the unchanged actual test source.
+        boundary = valid.replace(":1308:", f":{target.NATIVE_FAILURE_MAX_LINE}:")
+        self.assertEqual(target.native_panic_location(boundary),
+                         expected | {"line": target.NATIVE_FAILURE_MAX_LINE})
+        # Bind this diagnostic's line cap to the reviewed actual test source.
         self.assertEqual(len((target.REPO / source).read_bytes().splitlines()), target.NATIVE_FAILURE_MAX_LINE)
 
     def test_native_failure_receipt_is_typed_and_cannot_satisfy_any_call_fact(self):
         expected = {"file": target.NATIVE_FAILURE_SOURCE, "line": 1308, "category": "panic"}
         raw = target.NATIVE_FAILURE_PREFIX + json.dumps(expected) + "\n"
         self.assertEqual(target.native_failure_location(raw), expected)
+        boundary = target.NATIVE_FAILURE_PREFIX + json.dumps(
+            expected | {"line": target.NATIVE_FAILURE_MAX_LINE}) + "\n"
+        self.assertEqual(target.native_failure_location(boundary),
+                         expected | {"line": target.NATIVE_FAILURE_MAX_LINE})
         self.assertEqual(target.diagnostics(raw), {"native_failure": expected})
         self.assertEqual(target.diagnostics(raw, include_native=False), {})
         self.assertIsNone(target.native_failure_location("ordinary private text"))
@@ -89,7 +97,8 @@ class EvidenceTests(unittest.TestCase):
                    target.NATIVE_FAILURE_PREFIX + json.dumps(expected | {"category": "opaque-fixture-password"}),
                    target.NATIVE_FAILURE_PREFIX + json.dumps({key:value for key,value in expected.items() if key!="line"}),
                    target.NATIVE_FAILURE_PREFIX + "é"]
-        for value in (True, False, 0, -1, 1417, 1308.0, "1308", None, [], {}):
+        for value in (True, False, 0, -1, target.NATIVE_FAILURE_MAX_LINE + 1,
+                      1308.0, "1308", None, [], {}):
             invalid.append(target.NATIVE_FAILURE_PREFIX + json.dumps(expected | {"line": value}))
         for malformed in invalid:
             with self.subTest(malformed=malformed[:40]):

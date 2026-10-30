@@ -149,9 +149,10 @@ pub struct LiveKitCallOptions {
     /// advertised transports (MSC4143 `GET /rtc/transports`). `None` takes the
     /// first LiveKit one advertised; joining fails if there is none.
     pub livekit_transport: Option<LiveKitTransport>,
-    /// Explicit auth contract. None selects legacy only for the standard
-    /// canonical `m.call#ROOM` service flow; custom slots retain the direct
-    /// draft route. No HTTP failure or unverified JWT changes this selection.
+    /// Explicit auth contract. None keeps Sticky2025's direct draft profile;
+    /// other formats select legacy for canonical `m.call#ROOM` service flows
+    /// and direct for custom slots. No HTTP failure or unverified JWT changes
+    /// this selection. An explicit contract remains authoritative.
     pub auth_dialect: Option<matrix_rtc_transport::livekit::LiveKitAuthDialect>,
     /// Override for the core's media-key policy. `None` keeps the core's
     /// default, which requires key senders to be cross-signed (MSC4153) —
@@ -384,7 +385,8 @@ impl LiveKitCall {
             LiveKitAttachOptions {
                 format: options.format,
                 auth_dialect: options.auth_dialect.unwrap_or_else(|| {
-                    matrix_rtc_transport::livekit::LiveKitAuthDialect::for_service_slot(
+                    matrix_rtc_transport::livekit::LiveKitAuthDialect::for_membership_profile(
+                        options.format,
                         &crate::attach::token_slot_id(options.format, &options.slot_id),
                     )
                 }),
