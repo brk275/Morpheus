@@ -527,6 +527,91 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 acceptance_module.app_timeline_evidence(output)
 
+    def test_failure_progress_reports_observations_without_claiming_an_active_phase(self):
+        progress = ("running 1 test\n"
+                    "MORPHEUS_UI_PHASE phase=97 elapsed_ms=100 phase_ms=2\n"
+                    "MORPHEUS_UI_PHASE phase=15 elapsed_ms=102 phase_ms=0\n")
+        self.assertEqual(acceptance_module.app_timeline_failure_progress(progress), {
+            "native_harness_entered": True, "common_ui_progress": {
+                "records": 2, "observation_cap_reached": False,
+                "last_observed_phase": 15, "elapsed_ms": 102, "phase_ms": 0}})
+        self.assertEqual(acceptance_module.app_timeline_diagnostics(progress), {"test_entered": False})
+        with self.assertRaises(RuntimeError):
+            acceptance_module.app_timeline_evidence(progress)
+        self.assertEqual(acceptance_module.app_timeline_evidence(self.output() + progress),
+                         {name: True for name in sorted(acceptance_module.APP_TIMELINE_CHECKS)})
+
+    def test_failure_progress_rejects_spoofs_duplicate_fields_and_unbounded_records(self):
+        marker = "MORPHEUS_UI_PHASE phase=0 elapsed_ms=1 phase_ms=1\n"
+        prefix = "running 1 test\n"
+        # Repeated values may come from legitimate millisecond observations.
+        # Duplicates still consume the exact64-record source bound.
+        observed = acceptance_module.app_timeline_failure_progress(prefix + marker * 64)
+        self.assertEqual(observed["common_ui_progress"]["records"], 64)
+        self.assertTrue(observed["common_ui_progress"]["observation_cap_reached"])
+        invalid = {"native_harness_entered": True, "common_ui_progress": {"invalid": True}}
+        self.assertEqual(acceptance_module.app_timeline_failure_progress(prefix + marker * 65), invalid)
+        malformed = (
+            marker * 65,
+            "MORPHEUS_UI_PHASE phase=1 phase=1 elapsed_ms=1 phase_ms=1\n",
+            "MORPHEUS_UI_PHASE phase=True elapsed_ms=1 phase_ms=1\n",
+            "MORPHEUS_UI_PHASE phase=01 elapsed_ms=1 phase_ms=1\n",
+            "MORPHEUS_UI_PHASE phase=-1 elapsed_ms=1 phase_ms=1\n",
+            "MORPHEUS_UI_PHASE phase=101 elapsed_ms=1 phase_ms=1\n",
+            "MORPHEUS_UI_PHASE phase=1 elapsed_ms=600001 phase_ms=1\n",
+            "MORPHEUS_UI_PHASE phase=1 elapsed_ms=1 phase_ms=2\n",
+            "MORPHEUS_UI_PHASE phase=1 elapsed_ms=1 phase_ms=600001\n",
+            "MORPHEUS_UI_PHASE phase=1 elapsed_ms=1.0 phase_ms=1\n",
+            "MORPHEUS_UI_PHASE phase=1 elapsed_ms=1 phase_ms=1 PRIVATE\n",
+            "MORPHEUS_UI_PHASE phase=" + "9" * 1000 + "\n",
+            "MORPHEUS_UI_PHASE phase=1 elapsed_ms=2 phase_ms=1\n" + marker,
+        )
+        for record in malformed:
+            with self.subTest(record=record):
+                self.assertEqual(acceptance_module.app_timeline_failure_progress(
+                    prefix + marker + record + marker), invalid)
+        spoofed = "PRIVATE " + marker + "quoted running 1 test\n"
+        self.assertEqual(acceptance_module.app_timeline_failure_progress(spoofed), {
+            "native_harness_entered": False,
+            "common_ui_progress": {"records": 0, "observation_cap_reached": False}})
+        self.assertEqual(acceptance_module.app_timeline_failure_progress(
+            prefix + "MORPHEUS_UI_PHASE phase=100 elapsed_ms=600000 phase_ms=600000\n")
+            ["common_ui_progress"]["last_observed_phase"], 100)
+
+    def test_failure_progress_rejects_non_text_without_coercion(self):
+        class UnsafeText(str):
+            def splitlines(self, *args):
+                raise AssertionError("must not invoke supplied text methods")
+        for value in (None, True, 1, 1.0, b"private", {}, UnsafeText("private")):
+            with self.subTest(value=type(value)):
+                self.assertEqual(acceptance_module.app_timeline_failure_progress(value), {"invalid": True})
+
+    def test_common_ui_progress_is_forwarded_only_after_scanned_failure(self):
+        progress = ("running 1 test\nMORPHEUS_UI_PHASE phase=97 elapsed_ms=100 phase_ms=2\n"
+                    "PRIVATE_CHILD_PAYLOAD\n")
+        for scanner_code in (0, 1):
+            with self.subTest(scanner_code=scanner_code), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "unused-scanner")
+                with LiveStageTests.child(self, runner, progress, timeout=True,
+                                          scanner_code=scanner_code) as (visible, _):
+                    with self.assertRaisesRegex(RuntimeError, "deadline" if scanner_code == 0 else "credential scanning"):
+                        runner.run(acceptance_module.APP_TIMELINE_LABEL, ["mock-test"], test=True, seconds=1)
+                records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+                if scanner_code == 0:
+                    self.assertEqual(records[0]["app_timeline_failure_progress"],
+                                     acceptance_module.app_timeline_failure_progress(progress))
+                else:
+                    self.assertEqual(records, [])
+                self.assertNotIn("PRIVATE_CHILD_PAYLOAD", visible.getvalue())
+                self.assertEqual(runner.results, [])
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with LiveStageTests.child(self, runner, self.output() + progress) as (visible, _):
+                runner.run(acceptance_module.APP_TIMELINE_LABEL, ["mock-test"], test=True)
+            self.assertEqual(len(runner.results), 1)
+            self.assertNotIn("app_timeline_failure_progress", runner.results[0])
+            self.assertNotIn("app_timeline_failure_progress", visible.getvalue())
+
     def test_validated_record_requires_native_test_mode_and_attaches_safe_facts(self):
         with tempfile.TemporaryDirectory() as folder:
             runner = Acceptance(Path(folder), "scanner", suite="timeline-reads")

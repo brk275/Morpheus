@@ -63,6 +63,11 @@ GROUP_ROSTER_FIELDS = (
     'carol_exactly_one_carol',
 )
 NATIVE_STAGE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_STAGE "
+NATIVE_FAILURE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_FAILURE "
+NATIVE_FAILURE_SOURCE = "crates/morpheus-rtc/tests/element_call_peer.rs"
+# The unchanged reviewed Rust test has exactly this many source lines. A
+# receipt cannot name another path, arbitrary text or an unbounded location.
+NATIVE_FAILURE_MAX_LINE = 1416
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILES = 128
 MAX_LOG_ENTRIES = 65_536
@@ -134,7 +139,68 @@ def group_roster_receipt(output: str) -> dict[str, bool] | str | None:
     return found
 
 
-def diagnostics(output: str, *, include_native=True) -> dict[str, str | dict[str, bool]]:
+def native_panic_location(output: str) -> dict[str, str | int] | str | None:
+    """Reduce only this named test's panic header from the scanned native log."""
+    marker = "thread '" + TEST_NAME + "'"
+    found = None
+    cursor = 0
+    while (start := output.find(marker, cursor)) >= 0:
+        cursor = start + len(marker)
+        if start and output[start - 1] != "\n":
+            continue
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        if found is not None or end - start > 256:
+            return "invalid"
+        match = re.fullmatch(re.escape(marker) + r"(?: \([1-9][0-9]{0,9}\))? panicked at "
+                             + re.escape(NATIVE_FAILURE_SOURCE) + r":([1-9][0-9]{0,3}):([1-9][0-9]{0,3}):",
+                             output[start:end])
+        if match is None:
+            return "invalid"
+        line, column = int(match[1]), int(match[2])
+        if not 1 <= line <= NATIVE_FAILURE_MAX_LINE or not 1 <= column <= 4096:
+            return "invalid"
+        found = {"file": NATIVE_FAILURE_SOURCE, "line": line, "category": "panic"}
+    return found
+
+
+def native_failure_location(output: str) -> dict[str, str | int] | str | None:
+    """Validate the fixed diagnostic receipt without reflecting payload text."""
+    found = None
+    cursor = 0
+    marker = "MORPHEUS_ELEMENT_NATIVE_FAILURE"
+    while (start := output.find(marker, cursor)) >= 0:
+        cursor = start + len(marker)
+        if start and output[start - 1] != "\n":
+            continue
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        if found is not None or end - start > 256 or not output.startswith(NATIVE_FAILURE_PREFIX, start):
+            return "invalid"
+        line = output[start:end]
+        if not line.isascii():
+            return "invalid"
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate native failure field")
+                result[key] = value
+            return result
+        try:
+            value = json.loads(line[len(NATIVE_FAILURE_PREFIX):], object_pairs_hook=unique_object)
+        except (ValueError, TypeError, RecursionError):
+            return "invalid"
+        if (type(value) is not dict or set(value) != {"file", "line", "category"}
+                or type(value["file"]) is not str or value["file"] != NATIVE_FAILURE_SOURCE
+                or type(value["category"]) is not str or value["category"] != "panic"
+                or type(value["line"]) is not int or not 1 <= value["line"] <= NATIVE_FAILURE_MAX_LINE):
+            return "invalid"
+        found = value
+    return found
+
+
+def diagnostics(output: str, *, include_native=True) -> dict[str, str | dict[str, bool] | dict[str, str | int]]:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
     failures = [value for value in FAILURE_PATTERN.findall(output) if value in FAILURES]
@@ -144,6 +210,8 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str | dict[str
         result["failure"] = failures[-1]
     if include_native and (roster := group_roster_receipt(output)) is not None:
         result["group_roster"] = roster
+    if include_native and (location := native_failure_location(output)) is not None:
+        result["native_failure"] = location
     if include_native and (native := native_stages(output)):
         result["native_stage"] = native[-1]
     return result
@@ -522,6 +590,8 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         print(f"MORPHEUS_ELEMENT_CHECK {key}={str(value).lower()}", flush=True)
     if children_joined and cleanup_failure is None:
         if scan_complete and failure == "native_acceptance":
+            if (location := native_panic_location(native_output)) is not None:
+                print(NATIVE_FAILURE_PREFIX + json.dumps(location, sort_keys=True), flush=True)
             if (roster := group_roster_receipt(native_output)) is not None:
                 print(GROUP_ROSTER_PREFIX + json.dumps(roster, sort_keys=True), flush=True)
         for value in native_stages(native_output):
