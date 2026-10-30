@@ -154,6 +154,7 @@ mod tests {
             assert!(rejoin_retryable(&retryable), "{retryable}");
         }
         for terminal in [
+            CallControllerError::Rtc(RtcError::IdentityRejected),
             CallControllerError::Rtc(RtcError::EncryptionIdentityNotReady),
             CallControllerError::Rtc(RtcError::UnencryptedRoomUnsupported),
             CallControllerError::Rtc(RtcError::StickyEventsUnsupported),

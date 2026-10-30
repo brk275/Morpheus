@@ -48,6 +48,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::{Future, poll_fn};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::Poll;
 use std::time::Duration;
@@ -483,6 +484,7 @@ pub struct MediaPool {
     /// so the host saw one key import where the core had imported several, and
     /// could not tell which index the transport actually held.
     pending_keys: HashMap<String, Vec<u8>>,
+    member_pending_keys: HashMap<(String, String), (Arc<AtomicBool>, Vec<u8>)>,
     pool: HashMap<String, ManagedConnection>,
     connection_generation: u64,
     /// Connections currently impaired (reconnecting or failing to connect);
@@ -514,6 +516,7 @@ impl MediaPool {
             constraints: HashMap::new(),
             pending_tracks: HashMap::new(),
             pending_keys: HashMap::new(),
+            member_pending_keys: HashMap::new(),
             pool: HashMap::new(),
             connection_generation: 0,
             degraded_keys: HashSet::new(),
@@ -620,6 +623,50 @@ impl MediaPool {
         }
     }
 
+    /// A generation-attributed import. Keys ahead of the actor's membership
+    /// view remain pending only for that exact member and still-live lease.
+    pub fn member_key_imported(
+        &mut self,
+        identity: String,
+        member_id: String,
+        key_index: u8,
+        active: Arc<AtomicBool>,
+    ) -> Vec<PoolEvent> {
+        self.member_pending_keys
+            .retain(|_, (lease, _)| lease.load(Ordering::Acquire));
+        if !active.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        if self.known_members.contains(&member_id)
+            && !self.member_identities.contains_key(&member_id)
+        {
+            // The authenticated core can lead the actor's watch view. A guarded
+            // import has already proved this exact current member and alias;
+            // repair only that previously unmapped member, never another owner.
+            self.map_member_identity(&member_id, identity.clone());
+        }
+        if self.identity_map.get(&identity) == Some(&member_id) {
+            let mut events = std::mem::take(&mut self.out);
+            events.push(PoolEvent::KeyImported {
+                member_id,
+                identity,
+                key_index,
+            });
+            return events;
+        }
+        let pending = self
+            .member_pending_keys
+            .entry((identity, member_id))
+            .or_insert_with(|| (Arc::clone(&active), Vec::new()));
+        if !Arc::ptr_eq(&pending.0, &active) {
+            *pending = (active, Vec::new());
+        }
+        if !pending.1.contains(&key_index) {
+            pending.1.push(key_index);
+        }
+        Vec::new()
+    }
+
     /// Set the subscription constraints for one stream of one member.
     ///
     /// Applied after a short debounce (rapid changes coalesce, e.g. while
@@ -663,6 +710,7 @@ impl MediaPool {
         self.constraints.clear();
         self.pending_tracks.clear();
         self.pending_keys.clear();
+        self.member_pending_keys.clear();
         for (_, entry) in self.pool.drain() {
             if let ConnState::Up { connection, .. } = entry.state
                 && !entry.is_own
@@ -673,6 +721,59 @@ impl MediaPool {
                     }
                 });
             }
+        }
+    }
+
+    /// Irreversibly retire this call's routes, including the adopted own
+    /// connection and successful connects still queued in the actor inbox.
+    /// The caller must close every returned connection; the inbox cannot reopen.
+    pub fn retire(
+        &mut self,
+        inbox: &mut mpsc::UnboundedReceiver<PoolMessage>,
+    ) -> Vec<Arc<dyn TransportConnection>> {
+        inbox.close();
+        let mut connections = Vec::new();
+        while let Ok(PoolMessage(message)) = inbox.try_recv() {
+            if let Message::ConnectFinished {
+                result: Ok((connection, _events)),
+                ..
+            } = message
+            {
+                connections.push(Arc::from(connection));
+            }
+        }
+        self.constraints.clear();
+        self.pending_tracks.clear();
+        self.pending_keys.clear();
+        self.member_pending_keys.clear();
+        self.tracks
+            .lock()
+            .expect("track map mutex poisoned")
+            .clear();
+        self.members_snapshot.clear();
+        self.known_members.clear();
+        self.identity_map.clear();
+        self.member_identities.clear();
+        self.degraded_keys.clear();
+        self.out.clear();
+        for (_, entry) in self.pool.drain() {
+            if let ConnState::Up { connection, .. } = entry.state {
+                connections.push(connection);
+            }
+        }
+        connections
+    }
+
+    /// Close a completed connection consumed after its call was refused.
+    pub fn discard_retired(message: PoolMessage) {
+        if let PoolMessage(Message::ConnectFinished {
+            result: Ok((connection, _events)),
+            ..
+        }) = message
+        {
+            rt::spawn(async move {
+                let _ = connection.close().await;
+            });
         }
     }
 
@@ -752,37 +853,56 @@ impl MediaPool {
             member.member_id,
             member.sender,
         );
+        self.map_member_identity(&member.member_id, identity);
+    }
+
+    fn map_member_identity(&mut self, member_id: &str, identity: String) {
         self.identity_map
-            .insert(identity.clone(), member.member_id.clone());
+            .insert(identity.clone(), member_id.to_owned());
         self.member_identities
-            .insert(member.member_id.clone(), identity.clone());
+            .insert(member_id.to_owned(), identity.clone());
 
         // Media and keys that arrived before this membership.
         if let Some(pending) = self.pending_tracks.remove(&identity) {
             log::debug!(
                 "flushing {} buffered track(s) onto member {}",
                 pending.len(),
-                member.member_id,
+                member_id,
             );
             for (kind, track) in pending {
                 if self.track_is_current(&track) {
-                    self.add_track(&member.member_id, kind, track);
+                    self.add_track(member_id, kind, track);
                 }
             }
             // The owner clears member state on departure, but an unchanged
             // cryptor need not repeat its last transition. Replay only after
             // every winning receiver has been restored and agrees: an unknown
             // replacement must not inherit a different receiver's state.
-            if let Some(state) = self.restored_encryption_state(&member.member_id) {
+            if let Some(state) = self.restored_encryption_state(member_id) {
                 self.out.push(PoolEvent::EncryptionStateChanged {
-                    member_id: member.member_id.clone(),
+                    member_id: member_id.to_owned(),
                     state,
+                });
+            }
+        }
+        self.member_pending_keys
+            .retain(|_, (lease, _)| lease.load(Ordering::Acquire));
+        if let Some((active, indices)) = self
+            .member_pending_keys
+            .remove(&(identity.clone(), member_id.to_owned()))
+            && active.load(Ordering::Acquire)
+        {
+            for key_index in indices {
+                self.out.push(PoolEvent::KeyImported {
+                    member_id: member_id.to_owned(),
+                    identity: identity.clone(),
+                    key_index,
                 });
             }
         }
         for key_index in self.pending_keys.remove(&identity).unwrap_or_default() {
             self.out.push(PoolEvent::KeyImported {
-                member_id: member.member_id.clone(),
+                member_id: member_id.to_owned(),
                 identity: identity.clone(),
                 key_index,
             });
@@ -791,6 +911,8 @@ impl MediaPool {
 
     fn forget_member(&mut self, member_id: &str) {
         self.known_members.remove(member_id);
+        self.member_pending_keys
+            .retain(|(_, member), (lease, _)| member != member_id && lease.load(Ordering::Acquire));
         let identity = self.member_identities.remove(member_id);
         // A stale key index could otherwise resurface against the identity.
         if let Some(identity) = &identity {
@@ -1067,11 +1189,19 @@ impl MediaPool {
         let key = key.to_owned();
         rt::spawn(async move {
             let result = backend.connect(&key, &ctx).await;
-            let _ = messages.send(PoolMessage(Message::ConnectFinished {
+            if let Err(error) = messages.send(PoolMessage(Message::ConnectFinished {
                 connection_key: key,
                 attempt,
                 result,
-            }));
+            })) {
+                if let PoolMessage(Message::ConnectFinished {
+                    result: Ok((connection, _events)),
+                    ..
+                }) = error.0
+                {
+                    let _ = connection.close().await;
+                }
+            }
         });
     }
 
