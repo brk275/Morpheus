@@ -576,6 +576,11 @@ jobs:
       - name: Prepare candidate-bound portable source notice inputs
         if: runner.os != 'Linux'
         timeout-minutes: 35
+        env:
+          # Provider metadata only; never serialize profiles or the full event.
+          # Values enter an environment field, never executable shell source.
+          MORPHEUS_NATIVE_PACKAGE_CONTEXT: >-
+            {"owner_id":${{ toJSON(github.event.repository.owner.id) }},"sender_id":${{ toJSON(github.event.sender.id) }},"private":${{ toJSON(github.event.repository.private) }},"inputs":{"source_revision":${{ toJSON(needs.scope.outputs.source_revision) }},"platform":${{ toJSON(inputs.platform) }},"linux_formats":${{ toJSON(inputs.linux_formats) }},"appimage_updates":${{ toJSON(inputs.appimage_updates) }},"appimage_capture":${{ toJSON(inputs.appimage_capture) }},"source_bundle":${{ toJSON(inputs.source_bundle) }},"native_updates":${{ toJSON(inputs.native_updates) }}}}
         shell: bash
         run: python3 -I -B scripts/native_notice_source.py --prepare --gitleaks "$MORPHEUS_NATIVE_QA_SCANNER"
       - name: Verify synthetic installed Mac update transactions
@@ -620,6 +625,9 @@ jobs:
       - name: Scan and remove owned native notice source inputs
         if: always() && runner.os != 'Linux' && env.MORPHEUS_NATIVE_SOURCE_ROOT != ''
         timeout-minutes: 5
+        env:
+          MORPHEUS_NATIVE_PACKAGE_CONTEXT: >-
+            {"owner_id":${{ toJSON(github.event.repository.owner.id) }},"sender_id":${{ toJSON(github.event.sender.id) }},"private":${{ toJSON(github.event.repository.private) }},"inputs":{"source_revision":${{ toJSON(needs.scope.outputs.source_revision) }},"platform":${{ toJSON(inputs.platform) }},"linux_formats":${{ toJSON(inputs.linux_formats) }},"appimage_updates":${{ toJSON(inputs.appimage_updates) }},"appimage_capture":${{ toJSON(inputs.appimage_capture) }},"source_bundle":${{ toJSON(inputs.source_bundle) }},"native_updates":${{ toJSON(inputs.native_updates) }}}}
         shell: bash
         run: python3 -I -B scripts/native_notice_source.py --finish --gitleaks "$MORPHEUS_NATIVE_QA_SCANNER"
       # Installers deliberately stay on the ephemeral runner. Public artifact
