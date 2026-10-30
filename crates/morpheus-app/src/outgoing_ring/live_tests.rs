@@ -119,9 +119,9 @@ mod actor_tests;
 mod alsa_playback;
 #[cfg(target_os = "linux")]
 mod outage_tests;
+use actor_tests::ActorAcceptance;
 #[cfg(all(target_os = "linux", morpheus_timeline_acceptance))]
 pub(crate) use outage_tests::run_received_video_ui_if_configured;
-use actor_tests::ActorAcceptance;
 use std::sync::Arc;
 
 // Leave at least 107 seconds for retained-join/account cleanup inside the

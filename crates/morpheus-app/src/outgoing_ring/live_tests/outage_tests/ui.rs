@@ -184,7 +184,10 @@ pub(crate) async fn run_if_configured(runtime: Handle) {
         // AccountManager::stop does not drop its lifetime profile lock. The
         // actual controller AND every manager must have no strong owner left.
         let controller_owner = controller.upgrade();
-        let manager_owners: Vec<_> = managers.iter().filter_map(|owner| owner.upgrade()).collect();
+        let manager_owners: Vec<_> = managers
+            .iter()
+            .filter_map(|owner| owner.upgrade())
+            .collect();
         let released = session_dropped && controller_owner.is_none() && manager_owners.is_empty();
         eprintln!("MORPHEUS_RTC_UI_CHECK presenter_owners_released={released}");
         if released {
@@ -256,7 +259,11 @@ async fn exercise(
     let preferences = Arc::new(VoiceSpaces::new(store));
     session
         .calls
-        .open_slot(selection.clone(), case.room.as_str(), CallJoinMode::Standard)
+        .open_slot(
+            selection.clone(),
+            case.room.as_str(),
+            CallJoinMode::Standard,
+        )
         .await
         .map_err(|_| ())?;
     session
@@ -317,7 +324,11 @@ async fn exercise(
     eprintln!("MORPHEUS_RTC_UI_CHECK leave_clears_received_images=true");
     session
         .calls
-        .open_slot(selection.clone(), case.room.as_str(), CallJoinMode::Standard)
+        .open_slot(
+            selection.clone(),
+            case.room.as_str(),
+            CallJoinMode::Standard,
+        )
         .await
         .map_err(|_| ())?;
     session
@@ -459,7 +470,12 @@ fn received_pair(
     let account = peer.account.as_ref().ok_or(())?;
     require(session.calls.video_token() == token)?;
     let mut both = [false; 2];
-    for tile in stage.layout.featured.iter().chain(stage.layout.tiles.iter()) {
+    for tile in stage
+        .layout
+        .featured
+        .iter()
+        .chain(stage.layout.tiles.iter())
+    {
         if tile.is_local
             || tile.key.member_id != info.membership_id
             || tile.user_id != account.user_id
@@ -545,7 +561,11 @@ fn visible_image(ui: &crate::AppWindow, tile: &crate::CallTileItem, level: u8) -
     use std::ops::ControlFlow;
     let label = format!(
         "{}{}, video",
-        if tile.screen { "Screen share from " } else { "" },
+        if tile.screen {
+            "Screen share from "
+        } else {
+            ""
+        },
         tile.name
     );
     let root = ItemRc::new_root(WindowInner::from_pub(ui.window()).component());

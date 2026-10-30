@@ -3017,7 +3017,11 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
         // Opt-in live room/thread controller coverage shares this one event
         // loop; it returns at once unless a disposable local fixture is set.
         crate::live::timeline_controller_tests::run_if_configured(runtime_handle.clone()).await;
-        #[cfg(all(feature = "native-calls", target_os = "linux", morpheus_timeline_acceptance))]
+        #[cfg(all(
+            feature = "native-calls",
+            target_os = "linux",
+            morpheus_timeline_acceptance
+        ))]
         crate::outgoing_ring::run_received_video_ui_if_configured(runtime_handle.clone()).await;
         // Opt-in too: the People busy path on the real window and fixture.
         eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_entered");
