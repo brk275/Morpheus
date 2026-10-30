@@ -182,7 +182,7 @@ MANUAL_CHECKS = frozenset({"all", "models", "desktop", "desktop-video", "devices
 # Exact existing suites from run_matrix_acceptance.py; no new test composition.
 MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-reads",
                            "timeline-failures", "media-only", "app-timeline",
-                           "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop"})
+                           "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop", "copy-element"})
 
 
 # Exact reviewed development inputs only. Desktop still compiles and tests all

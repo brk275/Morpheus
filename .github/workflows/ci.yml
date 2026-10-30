@@ -1,3 +1,4 @@
+# NEVER_MERGE: temporary exact two-existing-case diagnostic delivery only.
 name: CI
 
 on:
@@ -22,7 +23,7 @@ on:
         description: Existing Matrix suite (non-full requires Linux and matrix)
         type: choice
         default: full
-        options: [full, draft-recovery, drafts-only, timeline-reads, timeline-failures, media-only, app-timeline, outgoing-ring, native-call, oauth-only, rtc-recovery, element-interop]
+        options: [full, draft-recovery, drafts-only, timeline-reads, timeline-failures, media-only, app-timeline, outgoing-ring, native-call, oauth-only, rtc-recovery, element-interop, copy-element]
 
 permissions:
   contents: read
@@ -42,7 +43,7 @@ jobs:
   scope:
     name: Security and change scope
     # Hosted validation is disabled while private to prevent unauthorized paid builds.
-    if: github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || (github.repository == 'brk275/Morpheus' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner))
+    if: github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || (github.repository == 'brk275/Morpheus' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner)) && github.ref == 'refs/heads/codex/diagnostic-copy-element-failures-20261029' && github.event_name == 'workflow_dispatch' && inputs.platform == 'linux' && inputs.checks == 'matrix' && inputs.matrix_suite == 'copy-element'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -748,7 +749,7 @@ jobs:
             done
           fi
       - name: Compile focused app timeline test before live fixture deadlines
-        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads')
+        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads' || needs.scope.outputs.matrix_suite == 'copy-element')
         # Same target/features and Slint metadata as Acceptance.app_timeline.
         # Build under the existing job bound, before services/test clocks start;
         # the 480-second command and 420-second live-case limits stay fixed.
@@ -944,7 +945,7 @@ jobs:
                          "macos-arm": ["macos-15"], "macos-intel": ["macos-15-intel"]}
               routes = {"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "matrix", "wayland", "config", "helpers"}
               suites = {"full", "draft-recovery", "drafts-only", "timeline-reads", "timeline-failures",
-                        "media-only", "app-timeline", "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop"}
+                        "media-only", "app-timeline", "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop", "copy-element"}
               if (event_name not in ("push", "pull_request", "workflow_dispatch")
                       or manual not in ("true", "false") or not isinstance(platform, str) or platform not in choices
                       or not isinstance(route, str) or route not in routes

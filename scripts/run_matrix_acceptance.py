@@ -614,7 +614,9 @@ SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
           "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS,
           "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS), "oauth-only": OAUTH_LABELS,
-          "rtc-recovery": OUTAGE_LABELS, "element-interop": (ELEMENT_LABEL,)}
+          "rtc-recovery": OUTAGE_LABELS, "element-interop": (ELEMENT_LABEL,),
+          # NEVER_MERGE temporary delivery: only the two actually failed cases.
+          "copy-element": (APP_TIMELINE_LABEL, ELEMENT_LABEL)}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -1803,6 +1805,20 @@ class Acceptance:
                 # cleanup. Its earlier fixed diagnostics are already public.
                 raise RuntimeError("OAuth fixture cleanup incomplete; private state retained") from None
 
+    def copy_element_cases(self, fixture):
+        # NEVER_MERGE temporary selector; one root/lifecycle, two original cases.
+        if self.suite != "copy-element" or self.planned_checks != (APP_TIMELINE_LABEL, ELEMENT_LABEL):
+            raise RuntimeError("Temporary two-case selection is invalid")
+        self.group((APP_TIMELINE_LABEL,), lambda: self.app_timeline(fixture))
+        def existing_element_case():
+            self.script("local_matrix_rtc", "up")
+            self.script("local_matrix_rtc", "probe")
+            self.element_case()
+        # A recoverable app assertion must not prevent independent Element
+        # evidence. Infrastructure/cleanup errors still escape and stop safely.
+        self.group((ELEMENT_LABEL,), existing_element_case)
+        self.finish_checks()
+
     def element_case(self):
         self.require_containment()
         fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-group-fixture"), self.root)
@@ -1884,6 +1900,9 @@ class Acceptance:
                                  "and complete bounded notification history "
                                  "after a real sync barrier. This is not Sticky/Element, incoming-app automatic rejoin, "
                                  "physical audio/video, installed-package or whole-beta acceptance.\n\n")
+                elif self.suite == "copy-element":
+                    output.write("Temporary focused check: only app-live-timeline and the ordinary Element RC case; "
+                                 "not full acceptance, stock44 or beta qualification.\n\n")
                 elif self.suite == "element-interop":
                     output.write("Focused stock Element interoperability: only the existing Element peer case ran "
                                  "with disposable Matrix and RTC services. "
@@ -2010,6 +2029,9 @@ def main():
             return
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
+        if args.suite == "copy-element":
+            acceptance.copy_element_cases(fixture)
+            return
         if args.suite == "element-interop":
             def element_interop_checks():
                 acceptance.script("local_matrix_rtc", "up")

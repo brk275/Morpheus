@@ -187,6 +187,21 @@ class AcceptanceTests(unittest.TestCase):
             changed["compile"]["result"] = outcome
             self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
 
+    def test_temporary_copy_element_requires_exact_partial_linux_scope_and_result(self):
+        value = snapshot(True, platforms=["ubuntu-24.04"], wayland=False)
+        value["scope"]["outputs"].update(manual="true", manual_platform="linux",
+                                          check_route="matrix", matrix_suite="copy-element")
+        self.assertIsNone(acceptance_error(value, "workflow_dispatch"))
+        for event in ("pull_request", "push"):
+            self.assertIsNotNone(acceptance_error(value, event))
+        for key, bad in (("manual_platform", "all"), ("check_route", "all"),
+                         ("matrix_suite", "copy-element-extra"), ("wayland", "true")):
+            changed = json.loads(json.dumps(value)); changed["scope"]["outputs"][key] = bad
+            self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
+        for outcome in ("skipped", "failure", "cancelled", "neutral", None):
+            changed = json.loads(json.dumps(value)); changed["compile"]["result"] = outcome
+            self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
+
     def test_element_interop_is_partial_and_requires_the_selected_linux_result(self):
         value = snapshot(True, platforms=["ubuntu-24.04"], wayland=False)
         value["scope"]["outputs"].update(manual="true", manual_platform="linux",
@@ -537,7 +552,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         end = "      - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC\n"
         self.assertEqual(source.count(start), 1)
         step = source.split(start, 1)[1].split(end, 1)[0]
-        condition = "        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads')\n"
+        condition = "        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads' || needs.scope.outputs.matrix_suite == 'copy-element')\n"
         self.assertIn(condition, step)
         self.assertIn('          SLINT_EMIT_DEBUG_INFO: "1"\n', step)
         self.assertNotIn("continue-on-error:", step)

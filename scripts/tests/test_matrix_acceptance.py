@@ -61,6 +61,50 @@ class TimelineFailureForwardingTests(unittest.TestCase):
 
 
 class FocusedSuiteTests(unittest.TestCase):
+    def test_temporary_two_case_route_runs_both_original_cases_once_and_fails_closed(self):
+        labels = (acceptance_module.APP_TIMELINE_LABEL, acceptance_module.ELEMENT_LABEL)
+        self.assertEqual(acceptance_module.SUITES["copy-element"], labels)
+        self.assertEqual(acceptance_module.SUITES["full"], acceptance_module.PLANNED_CHECKS)
+        for failed in (None, labels[0], labels[1]):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder); runner = Acceptance(root, "scanner", suite="copy-element")
+                events = []; fixture = root / "accounts.json"
+                def app(received):
+                    self.assertEqual(received, fixture); events.append("app")
+                    if failed == labels[0]: raise acceptance_module.CheckFailure(labels[0], "test_failed")
+                    runner.results.append({"check":labels[0], "passed":1, "seconds":0})
+                def element():
+                    events.append("element")
+                    if failed == labels[1]: raise acceptance_module.CheckFailure(labels[1], "test_failed")
+                    runner.results.append({"check":labels[1], "passed":1, "seconds":0})
+                def service(name, command):
+                    self.assertEqual(name,"local_matrix_rtc"); events.append(command)
+                with patch.object(runner,"app_timeline",side_effect=app), \
+                        patch.object(runner,"element_case",side_effect=element), \
+                        patch.object(runner,"script",side_effect=service), contextlib.redirect_stdout(io.StringIO()):
+                    if failed:
+                        with self.assertRaises(RuntimeError): runner.copy_element_cases(fixture)
+                    else:
+                        runner.copy_element_cases(fixture)
+                self.assertEqual(events,["app","up","probe","element"])
+                self.assertEqual({item["check"] for item in runner.results},set(labels)-({failed} if failed else set()))
+                summary=root/"summary.md"
+                with patch.dict(os.environ,{"GITHUB_STEP_SUMMARY":str(summary)}): runner.summary()
+                self.assertIn("not full acceptance",summary.read_text()); self.assertNotIn("Full suite:",summary.read_text())
+                full=Acceptance(root,"scanner"); full.results=list(runner.results)
+                with self.assertRaises(RuntimeError): full.finish_checks()
+        # Never continue an unowned/failed service cleanup or a foreign suite.
+        with tempfile.TemporaryDirectory() as folder:
+            runner=Acceptance(Path(folder),"scanner",suite="copy-element")
+            with patch.object(runner,"app_timeline",side_effect=RuntimeError("infrastructure")), \
+                    patch.object(runner,"element_case") as element, self.assertRaises(RuntimeError):
+                runner.copy_element_cases(Path(folder)/"accounts.json")
+            element.assert_not_called()
+            other=Acceptance(Path(folder),"scanner",suite="app-timeline")
+            with patch.object(other,"app_timeline") as app, self.assertRaises(RuntimeError):
+                other.copy_element_cases(Path(folder)/"accounts.json")
+            app.assert_not_called()
+
     def test_element_interop_requires_its_only_case_and_cannot_claim_full_acceptance(self):
         label = acceptance_module.ELEMENT_LABEL
         self.assertEqual(acceptance_module.SUITES["element-interop"], (label,))
