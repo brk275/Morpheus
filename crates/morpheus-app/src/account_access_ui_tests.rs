@@ -427,39 +427,74 @@ async fn assert_sign_in_keyboard(ui: &AppWindow) {
 // element search needs debug-info code generation; this direct item-tree read
 // keeps the normal build and production properties unchanged.
 fn focused_control_has_label(ui: &impl slint::ComponentHandle, expected: &str) -> bool {
-    use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
+    use slint::private_unstable_api::re_exports::{
+        AccessibleStringProperty, ItemRc, ItemTreeNode, ItemWeak, VRc, WindowInner,
+    };
 
     let window = WindowInner::from_pub(ui.window());
-    let Some(focused) = window.focus_item.borrow().upgrade() else {
+    let Some(mut item) = window.focus_item.borrow().upgrade() else {
         return false;
     };
     let root = ItemRc::new_root(window.component());
-    // Observe only the current tree. visit_descendants first instantiates the
-    // whole window, including unrelated conditional dialogs and their init
-    // handlers. A focus assertion must not create or refocus another control.
-    // Carry the named-ancestor predicate through each existing child once;
-    // popup roots are not children of this window's item tree.
-    let mut pending = Vec::new();
-    if let Some(child) = root.first_child() {
-        pending.push((child, false));
+    let mut labelled = false;
+    // Inspect only the actual focus path. Walking every existing sibling for
+    // each assertion repeats unrelated Settings layout/accessibility work.
+    // Match the old predicate only after reaching this window's exact root;
+    // popup roots and detached conditional instances must still be refused.
+    while item != root {
+        labelled |= item
+            .accessible_string_property(AccessibleStringProperty::Label)
+            .as_deref()
+            == Some(expected);
+        let component = VRc::borrow_pin(item.item_tree());
+        let nodes = component.as_ref().get_item_tree();
+        if !item.is_root() {
+            let Some(node) = nodes.as_slice().get(item.index() as usize) else {
+                return false;
+            };
+            item = ItemRc::new(item.item_tree().clone(), node.parent_index());
+            continue;
+        }
+        // Slint's parent_node identifies the dynamic placeholder, not an Item.
+        // Recheck that its current instance is this exact focused component:
+        // a retained old row may still know its parent after being removed.
+        let mut parent = ItemWeak::default();
+        component.as_ref().parent_node(&mut parent);
+        let Some(parent) = parent.upgrade() else {
+            return false;
+        };
+        let parent_component = VRc::borrow_pin(parent.item_tree());
+        let parent_nodes = parent_component.as_ref().get_item_tree();
+        let Some(ItemTreeNode::DynamicTree { index, parent_index }) =
+            parent_nodes.as_slice().get(parent.index() as usize)
+        else {
+            return false;
+        };
+        let range = parent_component.as_ref().get_subtree_range(*index);
+        let current_index = component.as_ref().subtree_index();
+        // Conditional/component-container roots have no model index. They
+        // occupy their sole existing slot; repeaters retain their model index.
+        let current_index = if current_index == usize::MAX
+            && range.end.checked_sub(range.start) == Some(1)
+        {
+            range.start
+        } else {
+            current_index
+        };
+        if current_index < range.start || current_index >= range.end {
+            return false;
+        }
+        let mut current = Default::default();
+        parent_component.as_ref().get_subtree(*index, current_index, &mut current);
+        let Some(current) = current.upgrade() else {
+            return false;
+        };
+        if !VRc::ptr_eq(&current, item.item_tree()) {
+            return false;
+        }
+        item = ItemRc::new(parent.item_tree().clone(), *parent_index);
     }
-    while let Some((item, named_ancestor)) = pending.pop() {
-        let contains_label = named_ancestor
-            || item
-                .accessible_string_property(AccessibleStringProperty::Label)
-                .as_deref()
-                == Some(expected);
-        if item == focused {
-            return contains_label;
-        }
-        if let Some(sibling) = item.next_sibling() {
-            pending.push((sibling, named_ancestor));
-        }
-        if let Some(child) = item.first_child() {
-            pending.push((child, contains_label));
-        }
-    }
-    false
+    labelled
 }
 
 #[track_caller]
