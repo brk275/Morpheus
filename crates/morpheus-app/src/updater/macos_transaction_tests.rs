@@ -449,6 +449,8 @@ fn health_commit_before_store_is_durable_and_cannot_be_reversed() {
     let (_root, mut session, journal) = awaiting_store_health();
     session.trial = Some(journal.id.clone());
     session.acknowledge_before_store().unwrap();
+    assert!(session.trial.is_none());
+    session.acknowledge_before_store().unwrap();
     let mut durable = session.journal().unwrap().unwrap();
     assert_eq!(durable.phase, Phase::Committed);
     assert_eq!(
@@ -748,11 +750,19 @@ fn serialized_trial_recovery_restores_old_tree_and_late_health_cannot_open_store
     let mut late = MacAppSession::lock(&installed, Duration::ZERO).unwrap();
     assert_eq!(tree_hash(&installed).unwrap(), journal.old_hash);
     assert!(late.journal().unwrap().is_none());
-    late.trial = Some(journal.id);
+    late.trial = Some(journal.id.clone());
     assert_eq!(
         late.acknowledge_before_store(),
         Err(UpdateError::RecoveryRequired)
     );
+    assert_eq!(late.trial.as_deref(), Some(journal.id.as_str()));
+    // A repeated boundary check after the same rejected late trial must
+    // remain closed; clearing the marker on error would return Ok here.
+    assert_eq!(
+        late.acknowledge_before_store(),
+        Err(UpdateError::RecoveryRequired)
+    );
+    assert_eq!(late.trial.as_deref(), Some(journal.id.as_str()));
     assert!(late.journal().unwrap().is_none());
     assert_eq!(tree_hash(&installed).unwrap(), journal.old_hash);
 }

@@ -691,8 +691,9 @@ and startup recovery foundation, with shared call/update exclusion. See
 pre-store commit boundary, packaging order and remaining acceptance checks.
 Recovery-key acknowledgement and the shared call lease block unsafe restarts.
 The new UI/controller integration still needs hosted and installed-package
-verification. macOS and Windows installation remains disabled pending their
-platform transactions and verification.
+verification. macOS and Windows have platform transaction implementations,
+but production installation remains disabled pending platform recovery and
+installed-package acceptance.
 
 Cargo Packager's default formats produce a macOS `.app` and `.dmg`, a Windows
 NSIS installer, and Linux `.deb`, AppImage, and Pacman packages. An update for

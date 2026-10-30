@@ -1019,7 +1019,7 @@ impl MacAppSession {
     }
 
     pub fn acknowledge_before_store(&mut self) -> Result<(), UpdateError> {
-        let Some(id) = self.trial.take() else {
+        let Some(id) = self.trial.as_deref() else {
             return Ok(());
         };
         let mut journal = self.journal()?.ok_or(UpdateError::RecoveryRequired)?;
@@ -1032,7 +1032,11 @@ impl MacAppSession {
             return Err(UpdateError::RecoveryRequired);
         }
         journal.phase = Phase::Committed;
-        self.save(&journal)
+        self.save(&journal)?;
+        // Failed validation or durable commit must never turn a retry into
+        // the no-trial fast path that permits opening persistence stores.
+        self.trial = None;
+        Ok(())
     }
 }
 
