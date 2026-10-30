@@ -201,8 +201,16 @@ mod auth_dialect_tests {
         assert!(sticky.validate_slot("m.call#ROOM").is_ok());
         // An explicit legacy service can carry sticky memberships too. Its
         // existing contract stays valid, but cannot address a custom slot.
-        assert!(LiveKitAuthDialect::LegacyService.validate_slot("m.call#ROOM").is_ok());
-        assert!(LiveKitAuthDialect::LegacyService.validate_slot("m.call#custom").is_err());
+        assert!(
+            LiveKitAuthDialect::LegacyService
+                .validate_slot("m.call#ROOM")
+                .is_ok()
+        );
+        assert!(
+            LiveKitAuthDialect::LegacyService
+                .validate_slot("m.call#custom")
+                .is_err()
+        );
     }
 
     #[test]
