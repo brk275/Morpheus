@@ -4880,6 +4880,7 @@ export component AppWindow inherits Window {
     // activation and confirmation.
     public function open-account-menu() {
         if !RoomAddresses.open && !RoomLeave.view.open {
+            root.message-copy-withdraw();
             CallBar.withdraw();
             MatrixLink.withdraw(); UnreadNavigation.withdraw-jump();
             IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
