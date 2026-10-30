@@ -428,38 +428,38 @@ async fn assert_sign_in_keyboard(ui: &AppWindow) {
 // keeps the normal build and production properties unchanged.
 fn focused_control_has_label(ui: &impl slint::ComponentHandle, expected: &str) -> bool {
     use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
-    use std::ops::ControlFlow;
 
     let window = WindowInner::from_pub(ui.window());
     let Some(focused) = window.focus_item.borrow().upgrade() else {
         return false;
     };
     let root = ItemRc::new_root(window.component());
-    root.visit_descendants(|item| {
-        if item
-            .accessible_string_property(AccessibleStringProperty::Label)
-            .as_deref()
-            != Some(expected)
-        {
-            return ControlFlow::Continue(());
-        }
-        let contains_focus = item == &focused
+    // Observe only the current tree. visit_descendants first instantiates the
+    // whole window, including unrelated conditional dialogs and their init
+    // handlers. A focus assertion must not create or refocus another control.
+    // Carry the named-ancestor predicate through each existing child once;
+    // popup roots are not children of this window's item tree.
+    let mut pending = Vec::new();
+    if let Some(child) = root.first_child() {
+        pending.push((child, false));
+    }
+    while let Some((item, named_ancestor)) = pending.pop() {
+        let contains_label = named_ancestor
             || item
-                .visit_descendants(|child| {
-                    if child == &focused {
-                        ControlFlow::Break(())
-                    } else {
-                        ControlFlow::Continue(())
-                    }
-                })
-                .is_some();
-        if contains_focus {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
+                .accessible_string_property(AccessibleStringProperty::Label)
+                .as_deref()
+                == Some(expected);
+        if item == focused {
+            return contains_label;
         }
-    })
-    .is_some()
+        if let Some(sibling) = item.next_sibling() {
+            pending.push((sibling, named_ancestor));
+        }
+        if let Some(child) = item.first_child() {
+            pending.push((child, contains_label));
+        }
+    }
+    false
 }
 
 #[track_caller]

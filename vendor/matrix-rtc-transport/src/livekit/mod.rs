@@ -75,6 +75,20 @@ pub enum LiveKitAuthDialect {
 }
 
 impl LiveKitAuthDialect {
+    /// Default the explicit 2025 sticky compatibility profile to its draft
+    /// token endpoint and triple-hashed identities, even for the upper room
+    /// slot. Membership carrier and slot spelling alone do not authorize a
+    /// switch to legacy identities. Callers can still explicitly select a
+    /// different verified service contract before any token request.
+    pub fn for_membership_profile(format: MembershipFormat, slot_id: &str) -> Self {
+        match format {
+            MembershipFormat::Sticky2025 => Self::DirectDraft,
+            MembershipFormat::Current | MembershipFormat::RoomState => {
+                Self::for_service_slot(slot_id)
+            }
+        }
+    }
+
     /// Resolve the advertised legacy room flow without collapsing custom slots.
     /// The custom-slot default preserves the existing direct draft API route.
     pub fn for_service_slot(slot_id: &str) -> Self {
@@ -166,6 +180,29 @@ mod auth_dialect_tests {
         assert!(dialect.validate_slot("m.call#ROOM").is_ok());
         assert!(dialect.validate_slot("m.call#custom").is_err());
         assert_eq!(dialect.identity("@alice:example.org", "", "member"), None);
+        for format in [MembershipFormat::Current, MembershipFormat::RoomState] {
+            assert_eq!(
+                LiveKitAuthDialect::for_membership_profile(format, "m.call#ROOM"),
+                LiveKitAuthDialect::LegacyService
+            );
+        }
+        let sticky =
+            LiveKitAuthDialect::for_membership_profile(MembershipFormat::Sticky2025, "m.call#ROOM");
+        assert_eq!(sticky, LiveKitAuthDialect::DirectDraft);
+        assert_eq!(sticky.token_endpoint(), TokenEndpoint::Msc4195);
+        assert_eq!(
+            sticky.identity("@alice:example.org", "DEVICE", "member"),
+            Some(identity::pseudonymous_identity(
+                "@alice:example.org",
+                "DEVICE",
+                "member"
+            ))
+        );
+        assert!(sticky.validate_slot("m.call#ROOM").is_ok());
+        // An explicit legacy service can carry sticky memberships too. Its
+        // existing contract stays valid, but cannot address a custom slot.
+        assert!(LiveKitAuthDialect::LegacyService.validate_slot("m.call#ROOM").is_ok());
+        assert!(LiveKitAuthDialect::LegacyService.validate_slot("m.call#custom").is_err());
     }
 
     #[test]
@@ -187,5 +224,15 @@ mod auth_dialect_tests {
             dialect.identity("@alice:example.org", "DEVICE", "another-member")
         );
         assert!(dialect.validate_slot("").is_err());
+        for format in [
+            MembershipFormat::Current,
+            MembershipFormat::Sticky2025,
+            MembershipFormat::RoomState,
+        ] {
+            assert_eq!(
+                LiveKitAuthDialect::for_membership_profile(format, "m.call#custom"),
+                LiveKitAuthDialect::DirectDraft
+            );
+        }
     }
 }

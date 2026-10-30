@@ -755,6 +755,22 @@ jobs:
           set -euo pipefail
           cargo test --locked -p matrix-rtc-transport --lib | tee "$RUNNER_TEMP/morpheus-pool-retry-result.txt"
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$RUNNER_TEMP/morpheus-pool-retry-result.txt"
+      - name: Test native auth profiles and plaintext refusal before live fixtures
+        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite == 'copy-element'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p morpheus-rtc --features native-rtc --lib -- --list > "$RUNNER_TEMP/morpheus-auth-profile-tests.txt"
+          auth_profile_tests=(
+            native::tests::default_slot_matches_pinned_rtc_room_slot
+            native::tests::element_matrix_2_0_converts_wire_slot_without_changing_core_slot
+            native::tests::exposed_sticky_modes_reject_plaintext_without_changing_legacy_policy
+          )
+          for auth_profile_test in "${auth_profile_tests[@]}"; do
+            grep -Fqx -- "$auth_profile_test: test" "$RUNNER_TEMP/morpheus-auth-profile-tests.txt"
+            cargo test --locked -p morpheus-rtc --features native-rtc --lib "$auth_profile_test" -- --exact | tee "$RUNNER_TEMP/morpheus-auth-profile-result.txt"
+            grep -Fqx -- "test $auth_profile_test ... ok" "$RUNNER_TEMP/morpheus-auth-profile-result.txt"
+          done
       - name: Compile focused app timeline test before live fixture deadlines
         if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads' || needs.scope.outputs.matrix_suite == 'copy-element')
         # Same target/features and Slint metadata as Acceptance.app_timeline.

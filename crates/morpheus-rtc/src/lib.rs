@@ -54,6 +54,8 @@ pub use audio_device::{
 #[cfg(feature = "native-rtc")]
 pub use matrix_rtc_call_sdk::CallEvent as RtcCallEvent;
 #[cfg(feature = "native-rtc")]
+pub use matrix_rtc_transport::livekit::LiveKitAuthDialect;
+#[cfg(feature = "native-rtc")]
 pub use matrix_rtc_transport::{
     AudioFrame, I420Buffer, MediaStreamKind, VideoFrame, VideoRotation,
 };
