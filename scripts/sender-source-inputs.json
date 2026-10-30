@@ -28,22 +28,22 @@
     },
     "version": "12.14.0"
   },
-  "proposal_binding_sha256": "01b96d4aceab7dde4df528524c0daa906c7026c785f6387e599d40be62293f5f",
+  "proposal_binding_sha256": "52b626e3c17ed1fc10aedfbe5ff7d9de0c318e30b832c3ffdc39e80bd4f3199d",
   "proposal_files": {
     "spec/unit/matrixrtc/MembershipManager.spec.ts": {
-      "before_sha256": "a3f3d8ed4a76052a8433e11f3d8c5de34b3d3119c689412b0ef1dca0e17e50d5",
-      "after_sha256": "4661387430faf7d6517f396425e9f1f5a0c7d2946fbaddab2d90651227bd4dac",
-      "after_bytes": 103500
+      "before_sha256": "bebbdeb69a4245ed0f59afb55413f33b135d7117c4d08c497ad9bd88901f474b",
+      "after_sha256": "e65f4b7dc6c8d856a37f6182eb9661d2a33aeb5b4124cfa9e160a8d0c5696754",
+      "after_bytes": 116657
     },
     "spec/unit/matrixrtc/mocks.ts": {
-      "before_sha256": "53ab9a4d3ba45427d77d90c28e40cfaecf9e809e43d9b060565be969b3dca269",
-      "after_sha256": "e3880c7e104d8d9e5c76718b75e8f4b5dbfa80634dad8b7c30ebee436384664f",
-      "after_bytes": 9642
+      "before_sha256": "fca2eb92160d2fccb9426dd1b2cf339ad76251c1c2e5b67ad6ecb5a07148fe3d",
+      "after_sha256": "2c893f91021ccbdc4b94b903731d9d8e824969fd528a709ba618e77981869fa5",
+      "after_bytes": 10031
     },
     "src/matrixrtc/MembershipManager.ts": {
-      "before_sha256": "5d9bdd3f6870aafd9823890110bb915afe648728450312162ef028fb5b1dd935",
-      "after_sha256": "d11bf47bc077c9dfcb12eca0daebb0704425ef6aa6093ee83bf4cf194d77fa99",
-      "after_bytes": 77819
+      "before_sha256": "25482e005d1a48e9cde9cea2927cf53ae5b51ff7f888308916c2820c5f60cfe8",
+      "after_sha256": "0cc6365ebde3978938c9496e1c398fda313b1a89e949f6217310532310217157",
+      "after_bytes": 82962
     },
     "src/matrixrtc/MembershipManagerActionScheduler.ts": {
       "before_sha256": "3a4ef26cc897253e2498bb593d008485ee5aa98f33793660f892003f13ae9628",
@@ -51,15 +51,15 @@
       "after_bytes": 7684
     }
   },
-  "proposal_sha256": "524ce961f6ce8cf7449f5deb93add070754974d2438bb6b555d17723c2e4801c",
+  "proposal_sha256": "e0ba0b4a73bf49f423d09940faea82ac05f499657eec34a4f02ebefae7b7e8bc",
   "registry_review_sha256": "4a2f2e4314c2322f649a4cba160872721b5ee8d13e338d610c9224538bdf9ead",
   "scanner_binary_sha256": "88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509",
   "schema": 1,
   "shared_cache_writes": false,
   "source": {
-    "url": "https://codeload.github.com/matrix-org/matrix-js-sdk/tar.gz/3e0dd1a2af40f7a22cd6deee894effffb956601b",
-    "bytes": 3219122,
-    "sha256": "bd7ba0d55ae27e284a247280b522de51a743541a2536b6c46dcaa33d4ae3ff30"
+    "url": "https://codeload.github.com/matrix-org/matrix-js-sdk/tar.gz/fa1bd59fe86831be3e6bec5e8a1185f37a62e1d2",
+    "bytes": 3222230,
+    "sha256": "c172dee5177228c42bd5944823fae294ad5bef57238a02c41fcd845c13b3c242"
   },
   "source_files": {
     ".editorconfig": {
@@ -879,8 +879,8 @@
     },
     "spec/unit/matrixrtc/MembershipManager.spec.ts": {
       "mode": "100644",
-      "bytes": 90035,
-      "sha256": "a3f3d8ed4a76052a8433e11f3d8c5de34b3d3119c689412b0ef1dca0e17e50d5"
+      "bytes": 103192,
+      "sha256": "bebbdeb69a4245ed0f59afb55413f33b135d7117c4d08c497ad9bd88901f474b"
     },
     "spec/unit/matrixrtc/OutdatedKeyFilter.spec.ts": {
       "mode": "100644",
@@ -899,8 +899,8 @@
     },
     "spec/unit/matrixrtc/mocks.ts": {
       "mode": "100644",
-      "bytes": 9577,
-      "sha256": "53ab9a4d3ba45427d77d90c28e40cfaecf9e809e43d9b060565be969b3dca269"
+      "bytes": 9966,
+      "sha256": "fca2eb92160d2fccb9426dd1b2cf339ad76251c1c2e5b67ad6ecb5a07148fe3d"
     },
     "spec/unit/matrixrtc/types.spec.ts": {
       "mode": "100644",
@@ -1794,8 +1794,8 @@
     },
     "src/matrixrtc/MatrixRTCSession.ts": {
       "mode": "100644",
-      "bytes": 44404,
-      "sha256": "afa1b8a5fc8e2cb674dcb81f23fa39a88c75c72c893ed1564ed631cd1f1314ea"
+      "bytes": 44476,
+      "sha256": "b5ba6aafa625bfa10ca692105850da43dc4d5482173a5034dd2e8d03df9c0a3e"
     },
     "src/matrixrtc/MatrixRTCSessionManager.ts": {
       "mode": "100644",
@@ -1804,8 +1804,8 @@
     },
     "src/matrixrtc/MembershipManager.ts": {
       "mode": "100644",
-      "bytes": 70530,
-      "sha256": "5d9bdd3f6870aafd9823890110bb915afe648728450312162ef028fb5b1dd935"
+      "bytes": 75673,
+      "sha256": "25482e005d1a48e9cde9cea2927cf53ae5b51ff7f888308916c2820c5f60cfe8"
     },
     "src/matrixrtc/MembershipManagerActionScheduler.ts": {
       "mode": "100644",
@@ -2239,8 +2239,8 @@
     },
     "src/serverCapabilities.ts": {
       "mode": "100644",
-      "bytes": 2950,
-      "sha256": "c989d09e10b42f97fe107d1dfc09936dce398856faf05d137bc8b1e1adbc6c49"
+      "bytes": 3609,
+      "sha256": "fd7b9a7280cdd2de714c0c261b0921451b0d0ae31dd01f95de1e5c4aa36f7482"
     },
     "src/service-types.ts": {
       "mode": "100644",
@@ -2523,5 +2523,6 @@
       "sha256": "9c5aa10acada72503b56023cc19cf4520e500e35b19960da6e6546150b8060f8"
     }
   },
-  "stock_interoperability_claim": false
+  "stock_interoperability_claim": false,
+  "successor_requires_root_new_source_review": true
 }

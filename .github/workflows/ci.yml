@@ -23,7 +23,7 @@ jobs:
       github.ref == 'refs/heads/codex/diagnostic-sdk45-sender-renewal-20261029' &&
       github.actor == 'brk275' && github.triggering_actor == 'brk275' &&
       inputs.candidate_sha == github.sha &&
-      inputs.admission_sha256 == '70b23661c9d237258c2d836961d91d5003bddf1833ebabf2820c57b5f333f4fe'
+      inputs.admission_sha256 == 'e2acad8331702d1a4ed53e39ee977e962eb3e29914cfde65f6b79fb3dc99c1d9'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
