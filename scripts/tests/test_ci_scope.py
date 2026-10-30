@@ -400,7 +400,13 @@ class ScopeTests(unittest.TestCase):
                     event_selection({"inputs": {"platform": platform, "checks": "native-libraries",
                                                 "matrix_suite": suite}}, "workflow_dispatch")
         for event in ("push", "pull_request"):
-            self.assertEqual(event_selection({"inputs": {"checks": "native-libraries"}}, event)["check_route"], "all")
+            payload = {"inputs": {"checks": "native-libraries"}}
+            with patch("scripts.ci_scope.changed_paths", return_value=(["Cargo.lock"], False)) as changed:
+                selected = event_selection(payload, event)
+            changed.assert_called_once_with(payload, event)
+            self.assertEqual(selected, classify(["Cargo.lock"]) | {
+                "manual": False, "manual_platform": "all", "check_route": "all", "matrix_suite": "full",
+            })
 
     def test_desktop_video_batches_only_affected_checks_on_fixed_native_platforms(self):
         for platform, platforms in MANUAL_PLATFORMS.items():
