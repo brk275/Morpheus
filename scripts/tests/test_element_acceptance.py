@@ -52,6 +52,57 @@ class EvidenceTests(unittest.TestCase):
             target.evidence(failed, complete=True)
         self.assertEqual(target.diagnostics(failed), {"failure": "native_acceptance", "group_roster": facts})
 
+    def test_native_panic_location_is_one_fixed_source_and_bounded_line_only(self):
+        name = "thread '" + target.TEST_NAME + "'"
+        source = target.NATIVE_FAILURE_SOURCE
+        expected = {"file": source, "line": 1308, "category": "panic"}
+        for thread in (name, name + " (1234)"):
+            raw = thread + " panicked at " + source + ":1308:6:\nopaque-fixture-password\n"
+            self.assertEqual(target.native_panic_location(raw), expected)
+        valid = name + " panicked at " + source + ":1308:6:"
+        self.assertIsNone(target.native_panic_location("ordinary private log"))
+        self.assertIsNone(target.native_panic_location("embedded " + valid))
+        for raw in (valid + "\n" + valid, valid + " opaque-fixture-password",
+                    valid.replace(source, "/private/opaque-fixture-password"),
+                    valid.replace(":1308:", ":0:"), valid.replace(":1308:", ":1417:"),
+                    valid.replace(":1308:", ":01308:"), valid.replace(":1308:", ":1.0:"),
+                    valid.replace(":6:", ":0:"), valid.replace(":6:", ":4097:"),
+                    name + " x" * 256):
+            with self.subTest(raw=raw[:40]):
+                self.assertEqual(target.native_panic_location(raw), "invalid")
+        # Bind this diagnostic's line cap to the unchanged actual test source.
+        self.assertEqual(len((target.REPO / source).read_bytes().splitlines()), target.NATIVE_FAILURE_MAX_LINE)
+
+    def test_native_failure_receipt_is_typed_and_cannot_satisfy_any_call_fact(self):
+        expected = {"file": target.NATIVE_FAILURE_SOURCE, "line": 1308, "category": "panic"}
+        raw = target.NATIVE_FAILURE_PREFIX + json.dumps(expected) + "\n"
+        self.assertEqual(target.native_failure_location(raw), expected)
+        self.assertEqual(target.diagnostics(raw), {"native_failure": expected})
+        self.assertEqual(target.diagnostics(raw, include_native=False), {})
+        self.assertIsNone(target.native_failure_location("ordinary private text"))
+        self.assertIsNone(target.native_failure_location("embedded " + raw))
+        invalid = [raw + raw, target.NATIVE_FAILURE_PREFIX + "x" * 256,
+                   target.NATIVE_FAILURE_PREFIX + '"invalid"', target.NATIVE_FAILURE_PREFIX + "[]",
+                   target.NATIVE_FAILURE_PREFIX + json.dumps(expected | {"private_owner": "opaque-fixture-password"}),
+                   target.NATIVE_FAILURE_PREFIX + json.dumps(expected)[:-1] + ',"line":1308}',
+                   target.NATIVE_FAILURE_PREFIX + json.dumps(expected | {"file": "opaque-fixture-password"}),
+                   target.NATIVE_FAILURE_PREFIX + json.dumps(expected | {"category": "opaque-fixture-password"}),
+                   target.NATIVE_FAILURE_PREFIX + json.dumps({key:value for key,value in expected.items() if key!="line"}),
+                   target.NATIVE_FAILURE_PREFIX + "é"]
+        for value in (True, False, 0, -1, 1417, 1308.0, "1308", None, [], {}):
+            invalid.append(target.NATIVE_FAILURE_PREFIX + json.dumps(expected | {"line": value}))
+        for malformed in invalid:
+            with self.subTest(malformed=malformed[:40]):
+                self.assertEqual(target.native_failure_location(malformed), "invalid")
+                self.assertEqual(target.diagnostics(malformed), {"native_failure": "invalid"})
+        with mock.patch.object(target.json, "loads") as parse:
+            self.assertEqual(target.native_failure_location(target.NATIVE_FAILURE_PREFIX + "x" * 256), "invalid")
+            parse.assert_not_called()
+        complete = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in target.CHECKS)
+        self.assertEqual(target.evidence(raw + complete, complete=True), dict.fromkeys(target.CHECKS, True))
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(raw + complete + "\nMORPHEUS_ELEMENT_FAILURE native_acceptance", complete=True)
+
     def test_requires_every_fixed_assertion_and_preserves_failure(self):
         complete = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in target.CHECKS)
         self.assertEqual(target.evidence(complete, complete=True), dict.fromkeys(target.CHECKS, True))
@@ -129,7 +180,9 @@ class EvidenceTests(unittest.TestCase):
                 roster_facts = {field: True for field in target.GROUP_ROSTER_FIELDS}
                 roster_line = target.GROUP_ROSTER_PREFIX + json.dumps(roster_facts) + "\n"
                 native = self.anchored_log(runner, "native.log", (
-                    "opaque-fixture-panic\nMORPHEUS_ELEMENT_CHECK native_audio=true\n"
+                    "thread '" + target.TEST_NAME + "' (1234) panicked at "
+                    + target.NATIVE_FAILURE_SOURCE + ":1308:6:\nopaque-fixture-panic\n"
+                    + "MORPHEUS_ELEMENT_CHECK native_audio=true\n"
                     + target.NATIVE_STAGE_PREFIX + "microphone_cryptor\n"
                     + target.NATIVE_STAGE_PREFIX + "late_login\n" + roster_line).encode())
                 browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
@@ -180,6 +233,9 @@ class EvidenceTests(unittest.TestCase):
                 admitted_roster = scanner_status == 0 and not join_failure and not service_failure
                 self.assertEqual(target.diagnostics(output).get("group_roster"),
                                  roster_facts if admitted_roster else None)
+                self.assertEqual(target.diagnostics(output).get("native_failure"),
+                                 {"file": target.NATIVE_FAILURE_SOURCE, "line": 1308, "category": "panic"}
+                                 if admitted_roster else None)
                 self.assertEqual(target.evidence(output),
                                  {"native_audio": True, "official_image": True} if scanner_status == 0 and not join_failure and not service_failure else {})
                 self.assertEqual(target.diagnostics(output).get("native_stage"),
