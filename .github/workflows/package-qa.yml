@@ -491,7 +491,7 @@ jobs:
         shell: bash
         run: |
           python3 -I -B - <<'NATIVE_UPDATE_SCANNER'
-          import hashlib, io, json, os, pathlib, platform, sys, tarfile, tempfile, urllib.parse, urllib.request, zipfile
+          import hashlib, io, json, os, pathlib, platform, re, sys, tarfile, tempfile, urllib.parse, urllib.request, zipfile
 
           MAX_SCANNER_BYTES = 32 * 1024 * 1024
 
@@ -551,8 +551,30 @@ jobs:
               asset, archive_hash, binary_hash, kind = pins[(sys.platform, platform.machine())]
               temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
               assert temporary.is_dir() and not any(c in str(temporary) for c in "\r\n")
-              root = pathlib.Path(tempfile.mkdtemp(prefix="morpheus-native-update-scanner-", dir=temporary))
-              root.chmod(0o700)
+              if sys.platform == "win32":
+                  # Import one byte-pinned helper from this immutable workflow
+                  # revision, never the selected checkout or PYTHONPATH.
+                  workflow_revision = os.environ["GITHUB_SHA"]
+                  assert re.fullmatch(r"[0-9a-f]{40}", workflow_revision)
+                  class NoHelperRedirect(urllib.request.HTTPRedirectHandler):
+                      def redirect_request(self, *args, **kwargs):
+                          raise ValueError("Trusted ownership helper redirect rejected")
+                  helper_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoHelperRedirect())
+                  helper_url = ("https://raw.githubusercontent.com/brk275/Morpheus/" + workflow_revision
+                                + "/scripts/native_notice_windows.py")
+                  with helper_opener.open(helper_url, timeout=30) as response:
+                      assert response.status == 200
+                      helper = response.read(65537)
+                  assert len(helper) <= 65536 and hashlib.sha256(helper).hexdigest() == "4fd3c52bb508da4c7ec52a63d21c2e5aa3cc3576a5ec6317f3c15ca7b729b626"
+                  namespace = {"__name__":"morpheus_trusted_native_notice_windows"}
+                  exec(compile(helper, "<pinned workflow ownership helper>", "exec"), namespace)
+                  security = namespace["security"]()
+                  parent = security.path(pathlib.Path.home().resolve(strict=True), directory=True)
+                  root = security.create_root(parent)
+              else:
+                  parent = temporary
+                  root = pathlib.Path(tempfile.mkdtemp(prefix="morpheus-native-update-scanner-", dir=parent))
+                  root.chmod(0o700)
               opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), ScannerRedirect())
               request = urllib.request.Request("https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/" + asset)
               with opener.open(request, timeout=120) as response:
@@ -562,8 +584,32 @@ jobs:
               with scanner.open("xb") as output:
                   output.write(binary)
               scanner.chmod(0o500)
+              # Reserve and mark the source root before any acquisition step.
+              # This immutable controller owns provider GITHUB_ENV; the source
+              # helper validates the private root and never writes that channel.
+              revision = os.environ["MORPHEUS_PACKAGE_SOURCE_REVISION"]
+              assert re.fullmatch(r"[0-9a-f]{40}", revision)
+              if sys.platform == "win32":
+                  source_root = security.create_root(parent)
+              else:
+                  source_root = pathlib.Path(tempfile.mkdtemp(prefix="morpheus-native-source-", dir=parent))
+                  source_root.chmod(0o700)
+              info = source_root.lstat()
+              marker = {"schema":1, "device":info.st_dev, "inode":info.st_ino, "source_revision":revision}
+              with (source_root/"owner.json").open("xb") as output:
+                  if sys.platform != "win32": os.fchmod(output.fileno(), 0o600)
+                  output.write(json.dumps(marker, sort_keys=True).encode("utf-8") + b"\n")
+                  output.flush(); os.fsync(output.fileno())
+              fields = {
+                  "MORPHEUS_NATIVE_QA_SCANNER": str(scanner),
+                  "MORPHEUS_NATIVE_SOURCE_ROOT": str(source_root),
+                  "MORPHEUS_NATIVE_SOURCE_BUNDLE": str(source_root/"output"/"morpheus-corresponding-source.tar.gz"),
+                  "MORPHEUS_NATIVE_SOURCE_RECEIPT": str(source_root/"receipt.json"),
+              }
+              assert all(len(value) <= 4096 and not any(c in value for c in "\r\n\0") for value in fields.values())
               with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
-                  output.write("MORPHEUS_NATIVE_QA_SCANNER=" + str(scanner) + "\n")
+                  for name, value in fields.items(): output.write(name + "=" + value + "\n")
+                  output.flush(); os.fsync(output.fileno())
                   if sys.platform == "darwin" and os.environ.get("MORPHEUS_NATIVE_UPDATES_SELECTED") == "true":
                       target = pathlib.Path(tempfile.mkdtemp(prefix="morpheus-mac-update-target-", dir=temporary))
                       target.chmod(0o700)

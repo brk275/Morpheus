@@ -409,14 +409,27 @@ def input_plan(home, packages, runner, environment, git):
     return {"schema":1,"registry_cache":str(cache),"git_mirrors":result}
 
 
-def publish_environment(root, environment):
-    path = checked(Path(environment["GITHUB_ENV"]))
-    require(not any(c in str(root) for c in "\r\n\0") and path.stat().st_size < 1024*1024)
-    with path.open("ab") as stream:
-        stream.write(("MORPHEUS_NATIVE_SOURCE_ROOT="+str(root)+"\n").encode())
-        stream.write(("MORPHEUS_NATIVE_SOURCE_BUNDLE="+str(root/"output"/S.BUNDLE_NAME)+"\n").encode())
-        stream.write(("MORPHEUS_NATIVE_SOURCE_RECEIPT="+str(root/"receipt.json")+"\n").encode())
-        stream.flush();os.fsync(stream.fileno())
+def source_parent(environment):
+    # A source tree requires the unchanged owned-source policy. The shared
+    # provider TEMP/command directory is not a Windows source-tree parent.
+    parent = Path.home().resolve(strict=True) if os.name == "nt" else Path(environment["RUNNER_TEMP"])
+    return _notice_checked("temp_parent", parent, directory=True)
+
+
+def owned_source_root(environment):
+    parent = source_parent(environment)
+    root = _notice_checked("private_root", Path(environment["MORPHEUS_NATIVE_SOURCE_ROOT"]),
+                           directory=True, private=True)
+    require(root.parent == parent and re.fullmatch(r"morpheus-native-source-[a-z0-9_]{8,32}", root.name))
+    require(environment["MORPHEUS_NATIVE_SOURCE_BUNDLE"] == str(root/"output"/S.BUNDLE_NAME)
+            and environment["MORPHEUS_NATIVE_SOURCE_RECEIPT"] == str(root/"receipt.json"))
+    _notice_phase("owner_marker")
+    marker = S.unique_json(S.read_owned(root/"owner.json", 4096, private=True))
+    info = root.lstat()
+    require(type(marker) is dict and all(type(marker.get(key)) is int for key in ("schema", "device", "inode"))
+            and marker == {"schema":1, "device":info.st_dev, "inode":info.st_ino,
+                           "source_revision":R.expected_revision(environment)})
+    return root
 
 
 
@@ -438,22 +451,21 @@ def fetch_export(root, files, identity):
 
 def prepare(environment, scanner):
     guard(environment)
+    root = owned_source_root(environment)
+    # Only the immutable workflow controller creates/reserves this root. Never
+    # reuse a partial acquisition or infer output destinations from borrowed data.
+    require({path.name for path in root.iterdir()} == {"owner.json"})
     scanner=_notice_checked("scanner_path",scanner)
     _notice_phase("scanner_hash")
     require(S.digest(N.read_regular(scanner,32*1024**2))==SCANNERS[(sys.platform,platform.machine())])
     cargo,rustc,git,rustup=tools(environment)
-    parent=_notice_checked("temp_parent",Path(environment["RUNNER_TEMP"]),directory=True)
-    _notice_phase("private_root")
-    root = S.windows_security().create_root(parent) if os.name=="nt" else Path(tempfile.mkdtemp(prefix="morpheus-native-source-",dir=parent))
-    if os.name!="nt":root.chmod(0o700)
-    _notice_phase("owner_marker")
-    info=root.lstat();revision=R.expected_revision(environment)
-    write_new(root/"owner.json",json.dumps({"schema":1,"device":info.st_dev,"inode":info.st_ino,"source_revision":revision}).encode()+b"\n")
-    # Publish before acquisition so the always-step can scan and remove a failed
-    # owned tree. No bundle/receipt consumer runs if this step fails.
-    _notice_phase("publish")
-    publish_environment(root,environment)
+    revision=R.expected_revision(environment)
+    # The trusted controller already published the exact owned paths for the
+    # always-cleanup step. Acquisition never opens a provider command file.
     _notice_phase("source")
+    # Irreversible phase marker precedes every Commands/child admission. A
+    # killed/partial acquisition can never resemble an untouched reservation.
+    write_new(root/"acquisition-started.json", json.dumps({"schema":1, "source_revision":revision}).encode()+b"\n")
     for name in ("home","cargo","fetch","target","temp","logs","output"):(root/name).mkdir(mode=0o700)
     controlled=environment_for_acquisition(environment,root,cargo,rustc,git,rustup)
     commands=Commands(root,controlled);success=False;scanned=False
@@ -490,11 +502,16 @@ def prepare(environment, scanner):
 def finish(environment, scanner):
     guard(environment)
     _notice_phase("cleanup")
-    parent=checked(Path(environment["RUNNER_TEMP"]),directory=True)
-    root=checked(Path(environment["MORPHEUS_NATIVE_SOURCE_ROOT"]),directory=True,private=True)
-    require(root.parent==parent and re.fullmatch(r"morpheus-native-source-[a-z0-9_]{8,32}",root.name))
-    marker=S.unique_json(S.read_owned(root/"owner.json",4096,private=True)); info=root.lstat()
-    require(marker=={"schema":1,"device":info.st_dev,"inode":info.st_ino,"source_revision":R.expected_revision(environment)})
+    root = owned_source_root(environment)
+    _notice_phase("cleanup")
+    if {path.name for path in root.iterdir()} == {"owner.json"}:
+        # Preparation failed before creating any acquisition directories, so no
+        # Commands child could have started. Remove only this validated empty
+        # reservation; do not manufacture log/stop receipts for an acquisition.
+        (root/"owner.json").unlink()
+        root.rmdir()
+        print('{"check":"native_notice_source_reservation_removed","passed":true,"distribution_ready":false}')
+        return
     state=S.unique_json(S.read_owned(root/"state.json",4096,private=True))
     require(set(state)=={"schema","source_revision","prepared","logs_scanned","logs_complete","owned_processes_stopped","distribution_ready"}
         and state["schema"]==1 and state["source_revision"]==R.expected_revision(environment)
