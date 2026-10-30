@@ -183,6 +183,8 @@ pub enum RtcCallEnd {
     /// The SFU connection this device publishes on closed and the transport
     /// gave up reconnecting it. The membership may still be published.
     ConnectionLost,
+    /// Identity/auth ambiguity permanently refused this call; never rejoin it.
+    IdentityRejected,
     /// The SFU deliberately removed this participant: an administrator
     /// removed it, deleted the room, or the same identity joined elsewhere.
     /// Rejoining automatically would undo that decision.
@@ -213,6 +215,7 @@ impl RtcConnectionSignal {
                 let end = match reason {
                     EndedReason::Left => RtcCallEnd::Left,
                     EndedReason::SlotClosed => RtcCallEnd::SlotClosed,
+                    EndedReason::IdentityRejected => RtcCallEnd::IdentityRejected,
                     EndedReason::ConnectionClosed { message } if removed_by_server(message) => {
                         RtcCallEnd::Removed
                     }
@@ -285,6 +288,17 @@ mod tests {
         let mut random = ReconnectBackoff::new(policy(), start);
         let delay = random.next_attempt(start).unwrap();
         assert!(delay >= Duration::from_millis(800) && delay <= Duration::from_secs(1));
+    }
+
+    #[cfg(feature = "native-rtc")]
+    #[test]
+    fn identity_refusal_preserves_its_terminal_reason() {
+        assert_eq!(
+            RtcConnectionSignal::from_event(&matrix_rtc_call_sdk::CallEvent::Ended {
+                reason: matrix_rtc_call_sdk::EndedReason::IdentityRejected,
+            }),
+            Some(RtcConnectionSignal::Ended(RtcCallEnd::IdentityRejected)),
+        );
     }
 
     #[cfg(feature = "native-rtc")]
