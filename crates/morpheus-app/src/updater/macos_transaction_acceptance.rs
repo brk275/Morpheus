@@ -575,14 +575,20 @@ impl UiRun {
     ) -> Result<(), UpdateError> {
         let mut staged = self.run.signed_stage(false)?;
         let mut startup = startup.lock().map_err(|_| UpdateError::RecoveryRequired)?;
-        let session = startup.macapp.as_mut().ok_or(UpdateError::RecoveryRequired)?;
+        let session = startup
+            .macapp
+            .as_mut()
+            .ok_or(UpdateError::RecoveryRequired)?;
         require(session.installed == self.run.installed && session.state == self.run.state)?;
         let lease = activity.try_install()?;
         let bytes = staged.verified_bytes()?;
         let restart = prepare_restart_admitted(session, &bytes, staged.version(), lease)?;
         self.run.mark("prepared")?;
         restart.launch_supervisor()?;
-        require(matches!(activity.try_start_call(), Err(UpdateError::UpdateActive)))?;
+        require(matches!(
+            activity.try_start_call(),
+            Err(UpdateError::UpdateActive)
+        ))?;
         self.run.mark("helper_ready_lease_held")?;
         RETAINED.with(|children| {
             let children = children.borrow();
@@ -613,7 +619,10 @@ impl UiRun {
             }
         };
         let completed: Result<(), UpdateError> = (|| {
-            let session = startup.macapp.as_ref().ok_or(UpdateError::RecoveryRequired)?;
+            let session = startup
+                .macapp
+                .as_ref()
+                .ok_or(UpdateError::RecoveryRequired)?;
             let journal = session.journal()?.ok_or(UpdateError::RecoveryRequired)?;
             require(
                 journal.phase == Phase::Prepared
@@ -683,11 +692,10 @@ pub(crate) fn dispatch() -> Result<(), UpdateError> {
             )
         }
         Some("--morpheus-mac-update-trial") if args.len() == 3 => startup(&run, true),
-        None
-            if args.len() == 1
-                && (!run.plan.case.normal_ui()
-                    || (run.seen("normal_ui_owners_drained")
-                        && run.seen("helper_parent_exit_observed"))) =>
+        None if args.len() == 1
+            && (!run.plan.case.normal_ui()
+                || (run.seen("normal_ui_owners_drained")
+                    && run.seen("helper_parent_exit_observed"))) =>
         {
             startup(&run, false)
         }

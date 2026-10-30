@@ -465,8 +465,10 @@ fn focused_control_has_label(ui: &impl slint::ComponentHandle, expected: &str) -
         };
         let parent_component = VRc::borrow_pin(parent.item_tree());
         let parent_nodes = parent_component.as_ref().get_item_tree();
-        let Some(ItemTreeNode::DynamicTree { index, parent_index }) =
-            parent_nodes.as_slice().get(parent.index() as usize)
+        let Some(ItemTreeNode::DynamicTree {
+            index,
+            parent_index,
+        }) = parent_nodes.as_slice().get(parent.index() as usize)
         else {
             return false;
         };
@@ -474,18 +476,19 @@ fn focused_control_has_label(ui: &impl slint::ComponentHandle, expected: &str) -
         let current_index = component.as_ref().subtree_index();
         // Conditional/component-container roots have no model index. They
         // occupy their sole existing slot; repeaters retain their model index.
-        let current_index = if current_index == usize::MAX
-            && range.end.checked_sub(range.start) == Some(1)
-        {
-            range.start
-        } else {
-            current_index
-        };
+        let current_index =
+            if current_index == usize::MAX && range.end.checked_sub(range.start) == Some(1) {
+                range.start
+            } else {
+                current_index
+            };
         if current_index < range.start || current_index >= range.end {
             return false;
         }
         let mut current = Default::default();
-        parent_component.as_ref().get_subtree(*index, current_index, &mut current);
+        parent_component
+            .as_ref()
+            .get_subtree(*index, current_index, &mut current);
         let Some(current) = current.upgrade() else {
             return false;
         };
