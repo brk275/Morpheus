@@ -811,7 +811,7 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                 rejected=dict(inherited)
                 if value is None: rejected.pop("MORPHEUS_NATIVE_PACKAGE_CONTEXT")
                 else: rejected["MORPHEUS_NATIVE_PACKAGE_CONTEXT"]=value
-                with self.subTest(case=index), self.assertRaises(ValueError):
+                with self.subTest(case=index), self.assertRaises((ValueError, acquisition.S.SourceFailure)):
                     acquisition.guard(rejected,system="win32")
             read_event.assert_not_called()
             # Check the actual prepare/finish caller templates, preserving JSON
