@@ -610,9 +610,9 @@ class ScopeTests(unittest.TestCase):
         # comparisons with owned fixture bytes under test-only pins, so a
         # future different workflow can safely fall back all without requiring
         # its execution layout to be admitted by this exemption.
-        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 71746)
+        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 72278)
         self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
-                         "702f44b0cd1b3c28426f9fb770280e1e32452550bb5322069217790d7371246e")
+                         "ccff722eacd2efc7d8612d9ec491b62f85d306b05530a62130a7c1e9649a1f2b")
         import hashlib
         with patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_BYTES", len(workflow)), \
                 patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_SHA256", hashlib.sha256(workflow).hexdigest()):

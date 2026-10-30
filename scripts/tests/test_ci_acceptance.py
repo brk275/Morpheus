@@ -445,6 +445,25 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertIn("github.triggering_actor == github.repository_owner", source)
         self.assertIn("'Focused CI acceptance (partial)' || 'CI acceptance'", source)
 
+    def test_device_units_match_app_feature_union_only_when_app_is_selected(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        step = source.split("      - name: Test native device and call guards\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("        id: device-tests\n", step)
+        self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'devices')", step)
+        self.assertIn("MORPHEUS_DEVICE_CHECK_ROUTE: ${{ needs.scope.outputs.check_route }}", step)
+        self.assertIn("          set -euo pipefail\n", step)
+        common, focused = step.split("            devices)\n", 1)
+        self.assertIn("            all|native)\n", common)
+        self.assertIn("cargo test --locked -p morpheus-app -p morpheus-rtc --features morpheus-app/native-calls --lib", common)
+        self.assertIn("cargo test --locked -p morpheus-rtc --features native-devices --lib", focused)
+        self.assertNotIn("-p morpheus-app", focused)
+        self.assertIn("            *) exit 1 ;;\n", focused)
+        self.assertEqual(step.count("cargo test "), 2)
+        self.assertNotIn("--bin", step)
+        self.assertNotIn("continue-on-error", step)
+        self.assertIn("run: cargo build --locked -p morpheus-app --features native-calls\n", source)
+        self.assertIn("run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app\n", source)
+
     def test_pure_vendor_regressions_keep_exact_original_tests_without_app_rebuild(self):
         source = WORKFLOW.read_text(encoding="utf-8")
         step = source.split("      - name: Test vendored security fixes\n", 1)[1].split("      - name:", 1)[0]

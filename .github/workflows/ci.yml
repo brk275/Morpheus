@@ -470,7 +470,21 @@ jobs:
       - name: Test native device and call guards
         id: device-tests
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'devices')
-        run: cargo test --locked -p morpheus-rtc --features native-devices --lib
+        shell: bash
+        env:
+          MORPHEUS_DEVICE_CHECK_ROUTE: ${{ needs.scope.outputs.check_route }}
+        run: |
+          set -euo pipefail
+          case "$MORPHEUS_DEVICE_CHECK_ROUTE" in
+            all|native)
+              # Match the preceding app tests' dependency feature union; only RTC has a lib target.
+              cargo test --locked -p morpheus-app -p morpheus-rtc --features morpheus-app/native-calls --lib
+              ;;
+            devices)
+              cargo test --locked -p morpheus-rtc --features native-devices --lib
+              ;;
+            *) exit 1 ;;
+          esac
       - name: Test Windows capture of an owned synthetic window and display
         id: windows-capture-tests
         if: runner.os == 'Windows' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'native' || needs.scope.outputs.check_route == 'devices')
