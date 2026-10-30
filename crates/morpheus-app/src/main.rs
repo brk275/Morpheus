@@ -1698,10 +1698,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::hint::black_box(&ENTRY);
         return updater::run_windows_update_acceptance();
     }
-    // The synthetic transaction variant never enters config, network, UI,
-    // accounts or vault initialization, even with missing/invalid arguments.
-    #[cfg(morpheus_macos_update_acceptance)]
-    return updater::run_macos_update_acceptance().map_err(Into::into);
+    // Existing transaction actors still exit before all application owners.
+    // Only the authenticated, compile-gated GUI fixture may continue below.
+    #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+    let macos_update_acceptance = match updater::run_macos_update_acceptance()? {
+        Some(ui) => ui,
+        None => return Ok(()),
+    };
     #[cfg(not(morpheus_macos_update_acceptance))]
     updater::reject_macos_update_acceptance_request()?;
     #[cfg(not(morpheus_windows_update_acceptance))]
@@ -1733,7 +1736,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     // Declared first and dropped last, after runtimes/account workers stop.
+    #[cfg(not(all(target_os = "macos", morpheus_macos_update_acceptance)))]
     let update_session = Arc::new(Mutex::new(updater::StartupSession::begin()?));
+    #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+    let update_session = Arc::new(Mutex::new(macos_update_acceptance.startup()?));
     if update_session
         .lock()
         .map_err(|_| updater::UpdateError::RecoveryRequired)?
@@ -1747,7 +1753,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         update_session.clone(),
         #[cfg(morpheus_timeline_acceptance)]
         acceptance,
+        #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+        &macos_update_acceptance,
     )?;
+    // This is reached only after the real AppWindow coordinator, runtime and
+    // all run_application owners have completed their ordinary shutdown.
+    #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+    let _macos_update_root = macos_update_acceptance.finish(update_session)?;
     #[cfg(target_os = "linux")]
     updater::complete_linux_shutdown(update_session)?;
     Ok(())
@@ -1756,6 +1768,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_application(
     update_session: Arc<Mutex<updater::StartupSession>>,
     #[cfg(morpheus_timeline_acceptance)] mut acceptance: timeline_acceptance::Acceptance,
+    #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+    macos_update_acceptance: &updater::MacUpdateAcceptanceUi,
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     morpheus_rtc::install_crypto_provider();
@@ -1772,8 +1786,13 @@ fn run_application(
         .lock()
         .map_err(|_| updater::UpdateError::RecoveryRequired)?
         .acknowledge_before_store()?;
-    #[cfg(not(morpheus_timeline_acceptance))]
+    #[cfg(not(any(
+        morpheus_timeline_acceptance,
+        all(target_os = "macos", morpheus_macos_update_acceptance)
+    )))]
     let qa_profile = qa_profile_root()?;
+    #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+    let qa_profile = Some(macos_update_acceptance.profile()?);
     // The run's generated, isolated profile replaces the standard app paths.
     #[cfg(morpheus_timeline_acceptance)]
     let qa_profile = Some(acceptance.profile_root().to_path_buf());
@@ -4830,6 +4849,9 @@ fn run_application(
     let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
     // Allocate actual cleanup captures before the task can run or panic.
     // The once-only origin conclusion retains the same pack on uncertainty.
+    #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+    let macos_update_preparation =
+        macos_update_acceptance.prepare(&update_session, &update_activity);
     #[cfg(target_os = "macos")]
     let macos_resources = macos_shutdown::Resources::new(
         manager.clone(),
@@ -4936,6 +4958,15 @@ fn run_application(
         coordinator.after_event_loop_return();
         let shutdown_result = coordinator.finish_after_event_loop();
         ui_result?;
+        #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+        {
+            // Preparation failures still pass through the actual normal owner
+            // drain; they never become a successful fixture handoff.
+            shutdown_result.map_err(macos_shutdown::ShutdownError)?;
+            macos_update_preparation?;
+            return Ok(());
+        }
+        #[cfg(not(all(target_os = "macos", morpheus_macos_update_acceptance)))]
         return shutdown_result.map_err(|failure| {
             Box::new(macos_shutdown::ShutdownError(failure)) as Box<dyn std::error::Error>
         });

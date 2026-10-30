@@ -71,8 +71,11 @@ fn reject_macos_update_acceptance_inputs(
 }
 
 #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
-pub(crate) fn run_macos_update_acceptance() -> Result<(), UpdateError> {
-    macos_transaction::acceptance::dispatch()
+pub(crate) use macos_transaction::acceptance::UiRun as MacUpdateAcceptanceUi;
+
+#[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+pub(crate) fn run_macos_update_acceptance() -> Result<Option<MacUpdateAcceptanceUi>, UpdateError> {
+    macos_transaction::acceptance::entry()
 }
 #[cfg(target_os = "windows")]
 mod windows_transaction;

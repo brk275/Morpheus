@@ -2,10 +2,11 @@
 """Private, explicit free-hosted Mac bundle transaction acceptance.
 
 Two nonce-separated release packages exercise production signature/staging,
-bundle/helper/trial/health/recovery code. No UI, account, vault or network client
-is initialized. The synthetic old parent actually exits under owned observation;
-this does not prove normal AppWindow/shipping shutdown, feed/download/TLS,
-Developer ID, power loss or device behavior.
+bundle/helper/trial/health/recovery code. Original actors remain non-GUI. Three
+additional cases close the real installed GUI with an owned empty profile and
+pending validated update, requiring actual normal owner drain and old-parent
+exit before helper apply. Child startup actors remain non-GUI; this does not
+prove update buttons/feed/download/TLS, Developer ID, power loss or devices.
 """
 from __future__ import annotations
 
@@ -55,11 +56,17 @@ MARKERS = {
     "trial_failure_rollback": {"prepared", "helper_ready_lease_held", "synthetic_shutdown", "trial_failed_before_health",
                                "old_restart_before_store", "rollback_preserved_old"},
 }
+NORMAL_UI_CASES = ("normal_ui_upgrade", "normal_ui_after_apply_recovery", "normal_ui_trial_failure_rollback")
 HELPER_CASES = frozenset(("upgrade", "tampered_stage", "after_apply_recovery", "trial_failure_rollback"))
 for _case in HELPER_CASES:
     MARKERS[_case] |= {"helper_ticket_ready", "helper_observer_armed", "old_actor_exit_observed",
                       "helper_parent_exit_observed"}
-STAGES = frozenset(("preflight", "export", "build_old", "build_new", "signing", "log_scan", "cleanup", "complete", *CASES))
+for _case in NORMAL_UI_CASES:
+    MARKERS[_case] = (MARKERS[_case.removeprefix("normal_ui_")]
+                      - {"synthetic_shutdown", "old_actor_exit_observed"}) | {
+                          "normal_ui_ready", "normal_ui_owners_drained", "normal_ui_parent_exit_observed"}
+STAGES = frozenset(("preflight", "export", "build_old", "build_new", "signing", "log_scan", "cleanup", "complete",
+                    *CASES, *NORMAL_UI_CASES))
 SCANNER_SHA256 = {
     "arm64": "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f",
     "x86_64": "cee01fea7173f1b779dff188e1c26ecbcb4027d394acc573b23aaf0be260e291",
@@ -552,6 +559,85 @@ def run_case(commands, case, old, old_receipt, new_receipt, public, signature, n
     return True
 
 
+def run_normal_ui_case(commands, case, old, old_receipt, new_receipt, public, signature, nonce, bridge_binary):
+    require(case in NORMAL_UI_CASES)
+    root = private_new(commands.root / case)
+    private_new(root / "events")
+    private_new(root / "profile")
+    installed = root / "Morpheus.app"
+    copy_bundle(old / "Morpheus.app", installed, old_receipt["bundle_sha256"])
+    plan = {"schema": 1, "nonce": nonce, "case": case, "old_version": old_receipt["version"],
+            "new_version": new_receipt["version"], "old_tree_sha256": old_receipt["bundle_sha256"],
+            "new_tree_sha256": new_receipt["bundle_sha256"], "archive_sha256": new_receipt["sha256"],
+            "public_key": public, "signature": signature}
+    private_write(root / "run.json", json.dumps(plan, sort_keys=True).encode("ascii"))
+    actor_env = {"MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN": str(root / "run.json")}
+    diagnostics = owned.Diagnostics({})
+    commands.sequence += 1
+    bridge_log = commands.logs / f"{commands.sequence:03d}.log"
+    fd = os.open(bridge_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    bridge = None
+    with os.fdopen(fd, "wb") as output:
+        try:
+            bridge = owned.Bridge(owned.bridge_command(bridge_binary), diagnostics,
+                                  environment=commands.environment, log=output)
+            # No TCC prompt or permission change. Fail before any GUI launch.
+            owned.check_permissions(bridge, diagnostics)
+            process, log = commands.start([str(installed / APP), "--morpheus-mac-qa-normal-ui"], extra=actor_env)
+            wait_event(root, "helper_ticket_ready", process, log)
+            observer = HelperExit(commands, process, root, nonce, old_receipt, new_receipt)
+            private_write(root / "events/helper_observer_armed", MARKER_BYTES)
+            wait_event(root, "normal_ui_ready", process, log)
+            owned.attach_owned(bridge, process, installed / APP, owned.installed_bundle(installed / APP), diagnostics)
+            owned.owned_window(bridge, process, diagnostics)
+            # Existing native AX close: retains this exact parent, requires real
+            # status zero and no live same-group descendants, never fabricates it.
+            owned.normal_close(bridge, process, diagnostics, installed / APP)
+            commands.finish_actor(process, log)
+            require(event_seen(root, "normal_ui_owners_drained"))
+            private_write(root / "events/normal_ui_parent_exit_observed", MARKER_BYTES)
+        finally:
+            # A failed GUI/helper remains in Commands.pending/observer ownership;
+            # no orphan PID kill or successful private cleanup is inferred.
+            if bridge is not None:
+                try:
+                    bridge.close()
+                except BaseException:
+                    commands.cleanup_failed = True
+                    raise
+    if case == "normal_ui_after_apply_recovery":
+        wait_helper_event(root, "after_apply_before_trial", observer)
+        private_write(root / "events/force_exit_after_apply", MARKER_BYTES)
+        observer.finish(expected=FORCED_AFTER_APPLY_EXIT)
+        private_write(root / "events/owned_helper_interrupted", MARKER_BYTES)
+    else:
+        observer.finish(expected=0 if case == "normal_ui_upgrade" else 1)
+    require(event_seen(root, "helper_parent_exit_observed"))
+    if case == "normal_ui_upgrade":
+        journal = json.loads(bounded(root / STATE / "journal.json", 16 * 1024), object_pairs_hook=closed_object)
+        require(journal["phase"] == "Committed" and journal["new_hash"] == new_receipt["bundle_sha256"]
+                and payload._snapshot(root / STATE / "previous.app")["tree_sha256"] == old_receipt["bundle_sha256"])
+    if case in {"normal_ui_upgrade", "normal_ui_after_apply_recovery"}:
+        # This child deliberately remains the existing non-GUI startup actor.
+        restarted, restart_log = commands.start([str(installed / APP)], extra=actor_env)
+        commands.finish_actor(restarted, restart_log, seconds=420)
+    expected = new_receipt if case == "normal_ui_upgrade" else old_receipt
+    require(payload._snapshot(installed)["tree_sha256"] == expected["bundle_sha256"]
+            and not (root / STATE / "journal.json").exists()
+            and not (root / STATE / "previous.app").exists()
+            and not (root / STATE / "next.app").exists())
+    if case == "normal_ui_upgrade":
+        private_write(root / "events/upgrade_and_committed_restart", MARKER_BYTES)
+    elif case == "normal_ui_trial_failure_rollback":
+        private_write(root / "events/rollback_preserved_old", MARKER_BYTES)
+    else:
+        private_write(root / "events/interrupted_recovery_preserved_old", MARKER_BYTES)
+    entries = {path.name for path in (root / "events").iterdir()}
+    require(entries == MARKERS[case] and all(event_seen(root, token) for token in entries))
+    require(not processes_in_fixture(root))
+    return True
+
+
 def wait_helper_event(root, token, observer):
     deadline = time.monotonic() + 180
     while not event_seen(root, token):
@@ -625,7 +711,8 @@ def main():
     args = parser.parse_args()
     report = {"schema": 1, "check": "installed_macos_transaction_synthetic", "status": "failed", "stage": "preflight",
               "checks": {}, "normal_ui_shutdown": False, "actual_old_parent_exit": False,
-              "production_group_cleanup": False, "power_loss": False, "installation_enabled": False}
+              "production_group_cleanup": False, "power_loss": False, "installation_enabled": False,
+              "update_button_restart": False, "child_normal_ui": False, "feed_transport": False}
     commands, root, completed = None, None, False
     try:
         hosted_guard(args.execute_on_free_hosted_runner)
@@ -673,6 +760,17 @@ def main():
         for case in CASES:
             report["stage"] = case
             report["checks"][case] = run_case(commands, case, old, old_receipt, new_receipt, public, signature, nonce)
+        bridge_binary = root / "morpheus-ax-bridge"
+        commands.run(["xcrun", "swiftc", "-O", "-module-name", "MorpheusAxBridge", "-o", str(bridge_binary),
+                      str(source / "scripts/macos_package_ui.swift")], seconds=600)
+        require(bridge_binary.is_file() and not bridge_binary.is_symlink())
+        for case in NORMAL_UI_CASES:
+            report["stage"] = case
+            report["checks"][case] = run_normal_ui_case(
+                commands, case, old, old_receipt, new_receipt, public, signature, nonce, bridge_binary)
+        report["normal_ui_shutdown"] = True
+        report["actual_old_parent_exit"] = True
+        report["production_group_cleanup"] = True
         report["checks"]["synthetic_parent_kernel_exit"] = True
         report["checks"]["owned_helper_kernel_exit"] = True
         report["checks"]["no_cleanup_after_apply_interruption"] = True

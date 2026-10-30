@@ -50,6 +50,63 @@ class InstalledUpdateTransactionBoundaryTests(unittest.TestCase):
                 with self.assertRaises(update_qa.Refused):
                     update_qa.hosted_guard(explicit, environment, event)
 
+    def test_normal_ui_permission_refusal_never_launches_the_application(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            logs = root / "logs"
+            logs.mkdir(mode=0o700)
+            commands = types.SimpleNamespace(root=root, logs=logs, sequence=0, environment={},
+                                             start=Mock(), cleanup_failed=False)
+            bridge = Mock()
+            old = {"version": "0.1.0", "bundle_sha256": "a" * 64}
+            new = {"version": "0.1.1", "bundle_sha256": "b" * 64, "sha256": "c" * 64}
+            with patch.object(update_qa, "copy_bundle"), patch.object(ui, "bridge_command", return_value=["bridge"]), \
+                    patch.object(ui, "Bridge", return_value=bridge), \
+                    patch.object(ui, "check_permissions", side_effect=ui.DiagnosticFailure("permission_unavailable")), \
+                    patch.object(update_qa, "HelperExit") as observe:
+                with self.assertRaises(ui.DiagnosticFailure):
+                    update_qa.run_normal_ui_case(commands, "normal_ui_upgrade", root, old, new,
+                                                "public-fixture", "signature-fixture", NONCE, root / "bridge")
+            commands.start.assert_not_called()
+            observe.assert_not_called()
+            bridge.close.assert_called_once()
+            self.assertTrue((root / "normal_ui_upgrade/profile").is_dir())
+            self.assertFalse(commands.cleanup_failed)
+
+    def test_normal_ui_close_or_missing_owner_receipt_cannot_accept_the_helper(self):
+        for close_error in (ui.DiagnosticFailure("process_remaining"), None):
+            with self.subTest(close_error=close_error), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                logs = root / "logs"
+                logs.mkdir(mode=0o700)
+                process, observer, bridge = Mock(), Mock(), Mock()
+                commands = types.SimpleNamespace(root=root, logs=logs, sequence=0, environment={},
+                                                 start=Mock(return_value=(process, root / "app.log")),
+                                                 finish_actor=Mock(), pending=[process],
+                                                 helper_observers=[observer], cleanup_failed=False)
+                old = {"version": "0.1.0", "bundle_sha256": "a" * 64}
+                new = {"version": "0.1.1", "bundle_sha256": "b" * 64, "sha256": "c" * 64}
+                with patch.object(update_qa, "copy_bundle"), patch.object(ui, "bridge_command", return_value=["bridge"]), \
+                        patch.object(ui, "Bridge", return_value=bridge), patch.object(ui, "check_permissions"), \
+                        patch.object(update_qa, "wait_event"), patch.object(update_qa, "HelperExit", return_value=observer), \
+                        patch.object(ui, "installed_bundle", return_value=smoke.IDENTIFIER), \
+                        patch.object(ui, "attach_owned"), patch.object(ui, "owned_window"), \
+                        patch.object(ui, "normal_close", side_effect=close_error) as close, \
+                        patch.object(update_qa, "event_seen", return_value=False):
+                    with self.assertRaises((ui.DiagnosticFailure, update_qa.Refused)):
+                        update_qa.run_normal_ui_case(commands, "normal_ui_upgrade", root, old, new,
+                                                    "public-fixture", "signature-fixture", NONCE, root / "bridge")
+                close.assert_called_once()
+                if close_error is not None:
+                    commands.finish_actor.assert_not_called()
+                else:
+                    commands.finish_actor.assert_called_once_with(process, root / "app.log")
+                observer.finish.assert_not_called()
+                self.assertEqual(commands.pending, [process])
+                self.assertEqual(commands.helper_observers, [observer])
+                self.assertFalse((root / "normal_ui_upgrade/events/normal_ui_parent_exit_observed").exists())
+                bridge.close.assert_called_once()
+
     def test_actor_environment_does_not_forward_keys_loader_config_or_activation(self):
         environment = self.environment() | {"PATH": "/fixed/toolchain", "DYLD_IMAGE_SUFFIX": "foreign",
                                             "MORPHEUS_UPDATE_PUBLIC_KEY": "foreign", "GITHUB_TOKEN": "foreign",

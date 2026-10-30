@@ -1,8 +1,8 @@
 //! Compile-gated synthetic installed-bundle transaction actors. Shipping builds
 //! contain no entry point or activation override. These actors never construct
-//! UI, runtimes, profiles, stores or network clients. The old actor really
-//! exits after its helper has an acknowledged kernel observer. This remains
-//! separate from normal AppWindow/account/media shutdown acceptance.
+//! UI, runtimes, profiles, stores or network clients. A distinct authenticated
+//! GUI role enters the real application with an owned empty profile; its
+//! helper still waits for actual normal parent exit after the real owner drain.
 
 use super::*;
 use std::cell::RefCell;
@@ -20,9 +20,21 @@ enum Case {
     PreparedRestart,
     AfterApplyRecovery,
     TrialFailureRollback,
+    NormalUiUpgrade,
+    NormalUiAfterApplyRecovery,
+    NormalUiTrialFailureRollback,
 }
 
 impl Case {
+    fn normal_ui(self) -> bool {
+        matches!(
+            self,
+            Self::NormalUiUpgrade
+                | Self::NormalUiAfterApplyRecovery
+                | Self::NormalUiTrialFailureRollback
+        )
+    }
+
     fn token(self) -> &'static str {
         match self {
             Self::Upgrade => "upgrade",
@@ -31,6 +43,9 @@ impl Case {
             Self::PreparedRestart => "prepared_restart",
             Self::AfterApplyRecovery => "after_apply_recovery",
             Self::TrialFailureRollback => "trial_failure_rollback",
+            Self::NormalUiUpgrade => "normal_ui_upgrade",
+            Self::NormalUiAfterApplyRecovery => "normal_ui_after_apply_recovery",
+            Self::NormalUiTrialFailureRollback => "normal_ui_trial_failure_rollback",
         }
     }
 }
@@ -390,7 +405,10 @@ pub(super) fn after_apply_checkpoint() -> Result<(), UpdateError> {
     let run = CURRENT
         .with(|run| run.borrow().clone())
         .ok_or(UpdateError::InvalidConfiguration)?;
-    if run.plan.case == Case::AfterApplyRecovery {
+    if matches!(
+        run.plan.case,
+        Case::AfterApplyRecovery | Case::NormalUiAfterApplyRecovery
+    ) {
         run.mark("after_apply_before_trial")?;
         run.wait("force_exit_after_apply")?;
         let journal =
@@ -417,6 +435,9 @@ pub(super) fn parent_exit_checkpoint() -> Result<(), UpdateError> {
         .with(|run| run.borrow().clone())
         .ok_or(UpdateError::InvalidConfiguration)?;
     require(run.seen("helper_observer_armed"))?;
+    if run.plan.case.normal_ui() {
+        require(run.seen("normal_ui_owners_drained"))?;
+    }
     // Called only after the unchanged production monitor returns NOTE_EXIT.
     run.mark("helper_parent_exit_observed")
 }
@@ -429,7 +450,12 @@ fn startup(run: &Run, trial: bool) -> Result<(), UpdateError> {
         return Ok(());
     }
     let session = session.as_mut().ok_or(UpdateError::RecoveryRequired)?;
-    if trial && run.plan.case == Case::TrialFailureRollback {
+    if trial
+        && matches!(
+            run.plan.case,
+            Case::TrialFailureRollback | Case::NormalUiTrialFailureRollback
+        )
+    {
         run.mark("trial_failed_before_health")?;
         return Err(UpdateError::RestartFailed);
     }
@@ -513,13 +539,141 @@ fn prepare(run: &Run) -> Result<(), UpdateError> {
     Ok(())
 }
 
+// This guard exists only in the compile-gated acceptance module. It owns
+// the same helper anchor while the actual application and cleanup run.
+#[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+pub(crate) struct UiRun {
+    run: Run,
+    _children: Children,
+}
+
+#[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+impl UiRun {
+    pub(crate) fn startup(&self) -> Result<super::super::StartupSession, UpdateError> {
+        self.run.assert_old()?;
+        let (macapp, restarted) = begin_startup_admitted(true)?;
+        require(macapp.is_some() && !restarted)?;
+        Ok(super::super::StartupSession { macapp, restarted })
+    }
+
+    pub(crate) fn profile(&self) -> Result<PathBuf, UpdateError> {
+        let profile = self.run.root.join("profile");
+        private_existing(&profile)?;
+        require(
+            fs::read_dir(&profile)
+                .map_err(|_| UpdateError::InvalidConfiguration)?
+                .next()
+                .is_none(),
+        )?;
+        Ok(profile)
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        startup: &std::sync::Arc<std::sync::Mutex<super::super::StartupSession>>,
+        activity: &super::super::UpdateActivity,
+    ) -> Result<(), UpdateError> {
+        let mut staged = self.run.signed_stage(false)?;
+        let mut startup = startup.lock().map_err(|_| UpdateError::RecoveryRequired)?;
+        let session = startup.macapp.as_mut().ok_or(UpdateError::RecoveryRequired)?;
+        require(session.installed == self.run.installed && session.state == self.run.state)?;
+        let lease = activity.try_install()?;
+        let bytes = staged.verified_bytes()?;
+        let restart = prepare_restart_admitted(session, &bytes, staged.version(), lease)?;
+        self.run.mark("prepared")?;
+        restart.launch_supervisor()?;
+        require(matches!(activity.try_start_call(), Err(UpdateError::UpdateActive)))?;
+        self.run.mark("helper_ready_lease_held")?;
+        RETAINED.with(|children| {
+            let children = children.borrow();
+            require(children.len() == 1)?;
+            self.run.offer_helper_observer(&children[0])
+        })?;
+        self.run.mark("normal_ui_ready")
+    }
+
+    pub(crate) fn finish(
+        self,
+        startup: std::sync::Arc<std::sync::Mutex<super::super::StartupSession>>,
+    ) -> Result<super::super::StartupSession, UpdateError> {
+        // A count snapshot cannot establish ownership. Extract the actual root;
+        // on uncertainty retain its real owner and fail, never emit the receipt.
+        let mutex = match std::sync::Arc::try_unwrap(startup) {
+            Ok(mutex) => mutex,
+            Err(owner) => {
+                Box::leak(Box::new(owner));
+                return Err(UpdateError::RecoveryRequired);
+            }
+        };
+        let startup = match mutex.into_inner() {
+            Ok(startup) => startup,
+            Err(poisoned) => {
+                Box::leak(Box::new(poisoned.into_inner()));
+                return Err(UpdateError::RecoveryRequired);
+            }
+        };
+        let completed: Result<(), UpdateError> = (|| {
+            let session = startup.macapp.as_ref().ok_or(UpdateError::RecoveryRequired)?;
+            let journal = session.journal()?.ok_or(UpdateError::RecoveryRequired)?;
+            require(
+                journal.phase == Phase::Prepared
+                    && session.install_lease.is_some()
+                    && tree_hash(&self.run.installed)? == self.run.plan.old_tree_sha256
+                    && self.run.seen("helper_observer_armed")
+                    && self.run.seen("normal_ui_ready"),
+            )?;
+            let mut helper = RETAINED
+                .with(|children| children.borrow_mut().pop())
+                .ok_or(UpdateError::RecoveryRequired)?;
+            require(RETAINED.with(|children| children.borrow().is_empty()) && !helper.exited()?)?;
+            self.run.mark("normal_ui_owners_drained")?;
+            // The existing external immutable kernel registration is already
+            // armed. Main keeps the extracted root lock/lease until actual exit.
+            drop(helper.child.take().ok_or(UpdateError::RecoveryRequired)?);
+            Ok(())
+        })();
+        if let Err(error) = completed {
+            Box::leak(Box::new(startup));
+            return Err(error);
+        }
+        Ok(startup)
+    }
+}
+
+#[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+pub(crate) fn entry() -> Result<Option<UiRun>, UpdateError> {
+    let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).and_then(|arg| arg.to_str()) == Some("--morpheus-mac-qa-normal-ui") {
+        require(args.len() == 2)?;
+        let run = Run::load()?;
+        require(
+            run.plan.case.normal_ui()
+                && PackageMetadata::embedded()?.version == run.plan.old_version
+                && RETAINED.with(|children| children.borrow().is_empty()),
+        )?;
+        CURRENT.with(|current| *current.borrow_mut() = Some(run.clone()));
+        let ui = UiRun {
+            run,
+            _children: Children,
+        };
+        // Before any GUI/profile/store entry, reject missing/foreign/nonempty
+        // profiles. There is no fallback to the account's standard profile.
+        ui.profile()?;
+        return Ok(Some(ui));
+    }
+    dispatch()?;
+    Ok(None)
+}
+
 pub(crate) fn dispatch() -> Result<(), UpdateError> {
     let _children = Children;
     let run = Run::load()?;
     CURRENT.with(|current| *current.borrow_mut() = Some(run.clone()));
     let args: Vec<_> = std::env::args_os().collect();
     let result = match args.get(1).and_then(|arg| arg.to_str()) {
-        Some("--morpheus-mac-qa-prepare") if args.len() == 2 => prepare(&run),
+        Some("--morpheus-mac-qa-prepare") if args.len() == 2 && !run.plan.case.normal_ui() => {
+            prepare(&run)
+        }
         Some("--morpheus-mac-update-supervise") if args.len() == 5 => {
             require(Path::new(&args[2]) == run.installed)?;
             supervise(
@@ -529,7 +683,14 @@ pub(crate) fn dispatch() -> Result<(), UpdateError> {
             )
         }
         Some("--morpheus-mac-update-trial") if args.len() == 3 => startup(&run, true),
-        None if args.len() == 1 => startup(&run, false),
+        None
+            if args.len() == 1
+                && (!run.plan.case.normal_ui()
+                    || (run.seen("normal_ui_owners_drained")
+                        && run.seen("helper_parent_exit_observed"))) =>
+        {
+            startup(&run, false)
+        }
         _ => Err(UpdateError::InvalidConfiguration),
     };
     let children = finish_children()?;
@@ -547,9 +708,22 @@ mod tests {
         let plan: Plan = serde_json::from_str(json).unwrap();
         plan.validate("0123456789abcdef0123456789abcdef").unwrap();
         assert!(plan.validate("ffffffffffffffffffffffffffffffff").is_err());
+        assert!(!plan.case.normal_ui());
+        for case in [
+            "normal_ui_upgrade",
+            "normal_ui_after_apply_recovery",
+            "normal_ui_trial_failure_rollback",
+        ] {
+            let gui: Plan = serde_json::from_str(&json.replace("upgrade", case)).unwrap();
+            gui.validate(&plan.nonce).unwrap();
+            assert!(gui.case.normal_ui());
+            assert_eq!(gui.case.token(), case);
+            assert!(gui.validate("ffffffffffffffffffffffffffffffff").is_err());
+        }
         for source in [
             json.replace("0.1.1", "0.1.0"),
             json.replace("\"upgrade\"", "\"foreign\""),
+            json.replace("\"case\":\"upgrade\",", ""),
             json.replace("{", "{\"arbitrary_path\":\"/foreign\","),
             json.replacen("{", "{\"schema\":1,", 1),
         ] {
