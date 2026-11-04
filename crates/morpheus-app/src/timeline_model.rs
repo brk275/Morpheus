@@ -292,7 +292,11 @@ impl TimelineModel {
         }
     }
 
-    fn replace(&self, next: Cow<'_, [Arc<MessageInfo>]>, snapshot: Option<&MessageSnapshot>) -> u64 {
+    fn replace(
+        &self,
+        next: Cow<'_, [Arc<MessageInfo>]>,
+        snapshot: Option<&MessageSnapshot>,
+    ) -> u64 {
         let serial = self.replacement_serial.get().saturating_add(1);
         self.replacement_serial.set(serial);
         let unchanged = serial != u64::MAX

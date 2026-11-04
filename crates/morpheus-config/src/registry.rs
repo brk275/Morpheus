@@ -2866,11 +2866,23 @@ impl SearchText {
     fn score(&self, words: &[&str]) -> Option<u32> {
         let mut total = 0;
         for word in words {
-            let best = if self.label.split_whitespace().any(|part| part.starts_with(word)) {
+            let best = if self
+                .label
+                .split_whitespace()
+                .any(|part| part.starts_with(word))
+            {
                 8
-            } else if self.keywords.iter().any(|keyword| keyword.as_str() == *word) {
+            } else if self
+                .keywords
+                .iter()
+                .any(|keyword| keyword.as_str() == *word)
+            {
                 7
-            } else if self.keywords.iter().any(|keyword| keyword.starts_with(word)) {
+            } else if self
+                .keywords
+                .iter()
+                .any(|keyword| keyword.starts_with(word))
+            {
                 5
             } else if self.label.contains(word) || self.category.starts_with(word) {
                 4
@@ -3147,7 +3159,15 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         for query in [
-            "e", "FoNt", "font size", "colour", "verify", "hex", "room keys", "opacity", "padding",
+            "e",
+            "FoNt",
+            "font size",
+            "colour",
+            "verify",
+            "hex",
+            "room keys",
+            "opacity",
+            "padding",
         ] {
             assert_eq!(
                 ids(query),
@@ -3197,7 +3217,9 @@ mod tests {
             ["CAFÉ", "Straße", "K"].into_iter(),
             "Λέξη",
         );
-        for query in ["Σ", "Σ İ", "i\u{307}", "CAFÉ", "écr", "straße", "STRASSE", "K"] {
+        for query in [
+            "Σ", "Σ İ", "i\u{307}", "CAFÉ", "écr", "straße", "STRASSE", "K",
+        ] {
             let query = query.to_lowercase();
             let words: Vec<_> = query.split_whitespace().collect();
             assert_eq!(
@@ -3222,7 +3244,12 @@ mod tests {
             .iter()
             .map(|target| target.requires)
             .collect();
-        assert!(search(" \u{2003}", |_| panic!("blank query consulted availability")).is_empty());
+        assert!(
+            search(" \u{2003}", |_| panic!(
+                "blank query consulted availability"
+            ))
+            .is_empty()
+        );
         assert!(search_settings("", |_| panic!("blank query consulted availability")).is_empty());
         for enabled in [true, false, true] {
             live.set(enabled);
