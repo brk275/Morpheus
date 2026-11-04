@@ -429,6 +429,53 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         self.assertIn("member_publication", acceptance_module.APP_TIMELINE_STAGES)
         self.assertIn("cleanup_complete", checks)
 
+    def test_renewal_checkpoints_preserve_all_facts_and_closed_failure_stage(self):
+        stages = (
+            "renewal_switch_to",
+            "renewal_switch_complete",
+            "renewal_rooms_snapshot",
+            "renewal_room_scan",
+            "renewal_room_ready",
+            "renewal_selection",
+            "renewal_copy_callback",
+            "renewal_copy_projection",
+            "renewal_copy_cache",
+            "renewal_send_room",
+            "renewal_room_sent",
+            "renewal_send_reply",
+            "renewal_reply_sent",
+            "renewal_core_room",
+            "renewal_core_room_ready",
+            "renewal_core_thread",
+            "renewal_core_thread_acquire",
+            "renewal_core_thread_wait",
+            "renewal_core_thread_ready",
+            "renewal_subscriber_window",
+            "renewal_first_barrier",
+            "renewal_second_barrier",
+            "renewal_stale_assertions",
+            "renewal_feed_status",
+            "renewal_complete",
+        )
+        marker = "MORPHEUS_LIVE_TIMELINE_STAGE renewal\n"
+        checkpoints = "".join("MORPHEUS_LIVE_TIMELINE_STAGE " + name + "\n"
+                              for name in stages)
+        output = self.output().replace(marker, marker + checkpoints)
+        self.assertEqual(acceptance_module.app_timeline_evidence(output),
+                         acceptance_module.app_timeline_evidence(self.output()))
+        for name in stages:
+            with self.subTest(stage=name):
+                observed = "MORPHEUS_LIVE_TIMELINE_STAGE setup\n"
+                observed += "MORPHEUS_LIVE_TIMELINE_STAGE " + name + "\n"
+                observed += "private-token\nMORPHEUS_LIVE_TIMELINE_STAGE private_token\n"
+                self.assertEqual(acceptance_module.app_timeline_diagnostics(observed),
+                                 {"test_entered": True, "stage": name})
+        expanded = output.replace("MORPHEUS_LIVE_TIMELINE_STAGE complete",
+                                  "MORPHEUS_LIVE_TIMELINE_STAGE queued_drain\n" * 89
+                                  + "MORPHEUS_LIVE_TIMELINE_STAGE complete")
+        with self.assertRaises(RuntimeError):
+            acceptance_module.app_timeline_evidence(expanded)
+
     def test_every_missing_fact_is_fatal_even_after_a_green_test_summary(self):
         for name in acceptance_module.APP_TIMELINE_CHECKS:
             incomplete = self.output().replace(f"MORPHEUS_LIVE_TIMELINE_CHECK {name}=true\n", "")

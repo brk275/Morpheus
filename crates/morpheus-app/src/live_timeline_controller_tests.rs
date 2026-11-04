@@ -302,11 +302,17 @@ pub(crate) fn callback_queued(
 
 /// Wait until the room is visible to the active account, then scan it the
 /// way the app does when a joined room is opened (fresh profile: no drafts).
-async fn wait_for_room(manager: &AccountManager, room_id: &str) {
+async fn wait_for_room(manager: &AccountManager, room_id: &str, observe_renewal: bool) {
     let deadline = Instant::now() + Duration::from_secs(90);
+    if observe_renewal {
+        stage!(renewal_rooms_snapshot);
+    }
     loop {
         let rooms = manager.rooms_snapshot().await.expect("Cannot read rooms");
         if rooms.iter().any(|room| room.room_id == room_id) {
+            if observe_renewal {
+                stage!(renewal_room_scan);
+            }
             super::opened_room::scan(manager, room_id)
                 .await
                 .expect("Opened fixture room must be scanned");
@@ -386,7 +392,7 @@ async fn exercise(runtime: Handle, alice: FixtureAccount, carol: FixtureAccount,
                 .await;
             let account = added.expect("First login failed");
             stage!(setup_rooms);
-            wait_for_room(&manager, &room).await;
+            wait_for_room(&manager, &room, false).await;
             stage!(setup_ready);
             account.id
         })
@@ -527,6 +533,7 @@ impl Scenario {
         // outlived its lease would publish them into this matching scope.
         stage!(renewal);
         self.switch_back().await;
+        stage!(renewal_selection);
         let renewed = self.manager.account_selection(&self.account).unwrap();
         assert!(
             renewed.is_current() && !lease.is_current(),
@@ -538,13 +545,16 @@ impl Scenario {
                 && self.live.feed_generation() == copy_aba_feed,
             "ABA leaves the original shown model/navigation intact for this boundary"
         );
+        stage!(renewal_copy_callback);
         self.ui
             .invoke_copy_message_text(copy_aba_token.into(), false);
         assert!(
             copy_requests.requests() == copy_after_positive,
             "a same-ID renewed account cannot revive the original registered Copy callback"
         );
+        stage!(renewal_copy_projection);
         let _ = Self::copy_token(&copy_aba_model, &root);
+        stage!(renewal_copy_cache);
         assert_eq!(
             crate::timeline_model::cached_text_count(&copy_aba_model),
             0,
@@ -554,16 +564,28 @@ impl Scenario {
 
         let late_room = marker("live-timeline-late-room");
         let late_reply = marker("live-timeline-late-reply");
+        stage!(renewal_send_room);
         self.send_room(&late_room).await;
+        stage!(renewal_room_sent);
+        stage!(renewal_send_reply);
         self.send_reply(&root, &late_reply).await;
+        stage!(renewal_reply_sent);
+        stage!(renewal_core_room);
         self.wait_for_core_room_event(&late_room).await;
+        stage!(renewal_core_room_ready);
+        stage!(renewal_core_thread);
         self.wait_for_core_thread_event(&root, &late_reply).await;
+        stage!(renewal_core_thread_ready);
         check!(late_events_in_core);
         // Bounded window for any surviving subscriber to queue a callback,
         // then drain the event loop in order before checking.
+        stage!(renewal_subscriber_window);
         tokio::time::sleep(Duration::from_secs(2)).await;
+        stage!(renewal_first_barrier);
         settle(&self.ui).await;
+        stage!(renewal_second_barrier);
         settle(&self.ui).await;
+        stage!(renewal_stale_assertions);
         assert!(self.shows_scope(&self.ui), "The scope must still match");
         assert!(
             self.ui.get_thread_root_id().as_str() == root,
@@ -579,11 +601,13 @@ impl Scenario {
             "A stale thread feed published after A -> B -> A"
         );
         check!(stale_thread_rejected);
+        stage!(renewal_feed_status);
         assert_eq!(
             feeds_running(&self.live).await,
             (false, false),
             "Ended feeds restarted"
         );
+        stage!(renewal_complete);
 
         // Positive controls under the renewed lease: the same window and the
         // actual open paths deliver the late events, so the negative checks
@@ -1928,10 +1952,12 @@ impl Scenario {
         let (account, room) = (self.account.clone(), self.room.clone());
         let (root, body) = (root.to_owned(), body.to_owned());
         on_runtime(&self.runtime, async move {
+            stage!(renewal_core_thread_acquire);
             let feed = manager
                 .thread_message_feed_for(&account, &room, &root)
                 .await;
             let feed = feed.expect("Cannot open the core thread timeline");
+            stage!(renewal_core_thread_wait);
             let deadline = Instant::now() + Duration::from_secs(60);
             while !holds(&feed.snapshot(), &body) {
                 assert!(
@@ -1963,9 +1989,12 @@ impl Scenario {
         let manager = self.manager.clone();
         let (account, room) = (self.account.clone(), self.room.clone());
         on_runtime(&self.runtime, async move {
+            stage!(renewal_switch_to);
             let switched = manager.switch_to(&account).await;
             switched.expect("Cannot switch back");
-            wait_for_room(&manager, &room).await;
+            stage!(renewal_switch_complete);
+            wait_for_room(&manager, &room, true).await;
+            stage!(renewal_room_ready);
         })
         .await;
     }

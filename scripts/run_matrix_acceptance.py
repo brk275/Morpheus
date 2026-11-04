@@ -128,7 +128,33 @@ APP_TIMELINE_STAGES = frozenset((
     "message_copy_callbacks",
     "revocation", "revocation_settle", "revocation_member_pause", "revocation_login",
     "revocation_members", "revocation_join", "revocation_feeds",
-    "renewal", "reopen", "queued_revocation", "queued_drain",
+    "renewal",
+    "renewal_rooms_snapshot",
+    "renewal_room_scan",
+    "renewal_selection",
+    "renewal_copy_callback",
+    "renewal_copy_projection",
+    "renewal_copy_cache",
+    "renewal_send_room",
+    "renewal_room_sent",
+    "renewal_send_reply",
+    "renewal_reply_sent",
+    "renewal_core_room",
+    "renewal_core_room_ready",
+    "renewal_core_thread",
+    "renewal_core_thread_ready",
+    "renewal_subscriber_window",
+    "renewal_first_barrier",
+    "renewal_second_barrier",
+    "renewal_stale_assertions",
+    "renewal_feed_status",
+    "renewal_complete",
+    "renewal_core_thread_acquire",
+    "renewal_core_thread_wait",
+    "renewal_switch_to",
+    "renewal_switch_complete",
+    "renewal_room_ready",
+    "reopen", "queued_revocation", "queued_drain",
     "queued_reopen", "link_continuation", "member_publication", "cleanup", "complete",
     "cleanup_logout_primary", "cleanup_logout_other", "cleanup_manager_stop",
     "cleanup_drop_live", "cleanup_drop_ui", "cleanup_wait_profile",
@@ -872,7 +898,8 @@ def app_timeline_evidence(output: str) -> dict[str, bool]:
             if not match or match[1] not in APP_TIMELINE_STAGES:
                 raise RuntimeError(error)
             proof.append(("stage", match[1]))
-        if len(proof) > 64:
+        # Original 64-record bound plus 25 fixed renewal checkpoints.
+        if len(proof) > 89:
             raise RuntimeError(error)
     if (passed_tests(output) != 1 or checks.keys() != APP_TIMELINE_CHECKS
             or not proof or proof[0] != ("stage", "setup")
