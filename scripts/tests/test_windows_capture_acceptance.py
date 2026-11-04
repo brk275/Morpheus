@@ -530,7 +530,7 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
             alias.parent.mkdir(parents=True)
             update.os.link(selected, alias)
             self.assertEqual(selected.stat().st_nlink, 2)
-            commands = Mock(cleanup_failed=False)
+            commands = Mock(cleanup_failed=False, environment={"RUSTUP_HOME":str(root)})
             commands.run.side_effect = [b"cargo-packager 0.11.8", ArchiveReached()]
             args = types.SimpleNamespace(source=root / "reviewed", gitleaks=root / "scanner.exe",
                 gitleaks_sha256="b" * 64, execute_on_free_hosted_runner=True)
