@@ -173,7 +173,9 @@ def plain(data, maximum=MAX_FILE):
         text = data.decode("utf-8", "strict")
     except UnicodeError:
         raise ValueError(INVALID) from None
-    require(all(ord(c) >= 32 or c in "\r\n\t" for c in text) and "\x7f" not in text)
+    # Standard license pagination, observed byte-exact in libdbus COPYING.
+    # Keep only CR/LF/TAB/FF whitespace; every other C0 and DEL is refused.
+    require(all(ord(c) >= 32 or c in "\r\n\t\f" for c in text) and "\x7f" not in text)
     return data
 
 

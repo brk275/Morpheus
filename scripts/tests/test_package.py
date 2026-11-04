@@ -504,7 +504,7 @@ class MacUpdatePayloadTests(unittest.TestCase):
 
 class NativeNoticeEvidenceTests(unittest.TestCase):
     @staticmethod
-    def evidence(drop_license=False, registry=False, drop_alsa_provenance=False):
+    def evidence(drop_license=False, registry=False, drop_alsa_provenance=False, formfeed=False):
         source = native_notices.catalogue()
         files = {"Cargo.toml": b'[workspace]\nmembers = ["app", "vendor/cpal", "vendor/slint"]\nexclude = ["vendor/alsa"]\n[patch.crates-io]\nalsa = { path = "vendor/alsa" }\n',
                  "Cargo.lock": b'version = 4\n[[package]]\nname = "fixture"\nversion = "0.1.0"\n[[package]]\nname = "cpal"\nversion = "0.18.2"\n[[package]]\nname = "slint"\nversion = "1.18.1"\n[[package]]\nname = "alsa"\nversion = "0.11.0"\n',
@@ -524,6 +524,7 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                  "vendor/slint/LICENSES/extra.txt": b"Fixture extra source license\n"}
         registry_files = {"Cargo.toml": b'[package]\nname = "fixture-registry"\nversion = "1.0.0"\nlicense = "MIT"\n',
                           "LICENSE": b"Fixture exact registry license\n"}
+        if formfeed:registry_files["LICENSE"] = b"Fixture registry license page one\n\fPage two\n"
         def packed(values):
             output = io.BytesIO()
             with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0) as zipped:
@@ -575,6 +576,34 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                        "distribution_ready": False, "unresolved_release_requirements": list(source.UNRESOLVED)}
             return bundle, json.dumps(receipt).encode()
         return source, files, manifest, revision, build
+
+    def test_plain_license_preserves_formfeed_and_refuses_every_other_forbidden_control(self):
+        license_bytes=b"License page one\r\n\t\fPage two\n"
+        self.assertIs(native_notices.plain(license_bytes),license_bytes)
+        for code in (*range(32),127):
+            if code in (9,10,12,13):continue
+            with self.subTest(code=code), self.assertRaises(ValueError):
+                native_notices.plain(b"License prefix"+bytes([code])+b"suffix")
+        for data in (b"\xff",b"",b"too long"):
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                native_notices.plain(data,maximum=4)
+
+    def test_formfeed_license_prepare_verify_roundtrip_preserves_bytes_hashes_and_unresolved_flags(self):
+        source,files,manifest,revision,build=self.evidence(registry=True,formfeed=True)
+        expected=b"Fixture registry license page one\n\fPage two\n"
+        checksum=hashlib.sha256(expected).hexdigest()
+        for platform in ("darwin","win32"):
+            with self.subTest(platform=platform):
+                contents=native_notices.prepare_bytes(*build(),revision,platform=platform,version="0.1.0")
+                ledger=native_notices.verify_bytes(contents,revision=revision,platform=platform,version="0.1.0")
+                record=next(item for item in ledger["locked_packages"] if item["name"]=="fixture-registry")
+                self.assertIn({"source_path":"LICENSE","sha256":checksum},record["license_texts"])
+                span=next(item for item in ledger["texts"] if item["sha256"]==checksum)
+                self.assertEqual(contents[native_notices.TEXT][span["offset"]:span["offset"]+span["bytes"]],expected)
+                self.assertEqual(span["bytes"],len(expected))
+                self.assertFalse(ledger["distribution_ready"])
+                self.assertFalse(ledger["license_compliance_verified"])
+                self.assertEqual(ledger["unresolved_release_requirements"],list(native_notices.OPEN))
 
     def test_source_bound_plain_notices_cover_all_packages_patch_and_slint_without_legal_acceptance(self):
         source, files, manifest, revision, build = self.evidence()
