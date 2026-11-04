@@ -121,6 +121,59 @@ def _notice_report_failure(error):
         print("MORPHEUS_NATIVE_NOTICE_SITE " + json.dumps(site, sort_keys=True), file=sys.stderr)
 
 
+# Observed fixed Cargo stderr hints, never root-cause or acceptance evidence.
+# Matching is bounded by the existing complete 8 MiB stderr ceiling. Bytes are
+# never decoded, reflected, counted per occurrence or copied into public facts.
+_CARGO_STDERR_MARKERS = {
+    "manifest": (b"failed to parse manifest", b"failed to load manifest", b"no targets specified in the manifest"),
+    "lockfile": (b"needs to be updated but --locked was passed", b"failed to parse lock file", b"lock file needs to be updated"),
+    "checkout": (b"failed to checkout", b"failed to clone", b"failed to fetch into:", b"filename too long", b"invalid path"),
+    "network": (b"failed to download", b"network failure", b"could not resolve host", b"connection timed out", b"failed to connect", b"connection reset"),
+    "tls": (b"ssl certificate problem", b"certificate verify failed", b"certificate verification", b"schannel", b"peer certificate", b"tls handshake"),
+    "auth": (b"authentication required", b"authentication failed", b"failed to authenticate", b"unauthorized"),
+}
+
+
+def _cargo_stderr_classes(data):
+    require(type(data) is bytes and len(data) <= 8 * 1024**2)
+    lower = data.lower()
+    return sorted(name for name, markers in _CARGO_STDERR_MARKERS.items()
+                  if any(marker in lower for marker in markers)) or ["other"]
+
+
+def _cargo_fetch_failure_diagnostic(commands, scanned):
+    if (scanned is not True or getattr(commands, "logs_complete", None) is not True
+            or getattr(commands, "cleanup_failed", None) is not False
+            or getattr(commands, "retained", None) != []):
+        return None
+    failure = getattr(commands, "cargo_fetch_failure", None)
+    if type(failure) is not tuple or len(failure) != 3:
+        return None
+    path, status, size = failure
+    if (type(status) is not int or status == 0 or not -255 <= status <= 0xffffffff
+            or type(size) is not int or not 0 <= size <= 8 * 1024**2):
+        return None
+    path = Path(path)
+    require(path.parent == commands.logs and commands.logs == commands.root / "logs"
+            and re.fullmatch(r"[0-9]{5}\.err", path.name) is not None)
+    # Existing strict private-path and stable opened-file identity checks; no
+    # partial stderr, unsafe alias or changed byte count can become a hint.
+    checked(path, private=True)
+    data = N.read_regular(path, 8 * 1024**2, allow_empty=True)
+    require(len(data) == size)
+    return {"schema": 1, "check": "native_notice_cargo_fetch_failure", "status": status,
+            "stderr_classes": _cargo_stderr_classes(data)}
+
+
+def _notice_report_cargo_fetch_failure(commands, scanned):
+    try:
+        facts = _cargo_fetch_failure_diagnostic(commands, scanned)
+        if facts is not None:
+            print("MORPHEUS_NATIVE_NOTICE_CARGO_FETCH " + json.dumps(facts, sort_keys=True), file=sys.stderr)
+    except BaseException:
+        return  # Diagnostic refusal never replaces the original command error.
+
+
 def require(value):
     if not value:
         raise ValueError("Native notice source preparation failed")
@@ -306,7 +359,7 @@ class Commands:
     def __init__(self, root, environment):
         self.root, self.environment = root, environment
         self.logs = root/"logs"; self.sequence = 0; self.cleanup_failed = False
-        self.retained = []; self.bytes = 0; self.logs_complete = True; self.deadline = time.monotonic() + 1800
+        self.retained = []; self.bytes = 0; self.logs_complete = True; self.cargo_fetch_failure = None; self.deadline = time.monotonic() + 1800
 
     def run(self, stage, command, *, cwd, env, timeout, output_limit, stderr_limit=65536, log_root=None,
             expected_status=(0,), binary_output=False, stdin_bytes=None):
@@ -426,6 +479,11 @@ class Commands:
                 destinations[0].seek(0)
                 data=destinations[0].read(output_limit+1)
                 require(len(data)==counts[0] and len(data)<=output_limit)
+        if stage == "fetch" and status not in expected_status:
+            # This is after the owned Job/group stopped, pipes reached EOF and
+            # both exact streams were flushed/fsynced/closed. Publish nothing
+            # here; the complete default scan must succeed first.
+            self.cargo_fetch_failure = (errors, status, counts[1])
         require(status in expected_status)
         if not binary_output:
             data=S.read_owned(output,output_limit,private=True) if counts[0] else b""
@@ -614,7 +672,10 @@ def prepare(environment, scanner):
         write_new(root/"receipt.json",json.dumps(receipt,sort_keys=True).encode()+b"\n")
         success=True
     finally:
-        try:commands.scan(scanner);scanned=True
+        try:
+            commands.scan(scanner);scanned=True
+            if not success:
+                _notice_report_cargo_fetch_failure(commands, scanned)
         finally:
             write_new(root/"state.json",json.dumps({"schema":1,"source_revision":revision,
                 "prepared":success,"logs_scanned":scanned,"logs_complete":commands.logs_complete,
@@ -622,6 +683,68 @@ def prepare(environment, scanner):
                 "distribution_ready":False},sort_keys=True).encode()+b"\n")
     require(success and scanned and commands.logs_complete and not commands.cleanup_failed)
     print(json.dumps({"check":"native_notice_sources","prepared":True,"distribution_ready":False},sort_keys=True))
+
+
+
+def _remove_readonly_owned_leaf(root, root_identity, function, path, error):
+    """Retry only an access-denied readonly unlink inside the authorized tree.
+
+    The caller has already proved stopped children, complete logs and a fresh
+    default scan. The original owner marker may be gone during rmtree; retain
+    its root inode authority instead of reopening a partially removed marker.
+    """
+    if (os.name != "nt" or (function is not os.unlink and function is not os.remove)
+            or not isinstance(error, PermissionError) or error.errno != 13
+            or getattr(error, "winerror", None) != 5):
+        raise error
+    root, path = Path(root), Path(path)
+    require(root.is_absolute() and re.fullmatch(r"morpheus-native-source-[a-z0-9_]{8,32}", root.name)
+            and path.is_absolute() and path != root and path.is_relative_to(root))
+    def validate_path():
+        checked(root, directory=True, private=True)
+        current = root.lstat()
+        require((current.st_dev, current.st_ino) == root_identity)
+        parent = path.parent
+        while parent != root:
+            checked(parent, directory=True, private=True)
+            parent = parent.parent
+        checked(path, private=True)
+        return path.lstat()
+    def identity(info):
+        born = info.st_birthtime_ns
+        require(type(born) is int and born > 0)
+        return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_nlink,
+                info.st_size, info.st_mtime_ns, born)
+    before = validate_path()
+    attributes = getattr(before, "st_file_attributes", 0)
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or not attributes & 0x1 or attributes & (0x400 | 0x10)
+            or not 0 <= before.st_size <= S.MAX_BUNDLE):
+        raise error
+    expected = identity(before)
+    descriptor = S.windows_security().open_read(path, private=True)
+    try:
+        # The existing handle denies write/delete sharing while the only
+        # intended mutation clears the Windows readonly attribute. Attribute
+        # access is not blocked by the file's sharing mode; ACLs are unchanged.
+        require(identity(os.fstat(descriptor)) == expected)
+        os.chmod(path, stat.S_IWRITE)
+        after = validate_path()
+        after_attributes = getattr(after, "st_file_attributes", 0)
+        require(identity(after) == expected and identity(os.fstat(descriptor)) == expected
+                and not after_attributes & 0x1
+                and after_attributes & ~(0x1 | 0x80) == attributes & ~(0x1 | 0x80))
+    finally:
+        os.close(descriptor)
+    # Close the deny-delete handle before retry, then recheck the private root,
+    # path/ACL and exact file identity once more. No directory or foreign leaf
+    # is chmod'ed, and a second deletion error propagates without another try.
+    final = validate_path()
+    require(identity(final) == expected
+            and not getattr(final, "st_file_attributes", 0) & 0x1
+            and getattr(final, "st_file_attributes", 0) & ~(0x1 | 0x80)
+                == attributes & ~(0x1 | 0x80))
+    function(path)
 
 
 def finish(environment, scanner):
@@ -652,7 +775,14 @@ def finish(environment, scanner):
     commands.scan(scanner)
     require(not commands.cleanup_failed)
     # Stop receipt + exact private root identity authorizes only this tree.
-    shutil.rmtree(root)
+    if os.name == "nt":
+        require(owned_source_root(environment) == root)
+        _notice_phase("cleanup")
+        info = root.lstat(); root_identity = (info.st_dev, info.st_ino)
+        shutil.rmtree(root, onexc=lambda function, path, error:
+                      _remove_readonly_owned_leaf(root, root_identity, function, path, error))
+    else:
+        shutil.rmtree(root)
     print('{"check":"native_notice_sources_removed","passed":true,"distribution_ready":false}')
 
 
