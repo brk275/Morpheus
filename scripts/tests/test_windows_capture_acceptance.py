@@ -518,6 +518,66 @@ class WindowsCaptureTests(unittest.TestCase):
 
 
 class InstalledWindowsUpdateTests(unittest.TestCase):
+    def test_installed_update_failure_diagnostic_keeps_only_scanned_clean_closed_stage_and_owned_site(self):
+        commands=types.SimpleNamespace(cleanup_failed=False,build_substage="notices_prepare")
+        site={"module":"native_notices","line":171}
+        value=update.failure_diagnostic(commands,"build-old",site,True,True)
+        self.assertEqual(value,{"schema":1,"check":"windows_update_failure_diagnostic",
+            "stage":"build-old","build_substage":"notices_prepare","site":site,
+            "private_log_scan_passed":True,"cleanup_passed":True,"passed":False,"distribution_ready":False})
+        for scanned,cleaned in ((False,True),(True,False),(1,True),(True,1)):
+            self.assertIsNone(update.failure_diagnostic(commands,"build-old",site,scanned,cleaned))
+        for bad in ({"module":"private-path","line":171}, {"module":"native_notices","line":True},
+                    {"module":"native_notices","line":100000},site|{"body":"private-body"}):
+            self.assertIsNone(update.failure_diagnostic(commands,"build-old",bad,True,True))
+        self.assertIsNone(update.failure_diagnostic(commands,"private-stage",site,True,True))
+        commands.build_substage="private-substage"
+        self.assertEqual(update.failure_diagnostic(commands,"build-old",None,True,True)["build_substage"],"unavailable")
+        commands.build_substage="notices_prepare"
+        self.assertEqual(update.failure_diagnostic(commands,"signing",None,True,True)["build_substage"],"unavailable")
+        commands.cleanup_failed=True
+        self.assertIsNone(update.failure_diagnostic(commands,"build-old",site,True,True))
+
+    def test_installed_update_failure_diagnostic_waits_for_scan_and_cleanup_without_replacing_refusal(self):
+        class PrivateFailure(Exception):pass
+        for scan_fails,cleanup_fails in ((False,False),(True,False),(False,True)):
+            with self.subTest(scan_fails=scan_fails,cleanup_fails=cleanup_fails), tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve();output=io.StringIO();events=[]
+                failure=PrivateFailure("private-body-path-argv-must-not-appear")
+                commands=Mock(cleanup_failed=False,environment={"RUSTUP_HOME":str(root)})
+                commands.run.side_effect=[b"cargo-packager 0.11.8",failure]
+                def scan(scanner):
+                    self.assertEqual(output.getvalue(),"");events.append("scan")
+                    if scan_fails:raise PrivateFailure("private-scan-refusal")
+                def cleanup(path,identity):
+                    self.assertEqual(output.getvalue(),"");events.append("cleanup")
+                    if cleanup_fails:raise PrivateFailure("private-cleanup-refusal")
+                commands.scan.side_effect=scan
+                args=types.SimpleNamespace(source=root/"reviewed",gitleaks=root/"scanner.exe",
+                    gitleaks_sha256="b"*64,execute_on_free_hosted_runner=True)
+                with contextlib.redirect_stderr(output), \
+                        patch.dict(update.os.environ,{"RUNNER_TEMP":str(root)},clear=True), \
+                        patch.object(update,"guard"),patch.object(update,"checked",side_effect=lambda p,**kw:Path(p)), \
+                        patch.object(update.revision,"expected_revision",return_value="c"*40), \
+                        patch.object(update.revision,"verify_checkout",return_value="c"*40), \
+                        patch.object(update,"digest",return_value="b"*64), \
+                        patch.object(update.secrets,"token_hex",return_value="a"*32), \
+                        patch.object(update,"private_environment",return_value={"RUSTUP_HOME":str(root)}), \
+                        patch.object(update,"Commands",return_value=commands), \
+                        patch.object(update.notice_source,"system_git",return_value=root/"git.exe"), \
+                        patch.object(update.notice_source,"_notice_failure_site",return_value={"module":"native_notices","line":171}), \
+                        patch.object(update,"absent_registry"),patch.object(update,"remove_owned_root",side_effect=cleanup):
+                    with self.assertRaises(PrivateFailure) as caught:update.execute(args)
+                self.assertEqual(events,["scan","cleanup"])
+                self.assertNotIn("private-",output.getvalue())
+                if scan_fails or cleanup_fails:self.assertEqual(output.getvalue(),"")
+                else:
+                    self.assertIs(caught.exception,failure)
+                    line,=output.getvalue().splitlines()
+                    value=json.loads(line.removeprefix("MORPHEUS_WINDOWS_UPDATE_FAILURE_DIAGNOSTIC "))
+                    self.assertEqual(value["stage"],"source-export")
+                    self.assertFalse(value["passed"])
+
     def test_installed_update_selects_fixed_git_without_path_or_generic_file_admission(self):
         class ArchiveReached(Exception):
             pass

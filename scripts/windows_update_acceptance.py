@@ -136,6 +136,7 @@ class Commands:
         self.root, self.environment = root, environment
         self.logs = root / "logs"; self.logs.mkdir()
         self.sequence = 0
+        self.build_substage = "unavailable"
         self.cleanup_failed = False
         self.deadline = time.monotonic() + 6900
     def close_job(self, job):
@@ -209,6 +210,33 @@ class Commands:
                 failed = True
         require(not failed)
 
+# Closed source-location metadata only. Never inspect command output, exception
+# messages, arguments, paths, fixture keys or transaction contents here.
+_FAILURE_STAGES = frozenset(("source-export", "build-old", "build-new", "signing", *CASES))
+_BUILD_SUBSTAGES = frozenset(("unavailable", "source_export", "notices_prepare", "cargo_build",
+                             "payload", "config", "producer", "cargo_packager"))
+
+
+def failure_diagnostic(commands, stage, site, scanned, cleaned):
+    if (scanned is not True or cleaned is not True
+            or getattr(commands, "cleanup_failed", None) is not False
+            or type(stage) is not str or stage not in _FAILURE_STAGES):
+        return None
+    substage = getattr(commands, "build_substage", None)
+    if stage not in {"build-old", "build-new"} or type(substage) is not str or substage not in _BUILD_SUBSTAGES:
+        substage = "unavailable"
+    if site is not None and (type(site) is not dict or set(site) != {"module", "line"}
+            or type(site["module"]) is not str
+            or site["module"] not in {"notice_source", "windows_security", "native_notices",
+                                       "source_catalogue", "windows_processes"}
+            or type(site["line"]) is not int or not 0 < site["line"] <= 99999):
+        return None
+    return {"schema": 1, "check": "windows_update_failure_diagnostic", "stage": stage,
+            "build_substage": substage, "site": site,
+            "private_log_scan_passed": True, "cleanup_passed": True,
+            "passed": False, "distribution_ready": False}
+
+
 def export_source(commands, source, archive, version, label):
     members = revision.source_export_members(archive)
     destination = commands.root / (label+"-source"); destination.mkdir()
@@ -251,25 +279,33 @@ def instrumented_entry(data, nonce):
 
 
 def build(commands, source, archive, version, nonce, label, cargo, notice_bundle, notice_receipt, reviewed):
+    commands.build_substage = "source_export"
     exported,proof = export_source(commands,source,archive,version,label)
     notice_dir=commands.root/(label+"-notices"); notice_dir.mkdir(mode=0o700)
+    commands.build_substage = "notices_prepare"
     notice_contents=notices.prepare(notice_bundle,notice_receipt,notice_dir,revision=reviewed,
                                     platform="win32",version=version,working=exported)
     target = commands.root/"native-target"
     environment = {"MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD":nonce,"MORPHEUS_PACKAGE_FORMAT":"nsis-payload-v2"}
+    commands.build_substage = "cargo_build"
     commands.run([cargo,"build","--release","--locked","-p","morpheus-app","--features","native-calls",
         "--target-dir",target],environment=environment,cwd=exported,seconds=3600)
+    commands.build_substage = "payload"
     require(revision.verify_versioned_export(exported,archive,version) == proof)
     binary = exported/"target/release/morpheus-app.exe"
     binary.parent.mkdir(parents=True); shutil.copyfile(target/"release/morpheus-app.exe",binary)
     identity = instrumented_entry(read(binary,LIMIT),nonce); require(identity["version"] == version)
     output = commands.root/(label+"-package"); output.mkdir()
+    commands.build_substage = "config"
     config = package.package_config(exported,"win32")
     config.update(version=version,**{"out-dir":str(output)})
     stage = commands.root/(label+"-producer"); stage.mkdir()
+    commands.build_substage = "producer"
     prepared,payload = producer.prepare(config,exported,stage,notice_contents=notice_contents)
+    commands.build_substage = "cargo_packager"
     commands.run([cargo,"packager","--release","--formats","nsis","--config",json.dumps(prepared)],
         environment=environment,cwd=exported,seconds=900)
+    commands.build_substage = "payload"
     setups = list(output.glob("*.exe")); require(len(setups)==1)
     final = output/payload.name; shutil.copyfile(payload,final)
     return {"setup":checked(setups[0]),"payload":checked(final),"identity":identity,
@@ -550,6 +586,7 @@ def execute(args):
     root.mkdir(); identity=(root.stat().st_dev,root.stat().st_ino)
     commands=Commands(root,private_environment(os.environ,root/"tools-home"))
     stage,results,scan,clean="source-export",[],False,False
+    failed, failure_site = False, None
     keys = {}
     try:
         # Use the already provisioned exact toolchain binary, not a rustup
@@ -587,6 +624,10 @@ def execute(args):
             stage=case; results.append(run_case(commands,case,old,new,nonce,signatures))
         # Reinstall/uninstall is exercised by every following genuine NSIS case.
         stage="complete"
+    except BaseException as error:
+        failed = True
+        failure_site = notice_source._notice_failure_site(error)
+        raise
     finally:
         try:
             commands.scan(scanner); scan=True
@@ -607,6 +648,11 @@ def execute(args):
             require(not commands.cleanup_failed)
             absent_registry()
             remove_owned_root(root,identity); clean=True
+        if failed:
+            diagnostic = failure_diagnostic(commands, stage, failure_site, scan, clean)
+            if diagnostic is not None:
+                print("MORPHEUS_WINDOWS_UPDATE_FAILURE_DIAGNOSTIC " + json.dumps(diagnostic, sort_keys=True),
+                      file=sys.stderr, flush=True)
     require(stage=="complete" and len(results)==len(CASES) and scan and clean)
     print(json.dumps({"check":"windows_installed_update_mechanism","passed":True,"source_revision":reviewed,
         "cohort":old["identity"]["persistence"],"old_source":old["source"],"new_source":new["source"],

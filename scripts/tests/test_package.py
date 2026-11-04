@@ -504,7 +504,7 @@ class MacUpdatePayloadTests(unittest.TestCase):
 
 class NativeNoticeEvidenceTests(unittest.TestCase):
     @staticmethod
-    def evidence(drop_license=False, registry=False, drop_alsa_provenance=False, formfeed=False):
+    def evidence(drop_license=False, registry=False, drop_alsa_provenance=False, formfeed=False, source_overrides=None):
         source = native_notices.catalogue()
         files = {"Cargo.toml": b'[workspace]\nmembers = ["app", "vendor/cpal", "vendor/slint"]\nexclude = ["vendor/alsa"]\n[patch.crates-io]\nalsa = { path = "vendor/alsa" }\n',
                  "Cargo.lock": b'version = 4\n[[package]]\nname = "fixture"\nversion = "0.1.0"\n[[package]]\nname = "cpal"\nversion = "0.18.2"\n[[package]]\nname = "slint"\nversion = "1.18.1"\n[[package]]\nname = "alsa"\nversion = "0.11.0"\n',
@@ -522,6 +522,7 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                  "vendor/slint/Cargo.toml": b'[package]\nname = "slint"\nversion = "1.18.1"\nlicense = "GPL-3.0-only"\n',
                  "vendor/slint/LICENSE": b"Fixture Slint license\n",
                  "vendor/slint/LICENSES/extra.txt": b"Fixture extra source license\n"}
+        if source_overrides is not None:files.update(source_overrides)
         registry_files = {"Cargo.toml": b'[package]\nname = "fixture-registry"\nversion = "1.0.0"\nlicense = "MIT"\n',
                           "LICENSE": b"Fixture exact registry license\n"}
         if formfeed:registry_files["LICENSE"] = b"Fixture registry license page one\n\fPage two\n"
@@ -604,6 +605,43 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                 self.assertFalse(ledger["distribution_ready"])
                 self.assertFalse(ledger["license_compliance_verified"])
                 self.assertEqual(ledger["unresolved_release_requirements"],list(native_notices.OPEN))
+
+    def test_empty_optional_nested_vendor_readme_remains_authenticated_source_but_not_notice_text(self):
+        name="vendor/slint/README.md"
+        source,files,manifest,revision,build=self.evidence(source_overrides={name:b""})
+        self.assertEqual(files[name],b"")
+        self.assertEqual(manifest["source"]["files"][name],
+            {"mode":"100644","oid":source.object_id("blob",b""),"bytes":0,
+             "sha256":hashlib.sha256(b"").hexdigest()})
+        contents=native_notices.prepare_bytes(*build(),revision,platform="darwin",version="0.1.0")
+        ledger=native_notices.verify_bytes(contents,revision=revision,platform="darwin",version="0.1.0")
+        self.assertEqual(ledger["source_tree"],manifest["source"]["tree"])
+        self.assertFalse(any(item["source_path"]==name for item in ledger["local_patch_provenance"]))
+        self.assertTrue(all(item["bytes"]>0 for item in ledger["texts"]))
+        for mandatory in ("vendor/cpal/OWNED_COREAUDIO.md","vendor/cpal/OWNED_ALSA.md"):
+            self.assertIn({"source_path":mandatory,"sha256":source.digest(files[mandatory])},
+                          ledger["local_patch_provenance"])
+        self.assertFalse(ledger["distribution_ready"])
+        self.assertFalse(ledger["license_compliance_verified"])
+        # A nonempty optional README still carries exact authenticated evidence.
+        _,_,_,revision,build=self.evidence(source_overrides={name:b"Upstream documentation\n"})
+        ledger=native_notices.verify_bytes(native_notices.prepare_bytes(*build(),revision,platform="win32",version="0.1.0"))
+        self.assertIn({"source_path":name,"sha256":source.digest(b"Upstream documentation\n")},ledger["local_patch_provenance"])
+
+    def test_empty_mandatory_provenance_license_and_nonempty_unsafe_readme_still_refuse(self):
+        cases=[("vendor/README.md",b""),("vendor/cpal/MORPHEUS_PATCH.md",b""),
+               ("vendor/cpal/OWNED_COREAUDIO.md",b""),("vendor/cpal/OWNED_ALSA.md",b""),
+               ("vendor/slint/LICENSE",b""),("vendor/slint/README.md",b"Bad\x00text"),
+               ("vendor/slint/README.md",b"Bad\x1btext")]
+        overrides=[{name:body} for name,body in cases]
+        # A README explicitly declared as license text remains mandatory.
+        overrides.append({"vendor/slint/README.md":b"",
+            "vendor/slint/Cargo.toml":b'[package]\nname = "slint"\nversion = "1.18.1"\nlicense-file = "README.md"\n'})
+        for changed in overrides:
+            with self.subTest(paths=sorted(changed)):
+                _,_,_,revision,build=self.evidence(source_overrides=changed)
+                with self.assertRaises(ValueError):
+                    native_notices.prepare_bytes(*build(),revision,platform="darwin",version="0.1.0")
 
     def test_source_bound_plain_notices_cover_all_packages_patch_and_slint_without_legal_acceptance(self):
         source, files, manifest, revision, build = self.evidence()

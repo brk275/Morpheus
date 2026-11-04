@@ -297,6 +297,13 @@ def prepare_bytes(bundle, receipt_bytes, revision, *, platform, version, working
         if (name in {"vendor/README.md", "vendor/cpal/OWNED_ALSA.md"}
                 or name.startswith("vendor/") and path.name in
                 {"MORPHEUS_PATCH.md", "OWNED_COREAUDIO.md", "README.md"}):
+            # Empty upstream nested READMEs are optional documentation, not
+            # source notice text. Their bytes remain authenticated in the full
+            # source archive/manifest; mandatory patch/OWNED/top-level evidence
+            # and every license candidate still require nonempty plain bytes.
+            if (path.name == "README.md" and name != "vendor/README.md"
+                    and type(value) is bytes and value == b""):
+                continue
             checksum = digest(plain(value)); keep_text(checksum, value)
             provenance.append({"source_path": name, "sha256": checksum})
     require(any(r["name"] == "slint" and r["license_texts"] for r in records)
