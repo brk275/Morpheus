@@ -23,6 +23,7 @@ enum Case {
     NormalUiUpgrade,
     NormalUiAfterApplyRecovery,
     NormalUiTrialFailureRollback,
+    ControllerRestartUpgrade,
 }
 
 impl Case {
@@ -32,6 +33,7 @@ impl Case {
             Self::NormalUiUpgrade
                 | Self::NormalUiAfterApplyRecovery
                 | Self::NormalUiTrialFailureRollback
+                | Self::ControllerRestartUpgrade
         )
     }
 
@@ -46,6 +48,7 @@ impl Case {
             Self::NormalUiUpgrade => "normal_ui_upgrade",
             Self::NormalUiAfterApplyRecovery => "normal_ui_after_apply_recovery",
             Self::NormalUiTrialFailureRollback => "normal_ui_trial_failure_rollback",
+            Self::ControllerRestartUpgrade => "controller_restart_upgrade",
         }
     }
 }
@@ -539,11 +542,69 @@ fn prepare(run: &Run) -> Result<(), UpdateError> {
     Ok(())
 }
 
+// Only an authenticated old-GUI case may create this capability. It travels
+// with the actual signature-verified StagedUpdate to its blocking worker.
+// The waitable helper moves back to the actual root owner before RestartReady.
+pub(crate) struct ControllerRestartAuthority {
+    run: Run,
+    helper: std::sync::Arc<std::sync::Mutex<Option<OwnedChild>>>,
+}
+
+impl ControllerRestartAuthority {
+    pub(crate) fn validate(&self, version: &str) -> Result<(), UpdateError> {
+        require(
+            self.run.plan.case == Case::ControllerRestartUpgrade
+                && version == self.run.plan.new_version
+                && self.run.seen("normal_ui_ready"),
+        )
+    }
+
+    pub(crate) fn prepare<'a>(
+        &self,
+        session: &'a mut MacAppSession,
+        bytes: &[u8],
+        version: &str,
+        lease: InstallLease,
+    ) -> Result<PreparedMacRestart<'a>, UpdateError> {
+        self.validate(version)?;
+        self.run.assert_old()?;
+        require(
+            session.installed == self.run.installed
+                && session.state == self.run.state
+                && digest(bytes) == self.run.plan.archive_sha256,
+        )?;
+        // Same preparation body, exact verified archive and call/install lease.
+        // Shipping preparation remains closed by INSTALLATION_VALIDATED.
+        let prepared = prepare_restart_admitted(session, bytes, version, lease)?;
+        self.run.mark("prepared")?;
+        Ok(prepared)
+    }
+
+    pub(crate) fn handed_off(&self) -> Result<(), UpdateError> {
+        let mut slot = self
+            .helper
+            .lock()
+            .map_err(|_| UpdateError::RecoveryRequired)?;
+        require(slot.is_none())?;
+        let mut children = RETAINED.with(|children| std::mem::take(&mut *children.borrow_mut()));
+        if children.len() != 1 {
+            RETAINED.with(|retained| retained.borrow_mut().append(&mut children));
+            return Err(UpdateError::RecoveryRequired);
+        }
+        *slot = children.pop();
+        let helper = slot.as_ref().ok_or(UpdateError::RecoveryRequired)?;
+        self.run.mark("helper_ready_lease_held")?;
+        self.run.offer_helper_observer(helper)?;
+        self.run.mark("controller_restart_handed_off")
+    }
+}
+
 // This guard exists only in the compile-gated acceptance module. It owns
 // the same helper anchor while the actual application and cleanup run.
 #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
 pub(crate) struct UiRun {
     run: Run,
+    controller_helper: std::sync::Arc<std::sync::Mutex<Option<OwnedChild>>>,
     _children: Children,
 }
 
@@ -570,10 +631,23 @@ impl UiRun {
 
     pub(crate) fn prepare(
         &self,
+        controller: &crate::update_controller::UpdateController,
         startup: &std::sync::Arc<std::sync::Mutex<super::super::StartupSession>>,
         activity: &super::super::UpdateActivity,
     ) -> Result<(), UpdateError> {
         let mut staged = self.run.signed_stage(false)?;
+        if self.run.plan.case == Case::ControllerRestartUpgrade {
+            staged.mac_controller_authority = Some(ControllerRestartAuthority {
+                run: self.run.clone(),
+                helper: self.controller_helper.clone(),
+            });
+            controller
+                .admit_mac_acceptance_stage(staged)
+                .map_err(|_| UpdateError::RecoveryRequired)?;
+            // Ready means a real verified payload is owned by the real
+            // controller; the native driver must press its actual Restart.
+            return self.run.mark("normal_ui_ready");
+        }
         let mut startup = startup.lock().map_err(|_| UpdateError::RecoveryRequired)?;
         let session = startup
             .macapp
@@ -631,9 +705,18 @@ impl UiRun {
                     && self.run.seen("helper_observer_armed")
                     && self.run.seen("normal_ui_ready"),
             )?;
-            let mut helper = RETAINED
-                .with(|children| children.borrow_mut().pop())
-                .ok_or(UpdateError::RecoveryRequired)?;
+            let mut helper = if self.run.plan.case == Case::ControllerRestartUpgrade {
+                require(self.run.seen("controller_restart_handed_off"))?;
+                self.controller_helper
+                    .lock()
+                    .map_err(|_| UpdateError::RecoveryRequired)?
+                    .take()
+                    .ok_or(UpdateError::RecoveryRequired)?
+            } else {
+                RETAINED
+                    .with(|children| children.borrow_mut().pop())
+                    .ok_or(UpdateError::RecoveryRequired)?
+            };
             require(RETAINED.with(|children| children.borrow().is_empty()) && !helper.exited()?)?;
             self.run.mark("normal_ui_owners_drained")?;
             // The existing external immutable kernel registration is already
@@ -663,6 +746,7 @@ pub(crate) fn entry() -> Result<Option<UiRun>, UpdateError> {
         CURRENT.with(|current| *current.borrow_mut() = Some(run.clone()));
         let ui = UiRun {
             run,
+            controller_helper: std::sync::Arc::new(std::sync::Mutex::new(None)),
             _children: Children,
         };
         // Before any GUI/profile/store entry, reject missing/foreign/nonempty
@@ -711,6 +795,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn controller_restart_authority_requires_exact_case_version_and_ready_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut authority = ControllerRestartAuthority {
+            run: Run {
+                plan: Plan {
+                    schema: 1,
+                    nonce: "0123456789abcdef0123456789abcdef".into(),
+                    case: Case::ControllerRestartUpgrade,
+                    old_version: "0.1.0".into(),
+                    new_version: "0.1.1".into(),
+                    old_tree_sha256: "a".repeat(64),
+                    new_tree_sha256: "b".repeat(64),
+                    archive_sha256: "c".repeat(64),
+                    public_key: "generated-public-fixture-key".into(),
+                    signature: "generated-fixture-signature".into(),
+                },
+                root: root.path().to_owned(),
+                installed: root.path().join("Morpheus.app"),
+                state: root.path().join("state"),
+            },
+            helper: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        };
+        assert!(authority.validate("0.1.1").is_err());
+        fs::create_dir(root.path().join("events")).unwrap();
+        authority.run.mark("normal_ui_ready").unwrap();
+        assert!(authority.validate("0.1.1").is_ok());
+        assert!(authority.validate("0.1.2").is_err());
+        authority.run.plan.case = Case::NormalUiUpgrade;
+        assert!(authority.validate("0.1.1").is_err());
+    }
+
+    #[test]
     fn synthetic_plan_is_closed_and_requires_distinct_version_and_exact_build_nonce() {
         let json = r#"{"schema":1,"nonce":"0123456789abcdef0123456789abcdef","case":"upgrade","old_version":"0.1.0","new_version":"0.1.1","old_tree_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","new_tree_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","archive_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","public_key":"generated-public-fixture-key","signature":"generated-fixture-signature"}"#;
         let plan: Plan = serde_json::from_str(json).unwrap();
@@ -721,6 +837,7 @@ mod tests {
             "normal_ui_upgrade",
             "normal_ui_after_apply_recovery",
             "normal_ui_trial_failure_rollback",
+            "controller_restart_upgrade",
         ] {
             let gui: Plan = serde_json::from_str(&json.replace("upgrade", case)).unwrap();
             gui.validate(&plan.nonce).unwrap();

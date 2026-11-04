@@ -73,7 +73,7 @@ BRIDGE_QUEUE_BOUND = 4
 TREE_BOUND = 5000
 NAME_BOUND = 256
 WINDOW_BOUND = 16
-KEYS = frozenset({"Return", "Space", "Tab", "ShiftTab", "Escape"})
+KEYS = frozenset({"Return", "Space", "Tab", "ShiftTab", "Escape", "u", "p", "d", "a", "t", "e", "s"})
 SETTINGS_TAB_BOUND = 160
 PROC_PIDPATHINFO_MAXSIZE = 4096
 OVERLONG = object()
@@ -962,6 +962,15 @@ def normal_close(bridge, process, diagnostics, executable, table=None, after_tab
         bridge.call({"op": "close"}, allow_error=True)
     except BridgeFailure as error:
         raise DiagnosticFailure("window_count" if error.code == "window_count" else "bridge_invalid") from None
+    wait_normal_exit(process, diagnostics, executable, after_table=after_table, seconds=seconds)
+
+
+def wait_normal_exit(process, diagnostics, executable, *, after_table=None, seconds=15):
+    """Observe actual orderly exit after an already issued production action.
+
+    No close request or signal is sent. Keep the original Popen leader unreaped
+    until status zero and empty owned process group are proven exactly as close.
+    """
     diagnostics.operation("process_wait")
     deadline = time.monotonic() + seconds
     while (status := smoke.process_status(process)) is None and time.monotonic() < deadline:

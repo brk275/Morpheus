@@ -4851,7 +4851,7 @@ fn run_application(
     // The once-only origin conclusion retains the same pack on uncertainty.
     #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
     let macos_update_preparation =
-        macos_update_acceptance.prepare(&update_session, &update_activity);
+        macos_update_acceptance.prepare(&updates, &update_session, &update_activity);
     #[cfg(target_os = "macos")]
     let macos_resources = macos_shutdown::Resources::new(
         manager.clone(),

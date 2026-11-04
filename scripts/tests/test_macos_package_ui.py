@@ -107,6 +107,119 @@ class InstalledUpdateTransactionBoundaryTests(unittest.TestCase):
                 self.assertFalse((root / "normal_ui_upgrade/events/normal_ui_parent_exit_observed").exists())
                 bridge.close.assert_called_once()
 
+    def test_controller_restart_permission_refusal_never_launches_or_presses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            logs = root / "logs"
+            logs.mkdir(mode=0o700)
+            commands = types.SimpleNamespace(root=root, logs=logs, sequence=0, environment={},
+                                             start=Mock(), cleanup_failed=False)
+            bridge = Mock()
+            old = {"version": "0.1.0", "bundle_sha256": "a" * 64}
+            new = {"version": "0.1.1", "bundle_sha256": "b" * 64, "sha256": "c" * 64}
+            with patch.object(update_qa, "copy_bundle"), patch.object(ui, "bridge_command", return_value=["bridge"]), \
+                    patch.object(ui, "Bridge", return_value=bridge), \
+                    patch.object(ui, "check_permissions", side_effect=ui.DiagnosticFailure("permission_unavailable")), \
+                    patch.object(update_qa, "HelperExit") as observe, patch.object(ui, "MacUI") as keyboard:
+                with self.assertRaises(ui.DiagnosticFailure):
+                    update_qa.run_controller_restart_case(commands, root, old, new,
+                                                         "public-fixture", "signature-fixture", NONCE, root / "bridge")
+            commands.start.assert_not_called()
+            observe.assert_not_called()
+            keyboard.assert_not_called()
+            bridge.close.assert_called_once()
+
+    def test_controller_restart_cannot_accept_nonzero_exit_or_missing_handoff(self):
+        for exit_error in (ui.DiagnosticFailure("exit_status"), None):
+            with self.subTest(exit_error=exit_error), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                logs = root / "logs"
+                logs.mkdir(mode=0o700)
+                process, observer, bridge, keyboard = Mock(), Mock(), Mock(), Mock()
+                keyboard.focused_name.return_value = "Restart to update"
+                bridge.call.side_effect = ui.BridgeFailure("input_rejected")
+                commands = types.SimpleNamespace(root=root, logs=logs, sequence=0, environment={},
+                                                 start=Mock(return_value=(process, root / "app.log")),
+                                                 finish_actor=Mock(), pending=[process],
+                                                 helper_observers=[observer], cleanup_failed=False)
+                old = {"version": "0.1.0", "bundle_sha256": "a" * 64}
+                new = {"version": "0.1.1", "bundle_sha256": "b" * 64, "sha256": "c" * 64}
+                with patch.object(update_qa, "copy_bundle"), patch.object(ui, "bridge_command", return_value=["bridge"]), \
+                        patch.object(ui, "Bridge", return_value=bridge), patch.object(ui, "check_permissions"), \
+                        patch.object(update_qa, "wait_event"), patch.object(update_qa, "HelperExit", return_value=observer), \
+                        patch.object(ui, "installed_bundle", return_value=smoke.IDENTIFIER), \
+                        patch.object(ui, "attach_owned"), patch.object(ui, "owned_window"), \
+                        patch.object(ui, "MacUI", return_value=keyboard), patch.object(ui, "enter_preview"), \
+                        patch.object(ui, "normal_close") as close, \
+                        patch.object(ui, "wait_normal_exit", side_effect=exit_error), \
+                        patch.object(update_qa, "event_seen", return_value=False):
+                    with self.assertRaises((ui.DiagnosticFailure, update_qa.Refused)):
+                        update_qa.run_controller_restart_case(commands, root, old, new,
+                                                             "public-fixture", "signature-fixture", NONCE, root / "bridge")
+                keyboard.wait.assert_called_once_with("Restart to update", role="AXButton")
+                self.assertEqual(keyboard.key.call_args_list[-1].args, ("Return",))
+                close.assert_not_called()
+                observer.finish.assert_not_called()
+                self.assertFalse((root / "controller_restart_upgrade/events/normal_ui_parent_exit_observed").exists())
+                self.assertEqual(commands.pending, [process])
+                self.assertEqual(commands.helper_observers, [observer])
+                bridge.close.assert_called_once()
+
+    def test_early_ui_permission_refusal_precedes_candidate_build_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            logs = root / "logs"
+            logs.mkdir(mode=0o700)
+            (root / "morpheus-ax-bridge").write_bytes(b"fixture-not-executed")
+            commands = types.SimpleNamespace(root=root, logs=logs, sequence=0, environment={},
+                                             run=Mock(), start=Mock(), cleanup_failed=False)
+            bridge = Mock()
+            with patch.object(ui, "bridge_command", return_value=["bridge"]), \
+                    patch.object(ui, "Bridge", return_value=bridge), \
+                    patch.object(ui, "check_permissions", side_effect=ui.DiagnosticFailure("permission_unavailable")):
+                with self.assertRaises(ui.DiagnosticFailure):
+                    update_qa.prepare_ui_bridge(commands, root)
+            self.assertEqual(commands.run.call_count, 1)
+            self.assertEqual(commands.run.call_args.args[0][:2], ["xcrun", "swiftc"])
+            commands.start.assert_not_called()
+            bridge.close.assert_called_once()
+            self.assertFalse(commands.cleanup_failed)
+
+    def test_authority_regression_receipt_refuses_missing_duplicate_or_ignored_tests(self):
+        prefix = "updater::macos_transaction::acceptance::tests::"
+        names = [prefix + "controller_restart_authority_requires_exact_case_version_and_ready_receipt",
+                 prefix + "synthetic_plan_is_closed_and_requires_distinct_version_and_exact_build_nonce"]
+        listing = "\n".join(name + ": test" for name in names) + "\n2 tests, 0 benchmarks\n"
+        passed = "\n".join("test " + name + " ... ok" for name in names) + "\n"
+        summary = "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 900 filtered out; finished in 0.01s\n"
+        for list_text, run_text, accepted in [
+            (listing, passed + summary, True),
+            (listing.replace(names[1] + ": test\n", ""), passed + summary, False),
+            (listing, passed.replace(names[1], names[0]) + summary, False),
+            (listing, passed + summary.replace("0 ignored", "1 ignored"), False),
+            (listing, passed + summary.replace("0 failed", "1 failed"), False),
+        ]:
+            with self.subTest(accepted=accepted, listing=list_text, result=run_text), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                listed, result = root / "list.log", root / "run.log"
+                listed.write_text(list_text)
+                result.write_text(run_text)
+                listed.chmod(0o600)
+                result.chmod(0o600)
+                commands = types.SimpleNamespace(run=Mock(side_effect=[listed, result]), scanner=root / "scanner")
+                with patch.object(update_qa, "scan_logs"):
+                    if accepted:
+                        self.assertTrue(update_qa.run_authority_regressions(commands, root, root / "target", NONCE))
+                    else:
+                        with self.assertRaises(update_qa.Refused):
+                            update_qa.run_authority_regressions(commands, root, root / "target", NONCE)
+                for call in commands.run.call_args_list:
+                    self.assertEqual(call.args[0][:9], ["cargo", "test", "--release", "--locked", "-p", "morpheus-app",
+                                                       "--features", "native-calls", "--bin"])
+                    self.assertEqual(call.kwargs["cwd"], root)
+                    self.assertEqual(call.kwargs["extra"], {"CARGO_TARGET_DIR": str(root / "target"),
+                                                           "MORPHEUS_MAC_UPDATE_ACCEPTANCE_BUILD": NONCE})
+
     def test_actor_environment_does_not_forward_keys_loader_config_or_activation(self):
         environment = self.environment() | {"PATH": "/fixed/toolchain", "DYLD_IMAGE_SUFFIX": "foreign",
                                             "MORPHEUS_UPDATE_PUBLIC_KEY": "foreign", "GITHUB_TOKEN": "foreign",

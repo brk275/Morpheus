@@ -567,6 +567,43 @@ impl UpdateController {
         }
     }
 
+    /// Authenticated compile-gated input only. The real controller owns the
+    /// real signed stage; no action callback or helper outcome is fabricated.
+    #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+    pub(crate) fn admit_mac_acceptance_stage(
+        &self,
+        mut staged: StagedUpdate,
+    ) -> Result<(), ControllerError> {
+        if !staged.has_mac_controller_authority() {
+            return Err(UpdateError::InvalidConfiguration.into());
+        }
+        staged.verify()?;
+        let mut inner = self
+            .shared
+            .inner
+            .lock()
+            .map_err(|_| ControllerError::WorkerFailed)?;
+        if inner.workflow.closing
+            || inner.workflow.pending.is_some()
+            || inner.workflow.handed_off
+            || inner.workflow.staged.is_some()
+            || inner.workflow.available.is_some()
+            || !inner.workers.is_empty()
+            || inner.restart_lease.is_some()
+            || inner.workflow.status.phase != UpdatePhase::Disabled
+        {
+            return Err(ControllerError::ActionUnavailable);
+        }
+        let version = display_version(staged.version());
+        inner.workflow = Workflow::new(None);
+        inner.workflow.staged = Some(staged);
+        inner.workflow.status.phase = UpdatePhase::Staged;
+        inner.workflow.status.version = Some(version);
+        inner.workflow.changed();
+        self.shared.publish(&inner);
+        Ok(())
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<UpdateStatus> {
         self.shared.status.subscribe()
     }
@@ -894,6 +931,10 @@ fn prepare_and_handoff(staged: &mut StagedUpdate, shared: &Shared) -> Result<(),
         staged
             .prepare_macos_restart(&shared.activity, session)?
             .launch_supervisor()?;
+        #[cfg(morpheus_macos_update_acceptance)]
+        if staged.has_mac_controller_authority() {
+            staged.finish_mac_controller_handoff(&shared.activity)?;
+        }
         Ok(())
     }
     #[cfg(target_os = "windows")]

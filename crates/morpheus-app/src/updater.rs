@@ -354,7 +354,12 @@ fn stage_bytes(
     file.write_all(bytes)
         .and_then(|_| file.as_file().sync_all())
         .map_err(|_| UpdateError::StageFailed)?;
-    Ok(StagedUpdate { update, file })
+    Ok(StagedUpdate {
+        update,
+        file,
+        #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+        mac_controller_authority: None,
+    })
 }
 
 /// Owns only a staged artifact. Dropping it removes the file; account databases,
@@ -362,9 +367,30 @@ fn stage_bytes(
 pub struct StagedUpdate {
     update: Update,
     file: NamedTempFile,
+    #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+    mac_controller_authority: Option<macos_transaction::acceptance::ControllerRestartAuthority>,
 }
 
 impl StagedUpdate {
+    #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+    pub(crate) fn has_mac_controller_authority(&self) -> bool {
+        self.mac_controller_authority.is_some()
+    }
+
+    #[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+    pub(crate) fn finish_mac_controller_handoff(
+        &self,
+        activity: &UpdateActivity,
+    ) -> Result<(), UpdateError> {
+        if !matches!(activity.try_start_call(), Err(UpdateError::UpdateActive)) {
+            return Err(UpdateError::RecoveryRequired);
+        }
+        self.mac_controller_authority
+            .as_ref()
+            .ok_or(UpdateError::InvalidConfiguration)?
+            .handed_off()
+    }
+
     pub fn version(&self) -> &str {
         &self.update.version
     }
@@ -419,6 +445,10 @@ impl StagedUpdate {
             return Err(UpdateError::UnsupportedFormat);
         }
         let bytes = self.verified_bytes()?;
+        #[cfg(morpheus_macos_update_acceptance)]
+        if let Some(authority) = &self.mac_controller_authority {
+            return authority.prepare(session, &bytes, &self.update.version, lease);
+        }
         macos_transaction::prepare_restart(session, &bytes, &self.update.version, lease)
     }
 

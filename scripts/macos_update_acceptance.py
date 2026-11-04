@@ -57,6 +57,7 @@ MARKERS = {
                                "old_restart_before_store", "rollback_preserved_old"},
 }
 NORMAL_UI_CASES = ("normal_ui_upgrade", "normal_ui_after_apply_recovery", "normal_ui_trial_failure_rollback")
+CONTROLLER_RESTART_CASE = "controller_restart_upgrade"
 HELPER_CASES = frozenset(("upgrade", "tampered_stage", "after_apply_recovery", "trial_failure_rollback"))
 for _case in HELPER_CASES:
     MARKERS[_case] |= {"helper_ticket_ready", "helper_observer_armed", "old_actor_exit_observed",
@@ -65,8 +66,9 @@ for _case in NORMAL_UI_CASES:
     MARKERS[_case] = (MARKERS[_case.removeprefix("normal_ui_")]
                       - {"synthetic_shutdown", "old_actor_exit_observed"}) | {
                           "normal_ui_ready", "normal_ui_owners_drained", "normal_ui_parent_exit_observed"}
-STAGES = frozenset(("preflight", "export", "build_old", "build_new", "signing", "log_scan", "cleanup", "complete",
-                    *CASES, *NORMAL_UI_CASES))
+MARKERS[CONTROLLER_RESTART_CASE] = MARKERS["normal_ui_upgrade"] | {"controller_restart_handed_off", "printable_neutral_refused"}
+STAGES = frozenset(("preflight", "export", "build_old", "build_new", "signing", "log_scan", "cleanup", "complete", "ui_permissions", "authority_regressions",
+                    *CASES, *NORMAL_UI_CASES, CONTROLLER_RESTART_CASE))
 SCANNER_SHA256 = {
     "arm64": "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f",
     "x86_64": "cee01fea7173f1b779dff188e1c26ecbcb4027d394acc573b23aaf0be260e291",
@@ -421,6 +423,63 @@ def build_bundle(commands, source, target, version, nonce, index, notice_bundle,
     return artifact, receipt, metadata
 
 
+def prepare_ui_bridge(commands, source):
+    """Refuse an incapable hosted UI before either expensive app variant."""
+    bridge_binary = commands.root / "morpheus-ax-bridge"
+    commands.run(["xcrun", "swiftc", "-O", "-module-name", "MorpheusAxBridge", "-o", str(bridge_binary),
+                  str(source / "scripts/macos_package_ui.swift")], seconds=600)
+    require(bridge_binary.is_file() and not bridge_binary.is_symlink())
+    diagnostics = owned.Diagnostics({})
+    commands.sequence += 1
+    bridge_log = commands.logs / f"{commands.sequence:03d}.log"
+    fd = os.open(bridge_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    bridge = None
+    with os.fdopen(fd, "wb") as output:
+        try:
+            bridge = owned.Bridge(owned.bridge_command(bridge_binary), diagnostics,
+                                  environment=commands.environment, log=output)
+            owned.check_permissions(bridge, diagnostics)
+        finally:
+            if bridge is not None:
+                try:
+                    bridge.close()
+                except BaseException:
+                    commands.cleanup_failed = True
+                    raise
+    return bridge_binary
+
+
+def run_authority_regressions(commands, export, target, nonce):
+    """Execute only the existing two authority tests in the same old cohort.
+
+    Cargo's bin test harness necessarily compiles cfg(test) app code once;
+    it uses the same release/native-calls target, version-only export and
+    compile nonce as the already built old package, never a full app test run.
+    """
+    prefix = "updater::macos_transaction::acceptance::tests::"
+    expected = {
+        prefix + "controller_restart_authority_requires_exact_case_version_and_ready_receipt",
+        prefix + "synthetic_plan_is_closed_and_requires_distinct_version_and_exact_build_nonce",
+    }
+    args = ["cargo", "test", "--release", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+            "--bin", "morpheus-app", prefix]
+    environment = {"CARGO_TARGET_DIR": str(target), "MORPHEUS_MAC_UPDATE_ACCEPTANCE_BUILD": nonce}
+    listing = commands.run(args + ["--", "--list"], cwd=export, extra=environment, seconds=3300)
+    # Independently scan all private command output before interpreting it.
+    scan_logs(commands, commands.scanner)
+    lines = re.sub(r"\x1b\[[0-9;]*[mK]", "", bounded(listing, MAX_LOG).decode("utf-8")).splitlines()
+    listed = [line.removesuffix(": test") for line in lines if line.endswith(": test")]
+    require(len(listed) == 2 and set(listed) == expected and "2 tests, 0 benchmarks" in lines)
+    result = commands.run(args + ["--", "--test-threads=1"], cwd=export, extra=environment, seconds=3300)
+    scan_logs(commands, commands.scanner)
+    lines = re.sub(r"\x1b\[[0-9;]*[mK]", "", bounded(result, MAX_LOG).decode("utf-8")).splitlines()
+    passed = [match[1] for line in lines if (match := re.fullmatch(r"test ([A-Za-z0-9_:]+) \.\.\. ok", line))]
+    summaries = [line for line in lines if line.startswith("test result:")]
+    require(len(passed) == 2 and set(passed) == expected and len(summaries) == 1
+            and re.fullmatch(r"test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [^\r\n]{1,128}", summaries[0]) is not None)
+    return True
+
+
 def sign_payload(commands, archive):
     # Official pinned Packager signer; no private key is read by this driver,
     # passed on argv, included in a report or used outside the private root.
@@ -638,6 +697,105 @@ def run_normal_ui_case(commands, case, old, old_receipt, new_receipt, public, si
     return True
 
 
+def run_controller_restart_case(commands, old, old_receipt, new_receipt, public, signature, nonce, bridge_binary):
+    """Real signed stage -> actual Settings Restart -> controller -> normal drain."""
+    case = CONTROLLER_RESTART_CASE
+    root = private_new(commands.root / case)
+    private_new(root / "events")
+    private_new(root / "profile")
+    installed = root / "Morpheus.app"
+    copy_bundle(old / "Morpheus.app", installed, old_receipt["bundle_sha256"])
+    plan = {"schema": 1, "nonce": nonce, "case": case, "old_version": old_receipt["version"],
+            "new_version": new_receipt["version"], "old_tree_sha256": old_receipt["bundle_sha256"],
+            "new_tree_sha256": new_receipt["bundle_sha256"], "archive_sha256": new_receipt["sha256"],
+            "public_key": public, "signature": signature}
+    private_write(root / "run.json", json.dumps(plan, sort_keys=True).encode("ascii"))
+    actor_env = {"MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN": str(root / "run.json")}
+    diagnostics = owned.Diagnostics({})
+    commands.sequence += 1
+    bridge_log = commands.logs / f"{commands.sequence:03d}.log"
+    fd = os.open(bridge_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    bridge = None
+    with os.fdopen(fd, "wb") as output:
+        try:
+            bridge = owned.Bridge(owned.bridge_command(bridge_binary), diagnostics,
+                                  environment=commands.environment, log=output)
+            owned.check_permissions(bridge, diagnostics)
+            process, log = commands.start([str(installed / APP), "--morpheus-mac-qa-normal-ui"], extra=actor_env)
+            wait_event(root, "normal_ui_ready", process, log)
+            owned.attach_owned(bridge, process, installed / APP, owned.installed_bundle(installed / APP), diagnostics)
+            owned.owned_window(bridge, process, diagnostics)
+            ui = owned.MacUI(bridge, process.pid, process, diagnostics)
+            # Account-free existing preview and real Settings navigation. No
+            # synthesized callback, forced event-loop exit or test-only button.
+            owned.enter_preview(ui)
+            ui.focus("Open settings")
+            # Exercise the native printable guard against an actually owned,
+            # focused neutral button before ever entering the search field.
+            # An accepted event or any different error is a real gate failure.
+            try:
+                bridge.call({"op": "key", "key": "u"}, allow_error=True, record_error=False)
+            except owned.BridgeFailure as error:
+                require(error.code == "input_rejected")
+            else:
+                raise Refused("mac_update_acceptance")
+            ui.expect_focus("Open settings")
+            private_write(root / "events/printable_neutral_refused", MARKER_BYTES)
+            ui.key("Return")
+            ui.focus("Search settings")
+            for key in "updates":
+                ui.key(key)
+            ui.focus("Application updates,", prefix=True)
+            ui.key("Return")
+            # The real registry reveals its status field while Check is
+            # disabled for the staged payload. Only nearby live controls are
+            # then traversed; do not tab through every customization setting.
+            for _ in range(8):
+                focused = ui.focused_name()
+                owned.require_ui(focused is not None, "focus_unowned")
+                if focused == "Restart to update":
+                    break
+                ui.key("Tab")
+                ui.wait_for(lambda: (name := ui.focused_name()) is not None and name != focused)
+            else:
+                raise owned.DiagnosticFailure("wait_timeout")
+            ui.wait("Restart to update", role="AXButton")
+            ui.key("Return")
+            # The real blocking controller worker retains the actual Child
+            # while its independent immutable kernel observer is armed here.
+            wait_event(root, "helper_ticket_ready", process, log)
+            observer = HelperExit(commands, process, root, nonce, old_receipt, new_receipt)
+            private_write(root / "events/helper_observer_armed", MARKER_BYTES)
+            owned.wait_normal_exit(process, diagnostics, installed / APP)
+            commands.finish_actor(process, log)
+            require(event_seen(root, "controller_restart_handed_off")
+                    and event_seen(root, "normal_ui_owners_drained"))
+            private_write(root / "events/normal_ui_parent_exit_observed", MARKER_BYTES)
+        finally:
+            if bridge is not None:
+                try:
+                    bridge.close()
+                except BaseException:
+                    commands.cleanup_failed = True
+                    raise
+    observer.finish(expected=0)
+    require(event_seen(root, "helper_parent_exit_observed"))
+    journal = json.loads(bounded(root / STATE / "journal.json", 16 * 1024), object_pairs_hook=closed_object)
+    require(journal["phase"] == "Committed" and journal["new_hash"] == new_receipt["bundle_sha256"]
+            and payload._snapshot(root / STATE / "previous.app")["tree_sha256"] == old_receipt["bundle_sha256"])
+    restarted, restart_log = commands.start([str(installed / APP)], extra=actor_env)
+    commands.finish_actor(restarted, restart_log, seconds=420)
+    require(payload._snapshot(installed)["tree_sha256"] == new_receipt["bundle_sha256"]
+            and not (root / STATE / "journal.json").exists()
+            and not (root / STATE / "previous.app").exists()
+            and not (root / STATE / "next.app").exists())
+    private_write(root / "events/upgrade_and_committed_restart", MARKER_BYTES)
+    entries = {path.name for path in (root / "events").iterdir()}
+    require(entries == MARKERS[case] and all(event_seen(root, token) for token in entries))
+    require(not processes_in_fixture(root))
+    return True
+
+
 def wait_helper_event(root, token, observer):
     deadline = time.monotonic() + 180
     while not event_seen(root, token):
@@ -737,6 +895,10 @@ def main():
         version_log = commands.run(["cargo", "packager", "--version"])
         scan_logs(commands, scanner)
         require(bounded(version_log, 4096).strip() == b"cargo-packager 0.11.8")
+        report["stage"] = "ui_permissions"
+        bridge_binary = prepare_ui_bridge(commands, source)
+        scan_logs(commands, scanner)
+        report["checks"]["native_ui_permissions"] = True
         report["stage"] = "export"
         exports = export_source(commands, source, revision)
         versions = app_versions(source)
@@ -745,6 +907,10 @@ def main():
             report["stage"] = "build_old" if index == 1 else "build_new"
             built.append(build_bundle(commands, export, target, version, nonce, index,
                                       args.native_source_bundle, args.native_source_receipt, revision))
+            if index == 1:
+                report["stage"] = "authority_regressions"
+                report["checks"]["controller_authority_regressions"] = run_authority_regressions(
+                    commands, export, target, nonce)
         old, old_receipt, old_identity = built[0]
         new, new_receipt, new_identity = built[1]
         require(old_identity["persistence"] == new_identity["persistence"]
@@ -760,14 +926,15 @@ def main():
         for case in CASES:
             report["stage"] = case
             report["checks"][case] = run_case(commands, case, old, old_receipt, new_receipt, public, signature, nonce)
-        bridge_binary = root / "morpheus-ax-bridge"
-        commands.run(["xcrun", "swiftc", "-O", "-module-name", "MorpheusAxBridge", "-o", str(bridge_binary),
-                      str(source / "scripts/macos_package_ui.swift")], seconds=600)
-        require(bridge_binary.is_file() and not bridge_binary.is_symlink())
         for case in NORMAL_UI_CASES:
             report["stage"] = case
             report["checks"][case] = run_normal_ui_case(
                 commands, case, old, old_receipt, new_receipt, public, signature, nonce, bridge_binary)
+        report["stage"] = CONTROLLER_RESTART_CASE
+        report["checks"][CONTROLLER_RESTART_CASE] = run_controller_restart_case(
+            commands, old, old_receipt, new_receipt, public, signature, nonce, bridge_binary)
+        report["checks"]["printable_key_neutral_refusal"] = True
+        report["update_button_restart"] = True
         report["normal_ui_shutdown"] = True
         report["actual_old_parent_exit"] = True
         report["production_group_cleanup"] = True

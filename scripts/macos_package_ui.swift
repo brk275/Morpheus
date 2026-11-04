@@ -24,7 +24,11 @@ import Foundation
 let maxNodes = 5000
 let maxName = 256
 let maxLine = 256
-let keyCodes: [String: CGKeyCode] = ["Return": 0x24, "Tab": 0x30, "Space": 0x31, "Escape": 0x35]
+let keyCodes: [String: CGKeyCode] = [
+    "Return": 0x24, "Tab": 0x30, "Space": 0x31, "Escape": 0x35,
+    "u": 0x20, "p": 0x23, "d": 0x02, "a": 0x00, "t": 0x11, "e": 0x0e, "s": 0x01
+]
+let settingsSearchKeys: Set<String> = ["u", "p", "d", "a", "t", "e", "s"]
 let shiftCode: CGKeyCode = 0x38
 let staticTextRole = "AXStaticText"
 let runLoopTurn: TimeInterval = 0.05
@@ -330,6 +334,21 @@ struct Transition {
 // immediately before EVERY native post, including releases. A failed proof
 // ends the chord at once; nothing further is posted toward whatever took the
 // foreground. The driver fails the run either way.
+// The only printable input this fixed QA protocol accepts spells "updates".
+// It may be posted only to the owned, nonprotected Settings search field;
+// no editable value, arbitrary text or clipboard is read or accepted.
+func settingsSearchHasFocus(_ pid: pid_t) -> Bool {
+    let application = AXUIElementCreateApplication(pid)
+    guard let value = attribute(application, kAXFocusedUIElementAttribute as String),
+          CFGetTypeID(value) == AXUIElementGetTypeID() else { return false }
+    let element = value as! AXUIElement
+    guard owner(element) == pid,
+          string(element, kAXRoleAttribute as String) == (kAXTextFieldRole as String),
+          string(element, kAXSubroleAttribute as String) != (kAXSecureTextFieldSubrole as String) else { return false }
+    let name = accessibleName(element, role: kAXTextFieldRole as String)
+    return name.0 == "Search settings" && !name.1
+}
+
 func sendKey(_ command: [String: Any]) {
     guard let target = target else { fail("not_attached"); return }
     guard var name = command["key"] as? String else { fail("invalid_key"); return }
@@ -356,6 +375,10 @@ func sendKey(_ command: [String: Any]) {
     for transition in transitions {
         guard frontmostOwned(target.pid) else {
             fail(posted == 0 ? "foreground_unowned" : "input_rejected")
+            return
+        }
+        if settingsSearchKeys.contains(name) && !settingsSearchHasFocus(target.pid) {
+            fail("input_rejected")
             return
         }
         guard let event = CGEvent(keyboardEventSource: nil, virtualKey: transition.code, keyDown: transition.down) else {
