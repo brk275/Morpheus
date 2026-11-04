@@ -3,6 +3,7 @@
 import importlib.util
 import base64
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -51,7 +52,7 @@ class FakeSelector:
 class ProcessTests(unittest.TestCase):
     def invoke(self, root, *, stdout=b"okay", stderr=b"private", limit=4096, binary=False,
                timeout=10, status=0, cleanup_error=None, interrupt=False, progress=None,
-               stdin_bytes=None, stderr_limit=8 * 1024 * 1024, expected_status=(0,)):
+               stdin_bytes=None, stderr_limit=8 * 1024 * 1024, expected_status=(0,), archive_revision=None):
         process = SimpleNamespace(pid=42, returncode=None, stdout=FakePipe(81), stderr=FakePipe(82))
         chunks = {81: [stdout, b""], 82: [stderr, b""]}
         runner = M.OwnedRunner(root / "logs", progress=progress)
@@ -68,9 +69,16 @@ class ProcessTests(unittest.TestCase):
                 mock.patch.object(M.containment, "stop_owned", side_effect=cleanup_error) as stopped, \
                 mock.patch.object(M.selectors, "DefaultSelector", return_value=selector), \
                 mock.patch.object(M.subprocess, "Popen", side_effect=spawn) as spawned, \
+                mock.patch.object(M.client.R, "trusted_tool", return_value="/usr/bin/git"), \
                 mock.patch.object(M.os, "set_blocking"), \
                 mock.patch.object(M.os, "read", side_effect=lambda fd, size: chunks[fd].pop(0)):
             try:
+                if archive_revision is not None:
+                    result = runner.source_archive(archive_revision, cwd=root, env={"GITHUB_SHA": archive_revision})
+                    self.assertEqual(spawned.call_args.args[0], ["/usr/bin/git", "-c", "core.hooksPath=/dev/null",
+                        "-c", "core.fsmonitor=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+                        "archive", "--format=tar", archive_revision])
+                    return result
                 return runner.run("fixture", ["/usr/bin/unused"], cwd=root, env={}, timeout=timeout,
                                   output_limit=limit, binary_output=binary,
                                   stdin_bytes=stdin_bytes, stderr_limit=stderr_limit, expected_status=expected_status)
@@ -83,6 +91,111 @@ class ProcessTests(unittest.TestCase):
                 if stdin_bytes is not None:
                     self.assertEqual(received_input, [stdin_bytes])
                     self.assertTrue(spawned.call_args.kwargs["stdin"].closed)
+
+    def test_selected_source_archive_reads_above_64mib_without_log_or_cleanup_waiver(self):
+        payload = b"x" * (64 * 1024 * 1024 + 1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.assertEqual(self.invoke(root, stdout=payload, archive_revision="a" * 40), payload)
+            self.assertEqual((root / "logs/0001-source-archive.stdout.log").read_bytes(), b"")
+            self.assertEqual((root / "logs/0001-source-archive.stderr.log").read_bytes(), b"private")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(M, "MAX_EXPORT_BYTES", 16), \
+                self.assertRaises(M.CommandFailure) as caught:
+            self.invoke(Path(directory).resolve(), stdout=b"x" * 17, archive_revision="a" * 40)
+        self.assertEqual(caught.exception.reason, "output")
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(M.CommandFailure) as caught:
+            self.invoke(Path(directory).resolve(), archive_revision="a" * 40,
+                        cleanup_error=RuntimeError("private cleanup failure"))
+        self.assertEqual(caught.exception.reason, "cleanup")
+
+    def test_source_archive_rejects_unselected_revision_and_generic_large_output_before_spawn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            runner = M.OwnedRunner(root / "logs")
+            for value, environment in [(None, {}), ("main", {}), ("a" * 7, {}), ("0" * 40, {}),
+                                       ("A" * 40, {}), ("a" * 40 + "\ninput", {}),
+                                       ("a" * 40, {}), ("a" * 40, {"GITHUB_SHA": "b" * 40})]:
+                with self.subTest(revision=value), mock.patch.object(M.client.R, "trusted_tool") as tool, \
+                        mock.patch.object(runner, "_execute") as execute, self.assertRaises(M.CommandFailure):
+                    runner.source_archive(value, cwd=root, env=environment)
+                tool.assert_not_called(); execute.assert_not_called()
+            for tool_path, cwd in (("/tmp/git", root), ("/usr/bin/git-link", root),
+                                   ("/usr/bin/git", Path("relative"))):
+                with self.subTest(tool=tool_path, cwd=str(cwd)), \
+                        mock.patch.object(M.client.R, "trusted_tool", return_value=tool_path), \
+                        mock.patch.object(runner, "_execute") as execute, self.assertRaises(M.CommandFailure):
+                    runner.source_archive("a" * 40, cwd=cwd, env={"GITHUB_SHA": "a" * 40})
+                execute.assert_not_called()
+            for stage, binary in (("fixture", False), ("download", True), ("source-archive", True)):
+                with self.subTest(stage=stage), mock.patch.object(M.containment, "assert_contained") as contained, \
+                        mock.patch.object(M.subprocess, "Popen") as spawned, self.assertRaises(M.CommandFailure):
+                    runner.run(stage, ["/usr/bin/git", "archive", "--format=tar", "a" * 40], cwd=root, env={},
+                               timeout=60, output_limit=64 * 1024 * 1024 + 1, binary_output=binary)
+                contained.assert_not_called(); spawned.assert_not_called()
+            self.assertEqual(runner.sequence, 0)
+            self.assertEqual(list((root / "logs").iterdir()), [])
+
+    def test_linux_update_producer_requires_head_clean_and_full_proof_around_source_archive(self):
+        revision = "a" * 40
+        for head, clean, proof_error in ((revision.encode() + b"\n", b"", None),
+                                          (b"b" * 40 + b"\n", b"", None),
+                                          (revision.encode() + b"\n", b"dirty", None),
+                                          (revision.encode() + b"\n", b"", P.SourceRevisionError("checkout"))):
+            with self.subTest(head=head[:4], dirty=bool(clean), proof_failure=proof_error is not None), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                exported, reference, target, case = (root / name for name in ("export", "reference", "target", "case"))
+                for path in (exported, reference, target, case):
+                    path.mkdir(mode=0o700)
+                event = root / "event.json"
+                event.write_text(json.dumps({"repository":{"owner":{"login":"brk275","id":42}},
+                                             "sender":{"login":"brk275","id":42}}))
+                event.chmod(0o600)
+                plan = {"schema":1,"reviewed_checkout":str(reference),"revision":revision,
+                        "target":str(target),"version":"0.1.0-updateqa.1",
+                        "feed":"https://127.0.0.1:12345/feed.json","public_key":"fixture-public-data"}
+                plan_path = case / "update-plan.json"
+                plan_path.write_text(json.dumps(plan)); plan_path.chmod(0o600)
+                environment = {"MORPHEUS_FREE_HOSTED_UPDATE_QA":"1","GITHUB_SHA":revision,
+                               "GITHUB_EVENT_PATH":str(event),"GITHUB_ACTOR":"brk275",
+                               "GITHUB_TRIGGERING_ACTOR":"brk275","GITHUB_ACTOR_ID":"42"}
+                archive, proof = b"synthetic selected archive bytes", {"fixture":"complete source proof"}
+                runner = SimpleNamespace(run=mock.Mock(side_effect=[head, clean]),
+                                         source_archive=mock.Mock(return_value=archive))
+                with mock.patch.dict(P.os.environ, environment, clear=True), \
+                        mock.patch.object(P, "ROOT", exported), \
+                        mock.patch.object(P, "public_hosted_environment"), \
+                        mock.patch.object(P.containment, "assert_contained"), \
+                        mock.patch.object(P, "controlled_environment", return_value={"GITHUB_SHA":revision}), \
+                        mock.patch.object(P, "command_tools", return_value={}), \
+                        mock.patch.object(P.client.R, "trusted_tool", return_value="/usr/bin/git"), \
+                        mock.patch.object(P, "OwnedRunner", return_value=runner), \
+                        mock.patch.object(P, "verify_versioned_export", return_value=proof,
+                                          side_effect=proof_error) as verified, \
+                        mock.patch.object(P, "validate_update_parameters"), \
+                        mock.patch.object(P, "build_unsigned") as built, \
+                        mock.patch.object(P, "owned_tool", return_value="/reviewed/scanner"), \
+                        mock.patch.object(P, "scan_private_logs") as scanned, \
+                        mock.patch.dict(sys.modules, {"appimage_notices":SimpleNamespace()}), \
+                        mock.patch("builtins.print"):
+                    admitted = head == revision.encode() + b"\n" and not clean
+                    if not admitted or proof_error is not None:
+                        with self.assertRaises((P.PackageFailure, P.SourceRevisionError)):
+                            P.update_build(plan_path, "/reviewed/scanner")
+                    else:
+                        P.update_build(plan_path, "/reviewed/scanner")
+                self.assertEqual(runner.source_archive.call_count, int(admitted))
+                if admitted:
+                    self.assertEqual(runner.source_archive.call_args.args, (revision,))
+                    self.assertEqual(runner.source_archive.call_args.kwargs["cwd"], reference)
+                    self.assertEqual(runner.source_archive.call_args.kwargs["env"]["PATH"], "/usr/bin:/bin")
+                    verified.assert_called_once_with(exported, archive, plan["version"])
+                else:
+                    verified.assert_not_called()
+                self.assertEqual(built.call_count, int(admitted and proof_error is None))
+                if admitted and proof_error is None:
+                    self.assertIs(built.call_args.kwargs["update"]["source_proof"], proof)
+                scanned.assert_called_once_with(case, "/reviewed/scanner")
 
     def test_private_bounded_input_and_source_stderr_limit_preserve_owned_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
