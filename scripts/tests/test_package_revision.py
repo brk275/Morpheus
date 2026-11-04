@@ -73,8 +73,19 @@ class RevisionIdentityTests(unittest.TestCase):
                 checkout.assert_called_once_with(source, "a" * 40)
                 self.assertEqual(len(exported), 2)
                 self.assertFalse((mac_root / "source.tar").exists())
-            windows_export, proof = windows.export_source(SimpleNamespace(root=windows_root), source,
-                                                          raw, "0.1.0-updateqa.1", "old")
+            # Keep this complete byte/version exporter test cross-platform;
+            # actual Windows ACL enforcement has its own standard-host case.
+            admitted=[]
+            def private_directory(path, *, parents=False, exist_ok=False):
+                path=Path(path);path.mkdir(parents=parents,exist_ok=exist_ok);return path
+            def private_file(path, *, private=False):
+                self.assertTrue(private)
+                path=Path(path);self.assertTrue(path.is_file());admitted.append(path);return path
+            security=SimpleNamespace(private_directory=private_directory,path=private_file)
+            with patch.object(windows.notice_source.S,"windows_security",return_value=security):
+                windows_export, proof = windows.export_source(SimpleNamespace(root=windows_root), source,
+                                                              raw, "0.1.0-updateqa.1", "old")
+            self.assertEqual(set(admitted),{windows_export/name for name in originals})
             self.assertEqual(proof["files"], len(originals))
             for tree in [*exported, windows_export]:
                 self.assertEqual(sum(path.is_file() for path in tree.rglob("*")), len(originals))
