@@ -221,7 +221,13 @@ class Commands:
 
     def run(self, argv, *, cwd=None, extra=None, seconds=180):
         process, path = self.start(argv, cwd=cwd, extra=extra)
-        self.finish(process, path, seconds=seconds, allow_stop=True)
+        try:
+            self.finish(process, path, seconds=seconds, allow_stop=True)
+        except BaseException:
+            # Retain only this owned command's identity and terminal status.
+            # No diagnostics are read or emitted before the final default scan.
+            self.failed_command = (path, process.returncode)
+            raise
         return path
 
     def finish_actor(self, process, path, *, seconds=180, expected=0):
@@ -392,6 +398,8 @@ def app_versions(source):
 
 
 def build_bundle(commands, source, target, version, nonce, index, notice_bundle, notice_receipt, revision):
+    commands.build_substage = "config"
+    commands.failed_command = None
     artifact = private_new(commands.root / f"package-{index}")
     config = packaging.package_config(source, platform="darwin")
     require(config["before-packaging-command"]
@@ -401,15 +409,18 @@ def build_bundle(commands, source, target, version, nonce, index, notice_bundle,
     config.update({"version": version, "out-dir": str(artifact), "binaries-dir": str(target / "release")})
     formats = packaging.macos_update_formats(config, "app")
     notice_dir = private_new(commands.root / f"notices-{index}")
+    commands.build_substage = "notices_prepare"
     notice_contents = notices.prepare(notice_bundle, notice_receipt, notice_dir,
                                      revision=revision, platform="darwin", version=version, working=source)
     config["resources"] = list(config["resources"]) + [
         {"src": str(notice_dir / name), "target": name} for name in notices.NAMES]
     # Exactly one existing before-packaging build for this version. DMG/UI QA
     # remains unchanged and separate; this route retains its actual .app bytes.
+    commands.build_substage = "cargo_packager"
     commands.run(["cargo", "packager", "--release", "--config", json.dumps(config), "--formats", formats],
                  cwd=source, extra={"CARGO_TARGET_DIR": str(target), "MORPHEUS_MAC_UPDATE_ACCEPTANCE_BUILD": nonce},
                  seconds=3300)
+    commands.build_substage = "payload"
     arch = {"arm64": "aarch64", "x86_64": "x86_64"}[platform.machine()]
     receipt = payload.prepare_update(artifact / "Morpheus.app", artifact / "Morpheus.app.tar.gz",
                                      version=version, arch=arch, root=source, notice_contents=notice_contents)
@@ -842,6 +853,70 @@ def scan_final_logs(commands, scanner, report):
     return final
 
 
+
+# Fixed, authenticated source names only. Absolute paths, arbitrary filenames,
+# messages, command arguments and environment values are never diagnostic data.
+BUILD_DIAGNOSTIC_PATHS = frozenset((
+    "crates/morpheus-app/build.rs",
+    "crates/morpheus-app/src/main.rs",
+    "crates/morpheus-app/src/updater.rs",
+    "crates/morpheus-app/src/update_controller.rs",
+    "crates/morpheus-app/src/updater/macos_transaction.rs",
+    "crates/morpheus-app/src/updater/macos_transaction_acceptance.rs",
+))
+BUILD_SUBSTAGES = frozenset(("config", "notices_prepare", "cargo_packager", "payload"))
+
+
+def build_failure_diagnostic(commands, report):
+    """Closed failure hints after the existing complete default scan only.
+
+    The owned command log combines stdout and stderr. Tokens observed here are
+    diagnostic hints, not authenticated compiler provenance or acceptance proof.
+    """
+    if (report.get("status") != "failed" or report.get("stage") not in {"build_old", "build_new"}
+            or report.get("checks", {}).get("default_log_scan") is not True
+            or commands.pending or commands.helper_observers or commands.cleanup_failed):
+        return None
+    phase = getattr(commands, "build_substage", None)
+    if phase not in BUILD_SUBSTAGES:
+        return None
+    result = {"schema": 1, "check": "macos_update_build_diagnostic", "stage": report["stage"],
+              "build_substage": phase, "command_exit": "not_observed", "return_code": None,
+              "observed_rust_error_codes": [], "observed_source_locations": []}
+    failed = getattr(commands, "failed_command", None)
+    if phase != "cargo_packager" or type(failed) is not tuple or len(failed) != 2:
+        return result
+    path, status = failed
+    path = Path(path)
+    require(path.parent == commands.logs and path.parent.resolve(strict=True) == path.parent
+            and re.fullmatch(r"[0-9]{3,6}\.log", path.name) is not None)
+    data = bounded(path, MAX_LOG).decode("utf-8", "replace")
+    if type(status) is int and -255 <= status <= 255:
+        result["return_code"] = status
+        result["command_exit"] = ("signal_exit" if status < 0 else
+                                  "nonzero_exit" if status > 0 else "zero_exit_other_refusal")
+    else:
+        result["command_exit"] = "no_bounded_terminal_status"
+    codes = set()
+    locations = set()
+    for line in data.splitlines():
+        # No arbitrary line is retained. Oversized lines cannot create hints.
+        if len(line) > 4096:
+            continue
+        match = re.match(r"^error\[(E[0-9]{4})\]:", line)
+        if match and len(codes) < 16:
+            codes.add(match[1])
+        match = re.fullmatch(r"\s*--> ([A-Za-z0-9_./-]+):([0-9]{1,10}):([0-9]{1,10})", line)
+        if match and match[1] in BUILD_DIAGNOSTIC_PATHS and len(locations) < 16:
+            row, column = int(match[2]), int(match[3])
+            if 0 < row < 2**31 and 0 < column < 2**31:
+                locations.add((match[1], row, column))
+    result["observed_rust_error_codes"] = sorted(codes)
+    result["observed_source_locations"] = [{"source": name, "line": row, "column": column}
+                                            for name, row, column in sorted(locations)]
+    return result
+
+
 def processes_in_fixture(root):
     # Observation only. Never signal a PID discovered in this snapshot.
     result = []
@@ -964,6 +1039,15 @@ def main():
                     report["stage"], report["status"] = "complete", "passed"
             except Exception:
                 report["status"] = "failed"
+    if commands is not None:
+        try:
+            diagnostic = build_failure_diagnostic(commands, report)
+            if diagnostic is not None:
+                print("MORPHEUS_MAC_UPDATE_BUILD_DIAGNOSTIC " + json.dumps(diagnostic, sort_keys=True))
+        except Exception:
+            # An unreadable/changed/over-bound diagnostic never weakens failure
+            # or publishes partial raw output; acceptance remains unchanged.
+            pass
     print("MORPHEUS_MAC_UPDATE_QA " + json.dumps(report, sort_keys=True))
     return 0 if report["status"] == "passed" else 1
 

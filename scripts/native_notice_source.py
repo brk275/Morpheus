@@ -51,12 +51,51 @@ _NOTICE_FAILURE_PHASES = frozenset({
     "guard", "event_file", "event_payload", "scanner_path", "scanner_hash",
     "rustup", "cargo", "rustc", "git", "temp_parent", "private_root",
     "owner_marker", "publish", "source", "private_children", "tool_versions", "fetch_export", "cleanup",
+    "git_export", "source_inputs", "cargo_fetch", "cache_check", "input_plan", "source_build",
 })
 
 
 def _notice_phase(phase):
     global _NOTICE_FAILURE_PHASE
     _NOTICE_FAILURE_PHASE = phase
+
+
+def _notice_failure_site(error):
+    # Code metadata only: never inspect locals, arguments, exception text,
+    # chained errors or source lines. Only exact owned module files map to a
+    # fixed public enum; an unknown innermost frame suppresses the site.
+    try:
+        owned = {
+            os.path.normcase(str(ROOT / "scripts/native_notice_source.py")): "notice_source",
+            os.path.normcase(str(ROOT / "scripts/native_notice_windows.py")): "windows_security",
+            os.path.normcase(str(ROOT / "scripts/native_notices.py")): "native_notices",
+            os.path.normcase(str(ROOT / "packaging/linux/corresponding_source.py")): "source_catalogue",
+            os.path.normcase(str(ROOT / "scripts/run_windows_capture_acceptance.py")): "windows_processes",
+        }
+        trace, site, visited = error.__traceback__, None, 0
+        while trace is not None and visited < 32:
+            visited += 1
+            code = trace.tb_frame.f_code
+            filename = code.co_filename
+            module_file = trace.tb_frame.f_globals.get("__file__")
+            if (type(filename) is str and len(filename) <= 4096
+                    and type(module_file) is str and len(module_file) <= 4096
+                    and os.path.normcase(filename) == os.path.normcase(module_file)
+                    and os.path.normcase(filename) in owned):
+                # Retain the rejecting caller's predicate, not this generic
+                # helper's `raise`. Function names never enter the record.
+                if code.co_name != "require":
+                    line = trace.tb_lineno
+                    site = ({"module": owned[os.path.normcase(filename)], "line": line}
+                            if type(line) is int and 0 < line <= 99999 else None)
+            else:
+                site = None
+            trace = trace.tb_next
+        return site if trace is None else None
+    except BaseException:
+        # Diagnostics cannot replace the original closed failure with a new
+        # traceback if code metadata is unavailable or malformed.
+        return None
 
 
 def _notice_report_failure(error):
@@ -77,6 +116,9 @@ def _notice_report_failure(error):
     phase = _NOTICE_FAILURE_PHASE if _NOTICE_FAILURE_PHASE in _NOTICE_FAILURE_PHASES else "source"
     print("MORPHEUS_NATIVE_NOTICE_FAILURE " + json.dumps({"phase": phase, "exception": category,
           **numbers}, sort_keys=True), file=sys.stderr)
+    site = _notice_failure_site(error)
+    if site is not None:
+        print("MORPHEUS_NATIVE_NOTICE_SITE " + json.dumps(site, sort_keys=True), file=sys.stderr)
 
 
 def require(value):
@@ -511,20 +553,24 @@ def prepare(environment, scanner):
         for tool,prefix in ((cargo,b"cargo 1.99.0 "),(rustc,b"rustc 1.99.0 ")):
             version=commands.run("version",[str(tool),"--version"],cwd=root/"fetch",env=controlled,timeout=30,output_limit=256)
             require(version.startswith(prefix) and version.endswith(b"\n") and version.count(b"\n")==1)
-        _notice_phase("source")
+        _notice_phase("git_export")
         _,source,files=S.git_export(commands,ROOT,revision,str(git),controlled,S.Budget())
+        _notice_phase("source_inputs")
         packages=source_inputs(files)
         _notice_phase("fetch_export")
         fetched_source=fetch_export(root,files,source)
-        _notice_phase("source")
+        _notice_phase("cargo_fetch")
         for directory in (root/"fetch",root,*root.parents):
             require(not any((directory/".cargo"/name).exists() for name in ("config","config.toml")))
         commands.run("fetch",[str(cargo),"--config","net.git-fetch-with-cli=false","--config","net.retry=0",
             "--config","registry.global-credential-providers=[]","fetch","--locked","--manifest-path",str(fetched_source/"Cargo.toml")],
             cwd=root/"fetch",env=controlled,timeout=1200,output_limit=8*1024**2,stderr_limit=8*1024**2)
+        _notice_phase("cache_check")
         check_cache(root/"cargo")
+        _notice_phase("input_plan")
         plan=input_plan(root/"cargo",packages,commands,controlled,git)
         write_new(root/"plan.json",json.dumps(plan,sort_keys=True).encode()+b"\n")
+        _notice_phase("source_build")
         receipt=S.build(commands,root/"output",ROOT,revision,str(git),controlled,root/"plan.json")
         require(receipt["source_tree"]==source["tree"])
         write_new(root/"receipt.json",json.dumps(receipt,sort_keys=True).encode()+b"\n")

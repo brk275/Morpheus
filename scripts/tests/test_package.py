@@ -734,6 +734,73 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
 
 
 class NativeSourceAcquisitionTests(unittest.TestCase):
+    def test_notice_failure_site_uses_owned_caller_code_only_without_private_values(self):
+        from scripts import native_notice_source as acquisition
+        marker = "synthetic-private-diagnostic-value"
+        try:
+            acquisition.checked(Path("relative-source-site"), private=True)
+        except ValueError as error:
+            # Exception arguments/chain may contain secrets or paths. Neither
+            # is an input to the bounded code-location diagnostic.
+            error.args = (marker, {"private_body": marker})
+            output = io.StringIO()
+            with mock.patch.object(acquisition, "_NOTICE_FAILURE_PHASE", "git_export"), \
+                    mock.patch.object(acquisition.sys, "stderr", output):
+                acquisition._notice_report_failure(error)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        failure = json.loads(lines[0].removeprefix("MORPHEUS_NATIVE_NOTICE_FAILURE "))
+        self.assertEqual(failure, {"phase":"git_export", "exception":"value_error", "errno":None, "winerror":None})
+        site = json.loads(lines[1].removeprefix("MORPHEUS_NATIVE_NOTICE_SITE "))
+        self.assertEqual(set(site), {"module", "line"})
+        self.assertEqual(site["module"], "notice_source")
+        self.assertIs(type(site["line"]), int)
+        self.assertTrue(acquisition.checked.__code__.co_firstlineno <= site["line"]
+                        < acquisition.checked.__code__.co_firstlineno + 10)
+        self.assertNotEqual(site["line"], acquisition.require.__code__.co_firstlineno + 2)
+        self.assertNotIn(marker, output.getvalue())
+        self.assertNotIn("relative-source-site", output.getvalue())
+        self.assertNotIn("native_notice_source.py", output.getvalue())
+        self.assertNotIn("checked", output.getvalue())
+
+    def test_notice_failure_site_omits_unknown_inner_code_and_excess_trace_depth(self):
+        from scripts import native_notice_source as acquisition
+        marker = "synthetic-private-diagnostic-value"
+        foreign = "/synthetic-private-home/foreign-diagnostic.py"
+        namespace = {"__file__":foreign}
+        exec(compile("def foreign():\n    raise ValueError('synthetic-private-diagnostic-value')\n",
+                     foreign, "exec"), namespace)
+        def deep(depth):
+            if depth:
+                return deep(depth - 1)
+            return acquisition.checked(Path("relative-source-site"))
+        class UnavailableMetadata(ValueError):
+            def __getattribute__(self, name):
+                if name == "__traceback__":
+                    raise RuntimeError("synthetic-private-diagnostic-value")
+                return super().__getattribute__(name)
+        errors = []
+        for invoke in (namespace["foreign"], lambda:deep(40)):
+            try:
+                invoke()
+            except ValueError as error:
+                errors.append(error)
+        errors.append(UnavailableMetadata(marker))
+        for error in errors:
+            output = io.StringIO()
+            with self.subTest(kind=type(error).__name__), \
+                    mock.patch.object(acquisition, "_NOTICE_FAILURE_PHASE", "source"), \
+                    mock.patch.object(acquisition.sys, "stderr", output):
+                acquisition._notice_report_failure(error)
+            lines = output.getvalue().splitlines()
+            self.assertEqual(len(lines), 1)
+            failure = json.loads(lines[0].removeprefix("MORPHEUS_NATIVE_NOTICE_FAILURE "))
+            self.assertEqual(set(failure), {"phase", "exception", "errno", "winerror"})
+            self.assertEqual(failure["phase"], "source")
+            self.assertNotIn("MORPHEUS_NATIVE_NOTICE_SITE", output.getvalue())
+            self.assertNotIn(marker, output.getvalue())
+            self.assertNotIn(foreign, output.getvalue())
+
     def test_isolated_file_entry_loads_only_reviewed_siblings_outside_the_checkout(self):
         import subprocess
         scripts=Path(__file__).resolve().parents[1]

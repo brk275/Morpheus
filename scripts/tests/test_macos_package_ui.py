@@ -24,6 +24,92 @@ PID = 4242
 
 
 class InstalledUpdateTransactionBoundaryTests(unittest.TestCase):
+    def test_build_bundle_records_exact_config_notice_packager_payload_failure_substages(self):
+        config = {"before-packaging-command": "cargo build --release --locked -p morpheus-app --features native-calls",
+                  "macos": {"info-plist-path": "packaging/macos/Info.plist",
+                            "entitlements": "packaging/macos/entitlements.plist"}, "resources": []}
+        for stage in ("config", "notices_prepare", "cargo_packager", "payload"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                commands = types.SimpleNamespace(root=root, run=Mock())
+                with patch.object(update_qa, "private_new", side_effect=lambda path: path), \
+                        patch.object(update_qa.packaging, "package_config", return_value=dict(config)) as configure, \
+                        patch.object(update_qa.packaging, "macos_update_formats", return_value="app"), \
+                        patch.object(update_qa.notices, "prepare", return_value={}) as prepare, \
+                        patch.object(update_qa.payload, "prepare_update") as payload, \
+                        patch.object(update_qa.platform, "machine", return_value="x86_64"):
+                    failed = {"config": configure, "notices_prepare": prepare,
+                              "cargo_packager": commands.run, "payload": payload}[stage]
+                    failed.side_effect = ValueError("fixed synthetic refusal")
+                    with self.assertRaises(ValueError):
+                        update_qa.build_bundle(commands, root, root, "0.1.0-updateqa.1", NONCE, 1,
+                                               root / "bundle", root / "receipt", "a" * 40)
+                    self.assertEqual(commands.build_substage, stage)
+                    self.assertIsNone(commands.failed_command)
+                    if stage in {"config", "notices_prepare"}:
+                        commands.run.assert_not_called()
+                    if stage != "payload":
+                        payload.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX owned complete log reader")
+    def test_build_failure_diagnostic_requires_complete_scan_and_emits_only_closed_bounded_hints(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            logs = root / "logs"
+            logs.mkdir(mode=0o700)
+            log = logs / "001.log"
+            body = "error[E0308]: private message content\n  --> crates/morpheus-app/src/main.rs:1739:7\n"
+            body += "error[E0308]: repeated\n  --> /private/runner/source/crates/morpheus-app/src/main.rs:7:2\n"
+            body += "  --> unreviewed/path.rs:1:2\n  --> crates/morpheus-app/src/main.rs:0:2\n"
+            body += "error[E0001]: " + "x" * 4096 + "\n"
+            body += "".join(f"error[E{number:04d}]: fixed\n" for number in range(30))
+            log.write_text(body)
+            log.chmod(0o600)
+            commands = types.SimpleNamespace(root=root, logs=logs, pending=[], helper_observers=[],
+                                             cleanup_failed=False, build_substage="cargo_packager",
+                                             failed_command=(log, 101))
+            report = {"status": "failed", "stage": "build_old", "checks": {"default_log_scan": False}}
+            self.assertIsNone(update_qa.build_failure_diagnostic(commands, report))
+            report["checks"]["default_log_scan"] = True
+            result = update_qa.build_failure_diagnostic(commands, report)
+            self.assertEqual(set(result), {"schema", "check", "stage", "build_substage", "command_exit",
+                                          "return_code", "observed_rust_error_codes", "observed_source_locations"})
+            self.assertEqual(result["command_exit"], "nonzero_exit")
+            self.assertEqual(result["return_code"], 101)
+            self.assertEqual(len(result["observed_rust_error_codes"]), 16)
+            self.assertEqual(result["observed_source_locations"], [
+                {"source": "crates/morpheus-app/src/main.rs", "line": 1739, "column": 7}])
+            self.assertNotIn("private message", json.dumps(result))
+            self.assertNotIn("/private", json.dumps(result))
+            for field, value in (("pending", [object()]), ("helper_observers", [object()]),
+                                 ("cleanup_failed", True)):
+                with patch.object(commands, field, value):
+                    self.assertIsNone(update_qa.build_failure_diagnostic(commands, report))
+            for stage in ("config", "notices_prepare", "payload"):
+                commands.build_substage = stage
+                self.assertEqual(update_qa.build_failure_diagnostic(commands, report)["command_exit"], "not_observed")
+            commands.build_substage = "cargo_packager"
+            commands.failed_command = (root / "foreign.log", 101)
+            with self.assertRaises(update_qa.Refused):
+                update_qa.build_failure_diagnostic(commands, report)
+            commands.failed_command = (log, -9)
+            self.assertEqual(update_qa.build_failure_diagnostic(commands, report)["command_exit"], "signal_exit")
+            commands.failed_command = (log, None)
+            self.assertEqual(update_qa.build_failure_diagnostic(commands, report)["command_exit"], "no_bounded_terminal_status")
+            report["status"] = "passed"
+            self.assertIsNone(update_qa.build_failure_diagnostic(commands, report))
+
+    def test_failed_command_retains_only_owned_log_and_status_without_skipping_finish(self):
+        commands = object.__new__(update_qa.Commands)
+        process = types.SimpleNamespace(returncode=101)
+        owned_log = Path("/fixed/owned/logs/001.log")
+        commands.start = Mock(return_value=(process, owned_log))
+        commands.finish = Mock(side_effect=update_qa.Refused("fixed synthetic refusal"))
+        with self.assertRaises(update_qa.Refused):
+            commands.run(["cargo", "packager"], seconds=3300)
+        commands.finish.assert_called_once_with(process, owned_log, seconds=3300, allow_stop=True)
+        self.assertEqual(commands.failed_command, (owned_log, 101))
+
     def environment(self):
         return HOSTED | {"GITHUB_REPOSITORY": "brk275/Morpheus", "GITHUB_EVENT_NAME": "workflow_dispatch",
                          "GITHUB_ACTOR": "brk275", "GITHUB_TRIGGERING_ACTOR": "brk275", "GITHUB_ACTOR_ID": "42"}
