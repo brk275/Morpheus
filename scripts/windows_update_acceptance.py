@@ -203,12 +203,10 @@ class Commands:
         require(not failed)
 
 def export_source(commands, source, archive, version, label):
+    members = revision.source_export_members(archive)
     destination = commands.root / (label+"-source"); destination.mkdir()
     with tarfile.open(fileobj=io.BytesIO(archive),mode="r:") as tar:
-        for member in tar.getmembers():
-            name = Path(member.name)
-            require(not name.is_absolute() and ".." not in name.parts and (member.isdir() or member.isfile()))
-        tar.extractall(destination,filter="data")
+        tar.extractall(destination, members=members, filter="data")
     for name in revision.UPDATE_VERSION_PATHS:
         path = destination/name
         path.write_bytes(revision.versioned_source_bytes(name,path.read_bytes(),version))

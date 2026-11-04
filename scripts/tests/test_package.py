@@ -769,12 +769,113 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
         with mock.patch.object(acquisition, "os", type("Windows",(),{"name":"nt"})()), \
                 mock.patch.object(acquisition.sys,"platform","win32"), \
                 mock.patch.object(acquisition.platform,"machine",return_value="AMD64"), \
-                mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)):
+                mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)), \
+                mock.patch.object(acquisition,"system_git",return_value=Path("/programs/Git/cmd/git.exe")) as selected:
             cargo,rustc,git,rustup=acquisition.tools({"RUSTUP_HOME":"/pinned/rustup","PROGRAMFILES":"/programs"})
+        selected.assert_called_once_with()
         self.assertEqual(cargo.name,"cargo.exe");self.assertEqual(rustc.name,"rustc.exe")
         self.assertEqual(rustup,Path("/pinned/rustup"))
         self.assertIn("1.99.0-x86_64-pc-windows-msvc",str(cargo))
         self.assertEqual(git,Path("/programs/Git/cmd/git.exe"))
+
+    @unittest.skipIf(os.name == "nt", "Windows path/ACL admission is modeled without native calls")
+    def test_windows_system_git_hardlinks_keep_exact_path_and_all_acl_guards(self):
+        from scripts import native_notice_windows as windows
+        tool = Path("/programs/Git/cmd/git.exe")
+        unrelated = [Path("/programs/Git/bin/git.exe"),Path("/owned/scanner.exe"),
+                     Path("/owned/source.json"),Path("/owned/private.json")]
+        files = {tool,*unrelated}
+        security = object.__new__(windows.Security)
+        security.k = SimpleNamespace(GetDriveTypeW=mock.Mock(return_value=3))
+        security.acl = mock.Mock()
+        def metadata(path):
+            return SimpleNamespace(st_mode=0o100777 if path in files else 0o40777,
+                                   st_nlink=2 if path in files else 1,st_file_attributes=0)
+        with mock.patch.object(windows,"os",SimpleNamespace(name="nt",environ={"PROGRAMFILES":"/programs"})), \
+                mock.patch.object(Path,"resolve",autospec=True,side_effect=lambda path,strict:path) as resolved, \
+                mock.patch.object(Path,"lstat",autospec=True,side_effect=metadata) as inspected:
+            self.assertEqual(security.system_git(),tool)
+            self.assertEqual(security.acl.call_args_list,
+                [mock.call(str(path),private=False,ancestor=path!=tool) for path in (tool,*tool.parents)])
+            for path in [tool,*unrelated]:
+                for private in (False,True):
+                    with self.subTest(path=str(path),private=private),self.assertRaises(ValueError):
+                        security.path(path,private=private)
+            with self.assertRaises(TypeError):security.system_git(unrelated[0])
+            for changed_path,field,value in ((tool,"st_nlink",0),(tool,"st_mode",0o40777),
+                    (tool,"st_mode",0o120777),(tool,"st_file_attributes",0x400),
+                    (tool.parent,"st_mode",0o120777),(tool.parent,"st_file_attributes",0x400),
+                    (Path("/programs"),"st_file_attributes",0x400)):
+                def changed(path):
+                    info=metadata(path)
+                    if path==changed_path:setattr(info,field,value)
+                    return info
+                inspected.side_effect=changed
+                with self.subTest(path=str(changed_path),field=field,value=value),self.assertRaises(ValueError):
+                    security.system_git()
+            inspected.side_effect=metadata
+            for component in (tool,*tool.parents):
+                def changed_acl(path,**kwargs):
+                    if path==str(component):raise ValueError("ownership or write ACL changed")
+                security.acl.side_effect=changed_acl
+                with self.subTest(component=str(component)),self.assertRaises(ValueError):security.system_git()
+            security.acl.side_effect=None
+            security.k.GetDriveTypeW.return_value=4
+            with self.assertRaises(ValueError):security.system_git()
+            security.k.GetDriveTypeW.return_value=3
+            with mock.patch.object(Path,"resolve",return_value=unrelated[0]),self.assertRaises(ValueError):
+                security.system_git()
+            for program in ("relative","//server/share"):
+                resolved.reset_mock();inspected.reset_mock();security.acl.reset_mock()
+                with self.subTest(program=program), \
+                        mock.patch.object(windows,"os",SimpleNamespace(name="nt",environ={"PROGRAMFILES":program})), \
+                        self.assertRaises(ValueError):
+                    security.system_git()
+                resolved.assert_not_called();inspected.assert_not_called();security.acl.assert_not_called()
+            resolved.side_effect=lambda path,strict:Path("/redirect/Git/cmd/git.exe")
+            inspected.reset_mock();security.acl.reset_mock()
+            with mock.patch.object(windows,"os",SimpleNamespace(name="nt",environ={"PROGRAMFILES":"/programs/../redirect"})), \
+                    self.assertRaises(ValueError):
+                security.system_git()
+            inspected.assert_not_called();security.acl.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "Windows launch admission is modeled without spawning native code")
+    def test_windows_system_git_rechecks_acl_at_tools_and_before_every_spawn(self):
+        from scripts import native_notice_source as acquisition, native_notice_windows as windows
+        from scripts import run_windows_capture_acceptance as capture
+        tool=Path("/programs/Git/cmd/git.exe")
+        host=SimpleNamespace(name="nt",environ={"PROGRAMFILES":"/programs"})
+        security=object.__new__(windows.Security)
+        security.k=SimpleNamespace(GetDriveTypeW=lambda anchor:3)
+        security.acl=mock.Mock()
+        def metadata(path):
+            regular=path.suffix==".exe"
+            return SimpleNamespace(st_mode=0o100777 if regular else 0o40777,
+                st_nlink=2 if regular and not str(path).startswith("/pinned/") else 1,st_file_attributes=0)
+        with mock.patch.object(acquisition,"os",host),mock.patch.object(windows,"os",host), \
+                mock.patch.object(acquisition.sys,"platform","win32"), \
+                mock.patch.object(acquisition.platform,"machine",return_value="AMD64"), \
+                mock.patch.object(acquisition.S,"windows_security",return_value=security), \
+                mock.patch.object(Path,"resolve",autospec=True,side_effect=lambda path,strict:path), \
+                mock.patch.object(Path,"lstat",autospec=True,side_effect=metadata), \
+                mock.patch.object(security,"system_git",wraps=security.system_git) as selected, \
+                mock.patch.object(acquisition.subprocess,"Popen") as posix_spawn, \
+                mock.patch.object(capture,"WindowsJob") as windows_spawn:
+            _,_,git,_=acquisition.tools({"RUSTUP_HOME":"/pinned/rustup"})
+            self.assertEqual(git,tool);selected.assert_called_once_with()
+            commands=acquisition.Commands(Path("/owned"),{})
+            security.acl.side_effect=ValueError("ownership or write ACL changed")
+            with self.assertRaises(ValueError):
+                commands.run("git",[git,"--version"],cwd=Path("/owned"),env={},timeout=1,output_limit=1024)
+            self.assertEqual(selected.call_args_list,[mock.call(),mock.call()])
+            self.assertEqual(commands.sequence,0)
+            security.acl.side_effect=None
+            for alias in ("/programs/Git/bin/git.exe","/owned/scanner.exe"):
+                with self.subTest(alias=alias),self.assertRaises(ValueError):
+                    commands.run("tool",[alias,"--version"],cwd=Path("/owned"),env={},timeout=1,output_limit=1024)
+            self.assertEqual(selected.call_count,2)
+            self.assertEqual(commands.sequence,0)
+            posix_spawn.assert_not_called();windows_spawn.assert_not_called()
 
     def test_apple_system_git_shim_accepts_only_protected_root_owned_hardlinks(self):
         from scripts import native_notice_source as acquisition

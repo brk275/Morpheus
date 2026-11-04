@@ -100,6 +100,9 @@ def checked(path, *, directory=False, private=False):
 
 
 def system_git():
+    if os.name == "nt":
+        require(sys.platform == "win32")
+        return S.windows_security().system_git()
     # Apple's fixed system Git launcher shares hardlinks with other command
     # shims. It is executable input, not a writable source/scanner/data file.
     # Keep every path component canonical, root-owned and non-writable by
@@ -219,11 +222,7 @@ def tools(environment):
     directory = rustup / ("toolchains/1.99.0-" + host) / "bin"
     cargo, rustc = (_notice_checked(name, directory / (name + suffix)) for name in ("cargo", "rustc"))
     _notice_phase("git")
-    if os.name == "nt":
-        program = Path(environment["PROGRAMFILES"])
-        git = _notice_checked("git", program / "Git/cmd/git.exe")
-    else:
-        git = system_git()
+    git = system_git()
     return cargo, rustc, git, rustup
 
 
@@ -263,10 +262,12 @@ class Commands:
             expected_status=(0,), binary_output=False, stdin_bytes=None):
         require(self.sequence < 16000 and 0 < timeout <= 1200 and 0 < output_limit <= 128*1024**2
                 and 0 < stderr_limit <= 8*1024**2)
-        # Revalidate the fixed protected Apple launcher at EVERY spawn, not
-        # only during tools(). Source/scanner/data and all other executables
+        # Revalidate only the exact protected provider Git at EVERY spawn,
+        # including all Windows ACLs. Source/scanner/data and all other tools
         # retain checked()'s strict single-link admission.
-        if sys.platform == "darwin" and str(command[0]) == "/usr/bin/git":
+        if ((sys.platform == "darwin" and str(command[0]) == "/usr/bin/git")
+                or (os.name == "nt" and sys.platform == "win32"
+                    and str(command[0]) == str(Path(os.environ["PROGRAMFILES"]) / "Git/cmd/git.exe"))):
             require(system_git() == Path(command[0]))
         else:
             checked(Path(command[0]))

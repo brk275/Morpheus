@@ -32,14 +32,16 @@ import tomllib
 if __package__:
     from . import macos_package_ui as owned, package as packaging, native_notices as notices
     from . import package_smoke as smoke, prepare_macos_update as payload
-    from .package_revision import expected_revision, verify_checkout, versioned_source_bytes, verify_versioned_export
+    from .package_revision import (MAX_EXPORT_BYTES, expected_revision, source_export_members,
+                                   verify_checkout, versioned_source_bytes, verify_versioned_export)
 else:
     import macos_package_ui as owned
     import package as packaging
     import native_notices as notices
     import package_smoke as smoke
     import prepare_macos_update as payload
-    from package_revision import expected_revision, verify_checkout, versioned_source_bytes, verify_versioned_export
+    from package_revision import (MAX_EXPORT_BYTES, expected_revision, source_export_members,
+                                 verify_checkout, versioned_source_bytes, verify_versioned_export)
 
 CASES = ("upgrade", "invalid_signature", "tampered_stage", "prepared_restart",
          "after_apply_recovery", "trial_failure_rollback")
@@ -74,7 +76,7 @@ SCANNER_SHA256 = {
     "x86_64": "cee01fea7173f1b779dff188e1c26ecbcb4027d394acc573b23aaf0be260e291",
 }
 MAX_LOG = 64 * 1024 * 1024
-MAX_ARCHIVE = 64 * 1024 * 1024
+MAX_ARCHIVE = MAX_EXPORT_BYTES
 MARKER_BYTES = b'{"passed":true}\n'
 APP = Path("Contents/MacOS/morpheus-app")
 STATE = ".Morpheus.app.morpheus-update"
@@ -358,25 +360,19 @@ def export_source(commands, source, revision):
     commands.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "archive",
                   "--format=tar", "--output=" + str(archive), revision], cwd=source)
     data = bounded(archive, MAX_ARCHIVE)
+    members = source_export_members(data)
     # Authenticate the complete exported source before any build. The existing
     # validator rejects symlinks, foreign paths and arbitrary version exclusions.
     exports = []
     for index, variant in enumerate(app_versions(source), 1):
         destination = private_new(commands.root / f"source-{index}")
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
-            names, expanded = set(), 0
-            for member in tar:
+            for member in members:
                 pure = Path(member.name)
-                require(not pure.is_absolute() and ".." not in pure.parts and "\\" not in member.name
-                        and str(pure) == member.name.rstrip("/") and (member.isdir() or member.isfile())
-                        and member.name not in names and len(names) < 5000)
-                names.add(member.name)
                 path = destination / pure
                 if member.isdir():
                     path.mkdir(mode=0o755, parents=True, exist_ok=True)
                 else:
-                    expanded += member.size
-                    require(member.size <= 8 * 1024 * 1024 and expanded <= MAX_ARCHIVE)
                     path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
                     blob = tar.extractfile(member).read(member.size + 1)
                     require(len(blob) == member.size)

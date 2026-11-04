@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import tarfile
 from pathlib import Path
 import subprocess
@@ -7,13 +8,163 @@ import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import package_revision as revision
 from scripts import package_scope
 
 
 class RevisionIdentityTests(unittest.TestCase):
+    def test_large_committed_source_inventories_keep_complete_version_only_identity(self):
+        from scripts import macos_update_acceptance as mac, windows_update_acceptance as windows
+        originals = {
+            "crates/morpheus-app/Cargo.toml": b'[package]\nname = "morpheus-app"\nversion = "0.1.0"\n',
+            "Cargo.lock": b'[[package]]\nname = "morpheus-app"\nversion = "0.1.0"\n',
+        }
+        # Exact sizes from the immutable reviewed 83878ed source tree. These
+        # are complete inert JSON documents, not truncated reads or exclusions.
+        sizes = {"native/webrtc/linux/expected-linux-overlay.json": 10_353_166,
+                 "native/webrtc/linux/selected-linux-build-inputs.json": 16_775_086}
+        prefix, suffix = b'{"reviewed_fixture":"', b'"}\n'
+        for name, size in sizes.items():
+            content = prefix + b"x" * (size - len(prefix) - len(suffix)) + suffix
+            self.assertEqual(len(content), size)
+            self.assertIn("reviewed_fixture", json.loads(content))
+            originals[name] = content
+        # The full real source is also over 64 MiB. Exercise that former outer
+        # failure with ordinary individually bounded source members as well.
+        for index in range(6):
+            originals[f"native/retained-source-{index}.txt"] = b"x" * (8 * 1024 * 1024)
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as stream:
+            for name, content in originals.items():
+                member = tarfile.TarInfo(name)
+                member.size, member.mode = len(content), 0o644
+                stream.addfile(member, io.BytesIO(content))
+        raw = archive.getvalue()
+        self.assertGreater(len(raw), 64 * 1024 * 1024)
+        self.assertLess(len(raw), revision.MAX_EXPORT_BYTES)
+        self.assertEqual(len(revision.source_export_members(raw)), len(originals))
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            root = parent / "canonical"
+            root.mkdir()
+            for name, content in originals.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(revision.versioned_source_bytes(name, content, "0.1.0-updateqa.1"))
+                path.chmod(0o600)
+            result = revision.verify_versioned_export(root, raw, "0.1.0-updateqa.1")
+            self.assertEqual(result["files"], len(originals))
+            self.assertEqual(result["allowed_paths"], sorted(revision.UPDATE_VERSION_PATHS))
+            # Exercise both real exporters with the SAME complete >64 MiB
+            # archive, including both inventories at their actual source size.
+            source = parent / "reviewed-source"
+            source.mkdir()
+            mac_root, windows_root = parent / "mac", parent / "windows"
+            mac_root.mkdir(); windows_root.mkdir()
+            exported = []
+            if os.name != "nt":
+                commands = SimpleNamespace(root=mac_root, run=Mock(side_effect=lambda *args, **kwargs:
+                                            (mac_root / "source.tar").write_bytes(raw)))
+                with patch.object(mac, "verify_checkout", return_value="a" * 40) as checkout, \
+                        patch.object(mac, "app_versions", return_value=("0.1.0-updateqa.1", "0.1.0-updateqa.2")):
+                    exported = mac.export_source(commands, source, "a" * 40)
+                checkout.assert_called_once_with(source, "a" * 40)
+                self.assertEqual(len(exported), 2)
+                self.assertFalse((mac_root / "source.tar").exists())
+            windows_export, proof = windows.export_source(SimpleNamespace(root=windows_root), source,
+                                                          raw, "0.1.0-updateqa.1", "old")
+            self.assertEqual(proof["files"], len(originals))
+            for tree in [*exported, windows_export]:
+                self.assertEqual(sum(path.is_file() for path in tree.rglob("*")), len(originals))
+                for name in sizes:
+                    self.assertEqual((tree / name).read_bytes(), originals[name])
+            # A same-sized change in an admitted large inventory still fails
+            # the full byte comparison. Its larger cap is not an exclusion.
+            with (root / next(iter(sizes))).open("r+b") as changed:
+                changed.write(b"!")
+            with self.assertRaises(revision.SourceRevisionError):
+                revision.verify_versioned_export(root, raw, "0.1.0-updateqa.1")
+
+    def test_source_export_manifest_limits_reject_aliases_and_over_bound_members(self):
+        # Oversized headers must be refused before reading their advertised
+        # body. No enormous allocation or extraction is needed to prove this.
+        entries = [
+            ("native/webrtc/linux/expected-linux-overlay.json", 16 * 1024 * 1024 + 1),
+            ("native/webrtc/linux/selected-linux-build-inputs.json", 32 * 1024 * 1024 + 1),
+            ("native/webrtc/linux/unrelated.json", 8 * 1024 * 1024 + 1),
+            ("native/webrtc/linux/EXPECTED-LINUX-OVERLAY.json", 8 * 1024 * 1024 + 1),
+            ("other/selected-linux-build-inputs.json", 8 * 1024 * 1024 + 1),
+            ("native/webrtc/linux/./expected-linux-overlay.json", 1),
+            ("native/webrtc/linux/../expected-linux-overlay.json", 1),
+            ("/native/webrtc/linux/expected-linux-overlay.json", 1),
+            ("C:/native/webrtc/linux/expected-linux-overlay.json", 1),
+            ("C:native/webrtc/linux/expected-linux-overlay.json", 1),
+            ("native\\webrtc\\linux\\expected-linux-overlay.json", 1),
+        ]
+        for name, size in entries:
+            with self.subTest(name=name, size=size):
+                member = tarfile.TarInfo(name)
+                member.size, member.mode = size, 0o644
+                raw = member.tobuf() + b"\0" * 1024
+                with self.assertRaises(revision.SourceRevisionError):
+                    revision.source_export_members(raw)
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE, tarfile.GNUTYPE_SPARSE):
+            with self.subTest(kind=kind):
+                member = tarfile.TarInfo("native/webrtc/linux/expected-linux-overlay.json")
+                member.type, member.mode, member.linkname = kind, 0o644, "outside"
+                with self.assertRaises(revision.SourceRevisionError):
+                    revision.source_export_members(member.tobuf() + b"\0" * 1024)
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as stream:
+            for name in ("one", "two"):
+                member = tarfile.TarInfo(name)
+                member.mode = 0o644
+                stream.addfile(member)
+        with patch.object(revision, "MAX_EXPORT_ENTRIES", 1), self.assertRaises(revision.SourceRevisionError):
+            revision.source_export_members(archive.getvalue())
+        with patch.object(revision, "MAX_EXPORT_BYTES", len(archive.getvalue()) - 1), \
+                self.assertRaises(revision.SourceRevisionError):
+            revision.source_export_members(archive.getvalue())
+        truncated = tarfile.TarInfo("truncated.txt")
+        truncated.size, truncated.mode = 32, 0o644
+        first = tarfile.TarInfo("valid-first.txt")
+        first.size, first.mode = 3, 0o644
+        for raw in (truncated.tobuf() + b"short",
+                    first.tobuf() + b"one" + b"\0" * 509 + truncated.tobuf() + b"short"):
+            with self.subTest(truncated_archive_bytes=len(raw)), self.assertRaises(revision.SourceRevisionError):
+                revision.source_export_members(raw)
+
+    def test_update_export_callers_refuse_invalid_headers_before_writing(self):
+        from scripts import macos_update_acceptance as mac, windows_update_acceptance as windows
+        oversized = tarfile.TarInfo("outside-large.json")
+        oversized.size, oversized.mode = 8 * 1024 * 1024 + 1, 0o644
+        truncated = tarfile.TarInfo("truncated.txt")
+        truncated.size, truncated.mode = 32, 0o644
+        first = tarfile.TarInfo("valid-first.txt")
+        first.size, first.mode = 3, 0o644
+        invalid = (oversized.tobuf() + b"\0" * 1024, truncated.tobuf() + b"short",
+                   first.tobuf() + b"one" + b"\0" * 509 + truncated.tobuf() + b"short")
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            source = parent / "reviewed-source"
+            source.mkdir()
+            rejected = parent / "rejected"
+            rejected.mkdir()
+            for bad in invalid:
+                with self.subTest(invalid_archive_bytes=len(bad)):
+                    with self.assertRaises(revision.SourceRevisionError):
+                        windows.export_source(SimpleNamespace(root=rejected), source, bad, "0.1.0-updateqa.1", "old")
+                    self.assertFalse((rejected / "old-source").exists())
+                    if os.name != "nt":
+                        commands = SimpleNamespace(root=rejected, run=Mock(side_effect=lambda *args, **kwargs:
+                                                    (rejected / "source.tar").write_bytes(bad)))
+                        with patch.object(mac, "verify_checkout", return_value="a" * 40), \
+                                self.assertRaises(revision.SourceRevisionError):
+                            mac.export_source(commands, source, "a" * 40)
+                        self.assertFalse((rejected / "source-1").exists())
+
     def test_update_export_allows_only_exact_two_version_fields_and_full_file_map(self):
         originals = {"crates/morpheus-app/Cargo.toml": b'[package]\nname = "morpheus-app"\nversion = "0.1.0"\n\n[dependencies]\nother = "0.1.0"\n',
                      "Cargo.lock": b'[[package]]\nname = "morpheus-app"\nversion = "0.1.0"\n\n[[package]]\nname = "other"\nversion = "0.1.0"\n',

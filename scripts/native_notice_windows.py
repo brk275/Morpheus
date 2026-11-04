@@ -123,6 +123,23 @@ class Security:
         require(stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode) and info.st_nlink == 1)
         return path
 
+    def system_git(self):
+        # The provider's exact Git launcher can have protected hardlink aliases.
+        # No caller supplies a path or a hardlink-policy flag. Keep the original
+        # non-private ownership/DACL and canonical local-path checks unchanged.
+        require(os.name == "nt")
+        path = Path(os.environ["PROGRAMFILES"]) / "Git/cmd/git.exe"
+        require(path.is_absolute() and not str(path).startswith(("\\\\", "//"))
+                and path.resolve(strict=True) == path
+                and self.k.GetDriveTypeW(path.anchor) == 3)
+        for item in (path, *path.parents):
+            info = item.lstat()
+            require(not stat.S_ISLNK(info.st_mode) and not getattr(info, "st_file_attributes", 0) & 0x400)
+            self.acl(str(item), private=False, ancestor=item != path)
+        info = path.lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink >= 1)
+        return path
+
     def create_root(self, parent):
         parent = self.path(parent, directory=True)
         class Attributes(ctypes.Structure):
