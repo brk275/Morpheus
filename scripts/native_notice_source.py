@@ -51,7 +51,7 @@ _NOTICE_FAILURE_PHASES = frozenset({
     "guard", "event_file", "event_payload", "scanner_path", "scanner_hash",
     "rustup", "cargo", "rustc", "git", "temp_parent", "private_root",
     "owner_marker", "publish", "source", "private_children", "tool_versions", "fetch_export", "cleanup",
-    "git_export", "source_inputs", "cargo_fetch", "cache_check", "input_plan", "source_build",
+    "workspace_repository", "git_export", "source_inputs", "cargo_fetch", "cache_check", "input_plan", "source_build",
 })
 
 
@@ -527,6 +527,42 @@ def fetch_export(root, files, identity):
         if os.name!="nt":path.chmod(0o700 if entry["mode"]=="100755" else 0o600)
     return target
 
+
+def workspace_repository(commands, root, revision, git, environment):
+    """Authenticate Windows source through an owned bare repository, not checkout ACLs.
+
+    The selected public commit is still authenticated by git_export/build's
+    complete raw commit/tree/blob checks. No checkout configuration, template,
+    hooks, alternate object store, credential helper or local transport is used.
+    """
+    if os.name != "nt":
+        return ROOT
+    require(type(revision) is str and re.fullmatch(r"[0-9a-f]{40}", revision) is not None
+            and revision != "0" * 40 and revision == R.expected_revision(environment))
+    require(Path(git) == system_git())
+    root = checked(root, directory=True, private=True)
+    cwd = checked(root/"fetch", directory=True, private=True)
+    repository = private_directory(root/"workspace.git")
+    base = [*S.safe_git(str(git), repository),
+            "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+            "-c", "http.sslVerify=true", "-c", "http.followRedirects=false",
+            "-c", "http.extraHeader=", "-c", "credential.helper=",
+            "-c", "credential.interactive=never", "-c", "core.askPass="]
+    clean = S.clean_git_environment(environment)
+    commands.run("workspace-init", [*base, "init", "--bare", "--quiet", "--template="],
+                 cwd=cwd, env=clean, timeout=30, output_limit=65536)
+    checked(repository, directory=True, private=True)
+    commands.run("workspace-fetch", [*base, "fetch", "--quiet", "--depth=1", "--no-tags",
+                 "--no-write-fetch-head", "--no-recurse-submodules", "--no-auto-maintenance",
+                 "https://github.com/brk275/Morpheus.git", revision], cwd=cwd,
+                 env=clean | {"GIT_ALLOW_PROTOCOL": "https"}, timeout=1200,
+                 output_limit=65536, stderr_limit=65536)
+    checked(repository, directory=True, private=True)
+    # Reuse the existing acquisition inventory limits: no links/reparse points,
+    # at most300000 entries/4GiB and each file within the source bundle ceiling.
+    check_cache(root)
+    return repository
+
 def prepare(environment, scanner):
     guard(environment)
     root = owned_source_root(environment)
@@ -553,8 +589,10 @@ def prepare(environment, scanner):
         for tool,prefix in ((cargo,b"cargo 1.99.0 "),(rustc,b"rustc 1.99.0 ")):
             version=commands.run("version",[str(tool),"--version"],cwd=root/"fetch",env=controlled,timeout=30,output_limit=256)
             require(version.startswith(prefix) and version.endswith(b"\n") and version.count(b"\n")==1)
+        _notice_phase("workspace_repository")
+        repository=workspace_repository(commands,root,revision,git,controlled)
         _notice_phase("git_export")
-        _,source,files=S.git_export(commands,ROOT,revision,str(git),controlled,S.Budget())
+        _,source,files=S.git_export(commands,repository,revision,str(git),controlled,S.Budget())
         _notice_phase("source_inputs")
         packages=source_inputs(files)
         _notice_phase("fetch_export")
@@ -566,12 +604,12 @@ def prepare(environment, scanner):
             "--config","registry.global-credential-providers=[]","fetch","--locked","--manifest-path",str(fetched_source/"Cargo.toml")],
             cwd=root/"fetch",env=controlled,timeout=1200,output_limit=8*1024**2,stderr_limit=8*1024**2)
         _notice_phase("cache_check")
-        check_cache(root/"cargo")
+        check_cache(root if os.name == "nt" else root/"cargo")
         _notice_phase("input_plan")
         plan=input_plan(root/"cargo",packages,commands,controlled,git)
         write_new(root/"plan.json",json.dumps(plan,sort_keys=True).encode()+b"\n")
         _notice_phase("source_build")
-        receipt=S.build(commands,root/"output",ROOT,revision,str(git),controlled,root/"plan.json")
+        receipt=S.build(commands,root/"output",repository,revision,str(git),controlled,root/"plan.json")
         require(receipt["source_tree"]==source["tree"])
         write_new(root/"receipt.json",json.dumps(receipt,sort_keys=True).encode()+b"\n")
         success=True

@@ -592,6 +592,7 @@ def update_build(plan_path, scanner):
     Ordinary packaging never enters this path. It is not an installed-capture
     pass, signer, release path or permission to execute an arbitrary export.
     """
+    global DIAGNOSTICS_PUBLISHED
     public_hosted_environment(os.environ)
     containment.assert_contained()
     if os.environ.get("MORPHEUS_FREE_HOSTED_UPDATE_QA") != "1":
@@ -622,28 +623,32 @@ def update_build(plan_path, scanner):
             or plan["revision"] != expected_revision(os.environ)):
         raise PackageFailure("identity")
     root = client.private_directory(plan_path.parent)
-    if plan_path.name != "update-plan.json":
-        raise PackageFailure("configuration")
-    reference = Path(plan["reviewed_checkout"])
-    target = Path(plan["target"])
-    if (not reference.is_absolute() or reference.resolve() != reference or not reference.is_dir()
-            or reference == ROOT or ROOT in reference.parents or reference in ROOT.parents
-            or not target.is_absolute() or target.resolve() != target or not target.is_dir()
-            or target == ROOT or ROOT in target.parents or target in ROOT.parents
-            or target.stat().st_uid != os.getuid() or target.stat().st_mode & 0o022):
-        raise PackageFailure("configuration")
-    source_details = ROOT.lstat()
-    if ROOT.resolve() != ROOT or not stat.S_ISDIR(source_details.st_mode) or source_details.st_uid != os.getuid() or source_details.st_mode & 0o077:
-        raise PackageFailure("identity")
-    environment = controlled_environment(os.environ)
-    tools = command_tools(os.environ)
-    runner = OwnedRunner(root / "command-logs")
-    git = client.R.trusted_tool("git")
-    git_env = {**environment, "PATH": "/usr/bin:/bin", "GIT_CONFIG_GLOBAL": "/dev/null",
-               "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
-    safe_git = [git, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-                "-c", "gc.auto=0", "-c", "maintenance.auto=false"]
+    progress = diagnostics.Progress(root)
+    failed = None
+    scan_passed = False
     try:
+        if plan_path.name != "update-plan.json":
+            raise PackageFailure("configuration")
+        reference = Path(plan["reviewed_checkout"])
+        target = Path(plan["target"])
+        if (not reference.is_absolute() or reference.resolve() != reference or not reference.is_dir()
+                or reference == ROOT or ROOT in reference.parents or reference in ROOT.parents
+                or not target.is_absolute() or target.resolve() != target or not target.is_dir()
+                or target == ROOT or ROOT in target.parents or target in ROOT.parents
+                or target.stat().st_uid != os.getuid() or target.stat().st_mode & 0o022):
+            raise PackageFailure("configuration")
+        source_details = ROOT.lstat()
+        if ROOT.resolve() != ROOT or not stat.S_ISDIR(source_details.st_mode) or source_details.st_uid != os.getuid() or source_details.st_mode & 0o077:
+            raise PackageFailure("identity")
+        environment = controlled_environment(os.environ)
+        tools = command_tools(os.environ)
+        runner = OwnedRunner(root / "command-logs", progress=progress)
+        git = client.R.trusted_tool("git")
+        git_env = {**environment, "PATH": "/usr/bin:/bin", "GIT_CONFIG_GLOBAL": "/dev/null",
+                   "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+        safe_git = [git, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                    "-c", "gc.auto=0", "-c", "maintenance.auto=false"]
+        progress.wrapper("source")
         head = runner.run("source-head", [*safe_git, "rev-parse", "--verify", "HEAD^{commit}"],
                           cwd=reference, env=git_env, timeout=20, output_limit=128)
         if head != (plan["revision"] + "\n").encode("ascii"):
@@ -660,11 +665,29 @@ def update_build(plan_path, scanner):
         import appimage_notices as notices
         # Same original-SONAME client, fixed static runtime, notices/deployment
         # and embedded-byte checks as the normal canonical builder.
+        progress.wrapper("build")
         build_unsigned(runner, root, tools=tools, environment=environment, notices=notices, target=target, update=update)
+    except BaseException as error:
+        failed = error
+        try:
+            progress.failed(error)
+        except BaseException:
+            pass  # Diagnostic I/O cannot skip complete child-log scanning.
     finally:
-        # Build-only is not scan-only: all child groups are already reaped by
-        # OwnedRunner, and private output cannot bypass the independent scan.
-        scan_private_logs(root, owned_tool(scanner))
+        # OwnedRunner stops/reaps every child before returning or raising.
+        # A failed cleanup stays failed in the existing fixed progress record.
+        try:
+            scan_private_logs(root, owned_tool(scanner))
+            scan_passed = True
+        except BaseException as error:
+            if failed is None:
+                failed = error
+    if failed is not None:
+        facts = diagnostics.public_failure(root, scan_passed=scan_passed,
+                    outer_cleanup="not_started", outer_reason=diagnostics.reason(failed))
+        print("MORPHEUS_APPIMAGE_RESULT " + json.dumps(facts, sort_keys=True), file=sys.stderr)
+        DIAGNOSTICS_PUBLISHED = True
+        raise failed
     print('MORPHEUS_APPIMAGE_UPDATE_BUILD {"built":true,"installed_capture_passed":false}')
 
 

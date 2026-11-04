@@ -70,16 +70,49 @@ class QAError(RuntimeError):
         self.selector = selector if selector in SELECTOR_CODES else None
         self.exit_status = exit_status if type(exit_status) is int and -64 <= exit_status <= 255 and exit_status != 0 else None
         self.stage = stage if stage in STAGES else None
+        self.package_diagnostics = None
         super().__init__(self.reason)
 
     def facts(self):
-        return {key: value for key, value in {"reason": self.reason, "operation": self.operation,
+        result = {key: value for key, value in {"reason": self.reason, "operation": self.operation,
                 "selector": self.selector, "exit_status": self.exit_status, "stage": self.stage}.items() if value is not None}
+        if type(self.package_diagnostics) is dict:
+            diagnostics = runpy.run_path(str(ROOT / "packaging/linux/appimage_diagnostics.py"))
+            value = self.package_diagnostics
+            if (set(value) == {"wrapper_phase", "command_stage", "reason"}
+                    and type(value["wrapper_phase"]) is str and value["wrapper_phase"] in diagnostics["WRAPPER"]
+                    and type(value["command_stage"]) is str and value["command_stage"] in diagnostics["COMMANDS"]
+                    and type(value["reason"]) is str and value["reason"] in diagnostics["REASONS"]):
+                result["package_diagnostics"] = dict(value)
+        return result
 
 
 def child_failure(output):
     found = None
+    package = None
+    package_records = 0
+    def unique(pairs):
+        value = dict(pairs)
+        if len(value) != len(pairs):
+            raise ValueError("Duplicate fixed diagnostic key")
+        return value
+    diagnostics = runpy.run_path(str(ROOT / "packaging/linux/appimage_diagnostics.py"))
     for line in output.splitlines():
+        if len(line) <= 8192 and line.startswith("MORPHEUS_APPIMAGE_RESULT "):
+            package_records += 1
+            try:
+                value = json.loads(line.removeprefix("MORPHEUS_APPIMAGE_RESULT "), object_pairs_hook=unique)
+                required = diagnostics["FIELDS"] | {"diagnostics", "passed", "outer_cleanup", "outer_reason"}
+                if (type(value) is dict and set(value) in (required, required | {"package_failure_markers"})
+                        and value["diagnostics"] == "scanned_fixed_facts" and value["passed"] is False
+                        and value["outer_cleanup"] in diagnostics["CLEANUP"]
+                        and value["outer_reason"] in diagnostics["REASONS"]
+                        and diagnostics["valid_record"]({key:value[key] for key in diagnostics["FIELDS"]})):
+                    failure = value["failure"]
+                    if failure is not None:
+                        package = {key:failure[key] for key in ("wrapper_phase", "command_stage", "reason")}
+            except (ValueError, TypeError, KeyError):
+                pass
         if not line.startswith("MORPHEUS_APPIMAGE_QA_FAILURE "):
             continue
         try:
@@ -90,6 +123,11 @@ def child_failure(output):
                                    and (isinstance(item, str) or type(item) is int)})
         except (ValueError, TypeError):
             continue
+    if package_records != 1:
+        package = None
+    if package is not None:
+        found = found or QAError("command_failed", operation="package_build")
+        found.package_diagnostics = package
     return found
 
 
@@ -702,9 +740,11 @@ def execute(args):
                 if feed is not None:
                     feed.close()
             finally:
-                certificate.close()
-        commands.mark("log_scan")
-        commands.scan(args.gitleaks)
+                try:
+                    certificate.close()
+                finally:
+                    commands.mark("log_scan")
+                    commands.scan(args.gitleaks)
         checks.add("private_cleanup")
     require(checks == CHECKS)
     print("MORPHEUS_APPIMAGE_QA_IDENTITY " + json.dumps(identity, separators=(",", ":")), flush=True)

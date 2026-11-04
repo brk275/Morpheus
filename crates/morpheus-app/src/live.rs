@@ -4720,7 +4720,7 @@ impl LiveUi {
                                     &room_id,
                                 )
                             {
-                                publish_live_messages_scoped(&ui, messages.as_slice(), copy_scope);
+                                publish_live_messages_scoped(&ui, &messages, copy_scope);
                                 recovery.publish(
                                     &ui,
                                     crate::timeline_recovery::Pane::Room,
@@ -4939,9 +4939,9 @@ impl LiveUi {
                             )
                         {
                             unshown.store(false, Ordering::Release);
-                            ui.set_messages(crate::timeline_model::update_snapshot_scoped(
+                            ui.set_messages(crate::timeline_model::update_feed_snapshot_scoped(
                                 ui.get_messages(),
-                                messages.as_slice(),
+                                &messages,
                                 copy_scope,
                             ));
                             ui.set_conversation_focused(true);
@@ -6341,19 +6341,31 @@ fn visible_feed_target(
 /// do not call it.
 #[cfg(test)]
 pub(crate) fn publish_live_messages(ui: &AppWindow, messages: Vec<Arc<MessageInfo>>) {
-    publish_live_messages_scoped(ui, &messages, None);
+    publish_live_messages_rows(ui, &messages, None);
 }
 
 fn publish_live_messages_scoped(
     ui: &AppWindow,
+    messages: &Arc<Vec<Arc<MessageInfo>>>,
+    scope: Option<std::rc::Rc<crate::message_copy::CopyScope>>,
+) {
+    let model =
+        crate::timeline_model::update_feed_snapshot_scoped(ui.get_messages(), messages, scope);
+    publish_live_message_model(ui, model);
+}
+
+#[cfg(test)]
+fn publish_live_messages_rows(
+    ui: &AppWindow,
     messages: &[Arc<MessageInfo>],
     scope: Option<std::rc::Rc<crate::message_copy::CopyScope>>,
 ) {
-    ui.set_messages(crate::timeline_model::update_snapshot_scoped(
-        ui.get_messages(),
-        messages,
-        scope,
-    ));
+    let model = crate::timeline_model::update_snapshot_scoped(ui.get_messages(), messages, scope);
+    publish_live_message_model(ui, model);
+}
+
+fn publish_live_message_model(ui: &AppWindow, model: slint::ModelRc<MessageItem>) {
+    ui.set_messages(model);
     // Live rows replace any focused view, and with it that view's history
     // paging state. Notify only after both the model and that state are final.
     if ui.get_conversation_focused() {

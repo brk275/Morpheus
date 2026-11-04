@@ -7,13 +7,13 @@
 use std::{
     any::Any,
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     rc::{Rc, Weak},
     sync::Arc,
 };
 
-use morpheus_matrix::MessageInfo;
+use morpheus_matrix::{MessageInfo, MessageSnapshot};
 use slint::{Model, ModelNotify, ModelRc, ModelTracker};
 
 use crate::MessageItem;
@@ -189,6 +189,13 @@ struct TimelineModel {
     copy_scope: RefCell<Option<Rc<crate::message_copy::CopyScope>>>,
     copy_projected: RefCell<VecDeque<usize>>,
     rows: RefCell<Vec<Arc<MessageInfo>>>,
+    // Weak identity only: never keep an old feed snapshot or plaintext alive.
+    // Every replacement clears it before changing rows; notification reentry
+    // cannot install the outer publication's identity after a newer write.
+    snapshot: RefCell<Option<std::sync::Weak<Vec<Arc<MessageInfo>>>>>,
+    replacement_serial: Cell<u64>,
+    #[cfg(test)]
+    snapshot_scans: Cell<usize>,
     text_cache: RefCell<TextCache>,
     // Built only by event lookup, owned by this exact model, and never larger
     // than the loaded row set. Duplicate event IDs keep their first position.
@@ -279,7 +286,29 @@ impl TimelineModel {
             self.notify.row_changed(row);
         }
     }
-    fn replace(&self, next: Cow<'_, [Arc<MessageInfo>]>) -> u64 {
+    fn remember_snapshot(&self, snapshot: Option<&MessageSnapshot>, serial: u64) {
+        if serial != u64::MAX && self.replacement_serial.get() == serial {
+            *self.snapshot.borrow_mut() = snapshot.map(Arc::downgrade);
+        }
+    }
+
+    fn replace(&self, next: Cow<'_, [Arc<MessageInfo>]>, snapshot: Option<&MessageSnapshot>) -> u64 {
+        let serial = self.replacement_serial.get().saturating_add(1);
+        self.replacement_serial.set(serial);
+        let unchanged = serial != u64::MAX
+            && snapshot.is_some_and(|next| {
+                self.snapshot
+                    .borrow()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .is_some_and(|previous| Arc::ptr_eq(&previous, next))
+            });
+        if unchanged {
+            return self.text_cache.borrow().epoch;
+        }
+        self.snapshot.borrow_mut().take();
+        #[cfg(test)]
+        self.snapshot_scans.set(self.snapshot_scans.get() + 1);
         let (prefix, removed, added) = {
             let old = self.rows.borrow();
             let prefix = old
@@ -288,6 +317,7 @@ impl TimelineModel {
                 .take_while(|(a, b)| same_row(a, b))
                 .count();
             if prefix == old.len() && prefix == next.len() {
+                self.remember_snapshot(snapshot, serial);
                 return self.text_cache.borrow().epoch;
             }
             let suffix = old[prefix..]
@@ -329,8 +359,10 @@ impl TimelineModel {
             };
             if changed.len() > MAX_ROW_NOTIFICATIONS {
                 self.invalidate_event_index();
+                self.snapshot.borrow_mut().take();
                 *self.rows.borrow_mut() = next.into_owned();
                 self.notify.reset();
+                self.remember_snapshot(snapshot, serial);
                 return publication_epoch;
             }
             let identifiers_changed = {
@@ -343,6 +375,7 @@ impl TimelineModel {
                 self.invalidate_event_index();
             }
             {
+                self.snapshot.borrow_mut().take();
                 let mut rows = self.rows.borrow_mut();
                 for &row in &changed {
                     rows[row] = next[row].clone();
@@ -356,6 +389,7 @@ impl TimelineModel {
             // read row_count/data and must see a valid intermediate model.
             if removed != 0 {
                 self.invalidate_event_index();
+                self.snapshot.borrow_mut().take();
                 drop(self.rows.borrow_mut().drain(prefix..prefix + removed));
                 self.notify.row_removed(prefix, removed);
             }
@@ -367,6 +401,7 @@ impl TimelineModel {
                 if prefix != self.rows.borrow().len() {
                     index = None;
                 }
+                self.snapshot.borrow_mut().take();
                 match next {
                     Cow::Borrowed(next) => drop(
                         self.rows
@@ -394,6 +429,7 @@ impl TimelineModel {
                 self.notify.row_added(prefix, added);
             }
         }
+        self.remember_snapshot(snapshot, serial);
         publication_epoch
     }
 }
@@ -470,24 +506,37 @@ pub(crate) fn update_scoped(
     rows: Vec<Arc<MessageInfo>>,
     scope: Option<Rc<crate::message_copy::CopyScope>>,
 ) -> ModelRc<MessageItem> {
-    update_rows_scoped(current, Cow::Owned(rows), scope)
+    update_rows_scoped(current, Cow::Owned(rows), scope, None)
 }
 
 /// Borrow the coalesced feed's immutable snapshot on the UI thread. Unchanged
 /// rows already belong to the model; only inserted or edited rows need new
 /// handles, unless a new model or a bulk reset replaces the whole history.
+#[cfg(test)]
 pub(crate) fn update_snapshot_scoped(
     current: ModelRc<MessageItem>,
     rows: &[Arc<MessageInfo>],
     scope: Option<Rc<crate::message_copy::CopyScope>>,
 ) -> ModelRc<MessageItem> {
-    update_rows_scoped(current, Cow::Borrowed(rows), scope)
+    update_rows_scoped(current, Cow::Borrowed(rows), scope, None)
+}
+
+/// Preserve the coalesced feed's immutable allocation identity. A repeated
+/// snapshot skips only row comparison; scope renewal and dynamic projection
+/// still run normally. Arc::make_mut dissociates remembered weak pointers.
+pub(crate) fn update_feed_snapshot_scoped(
+    current: ModelRc<MessageItem>,
+    rows: &MessageSnapshot,
+    scope: Option<Rc<crate::message_copy::CopyScope>>,
+) -> ModelRc<MessageItem> {
+    update_rows_scoped(current, Cow::Borrowed(rows.as_slice()), scope, Some(rows))
 }
 
 fn update_rows_scoped(
     current: ModelRc<MessageItem>,
     rows: Cow<'_, [Arc<MessageInfo>]>,
     scope: Option<Rc<crate::message_copy::CopyScope>>,
+    snapshot: Option<&MessageSnapshot>,
 ) -> ModelRc<MessageItem> {
     if let Some(model) = current.as_any().downcast_ref::<TimelineModel>() {
         let reuse = {
@@ -508,7 +557,7 @@ fn update_rows_scoped(
         }
         // Source replacement still precedes a reset that can synchronously
         // project; a changed scope cannot cache under the old authority.
-        let publication_epoch = model.replace(rows);
+        let publication_epoch = model.replace(rows, snapshot);
         if !same {
             *model.copy_scope.borrow_mut() = next;
             model.notify_copy_rows();
@@ -524,6 +573,10 @@ fn update_rows_scoped(
             copy_scope: RefCell::new(scope),
             copy_projected: RefCell::new(VecDeque::new()),
             rows: RefCell::new(rows.into_owned()),
+            snapshot: RefCell::new(snapshot.map(Arc::downgrade)),
+            replacement_serial: Cell::new(0),
+            #[cfg(test)]
+            snapshot_scans: Cell::new(0),
             text_cache: RefCell::new(TextCache::new()),
             event_index: RefCell::new(None),
             notify: ModelNotify::default(),
@@ -1250,6 +1303,120 @@ pub(crate) mod tests {
             3,
             "only two reentrant observer reads and one explicit read project text"
         );
+    }
+
+    #[test]
+    fn repeated_feed_identity_skips_scans_without_retaining_snapshots_or_stale_local_edits() {
+        let mut snapshot = Arc::new(vec![Arc::new(fixture(1)), Arc::new(fixture(2))]);
+        let previous = Arc::downgrade(&snapshot);
+        let model = update_feed_snapshot_scoped(ModelRc::default(), &snapshot, None);
+        let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+        assert_eq!(Arc::strong_count(&snapshot), 1);
+        assert_eq!(stored.snapshot_scans.get(), 0);
+        update_feed_snapshot_scoped(model.clone(), &snapshot, None);
+        assert_eq!(stored.snapshot_scans.get(), 0);
+        assert_eq!(Arc::strong_count(&snapshot), 1);
+
+        // A local/slice replacement invalidates the proof even when the next
+        // feed repeats an older allocation. Never skip restoring its rows.
+        update_shared(model.clone(), vec![Arc::new(fixture(3))]);
+        assert!(stored.snapshot.borrow().is_none());
+        let scans = stored.snapshot_scans.get();
+        update_feed_snapshot_scoped(model.clone(), &snapshot, None);
+        assert_eq!(stored.snapshot_scans.get(), scans + 1);
+        assert!(has_exact_row(&model, 0, &snapshot[0]));
+        assert_eq!(model.row_count(), 2);
+
+        // With only a weak observer, make_mut dissociates the old identity;
+        // modifying the feed cannot turn a changed snapshot into a fast hit.
+        Arc::make_mut(&mut snapshot)[0] = Arc::new(fixture(4));
+        assert!(previous.upgrade().is_none());
+        let scans = stored.snapshot_scans.get();
+        update_feed_snapshot_scoped(model.clone(), &snapshot, None);
+        assert_eq!(stored.snapshot_scans.get(), scans + 1);
+        assert!(has_exact_row(&model, 0, &snapshot[0]));
+        let retired = Arc::downgrade(&snapshot);
+        drop(snapshot);
+        assert!(retired.upgrade().is_none());
+
+        // Saturation permanently refuses identity shortcuts instead of
+        // wrapping into an old publication's serial.
+        let snapshot = Arc::new(vec![Arc::new(fixture(5))]);
+        stored.replacement_serial.set(u64::MAX - 1);
+        update_feed_snapshot_scoped(model.clone(), &snapshot, None);
+        let scans = stored.snapshot_scans.get();
+        update_feed_snapshot_scoped(model.clone(), &snapshot, None);
+        assert_eq!(stored.snapshot_scans.get(), scans + 1);
+        assert!(stored.snapshot.borrow().is_none());
+    }
+
+    #[test]
+    fn reentrant_feed_replacement_cannot_restore_an_outer_snapshot_identity() {
+        struct Replaced {
+            model: ModelRc<MessageItem>,
+            replacement: MessageSnapshot,
+            fired: Cell<bool>,
+        }
+        impl ModelChangeListener for Replaced {
+            fn row_changed(self: Pin<&Self>, _row: usize) {
+                self.reset();
+            }
+            fn row_added(self: Pin<&Self>, _row: usize, _count: usize) {
+                self.reset();
+            }
+            fn row_removed(self: Pin<&Self>, _row: usize, _count: usize) {
+                self.reset();
+            }
+            fn reset(self: Pin<&Self>) {
+                if !self.fired.replace(true) {
+                    update_feed_snapshot_scoped(self.model.clone(), &self.replacement, None);
+                }
+            }
+        }
+        for same_length in [true, false] {
+            let initial = Arc::new(vec![Arc::new(fixture(1)), Arc::new(fixture(2))]);
+            let outer = Arc::new(if same_length {
+                vec![Arc::new(fixture(3)), Arc::new(fixture(4))]
+            } else {
+                vec![
+                    Arc::new(fixture(3)),
+                    Arc::new(fixture(4)),
+                    Arc::new(fixture(5)),
+                ]
+            });
+            let replacement = Arc::new(vec![Arc::new(fixture(8)), Arc::new(fixture(9))]);
+            let model = update_feed_snapshot_scoped(ModelRc::default(), &initial, None);
+            let observer = Box::pin(ModelChangeListenerContainer::new(Replaced {
+                model: model.clone(),
+                replacement: replacement.clone(),
+                fired: Cell::new(false),
+            }));
+            model
+                .model_tracker()
+                .attach_peer(observer.as_ref().model_peer());
+            update_feed_snapshot_scoped(model.clone(), &outer, None);
+            assert!(observer.as_ref().get().fired.get());
+            let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+            let remembered = stored
+                .snapshot
+                .borrow()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            if same_length {
+                assert!(Arc::ptr_eq(remembered.as_ref().unwrap(), &replacement));
+            } else {
+                // The outer insertion resumed after the inner publication.
+                // Its further writes must discard the inner proof as well.
+                assert!(remembered.is_none());
+            }
+            let scans = stored.snapshot_scans.get();
+            update_feed_snapshot_scoped(model.clone(), &outer, None);
+            assert_eq!(stored.snapshot_scans.get(), scans + 1);
+            assert_eq!(model.row_count(), outer.len());
+            for (index, row) in outer.iter().enumerate() {
+                assert!(has_exact_row(&model, index, row));
+            }
+        }
     }
 
     #[test]

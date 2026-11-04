@@ -135,12 +135,76 @@ class ProcessTests(unittest.TestCase):
             self.assertEqual(runner.sequence, 0)
             self.assertEqual(list((root / "logs").iterdir()), [])
 
+    def test_update_failure_scans_after_fixture_cleanup_before_closed_facts_escape(self):
+        from scripts import appimage_update_acceptance as A
+        for fail_scan in (False, True):
+            with self.subTest(fail_scan=fail_scan), tempfile.TemporaryDirectory() as directory:
+                events = []
+                commands = SimpleNamespace(stage="preflight", deadline=0,
+                                           run=mock.Mock(return_value="cargo-packager 0.11.8\n"))
+                def mark(stage):
+                    commands.stage = stage
+                    events.append(stage)
+                def scan(scanner):
+                    events.append("scanned")
+                    if fail_scan:
+                        raise A.QAError("log_scan")
+                commands.mark, commands.scan = mark, scan
+                certificate = SimpleNamespace(close=lambda:events.append("certificate_closed"))
+                args = SimpleNamespace(execute_on_free_hosted_runner=True, gitleaks="/reviewed/scanner",
+                                       target_dir=Path(directory)/"target", source=Path(directory))
+                original = A.QAError("command_failed", operation="package_build")
+                original.package_diagnostics = {"wrapper_phase":"build","command_stage":"native-build",
+                                                "reason":"command_exit"}
+                with mock.patch.dict(A.os.environ, {}, clear=True), \
+                        mock.patch.object(A, "hosted_guard"), \
+                        mock.patch.object(A.shutil, "which", return_value="/reviewed/tool"), \
+                        mock.patch.object(A, "Commands", return_value=commands), \
+                        mock.patch.object(A, "Certificate", return_value=certificate), \
+                        mock.patch.object(A, "export_source", side_effect=original), \
+                        self.assertRaises(A.QAError) as caught:
+                    A.execute(args)
+                self.assertEqual(events, ["preflight","cleanup","certificate_closed","log_scan","scanned"])
+                self.assertEqual(caught.exception.reason, "log_scan" if fail_scan else "command_failed")
+                if fail_scan:
+                    self.assertNotIn("package_diagnostics", caught.exception.facts())
+                else:
+                    self.assertEqual(caught.exception.facts()["package_diagnostics"]["command_stage"], "native-build")
+
+    def test_update_child_failure_retains_only_scanned_fixed_package_tokens(self):
+        from scripts import appimage_update_acceptance as A
+        marker = "synthetic-private-compiler-body"
+        fixed = {"schema":1,"wrapper_phase":"build","command_stage":"native-build",
+                 "capture_mode":"none","capture_phase":"none","peer_facts":[],
+                 "inner_cleanup":"not_started","failure":{"wrapper_phase":"build",
+                 "command_stage":"native-build","capture_mode":"none","capture_phase":"none",
+                 "reason":"command_exit"},"diagnostics":"scanned_fixed_facts","passed":False,
+                 "outer_cleanup":"not_started","outer_reason":"command_exit"}
+        output = marker + "\nMORPHEUS_APPIMAGE_RESULT " + json.dumps(fixed)
+        error = A.child_failure(output)
+        self.assertEqual(error.facts(), {"reason":"command_failed","operation":"package_build",
+                         "package_diagnostics":{"wrapper_phase":"build","command_stage":"native-build",
+                                                "reason":"command_exit"}})
+        self.assertNotIn(marker, json.dumps(error.facts()))
+        for changed in ({**fixed,"diagnostics":"withheld"}, {**fixed,"extra":marker},
+                        {**fixed,"failure":{**fixed["failure"],"command_stage":marker}},
+                        {"diagnostics":"withheld","passed":False}):
+            self.assertIsNone(A.child_failure("MORPHEUS_APPIMAGE_RESULT " + json.dumps(changed)))
+        self.assertIsNone(A.child_failure(output + "\nMORPHEUS_APPIMAGE_RESULT " + json.dumps(fixed)))
+        duplicate = json.dumps(fixed).replace('"schema": 1', '"schema": 1, "schema": 1')
+        self.assertIsNone(A.child_failure("MORPHEUS_APPIMAGE_RESULT " + duplicate))
+        error.package_diagnostics = {"wrapper_phase":"build","command_stage":marker,"reason":"command_exit"}
+        self.assertNotIn("package_diagnostics", error.facts())
+
     def test_linux_update_producer_requires_head_clean_and_full_proof_around_source_archive(self):
         revision = "a" * 40
-        for head, clean, proof_error in ((revision.encode() + b"\n", b"", None),
-                                          (b"b" * 40 + b"\n", b"", None),
-                                          (revision.encode() + b"\n", b"dirty", None),
-                                          (revision.encode() + b"\n", b"", P.SourceRevisionError("checkout"))):
+        for head, clean, proof_error, build_error, scan_error in (
+                (revision.encode() + b"\n", b"", None, None, None),
+                (b"b" * 40 + b"\n", b"", None, None, None),
+                (revision.encode() + b"\n", b"dirty", None, None, None),
+                (revision.encode() + b"\n", b"", P.SourceRevisionError("checkout"), None, None),
+                (revision.encode() + b"\n", b"", None, M.CommandFailure("exit"), None),
+                (revision.encode() + b"\n", b"", None, M.CommandFailure("exit"), P.PackageFailure("scan"))):
             with self.subTest(head=head[:4], dirty=bool(clean), proof_failure=proof_error is not None), \
                     tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
@@ -164,6 +228,7 @@ class ProcessTests(unittest.TestCase):
                                          source_archive=mock.Mock(return_value=archive))
                 with mock.patch.dict(P.os.environ, environment, clear=True), \
                         mock.patch.object(P, "ROOT", exported), \
+                        mock.patch.object(P, "DIAGNOSTICS_PUBLISHED", False), \
                         mock.patch.object(P, "public_hosted_environment"), \
                         mock.patch.object(P.containment, "assert_contained"), \
                         mock.patch.object(P, "controlled_environment", return_value={"GITHUB_SHA":revision}), \
@@ -173,17 +238,29 @@ class ProcessTests(unittest.TestCase):
                         mock.patch.object(P, "verify_versioned_export", return_value=proof,
                                           side_effect=proof_error) as verified, \
                         mock.patch.object(P, "validate_update_parameters"), \
-                        mock.patch.object(P, "build_unsigned") as built, \
+                        mock.patch.object(P, "build_unsigned", side_effect=build_error) as built, \
                         mock.patch.object(P, "owned_tool", return_value="/reviewed/scanner"), \
-                        mock.patch.object(P, "scan_private_logs") as scanned, \
-                        mock.patch.dict(sys.modules, {"appimage_notices":SimpleNamespace()}), \
-                        mock.patch("builtins.print"):
+                        mock.patch.object(P, "scan_private_logs", side_effect=scan_error) as scanned, \
+                        mock.patch.dict(sys.modules, {"appimage_notices":SimpleNamespace(
+                            InventoryFailure=type("InventoryFailure", (RuntimeError,), {}))}), \
+                        mock.patch("builtins.print") as printed:
                     admitted = head == revision.encode() + b"\n" and not clean
-                    if not admitted or proof_error is not None:
-                        with self.assertRaises((P.PackageFailure, P.SourceRevisionError)):
+                    if not admitted or proof_error is not None or build_error is not None:
+                        with self.assertRaises((P.PackageFailure, P.SourceRevisionError, M.CommandFailure)):
                             P.update_build(plan_path, "/reviewed/scanner")
                     else:
                         P.update_build(plan_path, "/reviewed/scanner")
+                scanned.assert_called_once_with(case, "/reviewed/scanner")
+                if build_error is not None:
+                    diagnostics = [call.args[0] for call in printed.call_args_list
+                                   if call.args and str(call.args[0]).startswith("MORPHEUS_APPIMAGE_RESULT ")]
+                    self.assertEqual(len(diagnostics), 1)
+                    fact = json.loads(diagnostics[0].removeprefix("MORPHEUS_APPIMAGE_RESULT "))
+                    self.assertEqual(fact["diagnostics"], "withheld" if scan_error else "scanned_fixed_facts")
+                    if scan_error is None:
+                        self.assertEqual(fact["failure"]["wrapper_phase"], "build")
+                        self.assertEqual(fact["failure"]["reason"], "command_exit")
+                    self.assertNotIn("synthetic-private", diagnostics[0])
                 self.assertEqual(runner.source_archive.call_count, int(admitted))
                 if admitted:
                     self.assertEqual(runner.source_archive.call_args.args, (revision,))

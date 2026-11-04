@@ -1231,6 +1231,107 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                             "passed":True,"distribution_ready":False})
                     tools.assert_not_called();remove.assert_not_called()
 
+    def test_windows_workspace_repository_uses_fixed_private_https_source_without_checkout_config(self):
+        from scripts import native_notice_source as acquisition
+        root=Path("/private/owned/source");repository=root/"workspace.git";git=Path("/protected/Git/cmd/git.exe")
+        revision="a"*40;environment={"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"HOME":str(root/"home"),
+                                   "GIT_CONFIG_COUNT":"1","GIT_CONFIG_KEY_0":"url.foreign.insteadOf",
+                                   "GIT_CONFIG_VALUE_0":"https://github.com/","SSH_AUTH_SOCK":"foreign"}
+        commands=SimpleNamespace(run=mock.Mock(return_value=b""))
+        with mock.patch.object(acquisition,"os",SimpleNamespace(name="nt")), \
+                mock.patch.object(acquisition,"system_git",return_value=git), \
+                mock.patch.object(acquisition,"checked",side_effect=lambda path,**kwargs:Path(path)) as checked, \
+                mock.patch.object(acquisition,"private_directory",return_value=repository) as private, \
+                mock.patch.object(acquisition.S,"safe_git",return_value=[str(git),"-C",str(repository)]) as safe, \
+                mock.patch.object(acquisition,"check_cache") as inventory:
+            self.assertEqual(acquisition.workspace_repository(commands,root,revision,git,environment),repository)
+        private.assert_called_once_with(repository);safe.assert_called_once_with(str(git),repository)
+        self.assertEqual(checked.call_args_list,[mock.call(root,directory=True,private=True),
+            mock.call(root/"fetch",directory=True,private=True),mock.call(repository,directory=True,private=True),
+            mock.call(repository,directory=True,private=True)])
+        self.assertEqual(len(commands.run.call_args_list),2)
+        init,fetch=commands.run.call_args_list
+        self.assertEqual(init.args[0],"workspace-init");self.assertEqual(fetch.args[0],"workspace-fetch")
+        self.assertEqual(init.args[1][-4:],["init","--bare","--quiet","--template="])
+        self.assertEqual(fetch.args[1][-9:],["fetch","--quiet","--depth=1","--no-tags","--no-write-fetch-head",
+            "--no-recurse-submodules","--no-auto-maintenance","https://github.com/brk275/Morpheus.git",revision])
+        for call in (init,fetch):
+            argv=call.args[1]
+            for value in ("protocol.allow=never","protocol.https.allow=always","http.sslVerify=true",
+                          "http.followRedirects=false","http.extraHeader=","credential.helper=",
+                          "credential.interactive=never","core.askPass="):
+                self.assertIn(value,argv)
+            self.assertEqual(call.kwargs["cwd"],root/"fetch")
+            self.assertEqual(call.kwargs["output_limit"],65536)
+            for name in ("GIT_CONFIG_COUNT","GIT_CONFIG_KEY_0","GIT_CONFIG_VALUE_0","SSH_AUTH_SOCK"):
+                self.assertNotIn(name,call.kwargs["env"])
+        self.assertEqual(init.kwargs["env"]["GIT_ALLOW_PROTOCOL"],"")
+        self.assertEqual(fetch.kwargs["env"]["GIT_ALLOW_PROTOCOL"],"https")
+        self.assertEqual(fetch.kwargs["timeout"],1200);self.assertEqual(fetch.kwargs["stderr_limit"],65536)
+        inventory.assert_called_once_with(root)
+
+    def test_windows_workspace_repository_refuses_wrong_revision_existing_root_and_fetch_failure(self):
+        from scripts import native_notice_source as acquisition
+        root=Path("/private/owned/source");git=Path("/protected/Git/cmd/git.exe");revision="a"*40
+        commands=SimpleNamespace(run=mock.Mock(return_value=b""))
+        with mock.patch.object(acquisition,"os",SimpleNamespace(name="nt")), \
+                mock.patch.object(acquisition,"system_git",return_value=git), \
+                mock.patch.object(acquisition,"checked",side_effect=lambda path,**kwargs:Path(path)), \
+                mock.patch.object(acquisition,"private_directory",return_value=root/"workspace.git") as private, \
+                mock.patch.object(acquisition.S,"safe_git",return_value=[str(git)]), \
+                mock.patch.object(acquisition,"check_cache") as inventory:
+            for wrong in ("0"*40,"A"*40,"a"*39,"../revision","b"*40):
+                with self.subTest(revision=wrong),self.assertRaises(ValueError):
+                    acquisition.workspace_repository(commands,root,wrong,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision})
+            private.assert_not_called();commands.run.assert_not_called()
+            private.side_effect=FileExistsError("owned existing fixture")
+            with self.assertRaises(FileExistsError):
+                acquisition.workspace_repository(commands,root,revision,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision})
+            commands.run.assert_not_called();private.side_effect=None
+            commands.run.side_effect=[b"",ValueError("fixed fetch refusal")]
+            with self.assertRaises(ValueError):
+                acquisition.workspace_repository(commands,root,revision,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision})
+            inventory.assert_not_called()
+        with mock.patch.object(acquisition,"os",SimpleNamespace(name="posix")), \
+                mock.patch.object(acquisition,"private_directory") as private:
+            self.assertEqual(acquisition.workspace_repository(commands,root,"invalid",git,{}),acquisition.ROOT)
+            private.assert_not_called()
+
+    def test_windows_prepare_reuses_authenticated_private_repository_for_export_and_bundle(self):
+        from scripts import native_notice_source as acquisition
+        class WindowsOS:
+            name="nt"
+            def __getattr__(self,name):return getattr(os,name)
+        with tempfile.TemporaryDirectory() as temporary:
+            parent=Path(temporary).resolve();root=parent/"reserved";root.mkdir();(root/"owner.json").write_bytes(b"reservation")
+            revision="a"*40;repository=root/"workspace.git";tree="b"*40
+            commands=mock.Mock(cleanup_failed=False,logs_complete=True)
+            commands.run.side_effect=[b"cargo 1.99.0 fixture\n",b"rustc 1.99.0 fixture\n",b""]
+            with mock.patch.object(acquisition,"os",WindowsOS()),mock.patch.object(acquisition,"guard"), \
+                    mock.patch.object(acquisition,"owned_source_root",return_value=root), \
+                    mock.patch.object(acquisition,"checked",side_effect=lambda path,**kwargs:Path(path)), \
+                    mock.patch.object(acquisition.N,"read_regular",return_value=b"scanner"), \
+                    mock.patch.object(acquisition,"SCANNERS",{(sys.platform,acquisition.platform.machine()):hashlib.sha256(b"scanner").hexdigest()}), \
+                    mock.patch.object(acquisition,"tools",return_value=(parent/"cargo",parent/"rustc",parent/"git",parent/"rustup")), \
+                    mock.patch.object(acquisition,"environment_for_acquisition",return_value={"MORPHEUS_PACKAGE_SOURCE_REVISION":revision}), \
+                    mock.patch.object(acquisition,"private_directory",side_effect=lambda path,**kwargs:Path(path).mkdir(**kwargs)), \
+                    mock.patch.object(acquisition,"Commands",return_value=commands), \
+                    mock.patch.object(acquisition,"workspace_repository",return_value=repository) as select, \
+                    mock.patch.object(acquisition.S,"git_export",return_value=(b"",{"tree":tree},{})) as export, \
+                    mock.patch.object(acquisition,"source_inputs",return_value=[]), \
+                    mock.patch.object(acquisition,"fetch_export",return_value=root/"fetch-source"), \
+                    mock.patch.object(acquisition,"check_cache") as inventory, \
+                    mock.patch.object(acquisition,"input_plan",return_value={}), \
+                    mock.patch.object(acquisition.S,"build",return_value={"source_tree":tree}) as build:
+                acquisition.prepare({"MORPHEUS_PACKAGE_SOURCE_REVISION":revision},parent/"scanner")
+            self.assertEqual(select.call_args.args[:3],(commands,root,revision))
+            self.assertEqual(export.call_args.args[1],repository)
+            self.assertEqual(build.call_args.args[2],repository)
+            self.assertNotEqual(repository,acquisition.ROOT)
+            inventory.assert_called_once_with(root)
+            commands.scan.assert_called_once_with(parent/"scanner")
+            self.assertTrue(json.loads((root/"state.json").read_text())["prepared"])
+
     def test_prepare_records_acquisition_start_before_admitting_commands(self):
         from scripts import native_notice_source as acquisition
         with tempfile.TemporaryDirectory() as temporary:
