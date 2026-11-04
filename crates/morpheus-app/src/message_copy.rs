@@ -118,6 +118,20 @@ struct Owner {
     withdrawal: Rc<Cell<u64>>,
 }
 thread_local! { static OWNER: RefCell<Option<Owner>> = const { RefCell::new(None) }; }
+thread_local! { static CACHE_WITHDRAWING: Cell<bool> = const { Cell::new(false) }; }
+
+struct CacheWithdrawal(bool);
+impl CacheWithdrawal {
+    fn enter() -> Self {
+        Self(CACHE_WITHDRAWING.with(|withdrawing| withdrawing.replace(true)))
+    }
+}
+impl Drop for CacheWithdrawal {
+    fn drop(&mut self) {
+        CACHE_WITHDRAWING.with(|withdrawing| withdrawing.set(self.0));
+    }
+}
+
 
 fn ui_allowed(ui: &AppWindow) -> bool {
     ui.get_viewport_seek_allowed() && !ui.get_settings_reveal_protected()
@@ -246,6 +260,77 @@ fn accepted_text(info: &MessageInfo) -> Option<String> {
         .then(|| text.to_owned())
 }
 
+/// Cache admission only, never Copy authority. Recheck the original selection,
+/// room/thread, withdrawal and security epochs before retaining parsed text.
+/// A reentrant owner borrow refuses caching while full projection still works.
+pub(crate) fn text_projection_cache_allowed(
+    scope: Option<&Rc<CopyScope>>,
+    model: Weak<MessageModel>,
+    index: usize,
+    row: &Arc<MessageInfo>,
+) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    if CACHE_WITHDRAWING.with(Cell::get) {
+        return false;
+    }
+    // Snapshot only inert handles under the owner borrow. UI bindings may
+    // reenter withdrawal, so none of its guards may survive the closure.
+    let ui = OWNER.with(|owner| {
+        let owner = owner.try_borrow().ok()?;
+        let owner = owner.as_ref()?;
+        (SyncWeak::ptr_eq(&scope.live, &owner.live)
+            && Rc::ptr_eq(&scope.withdrawal, &owner.withdrawal))
+            .then(|| owner.ui.upgrade())
+            .flatten()
+    });
+    let Some(ui) = ui else {
+        return false;
+    };
+    if !scope.holds(&ui) {
+        return false;
+    }
+    let Some(model) = model.upgrade() else {
+        return false;
+    };
+    let shown = if scope.thread {
+        ui.get_thread_messages()
+    } else {
+        ui.get_messages()
+    };
+    let Ok(shown_owner): Result<Rc<MessageModel>, _> = shown.clone().try_into() else {
+        return false;
+    };
+    if !Rc::ptr_eq(&model, &shown_owner)
+        || !crate::timeline_model::has_exact_row(&shown, index, row)
+    {
+        return false;
+    }
+    // A binding/owner replacement during the UI checks must not authorize
+    // cache retention under the previous owner's otherwise still-live epochs.
+    scope.selection.is_current()
+        && scope.view.live.load(Ordering::Acquire)
+        && scope.view.navigation.load(Ordering::Acquire) == scope.view.navigation_at
+        && scope.view.generation.load(Ordering::Acquire) == scope.view.generation_at
+        && scope.view.gate.ringing_allowed(scope.view.security_at)
+        && scope
+            .live
+            .upgrade()
+            .is_some_and(|live| !live.action_admission_closed())
+        && !CACHE_WITHDRAWING.with(Cell::get)
+        && OWNER.with(|owner| {
+            let Ok(owner) = owner.try_borrow() else {
+                return false;
+            };
+            owner.as_ref().is_some_and(|owner| {
+                SyncWeak::ptr_eq(&scope.live, &owner.live)
+                    && Rc::ptr_eq(&scope.withdrawal, &owner.withdrawal)
+                    && owner.withdrawal.get() == scope.withdrawal_at
+            })
+        })
+}
+
 /// Cheap projection: bounded metadata, weak references and a deduplicated key.
 /// No account lookup, formatting, IO, observer or clipboard operation.
 pub(crate) fn row_token(
@@ -284,6 +369,11 @@ pub(crate) fn row_token(
 /// Withdraw on account/room/private-presentation retirement. Existing OS
 /// clipboard ownership is deliberately untouched: only explicit Copy writes.
 pub(crate) fn retire(ui: &AppWindow) {
+    let _cache_withdrawal = CacheWithdrawal::enter();
+    // Drop cached plaintext BEFORE the original scope/view is withdrawn;
+    // retained old model handles cannot refill it without a new publication.
+    crate::timeline_model::clear_text_projection_cache(&ui.get_messages());
+    crate::timeline_model::clear_text_projection_cache(&ui.get_thread_messages());
     OWNER.with(|owner| {
         if let Some(owner) = owner.borrow_mut().as_mut() {
             owner.book.clear();
@@ -419,6 +509,11 @@ pub(crate) fn thread_opened(ui: &AppWindow) {
 /// Canonical explicit protection/navigation entries call this BEFORE their
 /// visible changes. Deferred changed handlers alone can miss one-batch roundtrips.
 pub(crate) fn withdraw(ui: &AppWindow) {
+    let _cache_withdrawal = CacheWithdrawal::enter();
+    // Drop cached plaintext BEFORE the original scope/view is withdrawn;
+    // retained old model handles cannot refill it without a new publication.
+    crate::timeline_model::suspend_text_projection_cache(&ui.get_messages());
+    crate::timeline_model::suspend_text_projection_cache(&ui.get_thread_messages());
     OWNER.with(|owner| {
         if let Some(owner) = owner.borrow().as_ref() {
             owner
@@ -593,6 +688,16 @@ impl Drop for RecordingClipboard {
 }
 
 pub(crate) fn register(ui: &AppWindow, live: &Arc<LiveUi>) {
+    let _cache_withdrawal = CacheWithdrawal::enter();
+    let previous = OWNER.with(|owner| {
+        owner.borrow().as_ref().and_then(|owner| owner.ui.upgrade())
+    });
+    if let Some(previous) = previous {
+        crate::timeline_model::clear_text_projection_cache(&previous.get_messages());
+        crate::timeline_model::clear_text_projection_cache(&previous.get_thread_messages());
+    }
+    crate::timeline_model::clear_text_projection_cache(&ui.get_messages());
+    crate::timeline_model::clear_text_projection_cache(&ui.get_thread_messages());
     OWNER.with(|owner| {
         let mut owner = owner.borrow_mut();
         // Even a replacement controller must not reuse a queued old serial.

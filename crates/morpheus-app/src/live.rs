@@ -6180,11 +6180,18 @@ fn member_item(info: &RoomMemberInfo) -> MemberItem {
     }
 }
 
-pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
-    let sender = display_user(&info.sender);
-    let sender_initials = initials(&sender);
-    let clocks =
-        crate::message_metadata::ClockLabels::for_message(info.timestamp_ms, info.send_state);
+/// Immutable text only. Theme/font/highlight/sender, clocks, pins, poll and
+/// Copy capabilities are deliberately projected afresh by message_item_with_text.
+#[derive(Clone)]
+pub(super) struct MessageText {
+    pub(super) body: slint::SharedString,
+    pub(super) rich_body: StyledText,
+    pub(super) rich_accessible_body: slint::SharedString,
+    pub(super) edit_source: slint::SharedString,
+    pub(super) edit_markdown: bool,
+}
+
+pub(super) fn message_text(info: &MessageInfo) -> MessageText {
     let display_body = if info.attachment_name.as_deref() == Some(info.body.as_str()) {
         ""
     } else {
@@ -6215,6 +6222,40 @@ pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
         display_body
     };
     let rich_body = styled_markdown.unwrap_or_else(|| StyledText::from_plain_text(display_body));
+    // Plain messages used to allocate these same bytes separately for the
+    // visible body, accessibility label and edit source. Share immutable Slint
+    // strings whenever their contents coincide, including rich fallbacks.
+    let body: slint::SharedString = display_body.into();
+    let rich_accessible_body = if rich_accessible_body == display_body {
+        body.clone()
+    } else {
+        rich_accessible_body.into()
+    };
+    let edit_source = if edit_source == display_body {
+        body.clone()
+    } else if edit_source == rich_accessible_body.as_str() {
+        rich_accessible_body.clone()
+    } else {
+        edit_source.into()
+    };
+    MessageText {
+        body,
+        rich_body,
+        rich_accessible_body,
+        edit_source,
+        edit_markdown,
+    }
+}
+
+pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
+    message_item_with_text(info, &message_text(info))
+}
+
+pub(super) fn message_item_with_text(info: &MessageInfo, text: &MessageText) -> MessageItem {
+    let sender = display_user(&info.sender);
+    let sender_initials = initials(&sender);
+    let clocks =
+        crate::message_metadata::ClockLabels::for_message(info.timestamp_ms, info.send_state);
     MessageItem {
         copy_token: Default::default(),
         event_id: info.event_id.as_deref().unwrap_or("").into(),
@@ -6225,11 +6266,11 @@ pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
         time: clocks.twelve_hour.into(),
         time_24h: clocks.twenty_four_hour.into(),
         time_24h_seconds: clocks.twenty_four_hour_seconds.into(),
-        body: display_body.into(),
-        rich_body,
-        rich_accessible_body: rich_accessible_body.into(),
-        edit_source: edit_source.into(),
-        edit_markdown,
+        body: text.body.clone(),
+        rich_body: text.rich_body.clone(),
+        rich_accessible_body: text.rich_accessible_body.clone(),
+        edit_source: text.edit_source.clone(),
+        edit_markdown: text.edit_markdown,
         reply_to: info.reply_preview.as_deref().unwrap_or("").into(),
         attachment: info.attachment_name.as_deref().unwrap_or("").into(),
         attachment_is_image: info.attachment_is_image,

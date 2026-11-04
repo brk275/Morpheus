@@ -22,11 +22,177 @@ use crate::MessageItem;
 // removals each use one range notification regardless of the history length.
 const MAX_ROW_NOTIFICATIONS: usize = 128;
 
+// These are projection-cache limits, never timeline/history or render limits.
+const MAX_CACHED_TEXT_ROWS: usize = 128;
+const MAX_CACHED_TEXT_CHARGE: usize = 4 * 1024 * 1024;
+const MAX_CACHED_MARKDOWN_BYTES: usize = 4096;
+const MAX_CACHED_MARKDOWN_MARKERS: usize = 128;
+
+/// Conservative owned-text/span admission charge, not measured RSS. Complex
+/// rich text (including links/reference expansion) and oversized rows still
+/// render fully; only their optional parsed-text cache entry is refused.
+fn text_cache_charge(info: &MessageInfo) -> Option<usize> {
+    let bytes = info
+        .body
+        .len()
+        .checked_add(info.rich_markdown.as_ref().map_or(0, String::len))?
+        .checked_add(info.rich_accessible.as_ref().map_or(0, String::len))?;
+    let mut charge = bytes.checked_mul(16)?.checked_add(2048)?;
+    if let Some(markdown) = info.rich_markdown.as_ref() {
+        if markdown.len() > MAX_CACHED_MARKDOWN_BYTES
+            || markdown.contains('[')
+            || markdown.contains('<')
+        {
+            return None;
+        }
+        let markers = markdown
+            .bytes()
+            .filter(|byte| byte.is_ascii_punctuation() || matches!(*byte, b'\n' | b'\r'))
+            .count();
+        if markers > MAX_CACHED_MARKDOWN_MARKERS {
+            return None;
+        }
+        // Slint's pinned parser owns paragraph strings and flat span vectors.
+        // Charge both possible paragraph/style cross-products conservatively;
+        // no URLs/interpolated paragraphs are admitted through this path.
+        let span_charge = markers
+            .checked_add(1)?
+            .checked_pow(2)?
+            .checked_mul(128)?;
+        charge = charge.checked_add(span_charge)?;
+    }
+    (charge <= MAX_CACHED_TEXT_CHARGE).then_some(charge)
+}
+
+struct CachedText {
+    source: std::sync::Weak<MessageInfo>,
+    text: Rc<crate::live::MessageText>,
+    charge: usize,
+}
+
+struct TextCache {
+    entries: HashMap<usize, CachedText>,
+    order: VecDeque<usize>,
+    charge: usize,
+    epoch: u64,
+    enabled: bool,
+    publication_required: bool,
+}
+
+impl TextCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            charge: 0,
+            epoch: 0,
+            enabled: true,
+            publication_required: false,
+        }
+    }
+
+    fn invalidate(&mut self, enabled: bool) {
+        self.entries.clear();
+        self.order.clear();
+        self.charge = 0;
+        self.epoch = self.epoch.checked_add(1).unwrap_or(u64::MAX);
+        self.enabled = enabled && self.epoch != u64::MAX;
+    }
+
+    fn suspend(&mut self, publication_required: bool) {
+        self.invalidate(false);
+        self.publication_required |= publication_required;
+    }
+
+    fn enable_after_publication(&mut self, epoch: u64) {
+        if self.epoch == epoch && self.epoch != u64::MAX {
+            self.publication_required = false;
+            self.enabled = true;
+        }
+    }
+
+    fn resume_after_context(&mut self, epoch: u64) {
+        if self.epoch == epoch && self.epoch != u64::MAX && !self.publication_required {
+            self.enabled = true;
+        }
+    }
+
+    fn remove(&mut self, row: usize) {
+        if let Some(entry) = self.entries.remove(&row) {
+            self.charge -= entry.charge;
+        }
+        if let Some(position) = self.order.iter().position(|index| *index == row) {
+            self.order.remove(position);
+        }
+    }
+
+    fn get(&mut self, row: usize, info: &Arc<MessageInfo>) -> Option<Rc<crate::live::MessageText>> {
+        if !self.enabled {
+            return None;
+        }
+        let text = self
+            .entries
+            .get(&row)
+            .filter(|entry| {
+                entry
+                    .source
+                    .upgrade()
+                    .is_some_and(|source| Arc::ptr_eq(&source, info))
+            })
+            .map(|entry| entry.text.clone());
+        if text.is_some() {
+            if let Some(position) = self.order.iter().position(|index| *index == row) {
+                self.order.remove(position);
+            }
+            self.order.push_back(row);
+        } else {
+            self.remove(row);
+        }
+        text
+    }
+
+    fn insert(
+        &mut self,
+        row: usize,
+        info: &Arc<MessageInfo>,
+        epoch: u64,
+        text: crate::live::MessageText,
+        charge: usize,
+    ) {
+        if !self.enabled || self.epoch != epoch || charge > MAX_CACHED_TEXT_CHARGE {
+            return;
+        }
+        self.remove(row);
+        while self.entries.len() >= MAX_CACHED_TEXT_ROWS
+            || self.charge.saturating_add(charge) > MAX_CACHED_TEXT_CHARGE
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                self.invalidate(false);
+                return;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.charge -= entry.charge;
+            }
+        }
+        self.order.push_back(row);
+        self.charge += charge;
+        self.entries.insert(
+            row,
+            CachedText {
+                source: Arc::downgrade(info),
+                text: Rc::new(text),
+                charge,
+            },
+        );
+    }
+}
+
 struct TimelineModel {
     weak: Weak<Self>,
     copy_scope: RefCell<Option<Rc<crate::message_copy::CopyScope>>>,
     copy_projected: RefCell<VecDeque<usize>>,
     rows: RefCell<Vec<Arc<MessageInfo>>>,
+    text_cache: RefCell<TextCache>,
     // Built only by event lookup, owned by this exact model, and never larger
     // than the loaded row set. Duplicate event IDs keep their first position.
     event_index: RefCell<Option<HashMap<String, usize>>>,
@@ -35,9 +201,49 @@ struct TimelineModel {
     indexed_rows: std::cell::Cell<usize>,
     #[cfg(test)]
     projected: std::cell::Cell<usize>,
+    #[cfg(test)]
+    parsed_text: std::cell::Cell<usize>,
 }
 
 impl TimelineModel {
+    fn project_item(
+        &self,
+        row: usize,
+        info: &Arc<MessageInfo>,
+        mut allowed: impl FnMut() -> bool,
+    ) -> MessageItem {
+        let permitted = allowed();
+        let (epoch, cached) = {
+            let mut cache = self.text_cache.borrow_mut();
+            if !permitted && cache.enabled {
+                cache.invalidate(false);
+            }
+            (cache.epoch, cache.get(row, info))
+        };
+        if let Some(text) = cached {
+            crate::live::message_item_with_text(info, &text)
+        } else {
+            #[cfg(test)]
+            self.parsed_text.set(self.parsed_text.get() + 1);
+            let text = crate::live::message_text(info);
+            let item = crate::live::message_item_with_text(info, &text);
+            let permitted = allowed();
+            let current = self
+                .rows
+                .borrow()
+                .get(row)
+                .is_some_and(|source| Arc::ptr_eq(source, info));
+            if current && permitted {
+                if let Some(charge) = text_cache_charge(info) {
+                    self.text_cache
+                        .borrow_mut()
+                        .insert(row, info, epoch, text, charge);
+                }
+            }
+            item
+        }
+    }
+
     fn event_position(&self, event_id: &str) -> Option<usize> {
         let missing = self.event_index.borrow().is_none();
         if missing {
@@ -76,7 +282,7 @@ impl TimelineModel {
             self.notify.row_changed(row);
         }
     }
-    fn replace(&self, next: Cow<'_, [Arc<MessageInfo>]>) {
+    fn replace(&self, next: Cow<'_, [Arc<MessageInfo>]>) -> u64 {
         let (prefix, removed, added) = {
             let old = self.rows.borrow();
             let prefix = old
@@ -85,7 +291,7 @@ impl TimelineModel {
                 .take_while(|(a, b)| same_row(a, b))
                 .count();
             if prefix == old.len() && prefix == next.len() {
-                return;
+                return self.text_cache.borrow().epoch;
             }
             let suffix = old[prefix..]
                 .iter()
@@ -100,6 +306,14 @@ impl TimelineModel {
             )
         };
 
+        // Drop every old parsed plaintext object BEFORE any edit, splice or
+        // reset can notify/reenter the model. Only a no-op keeps the cache.
+        let publication_epoch = {
+            let mut cache = self.text_cache.borrow_mut();
+            let enabled = cache.enabled;
+            cache.invalidate(enabled);
+            cache.epoch
+        };
         if removed == added {
             // A wide changed span can contain only a few actual edits. Keep
             // unchanged delegates and payloads intact, with bounded tracking
@@ -120,7 +334,7 @@ impl TimelineModel {
                 self.invalidate_event_index();
                 *self.rows.borrow_mut() = next.into_owned();
                 self.notify.reset();
-                return;
+                return publication_epoch;
             }
             let identifiers_changed = {
                 let rows = self.rows.borrow();
@@ -183,6 +397,7 @@ impl TimelineModel {
                 self.notify.row_added(prefix, added);
             }
         }
+        publication_epoch
     }
 }
 
@@ -198,8 +413,9 @@ impl Model for TimelineModel {
     }
 
     fn row_data(&self, row: usize) -> Option<MessageItem> {
-        let rows = self.rows.borrow();
-        let info = rows.get(row)?;
+        // Hold neither the source-model nor the cache borrow while formatting
+        // or dynamic projection runs. A reentrant edit invalidates the epoch.
+        let info = self.rows.borrow().get(row)?.clone();
         {
             let mut recent = self.copy_projected.borrow_mut();
             if let Some(old) = recent.iter().position(|index| *index == row) {
@@ -212,12 +428,17 @@ impl Model for TimelineModel {
         }
         #[cfg(test)]
         self.projected.set(self.projected.get() + 1);
-        let mut item = crate::live::message_item(info);
+        let mut item = self.project_item(row, &info, || {
+            let scope = self.copy_scope.borrow().clone();
+            crate::message_copy::text_projection_cache_allowed(
+                scope.as_ref(), self.weak.clone(), row, &info,
+            )
+        });
         item.copy_token = crate::message_copy::row_token(
             self.weak.clone(),
             self.copy_scope.borrow().as_ref(),
             row,
-            info,
+            &info,
         )
         .into();
         Some(item)
@@ -269,8 +490,6 @@ fn update_rows_scoped(
     scope: Option<Rc<crate::message_copy::CopyScope>>,
 ) -> ModelRc<MessageItem> {
     if let Some(model) = current.as_any().downcast_ref::<TimelineModel>() {
-        // Source replacement precedes a reset that can synchronously project.
-        model.replace(rows);
         let reuse = {
             let old = model.copy_scope.borrow();
             old.as_ref()
@@ -285,9 +504,16 @@ fn update_rows_scoped(
             _ => false,
         };
         if !same {
+            model.text_cache.borrow_mut().invalidate(false);
+        }
+        // Source replacement still precedes a reset that can synchronously
+        // project; a changed scope cannot cache under the old authority.
+        let publication_epoch = model.replace(rows);
+        if !same {
             *model.copy_scope.borrow_mut() = next;
             model.notify_copy_rows();
         }
+        model.text_cache.borrow_mut().enable_after_publication(publication_epoch);
         current
     } else {
         let model = Rc::new_cyclic(|weak| TimelineModel {
@@ -295,12 +521,15 @@ fn update_rows_scoped(
             copy_scope: RefCell::new(scope),
             copy_projected: RefCell::new(VecDeque::new()),
             rows: RefCell::new(rows.into_owned()),
+            text_cache: RefCell::new(TextCache::new()),
             event_index: RefCell::new(None),
             notify: ModelNotify::default(),
             #[cfg(test)]
             indexed_rows: std::cell::Cell::new(0),
             #[cfg(test)]
             projected: std::cell::Cell::new(0),
+            #[cfg(test)]
+            parsed_text: std::cell::Cell::new(0),
         });
         ModelRc::from(model)
     }
@@ -312,15 +541,48 @@ pub(crate) fn refresh_copy_context(current: &ModelRc<MessageItem>) {
     let Some(model) = current.as_any().downcast_ref::<TimelineModel>() else {
         return;
     };
-    let next = crate::message_copy::context_scope(model.copy_scope.borrow().as_ref());
+    let old_scope = model.copy_scope.borrow().clone();
+    let next = crate::message_copy::context_scope(old_scope.as_ref());
     let same = match (model.copy_scope.borrow().as_ref(), next.as_ref()) {
         (Some(a), Some(b)) => Rc::ptr_eq(a, b),
         (None, None) => true,
         _ => false,
     };
     if !same {
+        model.text_cache.borrow_mut().invalidate(false);
+    }
+    let epoch = model.text_cache.borrow().epoch;
+    if !same {
         *model.copy_scope.borrow_mut() = next;
         model.notify_copy_rows();
+    }
+    let scope = model.copy_scope.borrow().clone();
+    // No RefCell guard survives this UI/capability check. A cache whose room
+    // retired still requires a real publication, not a context notification.
+    let first = model.rows.borrow().first().cloned();
+    if let Some(first) = first {
+        if crate::message_copy::text_projection_cache_allowed(
+            scope.as_ref(), model.weak.clone(), 0, &first,
+        ) {
+            model.text_cache.borrow_mut().resume_after_context(epoch);
+        }
+    }
+}
+
+/// Synchronous account/room/protection withdrawal clears parsed plaintext even
+/// if another internal callback still holds this old model. No notification or
+/// formatting can refill it until a fresh guarded publication enables it.
+pub(crate) fn clear_text_projection_cache(current: &ModelRc<MessageItem>) {
+    if let Some(model) = current.as_any().downcast_ref::<TimelineModel>() {
+        model.text_cache.borrow_mut().suspend(true);
+    }
+}
+
+/// A protected overlay suspends caching until the SAME original displayed
+/// scope becomes current again; it never binds an old model to a new target.
+pub(crate) fn suspend_text_projection_cache(current: &ModelRc<MessageItem>) {
+    if let Some(model) = current.as_any().downcast_ref::<TimelineModel>() {
+        model.text_cache.borrow_mut().suspend(false);
     }
 }
 
@@ -430,6 +692,18 @@ pub(crate) fn projection_count(model: &ModelRc<MessageItem>) -> usize {
 }
 
 #[cfg(test)]
+pub(crate) fn cached_text_count(model: &ModelRc<MessageItem>) -> usize {
+    model.as_any().downcast_ref::<TimelineModel>()
+        .map_or(0, |model| model.text_cache.borrow().entries.len())
+}
+
+#[cfg(test)]
+pub(crate) fn parsed_text_count(model: &ModelRc<MessageItem>) -> usize {
+    model.as_any().downcast_ref::<TimelineModel>()
+        .map_or(0, |model| model.parsed_text.get())
+}
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use morpheus_matrix::MessageSendState;
@@ -437,6 +711,204 @@ pub(crate) mod tests {
         ModelChangeListener, ModelChangeListenerContainer,
     };
     use std::pin::Pin;
+
+    #[test]
+    fn text_projection_shares_plain_strings_and_reuses_parse_without_freezing_pins() {
+        let mut plain = fixture(1);
+        plain.rich_markdown = None;
+        plain.rich_accessible = None;
+        let text = crate::live::message_text(&plain);
+        assert_eq!(text.body.as_str().as_ptr(), text.rich_accessible_body.as_str().as_ptr());
+        assert_eq!(text.body.as_str().as_ptr(), text.edit_source.as_str().as_ptr());
+        let row = Arc::new(plain);
+        let model = update_shared(ModelRc::default(), vec![row.clone()]);
+        let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+        crate::pinned_messages::seed_row_pins_for_test(&[]);
+        let before = stored.project_item(0, &row, || true);
+        assert!(!before.pinned);
+        crate::pinned_messages::seed_row_pins_for_test(&[row.event_id.as_deref().unwrap()]);
+        let after = stored.project_item(0, &row, || true);
+        assert!(after.pinned);
+        assert_eq!(before.rich_body, after.rich_body);
+        assert_eq!(before.rich_accessible_body, after.rich_accessible_body);
+        assert_eq!(stored.parsed_text.get(), 1);
+        assert_eq!(after, crate::live::message_item(&row));
+        crate::pinned_messages::seed_row_pins_for_test(&[]);
+    }
+
+    #[test]
+    fn text_cache_never_matches_event_ids_or_raw_addresses_and_keeps_no_source_alive() {
+        let mut cache = TextCache::new();
+        let row = Arc::new(fixture(7));
+        let weak = Arc::downgrade(&row);
+        let epoch = cache.epoch;
+        cache.insert(0, &row, epoch, crate::live::message_text(&row), text_cache_charge(&row).unwrap());
+        let cached = cache.get(0, &row).unwrap();
+        let parsed = Rc::downgrade(&cached);
+        drop(cached);
+        drop(row);
+        assert!(weak.upgrade().is_none());
+        let mut other = fixture(7);
+        other.body = "Different account or edit with the same event ID".into();
+        let other = Arc::new(other);
+        assert!(cache.get(0, &other).is_none());
+        assert!(parsed.upgrade().is_none());
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.charge, 0);
+    }
+
+    #[test]
+    fn text_cache_bounds_entry_and_payload_charge_without_limiting_history() {
+        let rows: Vec<_> = (0..10_000).map(|index| Arc::new(fixture(index))).collect();
+        let model = update_shared(ModelRc::default(), rows.clone());
+        let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+        for (index, row) in rows.iter().take(MAX_CACHED_TEXT_ROWS + 2).enumerate() {
+            stored.project_item(index, row, || true);
+        }
+        assert_eq!(model.row_count(), 10_000);
+        assert_eq!(stored.text_cache.borrow().entries.len(), MAX_CACHED_TEXT_ROWS);
+        assert!(stored.text_cache.borrow_mut().get(0, &rows[0]).is_none());
+        assert!(stored.text_cache.borrow().charge <= MAX_CACHED_TEXT_CHARGE);
+
+        let mut cache = TextCache::new();
+        let mut big = fixture(0);
+        big.body = "x".repeat(8192);
+        big.rich_markdown = None;
+        big.rich_accessible = None;
+        let big = Arc::new(big);
+        let charge = text_cache_charge(&big).unwrap();
+        let total = MAX_CACHED_TEXT_CHARGE / charge + 1;
+        assert!(total < MAX_CACHED_TEXT_ROWS);
+        for row in 0..total {
+            cache.insert(row, &big, cache.epoch, crate::live::message_text(&big), charge);
+        }
+        assert_eq!(cache.entries.len(), total - 1);
+        assert_eq!(cache.charge, (total - 1) * charge);
+        assert!(cache.get(0, &big).is_none());
+        assert!(cache.charge <= MAX_CACHED_TEXT_CHARGE);
+    }
+
+    #[test]
+    fn oversized_and_linked_rich_rows_render_fully_without_optional_cache_retention() {
+        let mut oversized = fixture(3);
+        oversized.body = "x".repeat(MAX_CACHED_TEXT_CHARGE / 16 + 1);
+        oversized.rich_markdown = None;
+        oversized.rich_accessible = None;
+        let mut linked = fixture(4);
+        linked.body = "Unrelated fallback".into();
+        linked.rich_markdown = Some("[Full visible link](https://example.org/path)".into());
+        linked.rich_accessible = Some("Full visible link".into());
+        for row in [oversized, linked] {
+            assert!(text_cache_charge(&row).is_none());
+            let row = Arc::new(row);
+            let model = update_shared(ModelRc::default(), vec![row.clone()]);
+            let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+            let first = stored.project_item(0, &row, || true);
+            let second = stored.project_item(0, &row, || true);
+            assert_eq!(first, crate::live::message_item(&row));
+            assert_eq!(second, first);
+            assert_eq!(second.body.as_str(), row.body);
+            assert_eq!(stored.parsed_text.get(), 2);
+            assert!(stored.text_cache.borrow().entries.is_empty());
+            assert_eq!(stored.text_cache.borrow().charge, 0);
+        }
+    }
+
+    #[test]
+    fn text_cache_withdrawal_drops_payloads_and_rejects_stale_insertion_until_publication() {
+        let row = Arc::new(fixture(9));
+        let model = update_shared(ModelRc::default(), vec![row.clone()]);
+        let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+        stored.project_item(0, &row, || true);
+        let cached = stored.text_cache.borrow_mut().get(0, &row).unwrap();
+        let weak = Rc::downgrade(&cached);
+        drop(cached);
+        let previous = stored.text_cache.borrow().epoch;
+        clear_text_projection_cache(&model);
+        assert!(weak.upgrade().is_none());
+        assert!(!stored.text_cache.borrow().enabled);
+        stored.text_cache.borrow_mut().insert(0, &row, previous, crate::live::message_text(&row), text_cache_charge(&row).unwrap());
+        assert!(stored.text_cache.borrow().entries.is_empty());
+        stored.project_item(0, &row, || true);
+        assert!(stored.text_cache.borrow().entries.is_empty());
+        assert_eq!(model.row_count(), 1);
+        update_shared(model.clone(), vec![row.clone()]);
+        assert!(stored.text_cache.borrow().enabled);
+        stored.text_cache.borrow_mut().insert(0, &row, previous, crate::live::message_text(&row), text_cache_charge(&row).unwrap());
+        assert!(stored.text_cache.borrow().entries.is_empty());
+        stored.project_item(0, &row, || true);
+        assert_eq!(stored.text_cache.borrow().entries.len(), 1);
+        assert_eq!(stored.parsed_text.get(), 3);
+    }
+
+    #[test]
+    fn edited_rows_clear_cached_plaintext_before_reentrant_model_notifications() {
+        struct Cleared {
+            model: ModelRc<MessageItem>,
+            previous: Weak<crate::live::MessageText>,
+            notifications: std::cell::Cell<usize>,
+        }
+        impl ModelChangeListener for Cleared {
+            fn row_changed(self: Pin<&Self>, _row: usize) { self.reset(); }
+            fn row_added(self: Pin<&Self>, _row: usize, _count: usize) { self.reset(); }
+            fn row_removed(self: Pin<&Self>, _row: usize, _count: usize) { self.reset(); }
+            fn reset(self: Pin<&Self>) {
+                assert!(self.previous.upgrade().is_none());
+                let stored = self.model.as_any().downcast_ref::<TimelineModel>().unwrap();
+                assert!(stored.text_cache.borrow().entries.is_empty());
+                // A synchronous listener can retire this very model during
+                // publication. Its later enable must not undo retirement.
+                clear_text_projection_cache(&self.model);
+                let _ = self.model.row_data(0);
+                self.notifications.set(self.notifications.get() + 1);
+            }
+        }
+        let row = Arc::new(fixture(11));
+        let model = update_shared(ModelRc::default(), vec![row.clone()]);
+        let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+        stored.project_item(0, &row, || true);
+        let cached = stored.text_cache.borrow_mut().get(0, &row).unwrap();
+        let previous = Rc::downgrade(&cached);
+        drop(cached);
+        let observer = Box::pin(ModelChangeListenerContainer::new(Cleared {
+            model: model.clone(), previous, notifications: std::cell::Cell::new(0),
+        }));
+        model.model_tracker().attach_peer(observer.as_ref().model_peer());
+        let mut edited = fixture(11);
+        edited.body = "Edited and redacted text".into();
+        edited.rich_markdown = None;
+        edited.rich_accessible = None;
+        let edited = Arc::new(edited);
+        update_shared(model.clone(), vec![edited.clone()]);
+        assert_eq!(observer.as_ref().get().notifications.get(), 1);
+        assert!(!stored.text_cache.borrow().enabled);
+        let shown = stored.project_item(0, &edited, || true);
+        assert_eq!(shown.body.as_str(), "Edited and redacted text");
+        assert!(stored.text_cache.borrow().entries.is_empty());
+        // A subsequent actual publication may renew the exact retained row.
+        update_shared(model.clone(), vec![edited.clone()]);
+        stored.project_item(0, &edited, || true);
+        assert_eq!(stored.text_cache.borrow().entries.len(), 1);
+        assert_eq!(model.row_count(), 1);
+    }
+
+    #[test]
+    fn text_cache_context_resume_requires_the_exact_unretired_epoch() {
+        let mut cache = TextCache::new();
+        cache.suspend(false);
+        let modal_epoch = cache.epoch;
+        cache.resume_after_context(modal_epoch);
+        assert!(cache.enabled);
+        cache.suspend(true);
+        let retired_epoch = cache.epoch;
+        cache.resume_after_context(retired_epoch);
+        cache.enable_after_publication(modal_epoch);
+        assert!(!cache.enabled);
+        assert!(cache.publication_required);
+        cache.enable_after_publication(retired_epoch);
+        assert!(cache.enabled);
+        assert!(!cache.publication_required);
+    }
 
     pub(crate) fn fixture(index: usize) -> MessageInfo {
         let body = format!(
