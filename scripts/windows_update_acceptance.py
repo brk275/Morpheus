@@ -24,12 +24,14 @@ import tomllib
 
 if __package__:
     from . import package as package, native_notices as notices
+    from . import native_notice_source as notice_source
     from . import package_revision as revision
     from . import prepare_windows_update as producer
     from . import run_windows_capture_acceptance as capture
 else:
     import package
     import native_notices as notices
+    import native_notice_source as notice_source
     import package_revision as revision
     import prepare_windows_update as producer
     import run_windows_capture_acceptance as capture
@@ -143,6 +145,11 @@ class Commands:
             self.cleanup_failed = True
             raise
     def start(self, job, args, environment=None, cwd=ROOT):
+        # Only the fixed protected system Git may retain provider hardlinks.
+        # Recheck its complete path/ACL contract immediately before each spawn;
+        # a same-named alias cannot borrow the initial selection's admission.
+        if args and Path(args[0]).name.casefold() == "git.exe":
+            require(Path(args[0]) == notice_source.system_git())
         checked(cwd, directory=True)
         self.sequence += 1
         log = self.logs / (str(self.sequence).zfill(4) + ".log")
@@ -549,7 +556,10 @@ def execute(args):
         # proxy that could select or auto-install an ambient toolchain.
         cargo=checked(Path(commands.environment["RUSTUP_HOME"]) /
                       "toolchains/1.99.0-x86_64-pc-windows-msvc/bin/cargo.exe")
-        git=checked(Path(shutil.which("git") or "").resolve())
+        # Use the same parameter-free protected provider Git as source notices.
+        # PATH Git can be another hardlinked launcher; private inputs still
+        # require checked()'s original single-link contract.
+        git=notice_source.system_git()
         require(commands.run([cargo,"packager","--version"]).strip()==b"cargo-packager 0.11.8")
         archive_path=root/"source.tar"
         commands.run([git,"archive","--format=tar","--output="+str(archive_path),reviewed],cwd=source)

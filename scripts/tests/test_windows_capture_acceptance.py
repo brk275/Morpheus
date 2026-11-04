@@ -518,6 +518,77 @@ class WindowsCaptureTests(unittest.TestCase):
 
 
 class InstalledWindowsUpdateTests(unittest.TestCase):
+    def test_installed_update_selects_fixed_git_without_path_or_generic_file_admission(self):
+        class ArchiveReached(Exception):
+            pass
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            selected = root / "provider/Git/cmd/git.exe"
+            selected.parent.mkdir(parents=True)
+            selected.write_bytes(b"synthetic protected provider Git")
+            alias = root / "path/Git/bin/git.exe"
+            alias.parent.mkdir(parents=True)
+            update.os.link(selected, alias)
+            self.assertEqual(selected.stat().st_nlink, 2)
+            commands = Mock(cleanup_failed=False)
+            commands.run.side_effect = [b"cargo-packager 0.11.8", ArchiveReached()]
+            args = types.SimpleNamespace(source=root / "reviewed", gitleaks=root / "scanner.exe",
+                gitleaks_sha256="b" * 64, execute_on_free_hosted_runner=True)
+            def checked(path, **kwargs):
+                if Path(path) in {selected, alias}:
+                    raise AssertionError("system Git must not enter private single-link admission")
+                return Path(path)
+            with (patch.dict(update.os.environ, {"RUNNER_TEMP":str(root)}, clear=True),
+                  patch.object(update, "guard"), patch.object(update, "checked", side_effect=checked),
+                  patch.object(update.revision, "expected_revision", return_value="c" * 40),
+                  patch.object(update.revision, "verify_checkout", return_value="c" * 40),
+                  patch.object(update, "digest", return_value="b" * 64),
+                  patch.object(update.secrets, "token_hex", return_value="a" * 32),
+                  patch.object(update, "private_environment", return_value={"RUSTUP_HOME":str(root)}),
+                  patch.object(update, "Commands", return_value=commands),
+                  patch.object(update.notice_source, "system_git", return_value=selected) as system_git,
+                  patch.object(update.shutil, "which") as path_lookup,
+                  patch.object(update, "absent_registry"), patch.object(update, "remove_owned_root")):
+                with self.assertRaises(ArchiveReached):
+                    update.execute(args)
+            system_git.assert_called_once_with()
+            path_lookup.assert_not_called()
+            self.assertEqual(commands.run.call_args_list[1].args[0][0], selected)
+            self.assertEqual(commands.run.call_args_list[1].args[0][1:3], ["archive", "--format=tar"])
+            commands.scan.assert_called_once_with(args.gitleaks)
+
+    def test_installed_update_git_acl_is_rechecked_before_every_spawn_and_aliases_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            git = root / "provider/git.exe"
+            git.parent.mkdir(); git.write_bytes(b"synthetic protected provider Git")
+            alias = root / "other/Git.ExE"
+            alias.parent.mkdir(); update.os.link(git, alias)
+            commands = update.Commands(root,{})
+            job = Mock(); job.spawn.return_value = 77
+            # The generic data-file validator retains its original link rule.
+            with self.assertRaises(update.Failure):
+                update.checked(git)
+            with patch.object(update.notice_source, "system_git",
+                              side_effect=[git, ValueError("synthetic changed ACL")]) as system_git:
+                handle, log = commands.start(job, [git, "archive"], cwd=root)
+                self.assertEqual(handle, 77)
+                self.assertTrue(log.is_file())
+                self.assertEqual(system_git.call_count, 1)
+                with self.assertRaises(ValueError):
+                    commands.start(job, [git, "archive"], cwd=root)
+            self.assertEqual(system_git.call_count, 2)
+            self.assertEqual(job.spawn.call_count, 1)
+            self.assertEqual(commands.sequence, 1)
+            self.assertEqual(len(list(commands.logs.iterdir())), 1)
+            with patch.object(update.notice_source, "system_git", return_value=git) as system_git:
+                with self.assertRaises(update.Failure):
+                    commands.start(job, [alias, "archive"], cwd=root)
+            system_git.assert_called_once_with()
+            self.assertEqual(job.spawn.call_count, 1)
+            self.assertEqual(commands.sequence, 1)
+            self.assertEqual(len(list(commands.logs.iterdir())), 1)
+
     def hosted(self, event):
         return {"GITHUB_ACTIONS":"true", "RUNNER_ENVIRONMENT":"github-hosted", "RUNNER_OS":"Windows",
                 "GITHUB_REPOSITORY":"brk275/Morpheus", "GITHUB_REF":"refs/heads/main",
