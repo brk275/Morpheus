@@ -127,7 +127,7 @@ def _notice_report_failure(error):
 _CARGO_STDERR_MARKERS = {
     "manifest": (b"failed to parse manifest", b"failed to load manifest", b"no targets specified in the manifest"),
     "lockfile": (b"needs to be updated but --locked was passed", b"failed to parse lock file", b"lock file needs to be updated"),
-    "checkout": (b"failed to checkout", b"failed to clone", b"failed to fetch into:", b"filename too long", b"invalid path"),
+    "checkout": (b"failed to checkout", b"failed to clone", b"failed to fetch into:", b"filename too long", b"path too long", b"invalid path"),
     "network": (b"failed to download", b"network failure", b"could not resolve host", b"connection timed out", b"failed to connect", b"connection reset"),
     "tls": (b"ssl certificate problem", b"certificate verify failed", b"certificate verification", b"schannel", b"peer certificate", b"tls handshake"),
     "auth": (b"authentication required", b"authentication failed", b"failed to authenticate", b"unauthorized"),
@@ -640,6 +640,12 @@ def prepare(environment, scanner):
     write_new(root/"acquisition-started.json", json.dumps({"schema":1, "source_revision":revision}).encode()+b"\n")
     _notice_phase("private_children")
     for name in ("home","cargo","fetch","target","temp","logs","output"):private_directory(root/name)
+    if os.name == "nt":
+        # The pinned Cargo/libgit2 checkout reads this private HOME config.
+        # Only working-tree path length support changes; CLI Git still has its
+        # isolated null global config, and every external path/ACL guard stays.
+        write_new(root/"home"/".gitconfig", b"[core]\n\tlongpaths = true\n")
+        checked(root/"home"/".gitconfig", private=True)
     controlled=environment_for_acquisition(environment,root,cargo,rustc,git,rustup)
     commands=Commands(root,controlled);success=False;scanned=False
     try:

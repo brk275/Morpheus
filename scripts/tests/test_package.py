@@ -747,6 +747,7 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                 self.assertEqual(acquisition._cargo_stderr_classes(body), [token])
         self.assertEqual(acquisition._cargo_stderr_classes(b"unrecognized synthetic-private-body\x00\xff"), ["other"])
         self.assertEqual(acquisition._cargo_stderr_classes(b""), ["other"])
+        self.assertEqual(acquisition._cargo_stderr_classes(b"path too long: synthetic-private-path"), ["checkout"])
         self.assertEqual(acquisition._cargo_stderr_classes(b"authentication failed "*100), ["auth"])
         with self.assertRaises(ValueError):
             acquisition._cargo_stderr_classes(b"x"*(8*1024**2+1))
@@ -1519,6 +1520,44 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     acquisition.prepare({"MORPHEUS_PACKAGE_SOURCE_REVISION":"a"*40,"GITHUB_SHA":"b"*40},parent/"scanner")
             self.assertFalse((root/"state.json").exists())
+
+    def test_windows_owned_home_longpaths_config_is_fixed_private_new_and_precedes_commands(self):
+        from scripts import native_notice_source as acquisition
+        class StopAdmission(Exception): pass
+        class HostOS:
+            def __init__(self,name):self.name=name
+            def __getattr__(self,name):return getattr(os,name)
+        cases=[("nt",False),("nt",True)]
+        if os.name != "nt":cases.insert(1,("posix",False))  # fchmod is POSIX-only.
+        for host,existing in cases:
+            with self.subTest(host=host,existing=existing), tempfile.TemporaryDirectory() as temporary:
+                parent=Path(temporary).resolve();root=parent/"reserved";root.mkdir(mode=0o700)
+                (root/"owner.json").write_bytes(b"synthetic reservation")
+                config=root/"home/.gitconfig";checks=[];admitted=[]
+                def private(path,**options):
+                    Path(path).mkdir(mode=0o700,**options)
+                    if existing and Path(path)==root/"home":config.write_bytes(b"foreign config must remain untouched")
+                def checked(path,**options):checks.append((Path(path),options));return Path(path)
+                def commands(*args):
+                    admitted.append(True)
+                    self.assertEqual(config.exists(),host=="nt")
+                    if host=="nt":
+                        self.assertEqual(config.read_bytes(),b"[core]\n\tlongpaths = true\n")
+                        self.assertIn((config,{"private":True}),checks)
+                    raise StopAdmission()
+                with mock.patch.object(acquisition,"os",HostOS(host)), \
+                        mock.patch.object(acquisition,"guard"),mock.patch.object(acquisition,"owned_source_root",return_value=root), \
+                        mock.patch.object(acquisition,"checked",side_effect=checked), \
+                        mock.patch.object(acquisition.N,"read_regular",return_value=b"scanner"), \
+                        mock.patch.object(acquisition,"SCANNERS",{(sys.platform,acquisition.platform.machine()):hashlib.sha256(b"scanner").hexdigest()}), \
+                        mock.patch.object(acquisition,"tools",return_value=(parent/"cargo",parent/"rustc",parent/"git",parent/"rustup")), \
+                        mock.patch.object(acquisition,"environment_for_acquisition",return_value={}), \
+                        mock.patch.object(acquisition,"private_directory",side_effect=private), \
+                        mock.patch.object(acquisition,"Commands",side_effect=commands):
+                    with self.assertRaises(FileExistsError if existing else StopAdmission):
+                        acquisition.prepare({"MORPHEUS_PACKAGE_SOURCE_REVISION":"a"*40,"GITHUB_SHA":"b"*40},parent/"scanner")
+                self.assertEqual(admitted,[] if existing else [True])
+                if existing:self.assertEqual(config.read_bytes(),b"foreign config must remain untouched")
 
     def test_windows_prepare_fetch_and_scan_use_private_directory_creation_for_every_child(self):
         from scripts import native_notice_source as acquisition
