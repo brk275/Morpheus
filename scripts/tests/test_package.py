@@ -615,10 +615,10 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
 
     def test_notice_reader_keeps_windows_birth_identity_and_each_api_change_time(self):
         # Exercise the production reader with real file bytes/descriptor and
-        # genuine IDs/mode/size/mtime. Only model the authenticated CPython
-        # 3.12 split: named ctime=CreationTime, fd ctime=ChangeTime.
+        # genuine IDs/size/mtime. Model CPython 3.12's named CreationTime vs
+        # handle ChangeTime, plus filename-inferred execute bits on .exe only.
         with tempfile.TemporaryDirectory() as temporary:
-            target = Path(temporary).resolve() / "event.json"
+            target = Path(temporary).resolve() / "scanner.exe"
             target.write_bytes(b'{"fixture":"owned metadata"}')
             named_stat, handle_stat = Path.lstat, os.fstat
             fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
@@ -629,6 +629,13 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                     value = SimpleNamespace(**{key: getattr(real, key) for key in fields})
                     value.st_birthtime_ns = 1_000_000
                     value.st_ctime_ns = 1_000_000 if kind == "named" else 2_000_000
+                    value.st_mode = (value.st_mode & ~0o111) | (0o111 if kind == "named" else 0)
+                    if mutation == "protection_changed" and kind == "fd" and counts[kind] == 1: value.st_mode ^= 0o200
+                    if mutation == "fd_mode_changed" and kind == "fd" and counts[kind] == 2: value.st_mode ^= 0o200
+                    if mutation == "named_mode_changed" and kind == "named" and counts[kind] == 3: value.st_mode ^= 0o111
+                    if mutation == "fd_exec_changed" and kind == "fd" and counts[kind] == 2: value.st_mode ^= 0o111
+                    if mutation == "type_changed" and kind == "fd" and counts[kind] == 1:
+                        value.st_mode = (value.st_mode & ~0o170000) | 0o040000
                     if mutation == "missing_birth": del value.st_birthtime_ns
                     if mutation == "invalid_birth": value.st_birthtime_ns = True
                     if mutation == "fd_change" and kind == "fd" and counts[kind] == 2: value.st_ctime_ns += 1
@@ -656,7 +663,8 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                 return value, counts
             self.assertEqual(attempt(), (target.read_bytes(), {"named":3,"fd":2,"opened":1}))
             for mutation in ("missing_birth", "invalid_birth", "fd_change", "named_change", "birth_change",
-                             "path_replaced", "opened_replaced", "link_change", "mtime_change"):
+                             "path_replaced", "opened_replaced", "link_change", "mtime_change",
+                             "protection_changed", "fd_mode_changed", "named_mode_changed", "fd_exec_changed", "type_changed"):
                 with self.subTest(mutation=mutation), self.assertRaises((ValueError, AttributeError)):
                     attempt(mutation)
 

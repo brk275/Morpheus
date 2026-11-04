@@ -68,12 +68,18 @@ def read_regular(path, maximum, *, allow_empty=False):
         # CPython 3.12 Windows named stat exposes CreationTime as ctime,
         # while fstat exposes ChangeTime. Birth time is the common identity;
         # retain both APIs' own change-time stability checks separately below.
+        mode = info.st_mode
         if os.name == "nt":
             born = info.st_birthtime_ns
             require(type(born) is int and born > 0)
+            # Named stat infers executable bits from .exe/.bat/.cmd/.com;
+            # fstat has no filename. These synthetic bits are not Windows ACL
+            # permissions. Compare real type/read/write bits across APIs, and
+            # retain each API's complete mode stability check below.
+            mode &= ~0o111
         else:
             born = info.st_ctime_ns
-        return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+        return (info.st_dev, info.st_ino, mode, info.st_nlink,
                 info.st_size, info.st_mtime_ns, born)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     descriptor = catalogue().windows_security().open_read(path) if os.name == "nt" else os.open(path, flags)
@@ -84,6 +90,7 @@ def read_regular(path, maximum, *, allow_empty=False):
         after = os.fstat(stream.fileno())
         named_after = path.lstat()
     require(stamp(before) == stamp(opened) == stamp(after) == stamp(named_after)
+            and before.st_mode == named_after.st_mode and opened.st_mode == after.st_mode
             and before.st_ctime_ns == named_after.st_ctime_ns
             and opened.st_ctime_ns == after.st_ctime_ns and len(data) == before.st_size)
     return data
