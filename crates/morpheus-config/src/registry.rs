@@ -6,6 +6,8 @@
 //! accepted key is never an inactive setting. Planned tokens are documented as
 //! gaps instead of being accepted early.
 
+use std::sync::OnceLock;
+
 /// A group of color tokens in the Appearance workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenGroup {
@@ -2696,11 +2698,12 @@ pub fn search_settings(
     if words.is_empty() {
         return Vec::new();
     }
-    let mut ranked: Vec<(u32, usize, &'static SettingTarget)> = SETTING_TARGETS
+    let mut ranked: Vec<(u32, usize, &'static SettingTarget)> = search_index()
+        .settings
         .iter()
         .enumerate()
-        .filter(|(_, target)| available(target.requires))
-        .filter_map(|(order, target)| Some((score(target, &words)?, order, target)))
+        .filter(|(_, entry)| available(entry.value.requires))
+        .filter_map(|(order, entry)| Some((entry.text.score(&words)?, order, entry.value)))
         .collect();
     ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
     ranked
@@ -2769,29 +2772,40 @@ pub fn search(query: &str, available: impl Fn(Requirement) -> bool) -> Vec<Searc
     if words.is_empty() {
         return Vec::new();
     }
-    let settings = SETTING_TARGETS
+    let index = search_index();
+    let settings = index
+        .settings
         .iter()
         .enumerate()
-        .filter(|(_, target)| available(target.requires))
-        .filter_map(|(order, target)| {
-            Some((score(target, &words)?, 0, order, SearchHit::Setting(target)))
-        });
-    let colors = COLOR_TOKENS
-        .iter()
-        .enumerate()
-        .filter_map(|(order, token)| {
+        .filter(|(_, entry)| available(entry.value.requires))
+        .filter_map(|(order, entry)| {
             Some((
-                token_score(token, &words)?,
-                1,
+                entry.text.score(&words)?,
+                0,
                 order,
-                SearchHit::Color(token),
+                SearchHit::Setting(entry.value),
             ))
         });
-    let metrics = metric_fields()
+    let colors = index
+        .colors
+        .iter()
         .enumerate()
-        .filter_map(|(order, (field, editor))| {
+        .filter_map(|(order, entry)| {
             Some((
-                metric_score(field, editor, &words)?,
+                entry.text.score(&words)?,
+                1,
+                order,
+                SearchHit::Color(entry.value),
+            ))
+        });
+    let metrics = index
+        .metrics
+        .iter()
+        .enumerate()
+        .filter_map(|(order, entry)| {
+            let (field, editor) = entry.value;
+            Some((
+                entry.text.score(&words)?,
                 2,
                 order,
                 SearchHit::Metric(field, editor),
@@ -2813,73 +2827,115 @@ pub fn search(query: &str, available: impl Fn(Requirement) -> bool) -> Vec<Searc
         .collect()
 }
 
-fn token_score(token: &ColorToken, words: &[&str]) -> Option<u32> {
-    let mut keywords: Vec<&str> = token.keywords.to_vec();
-    keywords.push(token.id);
-    keywords.extend(token.id.split('_'));
-    score_fields(
-        token.label,
-        token.group.label(),
-        &keywords,
-        token.description,
-        words,
-    )
+// The corpus is exclusively the immutable registry, never queries, account
+// data or availability. Its three fixed slices are normalized once per process;
+// Requirement is deliberately evaluated by each search, before scoring.
+struct SearchEntry<T> {
+    value: T,
+    text: SearchText,
 }
 
-fn metric_score(field: &FieldSpec, editor: &MetricEditor, words: &[&str]) -> Option<u32> {
-    let mut keywords: Vec<&str> = editor.keywords.to_vec();
-    keywords.push(field.key);
-    keywords.extend(field.key.split(['.', '_']));
-    score_fields(
-        editor.label,
-        editor.group.label(),
-        &keywords,
-        field.description,
-        words,
-    )
+struct SearchIndex {
+    settings: Box<[SearchEntry<&'static SettingTarget>]>,
+    colors: Box<[SearchEntry<&'static ColorToken>]>,
+    metrics: Box<[SearchEntry<(&'static FieldSpec, &'static MetricEditor)>]>,
 }
 
-fn score(target: &SettingTarget, words: &[&str]) -> Option<u32> {
-    score_fields(
-        target.label,
-        target.category,
-        target.keywords,
-        target.description,
-        words,
-    )
+struct SearchText {
+    label: String,
+    category: String,
+    keywords: Box<[String]>,
+    description: String,
 }
 
-fn score_fields(
-    label: &str,
-    category: &str,
-    keywords: &[&str],
-    description: &str,
-    words: &[&str],
-) -> Option<u32> {
-    let label = label.to_lowercase();
-    let category = category.to_lowercase();
-    let description = description.to_lowercase();
-    let mut total = 0;
-    for word in words {
-        let keyword = keywords.iter().map(|keyword| keyword.to_lowercase());
-        let best = if label.split_whitespace().any(|part| part.starts_with(word)) {
-            8
-        } else if keyword.clone().any(|keyword| keyword == *word) {
-            7
-        } else if keyword.clone().any(|keyword| keyword.starts_with(word)) {
-            5
-        } else if label.contains(word) || category.starts_with(word) {
-            4
-        } else if keyword.clone().any(|keyword| keyword.contains(word)) {
-            3
-        } else if description.contains(word) {
-            1
-        } else {
-            return None;
-        };
-        total += best;
+impl SearchText {
+    fn new(
+        label: &'static str,
+        category: &'static str,
+        keywords: impl Iterator<Item = &'static str>,
+        description: &'static str,
+    ) -> Self {
+        Self {
+            label: label.to_lowercase(),
+            category: category.to_lowercase(),
+            keywords: keywords.map(str::to_lowercase).collect(),
+            description: description.to_lowercase(),
+        }
     }
-    Some(total)
+
+    fn score(&self, words: &[&str]) -> Option<u32> {
+        let mut total = 0;
+        for word in words {
+            let best = if self.label.split_whitespace().any(|part| part.starts_with(word)) {
+                8
+            } else if self.keywords.iter().any(|keyword| keyword.as_str() == *word) {
+                7
+            } else if self.keywords.iter().any(|keyword| keyword.starts_with(word)) {
+                5
+            } else if self.label.contains(word) || self.category.starts_with(word) {
+                4
+            } else if self.keywords.iter().any(|keyword| keyword.contains(word)) {
+                3
+            } else if self.description.contains(word) {
+                1
+            } else {
+                return None;
+            };
+            total += best;
+        }
+        Some(total)
+    }
+}
+
+fn search_index() -> &'static SearchIndex {
+    static INDEX: OnceLock<SearchIndex> = OnceLock::new();
+    INDEX.get_or_init(|| SearchIndex {
+        settings: SETTING_TARGETS
+            .iter()
+            .map(|target| SearchEntry {
+                value: target,
+                text: SearchText::new(
+                    target.label,
+                    target.category,
+                    target.keywords.iter().copied(),
+                    target.description,
+                ),
+            })
+            .collect(),
+        colors: COLOR_TOKENS
+            .iter()
+            .map(|token| SearchEntry {
+                value: token,
+                text: SearchText::new(
+                    token.label,
+                    token.group.label(),
+                    token
+                        .keywords
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(token.id))
+                        .chain(token.id.split('_')),
+                    token.description,
+                ),
+            })
+            .collect(),
+        metrics: metric_fields()
+            .map(|(field, editor)| SearchEntry {
+                value: (field, editor),
+                text: SearchText::new(
+                    editor.label,
+                    editor.group.label(),
+                    editor
+                        .keywords
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(field.key))
+                        .chain(field.key.split(['.', '_'])),
+                    field.description,
+                ),
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -2970,6 +3026,230 @@ mod tests {
         assert_eq!(format_hex_color([0x1e, 0x23, 0x30, 0x80]), "#1E233080");
         for value in ["#ABCDEF", "#ABCDEF01", "#00000000"] {
             assert_eq!(format_hex_color(parse_hex_color(value).unwrap()), value);
+        }
+    }
+
+    // The pre-index scorer remains independent test-only reference logic.
+    fn original_score_fields(
+        label: &str,
+        category: &str,
+        keywords: &[&str],
+        description: &str,
+        words: &[&str],
+    ) -> Option<u32> {
+        let label = label.to_lowercase();
+        let category = category.to_lowercase();
+        let description = description.to_lowercase();
+        let mut total = 0;
+        for word in words {
+            let keyword = keywords.iter().map(|keyword| keyword.to_lowercase());
+            let best = if label.split_whitespace().any(|part| part.starts_with(word)) {
+                8
+            } else if keyword.clone().any(|keyword| keyword == *word) {
+                7
+            } else if keyword.clone().any(|keyword| keyword.starts_with(word)) {
+                5
+            } else if label.contains(word) || category.starts_with(word) {
+                4
+            } else if keyword.clone().any(|keyword| keyword.contains(word)) {
+                3
+            } else if description.contains(word) {
+                1
+            } else {
+                return None;
+            };
+            total += best;
+        }
+        Some(total)
+    }
+
+    fn original_search_ids(
+        query: &str,
+        available: impl Fn(Requirement) -> bool,
+        settings_only: bool,
+    ) -> Vec<String> {
+        let query: String = query.chars().take(MAX_SEARCH_QUERY_CHARS).collect();
+        let query = query.to_lowercase();
+        let words: Vec<&str> = query.split_whitespace().collect();
+        if words.is_empty() {
+            return Vec::new();
+        }
+        let mut ranked = Vec::new();
+        for (order, target) in SETTING_TARGETS.iter().enumerate() {
+            if available(target.requires) {
+                if let Some(score) = original_score_fields(
+                    target.label,
+                    target.category,
+                    target.keywords,
+                    target.description,
+                    &words,
+                ) {
+                    ranked.push((score, 0, order, target.id.to_owned()));
+                }
+            }
+        }
+        if !settings_only {
+            for (order, token) in COLOR_TOKENS.iter().enumerate() {
+                let mut keywords = token.keywords.to_vec();
+                keywords.push(token.id);
+                keywords.extend(token.id.split('_'));
+                if let Some(score) = original_score_fields(
+                    token.label,
+                    token.group.label(),
+                    &keywords,
+                    token.description,
+                    &words,
+                ) {
+                    ranked.push((score, 1, order, SearchHit::Color(token).id()));
+                }
+            }
+            for (order, (field, editor)) in metric_fields().enumerate() {
+                let mut keywords = editor.keywords.to_vec();
+                keywords.push(field.key);
+                keywords.extend(field.key.split(['.', '_']));
+                if let Some(score) = original_score_fields(
+                    editor.label,
+                    editor.group.label(),
+                    &keywords,
+                    field.description,
+                    &words,
+                ) {
+                    ranked.push((score, 2, order, SearchHit::Metric(field, editor).id()));
+                }
+            }
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then(left.1.cmp(&right.1))
+                .then(left.2.cmp(&right.2))
+        });
+        ranked
+            .into_iter()
+            .take(MAX_SEARCH_RESULTS)
+            .map(|(_, _, _, id)| id)
+            .collect()
+    }
+
+    #[test]
+    fn indexed_search_preserves_original_ranking_ties_and_character_bounds() {
+        let ids = |query: &str| {
+            search(query, |_| true)
+                .into_iter()
+                .map(SearchHit::id)
+                .collect::<Vec<_>>()
+        };
+        let settings = |query: &str| {
+            search_settings(query, |_| true)
+                .into_iter()
+                .map(|target| target.id.to_owned())
+                .collect::<Vec<_>>()
+        };
+        for query in [
+            "e", "FoNt", "font size", "colour", "verify", "hex", "room keys", "opacity", "padding",
+        ] {
+            assert_eq!(
+                ids(query),
+                original_search_ids(query, |_| true, false),
+                "{query}"
+            );
+            assert_eq!(
+                settings(query),
+                original_search_ids(query, |_| true, true),
+                "{query}"
+            );
+        }
+        assert_eq!(ids("e").len(), MAX_SEARCH_RESULTS);
+        let clamped = format!("{}FoNt ignored", " ".repeat(MAX_SEARCH_QUERY_CHARS - 4));
+        assert_eq!(ids(&clamped), ids("font"));
+        assert_eq!(settings(&clamped), settings("font"));
+        let unicode_clamped = format!("{}Kignored", " ".repeat(MAX_SEARCH_QUERY_CHARS - 1));
+        assert_eq!(ids(&unicode_clamped), ids("k"));
+        assert_eq!(settings(&unicode_clamped), settings("k"));
+        assert!(ids("font no_such_setting_zz").is_empty());
+    }
+
+    #[test]
+    fn normalized_search_preserves_each_score_weight_and_unicode_lowercasing() {
+        let text = SearchText::new(
+            "Alpha beta",
+            "Gamma",
+            ["omega", "alphabet", "threshold"].into_iter(),
+            "Epsilon text",
+        );
+        for (words, expected) in [
+            (vec!["alpha"], Some(8)),
+            (vec!["omega"], Some(7)),
+            (vec!["ome"], Some(5)),
+            (vec!["pha"], Some(4)),
+            (vec!["gam"], Some(4)),
+            (vec!["resh"], Some(3)),
+            (vec!["eps"], Some(1)),
+            (vec!["alpha", "omega"], Some(15)),
+            (vec!["alpha", "absent"], None),
+        ] {
+            assert_eq!(text.score(&words), expected);
+        }
+        let unicode = SearchText::new(
+            "ΣΟΣ İSTANBUL",
+            "Écran",
+            ["CAFÉ", "Straße", "K"].into_iter(),
+            "Λέξη",
+        );
+        for query in ["Σ", "Σ İ", "i\u{307}", "CAFÉ", "écr", "straße", "STRASSE", "K"] {
+            let query = query.to_lowercase();
+            let words: Vec<_> = query.split_whitespace().collect();
+            assert_eq!(
+                unicode.score(&words),
+                original_score_fields(
+                    "ΣΟΣ İSTANBUL",
+                    "Écran",
+                    &["CAFÉ", "Straße", "K"],
+                    "Λέξη",
+                    &words,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_search_rechecks_availability_once_per_setting_in_registry_order() {
+        use std::cell::{Cell, RefCell};
+        let live = Cell::new(true);
+        let seen = RefCell::new(Vec::new());
+        let expected: Vec<_> = SETTING_TARGETS
+            .iter()
+            .map(|target| target.requires)
+            .collect();
+        assert!(search(" \u{2003}", |_| panic!("blank query consulted availability")).is_empty());
+        assert!(search_settings("", |_| panic!("blank query consulted availability")).is_empty());
+        for enabled in [true, false, true] {
+            live.set(enabled);
+            let available = |requirement| requirement == Requirement::Always || live.get();
+            let hits = search("peer verification", |requirement| {
+                seen.borrow_mut().push(requirement);
+                available(requirement)
+            });
+            assert_eq!(*seen.borrow(), expected);
+            assert_eq!(
+                hits.into_iter().map(SearchHit::id).collect::<Vec<_>>(),
+                original_search_ids("peer verification", available, false)
+            );
+            seen.borrow_mut().clear();
+            let targets = search_settings("peer verification", |requirement| {
+                seen.borrow_mut().push(requirement);
+                available(requirement)
+            });
+            assert_eq!(*seen.borrow(), expected);
+            assert_eq!(
+                targets
+                    .into_iter()
+                    .map(|target| target.id.to_owned())
+                    .collect::<Vec<_>>(),
+                original_search_ids("peer verification", available, true)
+            );
+            seen.borrow_mut().clear();
         }
     }
 
