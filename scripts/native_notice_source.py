@@ -50,7 +50,7 @@ _NOTICE_FAILURE_PHASE = "guard"
 _NOTICE_FAILURE_PHASES = frozenset({
     "guard", "event_file", "event_payload", "scanner_path", "scanner_hash",
     "rustup", "cargo", "rustc", "git", "temp_parent", "private_root",
-    "owner_marker", "publish", "source", "cleanup",
+    "owner_marker", "publish", "source", "private_children", "tool_versions", "fetch_export", "cleanup",
 })
 
 
@@ -125,6 +125,14 @@ def system_git():
 def _notice_checked(phase, path, **options):
     _notice_phase(phase)
     return checked(path, **options)
+
+
+def private_directory(path, *, parents=False, exist_ok=False):
+    path = Path(path)
+    if os.name == "nt":
+        return S.windows_security().private_directory(path, parents=parents, exist_ok=exist_ok)
+    path.mkdir(mode=0o700, parents=parents, exist_ok=exist_ok)
+    return path
 
 
 def write_new(path, data):
@@ -389,7 +397,7 @@ class Commands:
         # own report. Reuse retained command ownership and separate raw streams.
         self.deadline = max(self.deadline, time.monotonic() + 120)
         scan_logs = self.root/"scanner-logs"
-        scan_logs.mkdir(mode=0o700, exist_ok=True)
+        private_directory(scan_logs, exist_ok=True)
         self.run("scan", [str(scanner),"dir","--no-banner","--config",str(config),
             "--gitleaks-ignore-path",str(ignore),"--ignore-gitleaks-allow","--redact=100",
             "--max-target-megabytes","0",str(self.logs)], cwd=self.root, env=self.environment,
@@ -463,7 +471,7 @@ def owned_source_root(environment):
 
 def fetch_export(root, files, identity):
     """Copy authenticated source data only; Cargo never reads ambient checkout files."""
-    target = root/"fetch-source";target.mkdir(mode=0o700)
+    target = private_directory(root/"fetch-source")
     require(set(files) == set(identity["files"]))
     names={}
     for name,data in sorted(files.items()):
@@ -472,7 +480,7 @@ def fetch_export(root, files, identity):
         # Current supported workspace is regular-only. Do not invent Windows
         # symlink creation or follow a repository-provided link during fetch.
         require(entry["mode"] in {"100644","100755"} and S.digest(data)==entry["sha256"])
-        path=target/name;path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+        path=target/name;private_directory(path.parent, parents=True, exist_ok=True)
         write_new(path,data)
         if os.name!="nt":path.chmod(0o700 if entry["mode"]=="100755" else 0o600)
     return target
@@ -494,16 +502,21 @@ def prepare(environment, scanner):
     # Irreversible phase marker precedes every Commands/child admission. A
     # killed/partial acquisition can never resemble an untouched reservation.
     write_new(root/"acquisition-started.json", json.dumps({"schema":1, "source_revision":revision}).encode()+b"\n")
-    for name in ("home","cargo","fetch","target","temp","logs","output"):(root/name).mkdir(mode=0o700)
+    _notice_phase("private_children")
+    for name in ("home","cargo","fetch","target","temp","logs","output"):private_directory(root/name)
     controlled=environment_for_acquisition(environment,root,cargo,rustc,git,rustup)
     commands=Commands(root,controlled);success=False;scanned=False
     try:
+        _notice_phase("tool_versions")
         for tool,prefix in ((cargo,b"cargo 1.99.0 "),(rustc,b"rustc 1.99.0 ")):
             version=commands.run("version",[str(tool),"--version"],cwd=root/"fetch",env=controlled,timeout=30,output_limit=256)
             require(version.startswith(prefix) and version.endswith(b"\n") and version.count(b"\n")==1)
+        _notice_phase("source")
         _,source,files=S.git_export(commands,ROOT,revision,str(git),controlled,S.Budget())
         packages=source_inputs(files)
+        _notice_phase("fetch_export")
         fetched_source=fetch_export(root,files,source)
+        _notice_phase("source")
         for directory in (root/"fetch",root,*root.parents):
             require(not any((directory/".cargo"/name).exists() for name in ("config","config.toml")))
         commands.run("fetch",[str(cargo),"--config","net.git-fetch-with-cli=false","--config","net.retry=0",

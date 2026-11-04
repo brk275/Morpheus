@@ -1180,10 +1180,53 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                     mock.patch.object(acquisition,"SCANNERS",{(sys.platform,acquisition.platform.machine()):hashlib.sha256(b"scanner").hexdigest()}), \
                     mock.patch.object(acquisition,"tools",return_value=(parent/"cargo",parent/"rustc",parent/"git",parent/"rustup")), \
                     mock.patch.object(acquisition,"environment_for_acquisition",return_value={}), \
+                    mock.patch.object(acquisition,"private_directory",side_effect=lambda path,**kwargs:Path(path).mkdir(mode=0o700,**kwargs)), \
                     mock.patch.object(acquisition,"Commands",side_effect=commands):
                 with self.assertRaises(RuntimeError):
                     acquisition.prepare({"MORPHEUS_PACKAGE_SOURCE_REVISION":"a"*40,"GITHUB_SHA":"b"*40},parent/"scanner")
             self.assertFalse((root/"state.json").exists())
+
+    def test_windows_prepare_fetch_and_scan_use_private_directory_creation_for_every_child(self):
+        from scripts import native_notice_source as acquisition
+        class StopAdmission(Exception): pass
+        class WindowsOS:
+            name = "nt"
+            def __getattr__(self, name): return getattr(os,name)
+        with tempfile.TemporaryDirectory() as temporary:
+            parent=Path(temporary).resolve();root=parent/"reserved";root.mkdir()
+            (root/"owner.json").write_bytes(b"synthetic reservation")
+            calls=[]
+            def private(path,*,parents=False,exist_ok=False):
+                path=Path(path);calls.append((path,parents,exist_ok))
+                path.mkdir(parents=parents,exist_ok=exist_ok);return path
+            security=SimpleNamespace(private_directory=private)
+            with mock.patch.object(acquisition,"os",WindowsOS()), \
+                    mock.patch.object(acquisition.S,"windows_security",return_value=security), \
+                    mock.patch.object(acquisition,"guard"),mock.patch.object(acquisition,"owned_source_root",return_value=root), \
+                    mock.patch.object(acquisition,"checked",side_effect=lambda path,**kwargs:Path(path)), \
+                    mock.patch.object(acquisition.N,"read_regular",return_value=b"scanner"), \
+                    mock.patch.object(acquisition,"SCANNERS",{(sys.platform,acquisition.platform.machine()):hashlib.sha256(b"scanner").hexdigest()}), \
+                    mock.patch.object(acquisition,"tools",return_value=(parent/"cargo",parent/"rustc",parent/"git",parent/"rustup")), \
+                    mock.patch.object(acquisition,"environment_for_acquisition",return_value={}), \
+                    mock.patch.object(acquisition,"Commands",side_effect=StopAdmission):
+                with self.assertRaises(StopAdmission):
+                    acquisition.prepare({"GITHUB_SHA":"a"*40},parent/"scanner")
+            expected=[root/name for name in ("home","cargo","fetch","target","temp","logs","output")]
+            self.assertEqual(calls,[(path,False,False) for path in expected])
+            calls.clear()
+            with mock.patch.object(acquisition,"os",WindowsOS()), \
+                    mock.patch.object(acquisition.S,"windows_security",return_value=security):
+                commands=acquisition.Commands(root,{})
+                with mock.patch.object(commands,"run",return_value=b"") as run:
+                    commands.scan(parent/"scanner")
+                self.assertEqual(run.call_args.kwargs["log_root"],root/"scanner-logs")
+                data=b"synthetic source bytes"
+                files={"crates/example/Cargo.toml":data}
+                identity={"files":{name:{"mode":"100644","sha256":hashlib.sha256(data).hexdigest()} for name in files}}
+                exported=acquisition.fetch_export(root,files,identity)
+                self.assertEqual((exported/"crates/example/Cargo.toml").read_bytes(),data)
+            self.assertEqual(calls,[(root/"scanner-logs",False,True),(root/"fetch-source",False,False),
+                                    (root/"fetch-source/crates/example",True,True)])
 
 
 class NativeNoticeCommandOwnershipTests(unittest.TestCase):
@@ -1265,6 +1308,93 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
             self.assertEqual((current.st_dev,current.st_ino),(identity.st_dev,identity.st_ino))
             root.rmdir()
 
+    def test_private_child_creation_uses_protected_user_system_acl_and_rejects_existing_writers(self):
+        import ctypes
+        from scripts import native_notice_windows as windows
+        class WindowsOS:
+            name = "nt"
+            def __getattr__(self, name): return getattr(os, name)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            protected, created, descriptors, validations = {root}, [], [], []
+            security = windows.Security.__new__(windows.Security)
+            security.sid = "S-1-5-21-synthetic-user"
+            def validate(path, *, directory=False, private=False):
+                path = Path(path); validations.append((path,directory,private))
+                if not directory or not private or path not in protected or not path.is_dir():
+                    raise ValueError("synthetic private ACL refused")
+                return path
+            def descriptor(sddl, version, output, size):
+                descriptors.append(sddl); output._obj.value = 42; return True
+            def create(path, attributes):
+                path = Path(path); path.mkdir(); protected.add(path); created.append(path); return True
+            security.path = validate
+            security.a = SimpleNamespace(ConvertStringSecurityDescriptorToSecurityDescriptorW=descriptor)
+            security.k = SimpleNamespace(CreateDirectoryW=create, LocalFree=mock.Mock(return_value=None))
+            with mock.patch.object(windows,"os",WindowsOS()):
+                leaf = root/"nested"/"source"/"logs"
+                self.assertEqual(security.private_directory(leaf,parents=True),leaf)
+                self.assertEqual(created,[root/"nested",root/"nested/source",leaf])
+                self.assertEqual(descriptors,["O:"+security.sid+"D:P(A;OICI;FA;;;"+security.sid+")(A;OICI;FA;;;SY)"]*3)
+                self.assertEqual(security.k.LocalFree.call_count,3)
+                self.assertEqual(security.private_directory(leaf,parents=True,exist_ok=True),leaf)
+                bad = root/"admin-writable"; bad.mkdir()
+                for path,options in ((bad,{"exist_ok":True}),(bad/"child",{}),
+                                     (root/"nested/../escape",{"parents":True}),(Path("relative"),{})):
+                    with self.subTest(path=str(path)),self.assertRaises(ValueError):
+                        security.private_directory(path,**options)
+                self.assertEqual(len(created),3)
+            self.assertTrue(all(directory and private for _,directory,private in validations))
+
+    @unittest.skipUnless(os.name == "nt", "actual Windows private child ACL and inherited file reads")
+    def test_private_nested_children_keep_user_system_reads_and_refuse_stdlib_admin_acl(self):
+        from scripts import native_notice_windows as windows
+        security = windows.security()
+        root = security.create_root(security.path(Path.home().resolve(),directory=True))
+        identity = root.stat().st_dev,root.stat().st_ino
+        leaf, bad = root/"nested"/"logs", root/"stdlib700"
+        bad_identity = None
+        try:
+            security.private_directory(leaf,parents=True)
+            target = leaf/"version.out";target.write_bytes(b"synthetic tool version\n")
+            security.path(leaf,directory=True,private=True)
+            with os.fdopen(security.open_read(target,private=True),"rb") as stream:
+                self.assertEqual(stream.read(),b"synthetic tool version\n")
+            self.assertEqual(security.private_directory(leaf,parents=True,exist_ok=True),leaf)
+            if sys.version_info >= (3,12,4):
+                bad.mkdir(mode=0o700)
+                created = bad.lstat()
+                self.assertTrue(windows.stat.S_ISDIR(created.st_mode) and not windows.stat.S_ISLNK(created.st_mode)
+                                and not getattr(created,"st_file_attributes",0) & 0x400)
+                self.assertEqual(bad.resolve(strict=True),bad)
+                bad_identity = created.st_dev,created.st_ino,created.st_mode,getattr(created,"st_file_attributes",0)
+                with self.assertRaises(ValueError):security.path(bad,directory=True,private=True)
+                with self.assertRaises(ValueError):security.private_directory(bad,exist_ok=True)
+        finally:
+            security.path(root,directory=True,private=True)
+            self.assertEqual((root.stat().st_dev,root.stat().st_ino),identity)
+            (leaf/"version.out").unlink(missing_ok=True)
+            for path in (leaf,leaf.parent):
+                if path.exists():security.path(path,directory=True,private=True);path.rmdir()
+            if bad_identity is not None:
+                # This intentionally invalid ACL cannot enter the normal path
+                # validator (even its non-private policy rejects OWNER RIGHTS).
+                # Remove only our same empty negative fixture beneath the exact
+                # still-private reserved root; never repair or admit its ACL.
+                security.path(root,directory=True,private=True)
+                self.assertEqual((root.stat().st_dev,root.stat().st_ino),identity)
+                current = bad.lstat()
+                self.assertEqual(bad.parent,root)
+                self.assertEqual(bad.resolve(strict=True),bad)
+                self.assertTrue(windows.stat.S_ISDIR(current.st_mode) and not windows.stat.S_ISLNK(current.st_mode)
+                                and not getattr(current,"st_file_attributes",0) & 0x400)
+                self.assertEqual((current.st_dev,current.st_ino,current.st_mode,getattr(current,"st_file_attributes",0)),bad_identity)
+                self.assertEqual(list(bad.iterdir()),[])
+                bad.rmdir()
+            else:
+                self.assertFalse(bad.exists(),"unknown negative fixture must remain untouched")
+            security.path(root,directory=True,private=True);root.rmdir()
+
     def test_acl_rejects_unknown_ace_and_foreign_writer_but_not_read_only_trustee(self):
         import ctypes
         from ctypes import wintypes
@@ -1301,6 +1431,8 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
         security.test_writer="bound-token-owner";security.a.mask=0x2
         with self.assertRaises(ValueError):security.acl("fixture",private=True)
         security.test_owner="S-1-5-32-544";security.a.mask=0x120089
+        with self.assertRaises(ValueError):security.acl("fixture",private=True)
+        security.test_owner="current-user";security.test_writer="S-1-5-32-544";security.a.mask=0x2
         with self.assertRaises(ValueError):security.acl("fixture",private=True)
 
 

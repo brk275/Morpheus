@@ -140,6 +140,43 @@ class Security:
         require(stat.S_ISREG(info.st_mode) and info.st_nlink >= 1)
         return path
 
+    def private_directory(self, path, *, parents=False, exist_ok=False):
+        """Create only inside an already private parent with explicit user/SYSTEM ACL.
+
+        Python's Windows mkdir(0700) grants Administrators access and overrides
+        the reserved root's protected inheritance. Never repair an existing ACL
+        or relax private readers; every existing parent and final child must
+        satisfy the unchanged private owner/DACL/reparse/fixed-drive policy.
+        """
+        require(os.name == "nt" and type(parents) is bool and type(exist_ok) is bool)
+        path = Path(path)
+        require(path.is_absolute() and not str(path).startswith(("\\\\", "//"))
+                and len(path.parts) <= 128)
+        for part in path.parts[1:]:
+            require(part not in {"", ".", ".."} and not part.endswith((" ", "."))
+                    and not any(character in part for character in '<>:"/\\|?*\0'))
+        require(path.name not in {"", ".", ".."})
+        if parents and not path.parent.exists():
+            self.private_directory(path.parent, parents=True, exist_ok=True)
+        parent = self.path(path.parent, directory=True, private=True)
+        require(path.parent == parent)
+        if path.exists():
+            require(exist_ok)
+            return self.path(path, directory=True, private=True)
+        class Attributes(ctypes.Structure):
+            _fields_ = [("size", W.DWORD), ("descriptor", ctypes.c_void_p), ("inherit", W.BOOL)]
+        descriptor = ctypes.c_void_p()
+        require(self.a.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            "O:" + self.sid + "D:P(A;OICI;FA;;;" + self.sid + ")(A;OICI;FA;;;SY)",
+            1, ctypes.byref(descriptor), None))
+        try:
+            attributes = Attributes(ctypes.sizeof(Attributes), descriptor, False)
+            created = self.k.CreateDirectoryW(str(path), ctypes.byref(attributes))
+            require(created or exist_ok and ctypes.get_last_error() == 183)
+            return self.path(path, directory=True, private=True)
+        finally:
+            require(self.k.LocalFree(descriptor) is None)
+
     def create_root(self, parent):
         parent = self.path(parent, directory=True)
         class Attributes(ctypes.Structure):
