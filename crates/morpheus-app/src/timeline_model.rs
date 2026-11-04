@@ -55,10 +55,7 @@ fn text_cache_charge(info: &MessageInfo) -> Option<usize> {
         // Slint's pinned parser owns paragraph strings and flat span vectors.
         // Charge both possible paragraph/style cross-products conservatively;
         // no URLs/interpolated paragraphs are admitted through this path.
-        let span_charge = markers
-            .checked_add(1)?
-            .checked_pow(2)?
-            .checked_mul(128)?;
+        let span_charge = markers.checked_add(1)?.checked_pow(2)?.checked_mul(128)?;
         charge = charge.checked_add(span_charge)?;
     }
     (charge <= MAX_CACHED_TEXT_CHARGE).then_some(charge)
@@ -431,7 +428,10 @@ impl Model for TimelineModel {
         let mut item = self.project_item(row, &info, || {
             let scope = self.copy_scope.borrow().clone();
             crate::message_copy::text_projection_cache_allowed(
-                scope.as_ref(), self.weak.clone(), row, &info,
+                scope.as_ref(),
+                self.weak.clone(),
+                row,
+                &info,
             )
         });
         item.copy_token = crate::message_copy::row_token(
@@ -513,7 +513,10 @@ fn update_rows_scoped(
             *model.copy_scope.borrow_mut() = next;
             model.notify_copy_rows();
         }
-        model.text_cache.borrow_mut().enable_after_publication(publication_epoch);
+        model
+            .text_cache
+            .borrow_mut()
+            .enable_after_publication(publication_epoch);
         current
     } else {
         let model = Rc::new_cyclic(|weak| TimelineModel {
@@ -562,7 +565,10 @@ pub(crate) fn refresh_copy_context(current: &ModelRc<MessageItem>) {
     let first = model.rows.borrow().first().cloned();
     if let Some(first) = first {
         if crate::message_copy::text_projection_cache_allowed(
-            scope.as_ref(), model.weak.clone(), 0, &first,
+            scope.as_ref(),
+            model.weak.clone(),
+            0,
+            &first,
         ) {
             model.text_cache.borrow_mut().resume_after_context(epoch);
         }
@@ -693,13 +699,17 @@ pub(crate) fn projection_count(model: &ModelRc<MessageItem>) -> usize {
 
 #[cfg(test)]
 pub(crate) fn cached_text_count(model: &ModelRc<MessageItem>) -> usize {
-    model.as_any().downcast_ref::<TimelineModel>()
+    model
+        .as_any()
+        .downcast_ref::<TimelineModel>()
         .map_or(0, |model| model.text_cache.borrow().entries.len())
 }
 
 #[cfg(test)]
 pub(crate) fn parsed_text_count(model: &ModelRc<MessageItem>) -> usize {
-    model.as_any().downcast_ref::<TimelineModel>()
+    model
+        .as_any()
+        .downcast_ref::<TimelineModel>()
         .map_or(0, |model| model.parsed_text.get())
 }
 
@@ -718,8 +728,14 @@ pub(crate) mod tests {
         plain.rich_markdown = None;
         plain.rich_accessible = None;
         let text = crate::live::message_text(&plain);
-        assert_eq!(text.body.as_str().as_ptr(), text.rich_accessible_body.as_str().as_ptr());
-        assert_eq!(text.body.as_str().as_ptr(), text.edit_source.as_str().as_ptr());
+        assert_eq!(
+            text.body.as_str().as_ptr(),
+            text.rich_accessible_body.as_str().as_ptr()
+        );
+        assert_eq!(
+            text.body.as_str().as_ptr(),
+            text.edit_source.as_str().as_ptr()
+        );
         let row = Arc::new(plain);
         let model = update_shared(ModelRc::default(), vec![row.clone()]);
         let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
@@ -742,7 +758,13 @@ pub(crate) mod tests {
         let row = Arc::new(fixture(7));
         let weak = Arc::downgrade(&row);
         let epoch = cache.epoch;
-        cache.insert(0, &row, epoch, crate::live::message_text(&row), text_cache_charge(&row).unwrap());
+        cache.insert(
+            0,
+            &row,
+            epoch,
+            crate::live::message_text(&row),
+            text_cache_charge(&row).unwrap(),
+        );
         let cached = cache.get(0, &row).unwrap();
         let parsed = Rc::downgrade(&cached);
         drop(cached);
@@ -766,7 +788,10 @@ pub(crate) mod tests {
             stored.project_item(index, row, || true);
         }
         assert_eq!(model.row_count(), 10_000);
-        assert_eq!(stored.text_cache.borrow().entries.len(), MAX_CACHED_TEXT_ROWS);
+        assert_eq!(
+            stored.text_cache.borrow().entries.len(),
+            MAX_CACHED_TEXT_ROWS
+        );
         assert!(stored.text_cache.borrow_mut().get(0, &rows[0]).is_none());
         assert!(stored.text_cache.borrow().charge <= MAX_CACHED_TEXT_CHARGE);
 
@@ -780,7 +805,13 @@ pub(crate) mod tests {
         let total = MAX_CACHED_TEXT_CHARGE / charge + 1;
         assert!(total < MAX_CACHED_TEXT_ROWS);
         for row in 0..total {
-            cache.insert(row, &big, cache.epoch, crate::live::message_text(&big), charge);
+            cache.insert(
+                row,
+                &big,
+                cache.epoch,
+                crate::live::message_text(&big),
+                charge,
+            );
         }
         assert_eq!(cache.entries.len(), total - 1);
         assert_eq!(cache.charge, (total - 1) * charge);
@@ -827,14 +858,26 @@ pub(crate) mod tests {
         clear_text_projection_cache(&model);
         assert!(weak.upgrade().is_none());
         assert!(!stored.text_cache.borrow().enabled);
-        stored.text_cache.borrow_mut().insert(0, &row, previous, crate::live::message_text(&row), text_cache_charge(&row).unwrap());
+        stored.text_cache.borrow_mut().insert(
+            0,
+            &row,
+            previous,
+            crate::live::message_text(&row),
+            text_cache_charge(&row).unwrap(),
+        );
         assert!(stored.text_cache.borrow().entries.is_empty());
         stored.project_item(0, &row, || true);
         assert!(stored.text_cache.borrow().entries.is_empty());
         assert_eq!(model.row_count(), 1);
         update_shared(model.clone(), vec![row.clone()]);
         assert!(stored.text_cache.borrow().enabled);
-        stored.text_cache.borrow_mut().insert(0, &row, previous, crate::live::message_text(&row), text_cache_charge(&row).unwrap());
+        stored.text_cache.borrow_mut().insert(
+            0,
+            &row,
+            previous,
+            crate::live::message_text(&row),
+            text_cache_charge(&row).unwrap(),
+        );
         assert!(stored.text_cache.borrow().entries.is_empty());
         stored.project_item(0, &row, || true);
         assert_eq!(stored.text_cache.borrow().entries.len(), 1);
@@ -849,9 +892,15 @@ pub(crate) mod tests {
             notifications: std::cell::Cell<usize>,
         }
         impl ModelChangeListener for Cleared {
-            fn row_changed(self: Pin<&Self>, _row: usize) { self.reset(); }
-            fn row_added(self: Pin<&Self>, _row: usize, _count: usize) { self.reset(); }
-            fn row_removed(self: Pin<&Self>, _row: usize, _count: usize) { self.reset(); }
+            fn row_changed(self: Pin<&Self>, _row: usize) {
+                self.reset();
+            }
+            fn row_added(self: Pin<&Self>, _row: usize, _count: usize) {
+                self.reset();
+            }
+            fn row_removed(self: Pin<&Self>, _row: usize, _count: usize) {
+                self.reset();
+            }
             fn reset(self: Pin<&Self>) {
                 assert!(self.previous.upgrade().is_none());
                 let stored = self.model.as_any().downcast_ref::<TimelineModel>().unwrap();
@@ -871,9 +920,13 @@ pub(crate) mod tests {
         let previous = Rc::downgrade(&cached);
         drop(cached);
         let observer = Box::pin(ModelChangeListenerContainer::new(Cleared {
-            model: model.clone(), previous, notifications: std::cell::Cell::new(0),
+            model: model.clone(),
+            previous,
+            notifications: std::cell::Cell::new(0),
         }));
-        model.model_tracker().attach_peer(observer.as_ref().model_peer());
+        model
+            .model_tracker()
+            .attach_peer(observer.as_ref().model_peer());
         let mut edited = fixture(11);
         edited.body = "Edited and redacted text".into();
         edited.rich_markdown = None;

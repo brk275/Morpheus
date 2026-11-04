@@ -546,7 +546,8 @@ impl Scenario {
         );
         let _ = Self::copy_token(&copy_aba_model, &root);
         assert_eq!(
-            crate::timeline_model::cached_text_count(&copy_aba_model), 0,
+            crate::timeline_model::cached_text_count(&copy_aba_model),
+            0,
             "same-ID fresh account selection cannot refill the original model's parsed cache"
         );
         check!(message_copy_account_aba);
@@ -805,13 +806,15 @@ impl Scenario {
         ));
 
         let retained = ui.get_messages();
-        let displayed_source = crate::timeline_model::info_of_event(&retained, root)
-            .expect("actual displayed source");
+        let displayed_source =
+            crate::timeline_model::info_of_event(&retained, root).expect("actual displayed source");
         let _ = Self::copy_token(&retained, root);
         let same_target_scope = crate::message_copy::capture_publication(ui, &selection, false);
         if selection.is_current() && self.shows_scope(ui) {
             ui.set_messages(crate::timeline_model::update_scoped(
-                ModelRc::default(), vec![displayed_source.clone()], same_target_scope,
+                ModelRc::default(),
+                vec![displayed_source.clone()],
+                same_target_scope,
             ));
         }
         let _ = Self::copy_token(&ui.get_messages(), root);
@@ -824,11 +827,17 @@ impl Scenario {
         ));
         let owner_model = ui.get_messages();
         let owner_scope = crate::message_copy::capture_publication(ui, &selection, false);
-        let owner_rc: std::rc::Rc<dyn slint::Model<Data = MessageItem>> =
-            owner_model.clone().try_into().ok().expect("actual timeline model owner");
+        let owner_rc: std::rc::Rc<dyn slint::Model<Data = MessageItem>> = owner_model
+            .clone()
+            .try_into()
+            .ok()
+            .expect("actual timeline model owner");
         let owner_weak = std::rc::Rc::downgrade(&owner_rc);
         let owner_allowed = crate::message_copy::text_projection_cache_allowed(
-            owner_scope.as_ref(), owner_weak.clone(), 0, &displayed_source,
+            owner_scope.as_ref(),
+            owner_weak.clone(),
+            0,
+            &displayed_source,
         );
         // Keep the old LiveUi, account selection, exact row and UI model alive;
         // IDs and view counters still match. Only the actual registered owner
@@ -837,14 +846,21 @@ impl Scenario {
         let _ = Self::copy_token(&owner_model, root);
         observations.push((
             "replacing the actual Copy owner rejects the retained original cache scope",
-            owner_allowed && !crate::message_copy::text_projection_cache_allowed(
-                owner_scope.as_ref(), owner_weak, 0, &displayed_source,
-            ) && crate::timeline_model::cached_text_count(&owner_model) == 0,
+            owner_allowed
+                && !crate::message_copy::text_projection_cache_allowed(
+                    owner_scope.as_ref(),
+                    owner_weak,
+                    0,
+                    &displayed_source,
+                )
+                && crate::timeline_model::cached_text_count(&owner_model) == 0,
         ));
         let fresh_scope = crate::message_copy::capture_publication(ui, &selection, false);
         if selection.is_current() && self.shows_scope(ui) {
             ui.set_messages(crate::timeline_model::update_scoped(
-                ModelRc::default(), vec![displayed_source], fresh_scope,
+                ModelRc::default(),
+                vec![displayed_source],
+                fresh_scope,
             ));
         }
         let _ = Self::copy_token(&ui.get_messages(), root);

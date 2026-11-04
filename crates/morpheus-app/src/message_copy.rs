@@ -132,7 +132,6 @@ impl Drop for CacheWithdrawal {
     }
 }
 
-
 fn ui_allowed(ui: &AppWindow) -> bool {
     ui.get_viewport_seek_allowed() && !ui.get_settings_reveal_protected()
 }
@@ -282,8 +281,8 @@ pub(crate) fn text_projection_cache_allowed(
         let owner = owner.as_ref()?;
         (SyncWeak::ptr_eq(&scope.live, &owner.live)
             && Rc::ptr_eq(&scope.withdrawal, &owner.withdrawal))
-            .then(|| owner.ui.upgrade())
-            .flatten()
+        .then(|| owner.ui.upgrade())
+        .flatten()
     });
     let Some(ui) = ui else {
         return false;
@@ -689,9 +688,7 @@ impl Drop for RecordingClipboard {
 
 pub(crate) fn register(ui: &AppWindow, live: &Arc<LiveUi>) {
     let _cache_withdrawal = CacheWithdrawal::enter();
-    let previous = OWNER.with(|owner| {
-        owner.borrow().as_ref().and_then(|owner| owner.ui.upgrade())
-    });
+    let previous = OWNER.with(|owner| owner.borrow().as_ref().and_then(|owner| owner.ui.upgrade()));
     if let Some(previous) = previous {
         crate::timeline_model::clear_text_projection_cache(&previous.get_messages());
         crate::timeline_model::clear_text_projection_cache(&previous.get_thread_messages());
