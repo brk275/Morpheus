@@ -1234,7 +1234,7 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
     def test_windows_workspace_repository_uses_fixed_private_https_source_without_checkout_config(self):
         from scripts import native_notice_source as acquisition
         root=Path("/private/owned/source");repository=root/"workspace.git";git=Path("/protected/Git/cmd/git.exe")
-        revision="a"*40;environment={"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"HOME":str(root/"home"),
+        revision="a"*40;environment={"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40,"HOME":str(root/"home"),
                                    "GIT_CONFIG_COUNT":"1","GIT_CONFIG_KEY_0":"url.foreign.insteadOf",
                                    "GIT_CONFIG_VALUE_0":"https://github.com/","SSH_AUTH_SOCK":"foreign"}
         commands=SimpleNamespace(run=mock.Mock(return_value=b""))
@@ -1282,15 +1282,15 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                 mock.patch.object(acquisition,"check_cache") as inventory:
             for wrong in ("0"*40,"A"*40,"a"*39,"../revision","b"*40):
                 with self.subTest(revision=wrong),self.assertRaises(ValueError):
-                    acquisition.workspace_repository(commands,root,wrong,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision})
+                    acquisition.workspace_repository(commands,root,wrong,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40})
             private.assert_not_called();commands.run.assert_not_called()
             private.side_effect=FileExistsError("owned existing fixture")
             with self.assertRaises(FileExistsError):
-                acquisition.workspace_repository(commands,root,revision,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision})
+                acquisition.workspace_repository(commands,root,revision,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40})
             commands.run.assert_not_called();private.side_effect=None
             commands.run.side_effect=[b"",ValueError("fixed fetch refusal")]
             with self.assertRaises(ValueError):
-                acquisition.workspace_repository(commands,root,revision,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision})
+                acquisition.workspace_repository(commands,root,revision,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40})
             inventory.assert_not_called()
         with mock.patch.object(acquisition,"os",SimpleNamespace(name="posix")), \
                 mock.patch.object(acquisition,"private_directory") as private:
@@ -1313,7 +1313,7 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                     mock.patch.object(acquisition.N,"read_regular",return_value=b"scanner"), \
                     mock.patch.object(acquisition,"SCANNERS",{(sys.platform,acquisition.platform.machine()):hashlib.sha256(b"scanner").hexdigest()}), \
                     mock.patch.object(acquisition,"tools",return_value=(parent/"cargo",parent/"rustc",parent/"git",parent/"rustup")), \
-                    mock.patch.object(acquisition,"environment_for_acquisition",return_value={"MORPHEUS_PACKAGE_SOURCE_REVISION":revision}), \
+                    mock.patch.object(acquisition,"environment_for_acquisition",return_value={"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40}), \
                     mock.patch.object(acquisition,"private_directory",side_effect=lambda path,**kwargs:Path(path).mkdir(**kwargs)), \
                     mock.patch.object(acquisition,"Commands",return_value=commands), \
                     mock.patch.object(acquisition,"workspace_repository",return_value=repository) as select, \
@@ -1323,7 +1323,7 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                     mock.patch.object(acquisition,"check_cache") as inventory, \
                     mock.patch.object(acquisition,"input_plan",return_value={}), \
                     mock.patch.object(acquisition.S,"build",return_value={"source_tree":tree}) as build:
-                acquisition.prepare({"MORPHEUS_PACKAGE_SOURCE_REVISION":revision},parent/"scanner")
+                acquisition.prepare({"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40},parent/"scanner")
             self.assertEqual(select.call_args.args[:3],(commands,root,revision))
             self.assertEqual(export.call_args.args[1],repository)
             self.assertEqual(build.call_args.args[2],repository)
