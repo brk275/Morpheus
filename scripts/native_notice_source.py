@@ -99,6 +99,26 @@ def checked(path, *, directory=False, private=False):
     return path
 
 
+def system_git():
+    # Apple's fixed system Git launcher shares hardlinks with other command
+    # shims. It is executable input, not a writable source/scanner/data file.
+    # Keep every path component canonical, root-owned and non-writable by
+    # group/other; only this exact Darwin tool may have multiple links.
+    require(sys.platform == "darwin")
+    path = Path("/usr/bin/git")
+    require(path.resolve(strict=True) == path)
+    for item in (path, *path.parents):
+        info = item.lstat()
+        require(not stat.S_ISLNK(info.st_mode) and info.st_uid == 0
+                and not info.st_mode & 0o022)
+        if item == path:
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink >= 1
+                    and info.st_mode & 0o111)
+        else:
+            require(stat.S_ISDIR(info.st_mode))
+    return path
+
+
 def _notice_checked(phase, path, **options):
     _notice_phase(phase)
     return checked(path, **options)
@@ -203,7 +223,7 @@ def tools(environment):
         program = Path(environment["PROGRAMFILES"])
         git = _notice_checked("git", program / "Git/cmd/git.exe")
     else:
-        git = _notice_checked("git", Path("/usr/bin/git"))
+        git = system_git()
     return cargo, rustc, git, rustup
 
 

@@ -768,6 +768,44 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
         self.assertIn("1.99.0-x86_64-pc-windows-msvc",str(cargo))
         self.assertEqual(git,Path("/programs/Git/cmd/git.exe"))
 
+    def test_apple_system_git_shim_accepts_only_protected_root_owned_hardlinks(self):
+        from scripts import native_notice_source as acquisition
+        tool = Path("/usr/bin/git")
+        def metadata(path):
+            return SimpleNamespace(st_mode=0o100755 if path == tool else 0o40755,
+                                   st_uid=0, st_nlink=78 if path == tool else 2)
+        with mock.patch.object(acquisition.sys,"platform","darwin"), \
+                mock.patch.object(Path,"resolve",autospec=True,side_effect=lambda path,strict: path), \
+                mock.patch.object(Path,"lstat",autospec=True,side_effect=metadata) as inspected:
+            self.assertEqual(acquisition.system_git(),tool)
+            for target,field,value in ((tool,"st_uid",501),(tool,"st_mode",0o100775),
+                    (tool,"st_mode",0o120777),(tool,"st_mode",0o100644),
+                    (tool,"st_mode",0o40755),(tool,"st_nlink",0),
+                    (tool.parent,"st_uid",501),(tool.parent,"st_mode",0o40775),
+                    (Path("/usr"),"st_mode",0o120755),(Path("/"),"st_mode",0o40777)):
+                def changed(path):
+                    info = metadata(path)
+                    if path == target: setattr(info,field,value)
+                    return info
+                inspected.side_effect = changed
+                with self.subTest(path=str(target),field=field,value=value), self.assertRaises(ValueError):
+                    acquisition.system_git()
+            inspected.side_effect = metadata
+            # The data/scanner/source admission remains single-link even for
+            # the very same protected regular-file metadata.
+            with mock.patch.object(acquisition,"os",SimpleNamespace(name="posix",getuid=lambda:501)), \
+                    self.assertRaises(ValueError):
+                acquisition.checked(tool)
+        with mock.patch.object(acquisition.sys,"platform","darwin"), \
+                mock.patch.object(Path,"resolve",return_value=Path("/foreign/git")), \
+                mock.patch.object(Path,"lstat") as inspected, self.assertRaises(ValueError):
+            acquisition.system_git()
+        inspected.assert_not_called()
+        with mock.patch.object(acquisition.sys,"platform","win32"), \
+                mock.patch.object(Path,"resolve") as resolved, self.assertRaises(ValueError):
+            acquisition.system_git()
+        resolved.assert_not_called()
+
     def test_copied_windows_environment_preserves_actual_host_guard_and_system_directory(self):
         from scripts import native_notice_source as acquisition
         # dict(os.environ) on Windows contains uppercase keys, unlike the old
