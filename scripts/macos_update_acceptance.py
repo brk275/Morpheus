@@ -31,7 +31,7 @@ import tomllib
 
 if __package__:
     from . import macos_package_ui as owned, package as packaging, native_notices as notices
-    from . import package_smoke as smoke, prepare_macos_update as payload
+    from . import package_smoke as smoke, prepare_macos_update as payload, native_notice_source as notice_source
     from .package_revision import (MAX_EXPORT_BYTES, expected_revision, source_export_members,
                                    verify_checkout, versioned_source_bytes, verify_versioned_export)
 else:
@@ -40,6 +40,7 @@ else:
     import native_notices as notices
     import package_smoke as smoke
     import prepare_macos_update as payload
+    import native_notice_source as notice_source
     from package_revision import (MAX_EXPORT_BYTES, expected_revision, source_export_members,
                                  verify_checkout, versioned_source_bytes, verify_versioned_export)
 
@@ -400,6 +401,7 @@ def app_versions(source):
 def build_bundle(commands, source, target, version, nonce, index, notice_bundle, notice_receipt, revision):
     commands.build_substage = "config"
     commands.failed_command = None
+    commands.notice_rejection_site = None
     artifact = private_new(commands.root / f"package-{index}")
     config = packaging.package_config(source, platform="darwin")
     require(config["before-packaging-command"]
@@ -410,8 +412,14 @@ def build_bundle(commands, source, target, version, nonce, index, notice_bundle,
     formats = packaging.macos_update_formats(config, "app")
     notice_dir = private_new(commands.root / f"notices-{index}")
     commands.build_substage = "notices_prepare"
-    notice_contents = notices.prepare(notice_bundle, notice_receipt, notice_dir,
-                                     revision=revision, platform="darwin", version=version, working=source)
+    try:
+        notice_contents = notices.prepare(notice_bundle, notice_receipt, notice_dir,
+                                         revision=revision, platform="darwin", version=version, working=source)
+    except BaseException as error:
+        # Retain only the existing reviewed fixed code-location reduction, not
+        # the exception, traceback, message, paths, arguments or source data.
+        commands.notice_rejection_site = notice_source._notice_failure_site(error)
+        raise
     config["resources"] = list(config["resources"]) + [
         {"src": str(notice_dir / name), "target": name} for name in notices.NAMES]
     # Exactly one existing before-packaging build for this version. DMG/UI QA
@@ -917,6 +925,22 @@ def build_failure_diagnostic(commands, report):
     return result
 
 
+def notice_rejection_diagnostic(commands, report):
+    # Reuse all complete-scan/owned-child cleanup gates without changing the
+    # existing build diagnostic schema or treating a site as acceptance proof.
+    if getattr(commands, "build_substage", None) != "notices_prepare":
+        return None
+    if build_failure_diagnostic(commands, report) is None:
+        return None
+    site = getattr(commands, "notice_rejection_site", None)
+    if (type(site) is not dict or set(site) != {"module", "line"}
+            or type(site["module"]) is not str
+            or site["module"] not in {"notice_source", "windows_security", "native_notices", "source_catalogue", "windows_processes"}
+            or type(site["line"]) is not int or not 0 < site["line"] <= 99999):
+        return None
+    return {"schema": 1, "check": "macos_notice_rejection_site", "stage": report["stage"], **site}
+
+
 def processes_in_fixture(root):
     # Observation only. Never signal a PID discovered in this snapshot.
     result = []
@@ -1044,6 +1068,9 @@ def main():
             diagnostic = build_failure_diagnostic(commands, report)
             if diagnostic is not None:
                 print("MORPHEUS_MAC_UPDATE_BUILD_DIAGNOSTIC " + json.dumps(diagnostic, sort_keys=True))
+            notice_diagnostic = notice_rejection_diagnostic(commands, report)
+            if notice_diagnostic is not None:
+                print("MORPHEUS_MAC_NOTICE_REJECTION_SITE " + json.dumps(notice_diagnostic, sort_keys=True))
         except Exception:
             # An unreadable/changed/over-bound diagnostic never weakens failure
             # or publishes partial raw output; acceptance remains unchanged.

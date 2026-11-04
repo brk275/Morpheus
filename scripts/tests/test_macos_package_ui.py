@@ -24,6 +24,55 @@ PID = 4242
 
 
 class InstalledUpdateTransactionBoundaryTests(unittest.TestCase):
+    def test_notice_rejection_site_requires_complete_scan_and_retains_only_owned_code_location(self):
+        marker = "synthetic-private-notice-body"
+        config = {"before-packaging-command":"cargo build --release --locked -p morpheus-app --features native-calls",
+                  "macos":{"info-plist-path":"packaging/macos/Info.plist",
+                           "entitlements":"packaging/macos/entitlements.plist"},"resources":[]}
+        def reject(*args, **kwargs):
+            try:
+                update_qa.notices.plain((marker + "\x00").encode())
+            except ValueError as error:
+                error.args = (marker, {"private_path":marker})
+                raise
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            commands = types.SimpleNamespace(root=root, run=Mock(), pending=[], helper_observers=[],
+                                             cleanup_failed=False)
+            with patch.object(update_qa, "private_new", side_effect=lambda path:path), \
+                    patch.object(update_qa.packaging, "package_config", return_value=config), \
+                    patch.object(update_qa.packaging, "macos_update_formats", return_value="app"), \
+                    patch.object(update_qa.notices, "prepare", side_effect=reject), \
+                    self.assertRaises(ValueError):
+                update_qa.build_bundle(commands, root, root, "0.1.0-updateqa.1", NONCE, 1,
+                                       root/"bundle", root/"receipt", "a"*40)
+            commands.run.assert_not_called()
+            report = {"status":"failed","stage":"build_old","checks":{"default_log_scan":False}}
+            self.assertIsNone(update_qa.notice_rejection_diagnostic(commands, report))
+            report["checks"]["default_log_scan"] = True
+            value = update_qa.notice_rejection_diagnostic(commands, report)
+            self.assertEqual(set(value), {"schema","check","stage","module","line"})
+            self.assertEqual(value["module"], "native_notices")
+            self.assertEqual(value["check"], "macos_notice_rejection_site")
+            self.assertTrue(update_qa.notices.plain.__code__.co_firstlineno <= value["line"]
+                            < update_qa.notices.plain.__code__.co_firstlineno + 10)
+            self.assertNotIn(marker, json.dumps(value))
+            self.assertNotIn(str(root), json.dumps(value))
+            self.assertEqual(set(update_qa.build_failure_diagnostic(commands, report)),
+                             {"schema","check","stage","build_substage","command_exit","return_code",
+                              "observed_rust_error_codes","observed_source_locations"})
+            for field, blocked in (("pending",[object()]), ("helper_observers",[object()]),
+                                   ("cleanup_failed",True), ("build_substage","cargo_packager")):
+                with patch.object(commands, field, blocked):
+                    self.assertIsNone(update_qa.notice_rejection_diagnostic(commands, report))
+            for site in (None, {"module":marker,"line":1}, {"module":"native_notices","line":True},
+                         {"module":"native_notices","line":100000},
+                         {"module":"native_notices","line":1,"message":marker}):
+                with patch.object(commands, "notice_rejection_site", site):
+                    self.assertIsNone(update_qa.notice_rejection_diagnostic(commands, report))
+            report["status"] = "passed"
+            self.assertIsNone(update_qa.notice_rejection_diagnostic(commands, report))
+
     def test_build_bundle_records_exact_config_notice_packager_payload_failure_substages(self):
         config = {"before-packaging-command": "cargo build --release --locked -p morpheus-app --features native-calls",
                   "macos": {"info-plist-path": "packaging/macos/Info.plist",
