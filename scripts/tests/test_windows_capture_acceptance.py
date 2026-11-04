@@ -7,6 +7,7 @@ import subprocess
 import struct
 import sys
 import tempfile
+import tarfile
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -518,6 +519,101 @@ class WindowsCaptureTests(unittest.TestCase):
 
 
 class InstalledWindowsUpdateTests(unittest.TestCase):
+    @staticmethod
+    def _workspace_security_fixture(parent, calls):
+        def check(path, **options):
+            path=Path(path);calls.append(("check",path,options));return path
+        def create(parent):
+            path=parent/("morpheus-native-source-"+"b"*32);path.mkdir();calls.append(("reserve",path,{}));return path
+        def private(path, *, parents=False, exist_ok=False):
+            path=Path(path);calls.append(("private",path,{"parents":parents,"exist_ok":exist_ok}))
+            path.mkdir(parents=parents,exist_ok=exist_ok);return path
+        return types.SimpleNamespace(path=check,create_root=create,private_directory=private)
+
+    @staticmethod
+    def _workspace_archive():
+        values={"Cargo.lock":b'version = 4\n[[package]]\nname = "morpheus-app"\nversion = "0.1.0"\n',
+            "crates/morpheus-app/Cargo.toml":b'[package]\nname = "morpheus-app"\nversion = "0.1.0"\n',
+            "vendor/fixture/README.md":b""}
+        data=io.BytesIO()
+        with tarfile.open(fileobj=data,mode="w:") as archive:
+            for name,body in values.items():
+                member=tarfile.TarInfo(name);member.mode=0o644;member.size=len(body)
+                archive.addfile(member,io.BytesIO(body))
+        return data.getvalue(),values
+
+    def test_update_workspace_preserves_nonce_contract_and_cleans_precommand_refusals_only_when_empty(self):
+        for retained_file in (False,True):
+            with self.subTest(retained_file=retained_file), tempfile.TemporaryDirectory() as temporary:
+                parent=Path(temporary).resolve();calls=[];security=self._workspace_security_fixture(parent,calls)
+                original=RuntimeError("synthetic child creation refusal")
+                def refuse(path,**options):
+                    if retained_file:(Path(path).parent/"unexpected").write_bytes(b"must remain")
+                    raise original
+                security.private_directory=refuse
+                with patch.object(Path,"home",return_value=parent), \
+                        patch.object(update.notice_source.S,"windows_security",return_value=security):
+                    with self.assertRaises(RuntimeError) as caught:update.reserve_workspace("a"*32)
+                self.assertIs(caught.exception,original)
+                outer=parent/("morpheus-native-source-"+"b"*32)
+                self.assertEqual(outer.exists(),retained_file)
+                if retained_file:self.assertEqual((outer/"unexpected").read_bytes(),b"must remain")
+        for failure_at in ("environment","commands"):
+            with self.subTest(failure_at=failure_at), tempfile.TemporaryDirectory() as temporary:
+                parent=Path(temporary).resolve();calls=[];security=self._workspace_security_fixture(parent,calls)
+                original=RuntimeError("synthetic pre-command refusal")
+                args=types.SimpleNamespace(source=parent/"reviewed",gitleaks=parent/"scanner",gitleaks_sha256="b"*64,execute_on_free_hosted_runner=True)
+                with patch.object(Path,"home",return_value=parent), \
+                        patch.object(update.notice_source.S,"windows_security",return_value=security), \
+                        patch.object(update,"guard"),patch.object(update,"checked",side_effect=lambda p,**kw:Path(p)), \
+                        patch.object(update.revision,"expected_revision",return_value="c"*40), \
+                        patch.object(update.revision,"verify_checkout",return_value="c"*40),patch.object(update,"digest",return_value="b"*64), \
+                        patch.object(update,"private_environment",side_effect=original if failure_at=="environment" else None,return_value={}), \
+                        patch.object(update,"Commands",side_effect=original) as commands:
+                    with self.assertRaises(RuntimeError) as caught:update.execute(args)
+                self.assertIs(caught.exception,original)
+                self.assertFalse(any(parent.iterdir()))
+                if failure_at=="environment":commands.assert_not_called()
+                else:
+                    outer=commands.call_args.args[0].parent
+                    self.assertEqual(commands.call_args.args[1]["RUNNER_TEMP"],str(outer))
+                    self.assertRegex(commands.call_args.args[0].name,r"^morpheus-windows-updateqa-[0-9a-f]{32}$")
+
+    def test_update_source_export_uses_private_directories_exact_bytes_and_refuses_unsafe_or_existing_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent=Path(temporary).resolve();calls=[];security=self._workspace_security_fixture(parent,calls)
+            root=parent/"run";root.mkdir();archive,original=self._workspace_archive();commands=types.SimpleNamespace(root=root)
+            with patch.object(update.notice_source.S,"windows_security",return_value=security), \
+                    patch.object(tarfile.TarFile,"extractall",side_effect=AssertionError("generic tar extraction must not run")):
+                exported,proof=update.export_source(commands,parent,archive,"0.1.0-updateqa.1","old")
+                self.assertEqual(proof,update.revision.verify_versioned_export(exported,archive,"0.1.0-updateqa.1"))
+                for name,body in original.items():
+                    self.assertEqual((exported/name).read_bytes(),update.revision.versioned_source_bytes(name,body,"0.1.0-updateqa.1"))
+                    self.assertIn(("check",exported/name,{"private":True}),calls)
+                for directory in (exported,exported/"crates/morpheus-app",exported/"vendor/fixture"):
+                    self.assertTrue(any(kind=="private" and path==directory for kind,path,options in calls))
+                with self.assertRaises(FileExistsError):update.export_source(commands,parent,archive,"0.1.0-updateqa.1","old")
+                for name in ("../outside","vendor/NUL/file","vendor/alias:stream/file"):
+                    data=io.BytesIO()
+                    with tarfile.open(fileobj=data,mode="w:") as tar:
+                        item=tarfile.TarInfo(name);item.mode=0o644;item.size=1;tar.addfile(item,io.BytesIO(b"x"))
+                    with self.assertRaises(ValueError):update.export_source(commands,parent,data.getvalue(),"0.1.0-updateqa.1","new")
+                    self.assertFalse((root/"new-source").exists())
+
+    @unittest.skipUnless(sys.platform=="win32","actual Windows protected update workspace and source ACL reads")
+    def test_update_workspace_actual_windows_acl_source_reads_and_cleanup_preserve_actor_parent(self):
+        workspace,workspace_identity,root,identity=update.reserve_workspace("a"*32)
+        archive,original=self._workspace_archive()
+        exported,proof=update.export_source(types.SimpleNamespace(root=root),root,archive,"0.1.0-updateqa.1","old")
+        security=update.notice_source.S.windows_security()
+        security.path(workspace,directory=True,private=True);security.path(root,directory=True,private=True)
+        for name,body in original.items():
+            expected=update.revision.versioned_source_bytes(name,body,"0.1.0-updateqa.1")
+            self.assertEqual(update.notices.read_regular(exported/name,1024,allow_empty=True),expected)
+        self.assertEqual(root,workspace/("morpheus-windows-updateqa-"+"a"*32))
+        update.remove_owned_workspace(workspace,workspace_identity,root,identity)
+        self.assertFalse(workspace.exists())
+
     def test_installed_update_failure_diagnostic_keeps_only_scanned_clean_closed_stage_and_owned_site(self):
         commands=types.SimpleNamespace(cleanup_failed=False,build_substage="notices_prepare")
         site={"module":"native_notices","line":171}
@@ -555,6 +651,10 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                 commands.scan.side_effect=scan
                 args=types.SimpleNamespace(source=root/"reviewed",gitleaks=root/"scanner.exe",
                     gitleaks_sha256="b"*64,execute_on_free_hosted_runner=True)
+                def reserve(nonce):
+                    workspace=root/("morpheus-native-source-"+"b"*32);workspace.mkdir()
+                    run=workspace/("morpheus-windows-updateqa-"+nonce);run.mkdir()
+                    return workspace,(workspace.stat().st_dev,workspace.stat().st_ino),run,(run.stat().st_dev,run.stat().st_ino)
                 with contextlib.redirect_stderr(output), \
                         patch.dict(update.os.environ,{"RUNNER_TEMP":str(root)},clear=True), \
                         patch.object(update,"guard"),patch.object(update,"checked",side_effect=lambda p,**kw:Path(p)), \
@@ -563,10 +663,11 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                         patch.object(update,"digest",return_value="b"*64), \
                         patch.object(update.secrets,"token_hex",return_value="a"*32), \
                         patch.object(update,"private_environment",return_value={"RUSTUP_HOME":str(root)}), \
+                        patch.object(update,"reserve_workspace",side_effect=reserve), \
                         patch.object(update,"Commands",return_value=commands), \
                         patch.object(update.notice_source,"system_git",return_value=root/"git.exe"), \
                         patch.object(update.notice_source,"_notice_failure_site",return_value={"module":"native_notices","line":171}), \
-                        patch.object(update,"absent_registry"),patch.object(update,"remove_owned_root",side_effect=cleanup):
+                        patch.object(update,"absent_registry"),patch.object(update,"remove_owned_workspace",side_effect=lambda workspace,workspace_identity,run,identity:cleanup(run,identity)):
                     with self.assertRaises(PrivateFailure) as caught:update.execute(args)
                 self.assertEqual(events,["scan","cleanup"])
                 self.assertNotIn("private-",output.getvalue())
@@ -594,6 +695,10 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
             commands.run.side_effect = [b"cargo-packager 0.11.8", ArchiveReached()]
             args = types.SimpleNamespace(source=root / "reviewed", gitleaks=root / "scanner.exe",
                 gitleaks_sha256="b" * 64, execute_on_free_hosted_runner=True)
+            def reserve(nonce):
+                workspace=root/("morpheus-native-source-"+"b"*32);workspace.mkdir()
+                run=workspace/("morpheus-windows-updateqa-"+nonce);run.mkdir()
+                return workspace,(workspace.stat().st_dev,workspace.stat().st_ino),run,(run.stat().st_dev,run.stat().st_ino)
             def checked(path, **kwargs):
                 if Path(path) in {selected, alias}:
                     raise AssertionError("system Git must not enter private single-link admission")
@@ -605,10 +710,11 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                   patch.object(update, "digest", return_value="b" * 64),
                   patch.object(update.secrets, "token_hex", return_value="a" * 32),
                   patch.object(update, "private_environment", return_value={"RUSTUP_HOME":str(root)}),
+                  patch.object(update, "reserve_workspace", side_effect=reserve),
                   patch.object(update, "Commands", return_value=commands),
                   patch.object(update.notice_source, "system_git", return_value=selected) as system_git,
                   patch.object(update.shutil, "which") as path_lookup,
-                  patch.object(update, "absent_registry"), patch.object(update, "remove_owned_root")):
+                  patch.object(update, "absent_registry"), patch.object(update, "remove_owned_workspace")):
                 with self.assertRaises(ArchiveReached):
                     update.execute(args)
             system_git.assert_called_once_with()
@@ -815,6 +921,51 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
         self.assertEqual(update.ManufacturerFixture.MODES,
                          {"invalid-signature":"named-values","truncated":"foreign-default","discard":"subkey",
                           "call-exclusion":"vendor-value"})
+
+    def test_actor_plan_verbatim_drive_encoding_refuses_other_namespaces_and_alias_syntax(self):
+        self.assertEqual(update.actor_verbatim_drive_path(r"C:\Users\runner\owned\discard"),
+                         "\\\\?\\C:\\Users\\runner\\owned\\discard")
+        for value in (r"\\server\share\owned", r"\\?\C:\owned", r"\\.\C:\owned",
+                      r"C:owned", r"\owned", "C:/owned", "C:\\owned\\..\\other",
+                      "C:\\owned\\.\\other", r"C:\owned\\other", "C:\\owned.\\other",
+                      "C:\\owned \\other", "C:\\owned:file", "C:\\owned\0file", True):
+            with self.subTest(value=value), self.assertRaises(update.Failure):
+                update.actor_verbatim_drive_path(value)
+
+    def test_actor_plan_canonicalizes_only_checked_path_kinds_before_immutable_hash_binding(self):
+        ordinary = {"root":r"C:\RUNNER~1\owned\discard",
+                    "install":r"C:\RUNNER~1\owned\discard\installed",
+                    "payload":r"C:\RUNNER~1\owned\new-package\Morpheus.windows-payload-v2.bin"}
+        resolved = {name:value.replace("RUNNER~1", "Runner Name") for name,value in ordinary.items()}
+        plan = {"schema":1,"nonce":"a"*32,"case":"discard",**ordinary,
+                "signature":"fixed-signature","payload_sha256":"b"*64}
+        admitted = []
+        def checked(value, *, directory=False):
+            name = next(name for name,path in ordinary.items() if path == value)
+            admitted.append((name,directory))
+            result = Mock()
+            result.resolve.return_value = resolved[name]
+            return result
+        with patch.object(update,"Path",side_effect=lambda value:value), \
+                patch.object(update,"checked",side_effect=checked):
+            encoded = update.actor_plan_windows_paths(plan)
+        self.assertEqual(admitted,[("root",True),("install",True),("payload",False)])
+        self.assertEqual(plan,{"schema":1,"nonce":"a"*32,"case":"discard",**ordinary,
+                               "signature":"fixed-signature","payload_sha256":"b"*64})
+        self.assertEqual({name:encoded[name] for name in ordinary},
+                         {name:"\\\\?\\"+value for name,value in resolved.items()})
+        self.assertEqual({name:value for name,value in encoded.items() if name not in ordinary},
+                         {name:value for name,value in plan.items() if name not in ordinary})
+        with tempfile.TemporaryDirectory() as temporary:
+            case = Path(temporary).resolve()
+            base = {"USERPROFILE":str(case/"original"),"RUNNER_TEMP":str(case)}
+            environment = update.actor_environment(case,encoded,base)
+            raw = (case/"plan.json").read_bytes()
+            self.assertEqual(json.loads(raw),encoded)
+            self.assertEqual(environment[update.PLAN_HASH],update.hashlib.sha256(raw).hexdigest())
+            with self.assertRaises(FileExistsError):update.actor_environment(case,encoded,base)
+        with patch.object(update,"checked",side_effect=update.Failure):
+            with self.assertRaises(update.Failure):update.actor_plan_windows_paths(plan)
 
     def test_plan_is_create_new_hash_bound_and_keeps_signer_credentials_out_of_actor_environment(self):
         with tempfile.TemporaryDirectory() as temporary:

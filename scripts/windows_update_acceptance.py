@@ -10,7 +10,7 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import secrets
 import shutil
@@ -238,13 +238,25 @@ def failure_diagnostic(commands, stage, site, scanned, cleaned):
 
 
 def export_source(commands, source, archive, version, label):
+    require(label in {"old", "new"})
     members = revision.source_export_members(archive)
-    destination = commands.root / (label+"-source"); destination.mkdir()
+    names = {}
+    for member in members:
+        notices.portable_source_name(str(PurePosixPath(member.name)), names, windows=True)
+    security = notice_source.S.windows_security()
+    destination = security.private_directory(commands.root / (label+"-source"))
     with tarfile.open(fileobj=io.BytesIO(archive),mode="r:") as tar:
-        tar.extractall(destination, members=members, filter="data")
-    for name in revision.UPDATE_VERSION_PATHS:
-        path = destination/name
-        path.write_bytes(revision.versioned_source_bytes(name,path.read_bytes(),version))
+        for member in members:
+            name = str(PurePosixPath(member.name)); path = destination.joinpath(*PurePosixPath(name).parts)
+            if member.isdir():
+                security.private_directory(path, parents=True, exist_ok=True)
+                continue
+            security.private_directory(path.parent, parents=True, exist_ok=True)
+            with tar.extractfile(member) as stream:
+                data = stream.read(member.size + 1)
+            require(len(data) == member.size)
+            write_new(path, revision.versioned_source_bytes(name, data, version))
+            security.path(path, private=True)
     proof = revision.verify_versioned_export(destination,archive,version)
     return destination,proof
 
@@ -281,7 +293,7 @@ def instrumented_entry(data, nonce):
 def build(commands, source, archive, version, nonce, label, cargo, notice_bundle, notice_receipt, reviewed):
     commands.build_substage = "source_export"
     exported,proof = export_source(commands,source,archive,version,label)
-    notice_dir=commands.root/(label+"-notices"); notice_dir.mkdir(mode=0o700)
+    notice_dir=notice_source.S.windows_security().private_directory(commands.root/(label+"-notices"))
     commands.build_substage = "notices_prepare"
     notice_contents=notices.prepare(notice_bundle,notice_receipt,notice_dir,revision=reviewed,
                                     platform="win32",version=version,working=exported)
@@ -356,6 +368,32 @@ def await_file(path, job, seconds=15):
         require(job.active()>0 and time.monotonic()<end)
         time.sleep(.025)
     checked(path)
+
+def actor_verbatim_drive_path(value):
+    """Encode only an already-resolved ordinary drive path for the Rust plan.
+
+    Filesystem guards continue to use ordinary paths. The actor compares plan
+    fields to GetFinalPathNameByHandleW's verbatim drive representation; no UNC,
+    device path or arbitrary prefix is stripped or accepted here.
+    """
+    require(type(value) is str and 3 < len(value) <= 30000
+            and re.fullmatch(r"[A-Za-z]:\\[^\x00]*", value))
+    parts = value[3:].split("\\")
+    require(all(part not in {"", ".", ".."} and not part.endswith((" ", "."))
+                and not any(character in part for character in '<>:"/|?*\0') for part in parts))
+    return "\\\\?\\" + value
+
+
+def actor_plan_windows_paths(plan):
+    # Keep the caller's ordinary paths for cleanup and process arguments. Only
+    # these three hashed JSON fields are canonicalized for the Windows actor.
+    result = dict(plan)
+    for name, directory in (("root", True), ("install", True), ("payload", False)):
+        require(type(plan.get(name)) is str)
+        path = checked(Path(plan[name]), directory=directory)
+        result[name] = actor_verbatim_drive_path(str(path.resolve(strict=True)))
+    return result
+
 
 def actor_environment(case, plan, base):
     raw=json.dumps(plan,sort_keys=True,separators=(",",":")).encode()+b"\n"
@@ -521,6 +559,8 @@ def run_case(commands, case_name, old, new, nonce, signatures):
             "payload":str(new["payload"]),"payload_sha256":new["payload_sha256"],"old":old["identity"],"new":new["identity"],
             "old_executable_sha256":old["executable_sha256"],"new_executable_sha256":new["executable_sha256"],
             "signature":signatures[1],"wrong_signature":signatures[0],"public_key":signatures[2]}
+        if os.name == "nt":
+            plan = actor_plan_windows_paths(plan)
         environment=actor_environment(case,plan,base)
         job=capture.WindowsJob()
         try:
@@ -573,6 +613,55 @@ def remove_owned_root(root, identity):
     shutil.rmtree(root)
     require(not root.exists())
 
+def remove_unused_workspace(workspace, identity):
+    """Before Commands exists, remove only this captured empty private tree.
+
+    There are no child processes or command logs yet. Any unexpected file,
+    alias, changed identity or ACL retains the failed tree instead of repair.
+    """
+    require(workspace.parent==Path.home().resolve(strict=True) and re.fullmatch(r"morpheus-native-source-[0-9a-f]{32}",workspace.name))
+    security = notice_source.S.windows_security()
+    security.path(workspace, directory=True, private=True)
+    info = workspace.lstat(); require((info.st_dev,info.st_ino)==identity)
+    directories=[]
+    for directory, dirs, files in os.walk(workspace,followlinks=False):
+        require(not files and len(directories)<32)
+        current=security.path(Path(directory),directory=True,private=True)
+        directories.append(current)
+        for name in dirs:security.path(current/name,directory=True,private=True)
+    for path in reversed(directories):path.rmdir()
+    require(not workspace.exists())
+
+
+def reserve_workspace(nonce):
+    require(type(nonce) is str and re.fullmatch(r"[0-9a-f]{32}",nonce))
+    security = notice_source.S.windows_security()
+    parent = security.path(Path.home().resolve(strict=True),directory=True)
+    workspace = security.create_root(parent)
+    info=workspace.lstat(); workspace_identity=(info.st_dev,info.st_ino)
+    try:
+        root=security.private_directory(workspace/("morpheus-windows-updateqa-"+nonce))
+        info=root.lstat(); identity=(info.st_dev,info.st_ino)
+        return workspace,workspace_identity,root,identity
+    except BaseException:
+        try:remove_unused_workspace(workspace,workspace_identity)
+        except BaseException:pass  # Retain unexpected private evidence; preserve the original refusal.
+        raise
+
+
+def remove_owned_workspace(workspace, workspace_identity, root, identity):
+    require(root.parent==workspace and re.fullmatch(r"morpheus-windows-updateqa-[0-9a-f]{32}",root.name))
+    require(workspace.parent==Path.home().resolve(strict=True) and re.fullmatch(r"morpheus-native-source-[0-9a-f]{32}",workspace.name))
+    security=notice_source.S.windows_security()
+    security.path(workspace,directory=True,private=True)
+    info=workspace.lstat();require((info.st_dev,info.st_ino)==workspace_identity)
+    security.path(root,directory=True,private=True)
+    remove_owned_root(root,identity)
+    security.path(workspace,directory=True,private=True)
+    info=workspace.lstat();require((info.st_dev,info.st_ino)==workspace_identity and not any(workspace.iterdir()))
+    workspace.rmdir();require(not workspace.exists())
+
+
 def execute(args):
     guard(os.environ)
     require(args.execute_on_free_hosted_runner)
@@ -582,9 +671,17 @@ def execute(args):
     require(type(args.gitleaks_sha256) is str and re.fullmatch(r"[0-9a-f]{64}",args.gitleaks_sha256)
             and digest(scanner,32*1024*1024)==args.gitleaks_sha256)
     nonce=secrets.token_hex(16)
-    root=Path(os.environ["RUNNER_TEMP"]).resolve()/ ("morpheus-windows-updateqa-"+nonce)
-    root.mkdir(); identity=(root.stat().st_dev,root.stat().st_ino)
-    commands=Commands(root,private_environment(os.environ,root/"tools-home"))
+    workspace,workspace_identity,root,identity=reserve_workspace(nonce)
+    try:
+        environment=private_environment(os.environ,root/"tools-home")
+        # The Rust actor keeps its exact RUNNER_TEMP/nonce-child/case contract;
+        # only this synthetic child's temporary parent becomes privately owned.
+        environment["RUNNER_TEMP"]=str(workspace)
+        commands=Commands(root,environment)
+    except BaseException:
+        try:remove_unused_workspace(workspace,workspace_identity)
+        except BaseException:pass  # No child exists; retain any unexpected private tree.
+        raise
     stage,results,scan,clean="source-export",[],False,False
     failed, failure_site = False, None
     keys = {}
@@ -647,7 +744,7 @@ def execute(args):
             # such a cleanup is a failure, never an installed acceptance pass.
             require(not commands.cleanup_failed)
             absent_registry()
-            remove_owned_root(root,identity); clean=True
+            remove_owned_workspace(workspace,workspace_identity,root,identity); clean=True
         if failed:
             diagnostic = failure_diagnostic(commands, stage, failure_site, scan, clean)
             if diagnostic is not None:
