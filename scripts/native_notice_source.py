@@ -263,7 +263,14 @@ class Commands:
             expected_status=(0,), binary_output=False, stdin_bytes=None):
         require(self.sequence < 16000 and 0 < timeout <= 1200 and 0 < output_limit <= 128*1024**2
                 and 0 < stderr_limit <= 8*1024**2)
-        checked(Path(command[0])); checked(cwd, directory=True)
+        # Revalidate the fixed protected Apple launcher at EVERY spawn, not
+        # only during tools(). Source/scanner/data and all other executables
+        # retain checked()'s strict single-link admission.
+        if sys.platform == "darwin" and str(command[0]) == "/usr/bin/git":
+            require(system_git() == Path(command[0]))
+        else:
+            checked(Path(command[0]))
+        checked(cwd, directory=True)
         timeout = min(timeout, self.deadline - time.monotonic()); require(timeout > 0)
         self.sequence += 1
         output, errors = ((self.logs if log_root is None else log_root)/(str(self.sequence).zfill(5) + suffix)

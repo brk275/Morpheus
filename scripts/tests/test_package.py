@@ -814,6 +814,69 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
             acquisition.system_git()
         resolved.assert_not_called()
 
+    @unittest.skipIf(os.name == "nt", "Apple Git launch fixture uses POSIX paths and pipes")
+    def test_command_launch_admits_only_exact_darwin_system_git(self):
+        from scripts import native_notice_source as acquisition
+        class LaunchReached(RuntimeError): pass
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root/"logs").mkdir(mode=0o700); (root/"temp").mkdir(mode=0o700)
+            commands = acquisition.Commands(root,{})
+            with mock.patch.object(acquisition.sys,"platform","darwin"), \
+                    mock.patch.object(acquisition,"system_git",return_value=Path("/usr/bin/git")) as apple, \
+                    mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)) as strict, \
+                    mock.patch.object(acquisition.subprocess,"Popen",side_effect=LaunchReached) as spawn:
+                with self.assertRaises(LaunchReached):
+                    commands.run("git",[Path("/usr/bin/git"),"--version"],cwd=root,env={},timeout=1,output_limit=1024)
+            apple.assert_called_once_with()
+            strict.assert_called_once_with(root,directory=True)
+            self.assertEqual(spawn.call_args.args[0],["/usr/bin/git","--version"])
+            # No other spelling, platform or executable may inherit the Apple
+            # hardlink exception; strict refusal must happen before any child.
+            for system, executable in (("darwin","/usr/bin/cargo"),("darwin","/usr/local/bin/git"),
+                    ("darwin","git"),("darwin","/usr/bin/./git"),("darwin","/usr/bin/git-link"),
+                    ("linux","/usr/bin/git"),("win32","/programs/Git/cmd/git.exe")):
+                with self.subTest(system=system,executable=executable), \
+                        mock.patch.object(acquisition.sys,"platform",system), \
+                        mock.patch.object(acquisition,"system_git") as apple, \
+                        mock.patch.object(acquisition,"checked",side_effect=ValueError("strict refusal")) as strict, \
+                        mock.patch.object(acquisition.subprocess,"Popen") as spawn:
+                    with self.assertRaises(ValueError):
+                        commands.run("tool",[executable,"--version"],cwd=root,env={},timeout=1,output_limit=1024)
+                    strict.assert_called_once_with(Path(executable))
+                    apple.assert_not_called(); spawn.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "Apple Git launch fixture uses POSIX paths and pipes")
+    def test_command_launch_revalidates_system_git_before_each_child_spawn(self):
+        from scripts import native_notice_source as acquisition
+        class LaunchReached(RuntimeError): pass
+        tool = Path("/usr/bin/git")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root/"logs").mkdir(mode=0o700); (root/"temp").mkdir(mode=0o700)
+            commands = acquisition.Commands(root,{})
+            rejected = False
+            def metadata(path):
+                return SimpleNamespace(st_mode=0o100755 if path == tool else 0o40755,
+                                       st_uid=501 if rejected and path == tool else 0,
+                                       st_nlink=78 if path == tool else 2)
+            with mock.patch.object(acquisition.sys,"platform","darwin"), \
+                    mock.patch.object(Path,"resolve",autospec=True,side_effect=lambda path,strict:path), \
+                    mock.patch.object(Path,"lstat",autospec=True,side_effect=metadata), \
+                    mock.patch.object(acquisition,"system_git",wraps=acquisition.system_git) as apple, \
+                    mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)) as strict, \
+                    mock.patch.object(acquisition.subprocess,"Popen",side_effect=LaunchReached) as spawn:
+                with self.assertRaises(LaunchReached):
+                    commands.run("git",[tool,"--version"],cwd=root,env={},timeout=1,output_limit=1024)
+                self.assertEqual(spawn.call_count,1)
+                rejected = True
+                with self.assertRaises(ValueError):
+                    commands.run("git",[tool,"--version"],cwd=root,env={},timeout=1,output_limit=1024)
+                self.assertEqual(spawn.call_count,1)  # Changed ownership never reaches spawn.
+                self.assertEqual(apple.call_args_list,[mock.call(),mock.call()])
+                strict.assert_called_once_with(root,directory=True)
+                self.assertEqual(commands.sequence,1)  # Refusal also precedes log/file allocation.
+
     def test_copied_windows_environment_preserves_actual_host_guard_and_system_directory(self):
         from scripts import native_notice_source as acquisition
         # dict(os.environ) on Windows contains uppercase keys, unlike the old
