@@ -49,6 +49,109 @@ class FakeSelector:
 
 
 class ProcessTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "Linux complete private log snapshot")
+    def test_owned_log_snapshot_is_complete_independent_and_scans_once(self):
+        import fixture_paths as F
+        import appimage_update_acceptance as A
+        original_mkdtemp = tempfile.mkdtemp
+        for action in ("valid", "finding", "warning", "stdout", "malformed", "missing",
+                       "source_changed", "source_added", "snapshot_changed", "snapshot_extra",
+                       "symlink", "oversize", "process_cleanup", "source_fifo_race", "report_fifo"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
+                fixture = Path(temporary).resolve()
+                root = fixture / "source"
+                root.mkdir(mode=0o700)
+                bodies = {"a.log":b"first\x00raw\nbody", "b.log":b"second separate body\n"}
+                for name, value in bodies.items():
+                    P.client.write_new(root / name, value)
+                foreign = fixture / "foreign"
+                P.client.write_new(foreign, b"preserve this unrelated fixture")
+                if action == "symlink":
+                    (root / "a.log").unlink()
+                    (root / "a.log").symlink_to(foreign)
+                if action == "oversize":
+                    with (root / "a.log").open("wb") as stream:
+                        stream.truncate(8 * 1024 * 1024 + 1)
+                snapshots = []
+                original_open = F.os.open
+                replaced = {"source":False, "report_nonblocking":False}
+                def raced_open(path, flags, *args, **options):
+                    if action == "report_fifo" and path == "report.json":
+                        replaced["report_nonblocking"] = bool(flags & F.os.O_NONBLOCK)
+                        self.assertTrue(replaced["report_nonblocking"])
+                    if action == "source_fifo_race" and path == "a.log" and not replaced["source"]:
+                        self.assertTrue(flags & F.os.O_NONBLOCK)
+                        (root / "a.log").unlink()
+                        F.os.mkfifo(root / "a.log", 0o600)
+                        replaced["source"] = True
+                    return original_open(path, flags, *args, **options)
+                def allocate(*args, **options):
+                    self.assertEqual(options["dir"], Path("/tmp"))
+                    path = original_mkdtemp(prefix=options["prefix"], dir=fixture)
+                    snapshots.append(Path(path))
+                    return path
+                def scanner(arguments, *, cwd, deadline):
+                    self.assertEqual(arguments[0:2], ["/scanner", "dir"])
+                    self.assertEqual(deadline, 40)
+                    data = Path(arguments[2])
+                    self.assertEqual(sorted(p.name for p in data.iterdir()), ["00000000.log", "00000001.log"])
+                    self.assertEqual([p.read_bytes() for p in sorted(data.iterdir())], list(bodies.values()))
+                    self.assertEqual(Path(arguments[arguments.index("--config") + 1]).read_bytes(),
+                                     b"[extend]\nuseDefault = true\n")
+                    self.assertEqual(Path(arguments[arguments.index("--gitleaks-ignore-path") + 1]).read_bytes(), b"")
+                    self.assertEqual(arguments[arguments.index("--max-target-megabytes") + 1], "0")
+                    self.assertEqual(arguments[arguments.index("--log-level") + 1], "warn")
+                    self.assertIn("--ignore-gitleaks-allow", arguments)
+                    report = Path(arguments[arguments.index("--report-path") + 1])
+                    if action == "process_cleanup":
+                        raise F.PrivateLogScanError(process_stopped=False)
+                    if action == "report_fifo":
+                        F.os.mkfifo(report, 0o600)
+                    if action not in {"missing", "report_fifo"}:
+                        P.client.write_new(report, b"{bad" if action == "malformed" else
+                                           b'[{"RuleID":"synthetic"}]' if action == "finding" else b"[]\n")
+                    if action == "source_changed": (root / "a.log").write_bytes(b"changed source")
+                    if action == "source_added": P.client.write_new(root / "c.log", b"new unscanned original")
+                    if action == "snapshot_changed": (data / "00000000.log").write_bytes(b"changed copy")
+                    if action == "snapshot_extra": P.client.write_new(data / "extra.log", b"unknown copy")
+                    return (1 if action == "finding" else 0,
+                            b"unexpected output" if action == "stdout" else b"",
+                            b"partial scan warning" if action == "warning" else b"")
+                with mock.patch.object(F.tempfile, "mkdtemp", side_effect=allocate), \
+                        mock.patch.object(F.os, "open", side_effect=raced_open), \
+                        mock.patch.object(P.time, "monotonic", return_value=10), \
+                        mock.patch.object(F, "_run_log_scanner", side_effect=scanner) as invoked:
+                    if action == "valid":
+                        P.scan_private_logs(root, "/scanner")
+                        self.assertEqual(invoked.call_count, 1)
+                        # The outer owner also uses explicit independent defaults.
+                        A.Commands(root, env={}).scan("/scanner")
+                        self.assertEqual(invoked.call_count, 2)
+                    else:
+                        with self.assertRaises(P.PackageFailure):
+                            P.scan_private_logs(root, "/scanner")
+                        self.assertEqual(invoked.call_count, 0 if action in {"symlink", "oversize", "source_fifo_race"} else 1)
+                if action == "report_fifo":
+                    self.assertTrue(replaced["report_nonblocking"])
+                self.assertEqual(foreign.read_bytes(), b"preserve this unrelated fixture")
+                if action in {"snapshot_changed", "snapshot_extra", "process_cleanup", "report_fifo"}:
+                    self.assertTrue(snapshots[0].exists())
+                elif snapshots:
+                    self.assertTrue(all(not path.exists() for path in snapshots))
+                if action not in {"symlink", "oversize", "source_changed", "source_fifo_race"}:
+                    self.assertEqual((root / "a.log").read_bytes(), bodies["a.log"])
+                if action == "source_fifo_race":
+                    self.assertTrue(replaced["source"])
+                    self.assertTrue(P.stat.S_ISFIFO((root / "a.log").lstat().st_mode))
+                self.assertEqual((root / "b.log").read_bytes(), bodies["b.log"])
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(P.time, "monotonic", return_value=10), \
+                mock.patch.object(F, "_run_log_scanner") as scanner:
+            with self.assertRaises(P.PackageFailure):
+                P.scan_private_logs(Path(temporary).resolve(), "/scanner", deadline=10)
+            scanner.assert_not_called()
+
+
     def invoke(self, root, *, stdout=b"okay", stderr=b"private", limit=4096, binary=False,
                timeout=10, status=0, cleanup_error=None, interrupt=False, progress=None,
                stdin_bytes=None, stderr_limit=8 * 1024 * 1024, expected_status=(0,)):

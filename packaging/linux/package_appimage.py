@@ -33,6 +33,7 @@ import appimage_diagnostics as diagnostics
 import element_process_namespace as containment
 from package import package_config
 from prepare_appimage_update import prepare_appimage, validate_metadata
+from fixture_paths import scan_owned_logs, PrivateLogScanError
 from package_revision import expected_revision, verify_checkout, verify_versioned_export, UPDATE_VERSION, SourceRevisionError
 
 
@@ -251,33 +252,12 @@ def bounded_file_log(path, maximum=8 * 1024 * 1024):
     return client.read_regular(path, maximum)
 
 
-def scan_private_logs(root, scanner):
-    # Child logs are private even after a clean scan. A scan does not prove an
-    # arbitrary server error is safe to print; publish only our fixed receipt.
-    # An independently specified default configuration and empty ignore file
-    # prevent checkout config, annotations or ambient ignores weakening this gate.
-    with tempfile.TemporaryDirectory(prefix="default-scan-", dir=root) as temporary:
-        scan = Path(temporary)
-        client.write_new(scan / "gitleaks.toml", b"[extend]\nuseDefault = true\n")
-        client.write_new(scan / "empty.ignore", b"")
-        failed = False
-        for path in sorted(root.rglob("*.log")):
-            try:
-                value = bounded_file_log(path)
-                result = subprocess.run([scanner, "stdin", "--config", str(scan / "gitleaks.toml"),
-                                        "--gitleaks-ignore-path", str(scan / "empty.ignore"),
-                                        "--redact=100", "--ignore-gitleaks-allow", "--no-banner"],
-                                        input=value, cwd=scan, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL, timeout=30, check=False)
-                if result.returncode:
-                    failed = True
-            except (PackageFailure, OSError, subprocess.SubprocessError):
-                # Retained data after failed child cleanup must not prevent
-                # attempts to scan later actual command logs. Every invalid
-                # entry or scanner failure still makes the complete gate fail.
-                failed = True
-        if failed:
-            raise PackageFailure("scan")
+def scan_private_logs(root, scanner, *, deadline=None):
+    # Scan exact separate snapshots once, using independent default rules.
+    try:
+        scan_owned_logs(root, scanner, deadline=deadline)
+    except PrivateLogScanError:
+        raise PackageFailure("scan") from None
 
 
 class NativeSourceCache:
