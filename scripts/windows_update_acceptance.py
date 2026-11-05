@@ -352,6 +352,18 @@ _BUILD_SUBSTAGES = frozenset(("unavailable", "source_export", "notices_prepare",
 
 
 
+_CLEANUP_PREDICATES = frozenset(("root_identity", "inventory_limit", "inventory_symlink",
+    "inventory_reparse", "callback_scope", "callback_root_identity", "inner_removed",
+    "workspace_scope", "workspace_identity", "workspace_empty", "workspace_removed"))
+
+
+def _cleanup_require(value, predicate):
+    if not value:
+        error = Failure()
+        error.cleanup_predicate = predicate
+        raise error
+
+
 def _cleanup_refusal_diagnostic(error):
     os_errors = {OSError, PermissionError, FileNotFoundError, FileExistsError,
                  NotADirectoryError, IsADirectoryError, InterruptedError, TimeoutError,
@@ -365,7 +377,12 @@ def _cleanup_refusal_diagnostic(error):
         for name in values:
             value = getattr(error, name, None)
             values[name] = value if type(value) is int and 0 <= value <= 65535 else None
-    return {"category": category, **values}
+    facts = {"category": category, **values}
+    if type(error) is Failure:
+        predicate = getattr(error, "cleanup_predicate", None)
+        if type(predicate) is str and predicate in _CLEANUP_PREDICATES:
+            facts["predicate"] = predicate
+    return facts
 
 
 def gate_failure_diagnostic(commands, stage, cleanup_phase, scanned, cleaned, cleanup_refusal=None):
@@ -391,7 +408,9 @@ def gate_failure_diagnostic(commands, stage, cleanup_phase, scanned, cleaned, cl
                 or type(refusal["code"]) is not str or refusal["code"] not in capture.FAILURES
                 or type(refusal["operation"]) is not str or refusal["operation"] not in capture.OPERATIONS))
             or (cleanup_refusal is not None and (type(cleanup_refusal) is not dict
-                or set(cleanup_refusal) != {"category", "errno", "winerror"}
+                or set(cleanup_refusal) not in ({"category", "errno", "winerror"}, {"category", "errno", "winerror", "predicate"})
+                or ("predicate" in cleanup_refusal and (cleanup_refusal.get("category") != "guard"
+                    or type(cleanup_refusal["predicate"]) is not str or cleanup_refusal["predicate"] not in _CLEANUP_PREDICATES))
                 or type(cleanup_refusal["category"]) is not str
                 or cleanup_refusal["category"] not in {"os_error", "guard", "value_error", "other"}
                 or any(v is not None and (type(v) is not int or not 0 <= v <= 65535)
@@ -845,13 +864,14 @@ def run_case(commands, case_name, old, new, nonce, signatures):
             cleanup_case(commands,case,old,new,uninstall_hash,environment)
 
 def remove_owned_root(root, identity, workspace, workspace_identity):
-    info=root.lstat(); require((info.st_dev,info.st_ino)==identity)
+    info=root.lstat(); _cleanup_require((info.st_dev,info.st_ino)==identity, "root_identity")
     count=0
     for directory, dirs, files in os.walk(root,followlinks=False):
         for name in dirs+files:
             path=Path(directory)/name; info=path.lstat(); count+=1
-            require(count<=300000 and not stat.S_ISLNK(info.st_mode)
-                    and not getattr(info,"st_file_attributes",0)&0x400)
+            _cleanup_require(count<=300000, "inventory_limit")
+            _cleanup_require(not stat.S_ISLNK(info.st_mode), "inventory_symlink")
+            _cleanup_require(not getattr(info,"st_file_attributes",0)&0x400, "inventory_reparse")
     if os.name == "nt":
         def readonly(function, path, error):
             # Only the known readonly-unlink failure can authorize a retry.
@@ -859,13 +879,13 @@ def remove_owned_root(root, identity, workspace, workspace_identity):
                     or not isinstance(error, PermissionError) or error.errno != 13
                     or getattr(error, "winerror", None) != 5):
                 raise error
-            require(root.parent == workspace
+            _cleanup_require(root.parent == workspace
                     and re.fullmatch(r"morpheus-windows-updateqa-[0-9a-f]{32}", root.name)
                     and Path(path).is_absolute() and Path(path) != root
-                    and Path(path).is_relative_to(root))
+                    and Path(path).is_relative_to(root), "callback_scope")
             notice_source.S.windows_security().path(root, directory=True, private=True)
             current = root.lstat()
-            require((current.st_dev, current.st_ino) == identity)
+            _cleanup_require((current.st_dev, current.st_ino) == identity, "callback_root_identity")
             # Reuse the exact protected-leaf handle/ACL/link/identity checks.
             # The outer native-source root retains its original inode authority
             # even after rmtree has consumed files in the inner nonce tree.
@@ -874,7 +894,7 @@ def remove_owned_root(root, identity, workspace, workspace_identity):
         shutil.rmtree(root, onexc=readonly)
     else:
         shutil.rmtree(root)
-    require(not root.exists())
+    _cleanup_require(not root.exists(), "inner_removed")
 
 def remove_unused_workspace(workspace, identity):
     """Before Commands exists, remove only this captured empty private tree.
@@ -913,16 +933,17 @@ def reserve_workspace(nonce):
 
 
 def remove_owned_workspace(workspace, workspace_identity, root, identity):
-    require(root.parent==workspace and re.fullmatch(r"morpheus-windows-updateqa-[0-9a-f]{32}",root.name))
-    require(workspace.parent==Path.home().resolve(strict=True) and re.fullmatch(r"morpheus-native-source-[0-9a-f]{32}",workspace.name))
+    _cleanup_require(root.parent==workspace and re.fullmatch(r"morpheus-windows-updateqa-[0-9a-f]{32}",root.name), "workspace_scope")
+    _cleanup_require(workspace.parent==Path.home().resolve(strict=True) and re.fullmatch(r"morpheus-native-source-[0-9a-f]{32}",workspace.name), "workspace_scope")
     security=notice_source.S.windows_security()
     security.path(workspace,directory=True,private=True)
-    info=workspace.lstat();require((info.st_dev,info.st_ino)==workspace_identity)
+    info=workspace.lstat();_cleanup_require((info.st_dev,info.st_ino)==workspace_identity, "workspace_identity")
     security.path(root,directory=True,private=True)
     remove_owned_root(root,identity,workspace,workspace_identity)
     security.path(workspace,directory=True,private=True)
-    info=workspace.lstat();require((info.st_dev,info.st_ino)==workspace_identity and not any(workspace.iterdir()))
-    workspace.rmdir();require(not workspace.exists())
+    info=workspace.lstat();_cleanup_require((info.st_dev,info.st_ino)==workspace_identity, "workspace_identity")
+    _cleanup_require(not any(workspace.iterdir()), "workspace_empty")
+    workspace.rmdir();_cleanup_require(not workspace.exists(), "workspace_removed")
 
 
 def execute(args):
