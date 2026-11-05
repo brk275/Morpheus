@@ -6949,16 +6949,16 @@ export component AppWindow inherits Window {
                 // Large text and simultaneous notices must not displace the
                 // composer. Every notice and action stays in scroll content.
                 canvas-notices := ScrollView {
-                    min-height: 0px;
+                    out property <length> natural-height: canvas-notice-content.preferred-height;
                     horizontal-scrollbar-policy: always-off;
                     // Narrow action rows retain their intrinsic horizontal
                     // canvas; full focus rectangles reveal either axis.
                     content-width: max(self.visible-width, canvas-notice-content.min-width);
-                    content-height: canvas-notice-content.preferred-height;
+                    content-height: self.natural-height;
                     height: root.page == 0
-                        ? min(self.content-height, max(conversation-canvas.action-viewport-min,
+                        ? min(self.natural-height, max(conversation-canvas.action-viewport-min,
                             conversation-canvas.height - canvas-header.height - StyleTokens.line-width - conversation-canvas.room-minimum))
-                        : self.content-height;
+                        : self.natural-height;
                     canvas-notice-content := VerticalLayout {
                         width: canvas-notices.content-width;
                         height: self.preferred-height;
@@ -6967,6 +6967,9 @@ export component AppWindow inherits Window {
                 // This device's native call on every page but the call page
                 // (call-bar.slint); never on a protected surface.
                 if root.call-bar-visible : CallBarStrip {
+                    // Compact mode depends on this viewport, not the wider
+                    // scroll content whose minimum the call bar contributes.
+                    width: max(0px, canvas-notices.visible-width - (root.page == 0 ? 16px : 0px));
                     text-scale: root.text-scale;
                     palette: root.call-bar-palette;
                     room: root.native-call-room-display;
@@ -7351,7 +7354,7 @@ export component AppWindow inherits Window {
                     // action: mirror its 10 px layout inset and TextAction
                     // caption padding at the actual header content width.
                     Rectangle {
-                        width: 0px; height: 0px; clip: true;
+                        x: 0px; y: 0px; width: 0px; height: 0px; clip: true;
                         recovery-action-measure := Text {
                             width: max(0px, room-headers.visible-width - 36px
                                 - 2 * StyleTokens.control-padding * root.text-scale);
@@ -7360,11 +7363,15 @@ export component AppWindow inherits Window {
                             accessible-role: none; accessible-label: "";
                         }
                     }
-                    VerticalLayout {
-                    spacing: 0px;
+                    // Assigned viewport heights must not feed the room's
+                    // intrinsic reservation back through layout constraints.
+                    Rectangle {
+                    x: 0px; y: 0px;
+                    width: parent.width;
+                    height: parent.height;
                     room-headers := ScrollView {
                         out property <length> natural-height: room-header-content.preferred-height;
-                        min-height: 0px;
+                        y: 0px; width: parent.width;
                         height: min(self.natural-height, max(room-canvas.header-minimum,
                             room-canvas.height - room-canvas.composer-fixed-height - 50px
                                 - room-footer.height - room-canvas.status-minimum));
@@ -7533,8 +7540,9 @@ export component AppWindow inherits Window {
                     }
                     timeline-list := ListView {
                         // Preserve the original conversation viewport minimum.
-                        min-height: 50px;
-                        vertical-stretch: 1;
+                        y: room-headers.height; width: parent.width;
+                        height: max(50px, room-canvas.height - room-headers.height
+                            - room-footer.height - room-composer.height);
                         accessible-label: "Messages in this room";
                         horizontal-scrollbar-policy: always-off;
                         // Automatic read receipts (room activity): the last row's event while
@@ -8119,7 +8127,8 @@ export component AppWindow inherits Window {
                     }
                     room-footer := ScrollView {
                         out property <length> natural-height: room-footer-content.preferred-height;
-                        min-height: 0px;
+                        y: room-headers.height + timeline-list.height;
+                        width: parent.width;
                         height: min(self.natural-height, max(room-canvas.footer-minimum,
                             room-canvas.height - room-canvas.composer-fixed-height - 50px
                                 - room-canvas.header-minimum - room-canvas.status-minimum));
@@ -8150,8 +8159,10 @@ export component AppWindow inherits Window {
                     }
                         }
                     }
-                    Rectangle {
+                    room-composer := Rectangle {
                         property <length> status-height: root.composer-status-visible ? composer-status.height + 10px : 0px;
+                        y: room-canvas.height - self.height;
+                        width: parent.width;
                         height: room-canvas.composer-fixed-height + self.status-height;
                         background: transparent;
                         composer-status := PendingSendStrip {
