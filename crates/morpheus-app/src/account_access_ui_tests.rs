@@ -14465,7 +14465,10 @@ async fn assert_font_browser(ui: &AppWindow, directory: &std::path::Path) {
     assert_eq!(std::fs::read(store.path()).unwrap(), before_staged);
     ui.invoke_studio_apply();
     let inherited = store.load().unwrap();
-    assert_eq!(inherited.appearance.font_family, inherited_inputs[0].as_str());
+    assert_eq!(
+        inherited.appearance.font_family,
+        inherited_inputs[0].as_str()
+    );
     assert_eq!(inherited.typography.message_font_family, None);
     assert_eq!(
         inherited.typography.composer_font_family.as_deref(),
