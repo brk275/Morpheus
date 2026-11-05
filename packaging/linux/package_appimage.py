@@ -570,7 +570,7 @@ def validate_update_parameters(update):
                 or url.netloc != "127.0.0.1:" + str(url.port)):
             raise ValueError()
         lines = base64.b64decode(key, validate=True).decode("ascii").splitlines()
-        if (len(lines) != 2 or not lines[0].startswith("untrusted comment: minisign public key ")
+        if (len(lines) != 2 or not lines[0].startswith("untrusted comment: minisign public key: ")
                 or len(lines[0]) > 256 or any(ord(c) < 32 or ord(c) > 126 for c in lines[0])):
             raise ValueError()
         raw = base64.b64decode(lines[1], validate=True)

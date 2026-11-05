@@ -450,17 +450,19 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
         self.assertNotIn("private", result.values())
 
     def test_update_compile_inputs_are_only_bounded_loopback_public_metadata(self):
+        # cargo-packager0.11.8/minisign0.7.9 serialize this colon-bearing header.
         public = base64.b64encode(b"Ed" + bytes(40)).decode()
-        key = base64.b64encode(("untrusted comment: minisign public key 0000000000000000\n" + public + "\n").encode()).decode()
+        key = base64.b64encode(("untrusted comment: minisign public key: 0000000000000000\n" + public + "\n").encode()).decode()
         valid = {"version": "0.1.0-updateqa.1", "feed": "https://127.0.0.1:12345/feed.json", "public_key": key,
                  "source_proof": {"variant": "updateqa-version-only", "version": "0.1.0-updateqa.1", "inventory_sha256": "a" * 64}}
         P.validate_update_parameters(valid)
         alternate = base64.b64encode(b"ED" + bytes(40)).decode()
-        P.validate_update_parameters(valid | {"public_key": base64.b64encode(("untrusted comment: minisign public key 0000000000000000\n" + alternate + "\n").encode()).decode()})
+        P.validate_update_parameters(valid | {"public_key": base64.b64encode(("untrusted comment: minisign public key: 0000000000000000\n" + alternate + "\n").encode()).decode()})
         for change in ({"feed": "http://127.0.0.1:12345/feed.json"}, {"feed": "https://remote.invalid/feed.json"},
                        {"feed": "https://user@127.0.0.1:12345/feed.json"}, {"feed": "https://127.0.0.1:12345/feed.json?x=1"},
                        {"version": "0.1.0"}, {"public_key": "private-value"},
                        {"public_key": base64.b64encode(b"untrusted comment: minisign encrypted secret key\nwrong\n").decode()},
+                       {"public_key": base64.b64encode(("untrusted comment: minisign public key 0000000000000000\n" + public + "\n").encode()).decode()},
                        {"source_proof": {"variant": "arbitrary-export"}}):
             with self.subTest(change=list(change)), self.assertRaises(P.PackageFailure):
                 P.validate_update_parameters(valid | change)
