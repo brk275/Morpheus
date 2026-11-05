@@ -4,12 +4,12 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: windows-owned-production-fixture-b0fc55cd5cd07aa65dacfb4eb6b71a768d5a3a64
+  group: windows-owned-production-fixture-7d40c0f4643c66ef31d6cdf3e4cdf48c26810b92
   cancel-in-progress: false
 env:
-  REVIEWED_TINY_SOURCE: b0fc55cd5cd07aa65dacfb4eb6b71a768d5a3a64
-  REVIEWED_TINY_TREE: 6d8f751b85df2c8bb5030ccc4a102c3b99ce5216
-  MORPHEUS_PACKAGE_SOURCE_REVISION: b0fc55cd5cd07aa65dacfb4eb6b71a768d5a3a64
+  REVIEWED_TINY_SOURCE: 7d40c0f4643c66ef31d6cdf3e4cdf48c26810b92
+  REVIEWED_TINY_TREE: 0d6991032087e11ff051d744236f7dc3f5dc53d1
+  MORPHEUS_PACKAGE_SOURCE_REVISION: 7d40c0f4643c66ef31d6cdf3e4cdf48c26810b92
 jobs:
   tiny:
     name: Synthetic protected Windows compiler and cleanup probe
