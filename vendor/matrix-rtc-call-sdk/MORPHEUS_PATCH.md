@@ -167,3 +167,19 @@ cover dialect selection, ownership collisions, timestamp transitions, delayed
 and replayed imports, and retirement. They require affected hosted execution;
 this patch does not establish stock-peer interoperability or native media
 acceptance. No dependency, upstream revision or license term changes.
+
+## Standalone Windows SDK test SQLite linkage
+
+The Windows-only dev-dependencies now enable `libsqlite3-sys =0.38.2` with
+`bundled-windows`, matching the existing application and standalone adapter
+test policy. The adapter's dev-dependencies do not propagate when the call SDK
+selects it as a dependency. SDK library tests with `matrix-sdk` therefore need
+their own development edge to avoid depending on an ambient `sqlite3.lib`.
+
+The lockfile adds only that edge to the call SDK package. No crate, version,
+checksum, normal dependency, production feature or build-hook source changes;
+the already locked bundled SQLite source supplies the test library. No system
+library download, linker bypass or test disablement is introduced. Fresh
+Windows SDK library tests with `--features matrix-sdk` remain required; source
+review is not a passing link or runtime result. Other platforms' dependency
+activation and ordinary application dependencies are unchanged.

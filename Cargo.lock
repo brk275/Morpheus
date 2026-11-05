@@ -5680,6 +5680,7 @@ dependencies = [
  "clap",
  "futures-core",
  "futures-util",
+ "libsqlite3-sys",
  "livekit",
  "log",
  "matrix-rtc-call",
