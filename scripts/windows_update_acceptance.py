@@ -218,6 +218,7 @@ class Commands:
         self.sequence = 0
         self.build_substage = "unavailable"
         self.failed_command = None
+        self.last_exit_status = None
         # Closed observations only; never retain command text or private output.
         self.command_phase = "unavailable"
         self.close_state = "unattempted"
@@ -290,6 +291,7 @@ class Commands:
         self.bounded_logs()
     def run(self, args, *, environment=None, cwd=ROOT, seconds=180):
         self.failed_command = None
+        self.last_exit_status = None
         status = None
         self.command_phase = "job_create"
         job = capture.WindowsJob()
@@ -297,6 +299,10 @@ class Commands:
             self.command_phase = "start"
             handle, log = self.start(job,args,environment,cwd)
             status = self.wait(job, handle, seconds)
+            try:
+                self.last_exit_status = status if type(status) is int and 0 <= status <= 0xffffffff else None
+            except BaseException:
+                pass  # Optional metadata cannot replace the original lifecycle.
             self.command_phase = "exit_status"
             require(status == 0)
             self.empty(job)
@@ -383,21 +389,29 @@ def _cleanup_reparse_metadata(root, path, info):
                          "my documents": "my-documents", "nethood": "nethood", "printhood": "printhood",
                          "recent": "recent", "sendto": "sendto", "templates": "templates",
                          "start menu": "start-menu"}.get(relative.name.casefold(), "other")
+    known_components = {"tools-home", "home", "appdata", "local", "roaming", "temp", "microsoft",
+                        "windows", "visualstudio", ".cargo", ".rustup", "toolchains", "registry", "cache",
+                        "native-target", "tiny-source", "synthetic-git", "logs"}
+    components = [part.casefold() if part.casefold() in known_components else "opaque"
+                  for part in relative.parts] if len(relative.parts) <= 64 else None
     return {"role": role, "kind": kind,
             "attributes": attributes if type(attributes) is int and 0 <= attributes <= 0xffffffff else None,
             "tag": tag if type(tag) is int and 0 <= tag <= 0xffffffff else None,
             "subcomponent": subcomponent, "compatibility_name": compatibility,
-            "depth": len(relative.parts) if 1 <= len(relative.parts) <= 64 else None}
+            "depth": len(relative.parts) if 1 <= len(relative.parts) <= 64 else None, "components": components}
 
 
 def _valid_cleanup_reparse(value):
-    return (type(value) is dict and set(value) == {"role", "kind", "attributes", "tag", "subcomponent", "compatibility_name", "depth"}
+    return (type(value) is dict and set(value) == {"role", "kind", "attributes", "tag", "subcomponent", "compatibility_name", "depth", "components"}
             and type(value["role"]) is str and value["role"] in {"native-target", "tools-home", "tiny-source", "synthetic-git", "logs", "other"}
             and type(value["kind"]) is str and value["kind"] in {"directory", "regular", "other"}
             and all(value[k] is None or type(value[k]) is int and 0 <= value[k] <= 0xffffffff for k in ("attributes", "tag"))
             and type(value["subcomponent"]) is str and value["subcomponent"] in {"not-tools-home", "home", "roaming", "local", "temp", "other", "none"}
             and type(value["compatibility_name"]) is str and value["compatibility_name"] in {"not-tools-home", "application-data", "local-settings", "history", "cookies", "temporary-internet-files", "my-documents", "nethood", "printhood", "recent", "sendto", "templates", "start-menu", "other"}
             and (value["depth"] is None or type(value["depth"]) is int and 1 <= value["depth"] <= 64)
+            and ((value["depth"] is None and value["components"] is None)
+                 or (type(value["components"]) is list and len(value["components"]) == value["depth"]
+                     and all(type(part) is str and part in {"tools-home", "home", "appdata", "local", "roaming", "temp", "microsoft", "windows", "visualstudio", ".cargo", ".rustup", "toolchains", "registry", "cache", "native-target", "tiny-source", "synthetic-git", "logs", "opaque"} for part in value["components"])))
             and ((value["role"] == "tools-home" and value["subcomponent"] != "not-tools-home" and value["compatibility_name"] != "not-tools-home")
                  or (value["role"] != "tools-home" and value["subcomponent"] == value["compatibility_name"] == "not-tools-home")))
 

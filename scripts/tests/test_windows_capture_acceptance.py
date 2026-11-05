@@ -151,6 +151,17 @@ def _temporary_tiny_msvc_workspace(test):
                 cleanup_failure = error
         cleanup_refusal = (update._cleanup_refusal_diagnostic(cleanup_failure)
                            if cleanup_failure is not None else None)
+        # Reuse the complete existing closed lifecycle record. A zero retained
+        # status distinguishes post-exit drain/log failures from compiler exit.
+        lifecycle = None
+        status = None
+        try:
+            lifecycle = update.gate_failure_diagnostic(commands, "build-old", "workspace",
+                                                       scanned, cleaned, cleanup_refusal)
+            observed_status = getattr(commands, "last_exit_status", None)
+            status = observed_status if type(observed_status) is int and 0 <= observed_status <= 0xffffffff else None
+        except BaseException:
+            pass  # Optional observations cannot replace the original failure.
         # No exception string, compiler body, path, argv or environment is reflected.
         record = {"schema":1, "check":"tiny_owned_windows_msvc", "source_revision":source,
                   "source_tree":tree, "phase":phase, "build_passed":build_passed,
@@ -160,6 +171,7 @@ def _temporary_tiny_msvc_workspace(test):
                   "job_cleanup_failed":commands is not None and commands.cleanup_failed,
                   "readonly_retries":readonly_retries,
                   "compiler_hint":_temporary_tiny_compiler_hint(commands, scanned, compiler_hint),
+                  "command_lifecycle":lifecycle, "last_exit_status":status,
                   "native_failure_cause_proven":False, "installed_update_qualified":False}
         print("MORPHEUS_WINDOWS_TINY_MSVC " + json.dumps(record, sort_keys=True), flush=True)
     if cleanup_failure is not None:
@@ -980,7 +992,8 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                 fixed={"role":role if role in {"native-target","tools-home"} else "other",
                        "kind":kind,"attributes":0x400,"tag":tag,
                        "subcomponent":"none" if role=="tools-home" else "not-tools-home",
-                       "compatibility_name":"other" if role=="tools-home" else "not-tools-home","depth":1}
+                       "compatibility_name":"other" if role=="tools-home" else "not-tools-home","depth":1,
+                       "components":[role if role in {"native-target","tools-home"} else "opaque"]}
                 refusal=update._cleanup_refusal_diagnostic(caught.exception)
                 self.assertEqual(refusal,{"category":"guard","errno":None,"winerror":None,
                                           "predicate":"inventory_reparse","reparse":fixed})
@@ -989,7 +1002,9 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                 for changed in (fixed|{"role":"private-path"},fixed|{"kind":True},
                                 fixed|{"tag":True},fixed|{"attributes":0x100000000},
                                 fixed|{"target":"private-path"},fixed|{"depth":True},fixed|{"depth":65},
-                                fixed|{"subcomponent":"private-path"},fixed|{"compatibility_name":"private-path"}):
+                                fixed|{"subcomponent":"private-path"},fixed|{"compatibility_name":"private-path"},
+                                fixed|{"components":["private-path"]},fixed|{"components":True},
+                                fixed|{"components":["opaque"]*65},fixed|{"components":None}):
                     self.assertIsNone(update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,refusal|{"reparse":changed}))
                 self.assertIsNone(update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,refusal|{"predicate":"inventory_limit"}))
             info=types.SimpleNamespace(st_mode=update.stat.S_IFDIR,st_file_attributes=0x2416,st_reparse_tag=0xa0000003)
@@ -1000,6 +1015,18 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                 self.assertTrue(update._valid_cleanup_reparse(value))
                 self.assertEqual((value["subcomponent"],value["compatibility_name"],value["depth"]),(component,category,len(parts)))
                 self.assertNotIn("private-",json.dumps(value))
+                self.assertEqual(value["components"],[part.casefold() if part.casefold() in {"tools-home","home","appdata","local","roaming"} else "opaque" for part in parts])
+            for parts,expected in ((("tools-home","home","AppData","Local","Microsoft","Windows","private-one","private-two"),
+                                     ["tools-home","home","appdata","local","microsoft","windows","opaque","opaque"]),
+                                    (("tools-home","home",".rustup","toolchains","private-toolchain"),
+                                     ["tools-home","home",".rustup","toolchains","opaque"])):
+                value=update._cleanup_reparse_metadata(root,root.joinpath(*parts),info)
+                self.assertTrue(update._valid_cleanup_reparse(value))
+                self.assertEqual(value["components"],expected)
+                self.assertNotIn("private-",json.dumps(value))
+            deep=update._cleanup_reparse_metadata(root,root.joinpath(*(["opaque"]*65)),info)
+            self.assertIsNone(deep["components"]);self.assertIsNone(deep["depth"])
+            self.assertTrue(update._valid_cleanup_reparse(deep))
 
     @unittest.skipUnless(sys.platform=="win32","actual Windows protected update workspace and source ACL reads")
     def test_update_workspace_actual_windows_acl_source_reads_and_cleanup_preserve_actor_parent(self):
@@ -1396,6 +1423,45 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                 log.write_bytes(b" ".join(("error[E%04d]" % n).encode() for n in range(17)))
                 commands.failed_command=(log,1,log.stat().st_size)
                 self.assertIsNone(update.cargo_failure_diagnostic(commands,"build-old",True))
+        # Retain zero as well as nonzero without changing run/drain refusal.
+        for returned,phase in ((0,"drain"),(101,"exit"),(None,"wait")):
+            with self.subTest(lifecycle=phase),tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve();commands=update.Commands(root,{})
+                self.assertIsNone(commands.last_exit_status)
+                commands.last_exit_status=77  # A new failed wait must not reuse a prior exit.
+                log=commands.logs/"0001.log";log.write_bytes(b"fixed synthetic compiler output")
+                job=Mock()
+                def closed():
+                    self.assertEqual(commands.last_exit_status,returned)
+                job.close.side_effect=closed
+                def wait(*args):
+                    commands.command_phase="process_wait"
+                    if returned is None:raise update.Failure()
+                    return returned
+                def empty(*args):
+                    commands.command_phase="drain_deadline"
+                    raise update.Failure()
+                with patch.object(update.capture,"WindowsJob",return_value=job), \
+                        patch.object(commands,"start",return_value=(17,log)), \
+                        patch.object(commands,"wait",side_effect=wait), \
+                        patch.object(commands,"empty",side_effect=empty) as drain:
+                    with self.assertRaises(update.Failure):
+                        commands.run(["fixed-synthetic-tool"],cwd=root)
+                job.close.assert_called_once()
+                self.assertEqual(commands.close_state,"complete")
+                self.assertEqual(commands.last_exit_status,returned)
+                self.assertEqual(commands.command_phase,{"drain":"drain_deadline","exit":"exit_status","wait":"process_wait"}[phase])
+                self.assertEqual(drain.call_count,1 if returned==0 else 0)
+                if returned in (0,None):
+                    self.assertIsNone(commands.failed_command)
+                else:
+                    self.assertEqual(commands.failed_command,(log,101,log.stat().st_size))
+                commands.scan_phase="complete";commands.scan_counts["success"]=1
+                diagnostic=update.gate_failure_diagnostic(commands,"build-old","workspace",True,False)
+                self.assertEqual(diagnostic["command_phase"],commands.command_phase)
+                self.assertFalse(diagnostic["passed"])
+                self.assertTrue(diagnostic["private_log_scan_passed"])
+                self.assertFalse(diagnostic["cleanup_passed"])
 
     def test_failed_build_command_metadata_is_retained_only_after_owned_job_close(self):
         with tempfile.TemporaryDirectory() as temporary:
