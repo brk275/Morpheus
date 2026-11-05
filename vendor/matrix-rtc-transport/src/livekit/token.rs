@@ -92,23 +92,49 @@ impl SfuAuthorization {
     }
 }
 
-pub fn authorization_room(jwt: &str, subject: &str, publisher: bool) -> Result<String, TokenServiceError> {
+pub fn authorization_room(
+    jwt: &str,
+    subject: &str,
+    publisher: bool,
+) -> Result<String, TokenServiceError> {
     Ok(authorization(jwt, subject, publisher)?.room)
 }
 
-pub fn authorization(jwt: &str, subject: &str, publisher: bool) -> Result<SfuAuthorization, TokenServiceError> {
+pub fn authorization(
+    jwt: &str,
+    subject: &str,
+    publisher: bool,
+) -> Result<SfuAuthorization, TokenServiceError> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     let rejected = || TokenServiceError::Authorization;
-    if jwt.len() > 64 * 1024 || subject.is_empty() { return Err(rejected()); }
+    if jwt.len() > 64 * 1024 || subject.is_empty() {
+        return Err(rejected());
+    }
     let mut parts = jwt.split('.');
-    let header = parts.next().filter(|s| !s.is_empty()).ok_or_else(rejected)?;
-    let payload = parts.next().filter(|s| !s.is_empty()).ok_or_else(rejected)?;
-    let signature = parts.next().filter(|s| !s.is_empty()).ok_or_else(rejected)?;
-    if parts.next().is_some() || header.len() > 4096 || signature.len() > 8192 { return Err(rejected()); }
+    let header = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(rejected)?;
+    let payload = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(rejected)?;
+    let signature = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(rejected)?;
+    if parts.next().is_some() || header.len() > 4096 || signature.len() > 8192 {
+        return Err(rejected());
+    }
     let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|_| rejected())?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| rejected())?;
-    if value.get("sub").and_then(serde_json::Value::as_str) != Some(subject) { return Err(rejected()); }
-    let video = value.get("video").and_then(serde_json::Value::as_object).ok_or_else(rejected)?;
+    if value.get("sub").and_then(serde_json::Value::as_str) != Some(subject) {
+        return Err(rejected());
+    }
+    let video = value
+        .get("video")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(rejected)?;
     let flag = |name: &str, default: bool| -> Result<bool, TokenServiceError> {
         match video.get(name) {
             None => Ok(default),
@@ -122,17 +148,44 @@ pub fn authorization(jwt: &str, subject: &str, publisher: bool) -> Result<SfuAut
     let publish_sources = match video.get("canPublishSources") {
         None => Vec::new(),
         Some(value) => {
-            let values = value.as_array().filter(|values| values.len() <= 8).ok_or_else(rejected)?;
-            values.iter().map(|value| value.as_str()
-                .filter(|source| !source.is_empty() && source.len() <= 64 && !source.chars().any(char::is_control))
-                .map(str::to_owned).ok_or_else(rejected)).collect::<Result<Vec<_>, _>>()?
+            let values = value
+                .as_array()
+                .filter(|values| values.len() <= 8)
+                .ok_or_else(rejected)?;
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|source| {
+                            !source.is_empty()
+                                && source.len() <= 64
+                                && !source.chars().any(char::is_control)
+                        })
+                        .map(str::to_owned)
+                        .ok_or_else(rejected)
+                })
+                .collect::<Result<Vec<_>, _>>()?
         }
     };
-    if !flag("roomJoin", false)? || !flag("canSubscribe", true)?
-        || (publisher && !can_publish && publish_sources.is_empty()) { return Err(rejected()); }
-    let room = video.get("room").and_then(serde_json::Value::as_str).ok_or_else(rejected)?;
-    if room.is_empty() || room.len() > 1024 || room.chars().any(char::is_control) { return Err(rejected()); }
-    Ok(SfuAuthorization { room: room.to_owned(), can_publish, publish_sources })
+    if !flag("roomJoin", false)?
+        || !flag("canSubscribe", true)?
+        || (publisher && !can_publish && publish_sources.is_empty())
+    {
+        return Err(rejected());
+    }
+    let room = video
+        .get("room")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(rejected)?;
+    if room.is_empty() || room.len() > 1024 || room.chars().any(char::is_control) {
+        return Err(rejected());
+    }
+    Ok(SfuAuthorization {
+        room: room.to_owned(),
+        can_publish,
+        publish_sources,
+    })
 }
 
 /// Build the MSC4195 `POST /get_token` request: the endpoint URL and the JSON
@@ -226,7 +279,10 @@ mod tests {
 
     fn unsigned_consistency_fixture(payload: serde_json::Value) -> String {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-        format!("e30.{}.fixture", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap()))
+        format!(
+            "e30.{}.fixture",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        )
     }
 
     #[test]
@@ -234,8 +290,14 @@ mod tests {
         let jwt = unsigned_consistency_fixture(serde_json::json!({
             "sub":"exact-participant", "video":{"roomJoin":true,"room":"opaque-provider-room","canPublish":true,"canSubscribe":true}
         }));
-        assert_eq!(authorization_room(&jwt, "exact-participant", false).unwrap(), "opaque-provider-room");
-        assert_eq!(authorization_room(&jwt, "exact-participant", true).unwrap(), "opaque-provider-room");
+        assert_eq!(
+            authorization_room(&jwt, "exact-participant", false).unwrap(),
+            "opaque-provider-room"
+        );
+        assert_eq!(
+            authorization_room(&jwt, "exact-participant", true).unwrap(),
+            "opaque-provider-room"
+        );
         assert!(authorization_room(&jwt, "another-participant", false).is_err());
         // LiveKit defaults allow publish/subscribe; this does not grant the
         // caller's native subscriber handle permission to publish a track.
@@ -260,10 +322,14 @@ mod tests {
             serde_json::json!({"roomJoin":true,"room":""}),
             serde_json::json!({"roomJoin":true,"room":"x".repeat(1025)}),
         ] {
-            let jwt = unsigned_consistency_fixture(serde_json::json!({"sub":"exact-participant", "video":video}));
+            let jwt = unsigned_consistency_fixture(
+                serde_json::json!({"sub":"exact-participant", "video":video}),
+            );
             assert!(authorization_room(&jwt, "exact-participant", false).is_err());
         }
-        assert!(authorization_room(&"x".repeat(64 * 1024 + 1), "exact-participant", false).is_err());
+        assert!(
+            authorization_room(&"x".repeat(64 * 1024 + 1), "exact-participant", false).is_err()
+        );
     }
 
     #[test]

@@ -46,8 +46,7 @@ use morpheus_matrix::{
 pub use morpheus_rtc::CallInfo;
 use morpheus_rtc::{
     AudioControls, AudioDeviceSelection, AudioResume, AudioState, CallOptions, LiveKitDescriptor,
-    LocalRtcSupport,
-    MediaError, ReconnectBackoff, ReconnectPolicy, ReconnectWindow, RtcCallEnd,
+    LocalRtcSupport, MediaError, ReconnectBackoff, ReconnectPolicy, ReconnectWindow, RtcCallEnd,
     RtcConnectionSignal, RtcError, RtcService, TransportSupport, local_device_support,
     local_support,
 };
@@ -264,7 +263,9 @@ impl fmt::Display for CallControllerError {
             Self::AlreadyBusy => write!(formatter, "a call is already starting or active"),
             Self::Cancelled => write!(formatter, "call start was cancelled"),
             Self::AccountChanged => write!(formatter, "the active Matrix account changed"),
-            Self::CallProfileChanged => write!(formatter, "call settings changed; start the call again"),
+            Self::CallProfileChanged => {
+                write!(formatter, "call settings changed; start the call again")
+            }
             Self::StaleCall => write!(formatter, "that call is no longer active"),
             Self::IncomingOfferUnavailable => {
                 write!(formatter, "that incoming call is no longer available")
@@ -2017,7 +2018,8 @@ impl CallController {
     }
 
     async fn ready_account_id(&self) -> Result<String, CallControllerError> {
-        self.audio_account().await
+        self.audio_account()
+            .await
             .map(|account| account.id)
             .map_err(CallControllerError::Unavailable)
     }
@@ -2075,8 +2077,12 @@ async fn room_profile_changed(
 ) {
     let mut changes = spaces.subscribe_incoming_policy();
     loop {
-        if spaces.room_call_profile(account_id, room_id) != Some(profile) { return; }
-        if changes.changed().await.is_err() { return; }
+        if spaces.room_call_profile(account_id, room_id) != Some(profile) {
+            return;
+        }
+        if changes.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -2139,9 +2145,7 @@ enum SessionEnd {
 fn session_end(end: RtcCallEnd) -> SessionEnd {
     match end {
         RtcCallEnd::SlotClosed => SessionEnd::Ended("the room call was closed"),
-        RtcCallEnd::AuthenticationRequired => {
-            SessionEnd::Ended("Sign in again before calling")
-        }
+        RtcCallEnd::AuthenticationRequired => SessionEnd::Ended("Sign in again before calling"),
         RtcCallEnd::AuthenticationExpired => SessionEnd::Ended(
             "The account session is awaiting refresh; try calling after it reconnects.",
         ),
@@ -2303,7 +2307,9 @@ struct CallWorker {
 
 impl CallWorker {
     fn profile_current(&self) -> bool {
-        self.voice_spaces.room_call_profile(&self.account_id, &self.room_id) == Some(self.profile)
+        self.voice_spaces
+            .room_call_profile(&self.account_id, &self.room_id)
+            == Some(self.profile)
     }
 
     async fn run(mut self) {
@@ -2889,7 +2895,9 @@ impl CallWorker {
     }
 
     async fn setup(&mut self) -> Result<(RtcService, CallInfo), CallControllerError> {
-        if !self.profile_current() { return Err(CallControllerError::CallProfileChanged); }
+        if !self.profile_current() {
+            return Err(CallControllerError::CallProfileChanged);
+        }
         if !self.selection.is_current() {
             return Err(CallControllerError::AccountChanged);
         }
@@ -2971,8 +2979,10 @@ impl CallWorker {
             let profile_account = self.account_id.clone();
             let profile_room = self.room_id.clone();
             let original_admit = admit;
-            let admit = || original_admit()
-                && profiles.room_call_profile(&profile_account, &profile_room) == Some(profile);
+            let admit = || {
+                original_admit()
+                    && profiles.room_call_profile(&profile_account, &profile_room) == Some(profile)
+            };
             let join = timeout(JOIN_TIMEOUT, async {
                 if outgoing {
                     rtc.join_outgoing_room(&room_id, options, &admit).await
@@ -3033,7 +3043,9 @@ impl CallWorker {
                 .ok_or(CallControllerError::AccountChanged)
         });
         let account_check = account_check.and_then(|()| {
-            self.profile_current().then_some(()).ok_or(CallControllerError::CallProfileChanged)
+            self.profile_current()
+                .then_some(())
+                .ok_or(CallControllerError::CallProfileChanged)
         });
         if let Err(error) = account_check {
             leave_with_timeout(&mut rtc, &room_id)
@@ -3355,7 +3367,9 @@ impl CallWorker {
         remaining: Duration,
     ) -> Result<CallInfo, JoinAttemptError> {
         if !self.profile_current() {
-            return Err(JoinAttemptError::Stopped(Err(CallControllerError::CallProfileChanged)));
+            return Err(JoinAttemptError::Stopped(Err(
+                CallControllerError::CallProfileChanged,
+            )));
         }
         let room_id = self.room_id.clone();
         let (joined, cancelled) = {

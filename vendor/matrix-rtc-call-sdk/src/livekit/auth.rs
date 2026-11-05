@@ -83,7 +83,10 @@ impl Bindings {
                 .current
                 .iter()
                 .map(|(id, value)| {
-                    id.len() + value.member.len() + value.publication.len() + std::mem::size_of::<Option<u64>>()
+                    id.len()
+                        + value.member.len()
+                        + value.publication.len()
+                        + std::mem::size_of::<Option<u64>>()
                 })
                 .sum::<usize>()
             + self
@@ -91,7 +94,11 @@ impl Bindings {
                 .keys()
                 .map(|id| id.len() + std::mem::size_of::<Option<u64>>())
                 .sum::<usize>()
-            + self.publications.iter().map(|(id, scope)| id.len() + scope.len()).sum::<usize>()
+            + self
+                .publications
+                .iter()
+                .map(|(id, scope)| id.len() + scope.len())
+                .sum::<usize>()
     }
 
     #[cfg(test)]
@@ -122,12 +129,11 @@ impl Bindings {
                 .iter()
                 .all(|(id, owner)| self.members.get(id).is_none_or(|held| held == owner))
             && next.identities.iter().all(|(id, owner)| {
-                self.identities
-                    .get(id)
-                    .is_none_or(|held| held == owner || (
-                        id == &format!("{}:{}", owner.user, owner.device)
-                            && held.same_principal(owner)
-                    ))
+                self.identities.get(id).is_none_or(|held| {
+                    held == owner
+                        || (id == &format!("{}:{}", owner.user, owner.device)
+                            && held.same_principal(owner))
+                })
             });
         if valid {
             for (id, owner) in &next.members {
@@ -166,7 +172,11 @@ impl Bindings {
                 continue;
             }
             let extra = match held {
-                Some(held) => self.bytes() - held.member.len() - held.publication.len() + owner.member.len() + publication.len(),
+                Some(held) => {
+                    self.bytes() - held.member.len() - held.publication.len()
+                        + owner.member.len()
+                        + publication.len()
+                }
                 None => {
                     self.bytes()
                         + identity.len()
@@ -190,7 +200,7 @@ impl Bindings {
                 GenerationBinding {
                     member: owner.member.clone(),
                     membership_ts,
-                        publication: publication.clone(),
+                    publication: publication.clone(),
                     lease: KeyGeneration {
                         active: Arc::new(AtomicBool::new(true)),
                         serial,
@@ -273,13 +283,18 @@ impl AuthGuard {
         bindings.timestamps.insert(own_identity.clone(), None);
         let own_publication = match &self.own_transport {
             Some(transport) => {
-                let (dialect, publication) = self.publication(&self.own.user, std::slice::from_ref(transport))?;
-                if dialect != self.dialect { return None; }
+                let (dialect, publication) =
+                    self.publication(&self.own.user, std::slice::from_ref(transport))?;
+                if dialect != self.dialect {
+                    return None;
+                }
                 publication
             }
             None => "receive-only".to_owned(),
         };
-        bindings.publications.insert(own_identity.clone(), own_publication.clone());
+        bindings
+            .publications
+            .insert(own_identity.clone(), own_publication.clone());
         bindings.identities.insert(own_identity, self.own.clone());
         for member in snapshot {
             if member.transports.iter().any(|transport| {
@@ -307,11 +322,17 @@ impl AuthGuard {
                 continue;
             }
             // Receive-only members have no publisher identity or media keys.
-            if !member.transports.iter().any(|transport| transport.is_livekit()) {
+            if !member
+                .transports
+                .iter()
+                .any(|transport| transport.is_livekit())
+            {
                 continue;
             }
             let (dialect, publication) = self.publication(&owner.user, &member.transports)?;
-            dialect.validate_slot(&crate::attach::token_slot_id(self.format, &member.slot_id)).ok()?;
+            dialect
+                .validate_slot(&crate::attach::token_slot_id(self.format, &member.slot_id))
+                .ok()?;
             if owner == self.own && (dialect != self.dialect || publication != own_publication) {
                 return None;
             }
@@ -345,23 +366,43 @@ impl AuthGuard {
     /// One exact publisher identity contract per membership. Multiple endpoints
     /// with the same contract are permitted, but a single membership cannot
     /// ambiguously own both a legacy and a CSAPI identity. No alias fallback.
-    fn publication(&self, user: &str, transports: &[RtcTransport]) -> Option<(LiveKitAuthDialect, String)> {
-        if transports.len() > 16 { return None; }
+    fn publication(
+        &self,
+        user: &str,
+        transports: &[RtcTransport],
+    ) -> Option<(LiveKitAuthDialect, String)> {
+        if transports.len() > 16 {
+            return None;
+        }
         let historical = self.dialect == LiveKitAuthDialect::DirectDraft;
         let mut selected = None;
         let mut endpoints = Vec::new();
         for transport in transports {
             let (kind, endpoint, server_name) = match transport {
                 RtcTransport::LiveKit(t) => ("service", t.livekit_service_url.as_str(), None),
-                RtcTransport::LiveKitCsApi(t) => ("csapi", t.url.as_str(), t.server_name.as_deref()),
+                RtcTransport::LiveKitCsApi(t) => {
+                    ("csapi", t.url.as_str(), t.server_name.as_deref())
+                }
                 RtcTransport::Unsupported(t) if t.transport_type == "livekit" => return None,
                 _ => continue,
             };
-            if endpoint.is_empty() || endpoint.len() > MAX_IDENTITY_FIELD_BYTES { return None; }
-            if server_name.is_some_and(|server| server.is_empty() || server.len() > MAX_IDENTITY_FIELD_BYTES
-                || matrix_rtc_transport::livekit::publisher_server_name(&format!("@publisher:{server}")).is_none()) { return None; }
+            if endpoint.is_empty() || endpoint.len() > MAX_IDENTITY_FIELD_BYTES {
+                return None;
+            }
+            if server_name.is_some_and(|server| {
+                server.is_empty()
+                    || server.len() > MAX_IDENTITY_FIELD_BYTES
+                    || matrix_rtc_transport::livekit::publisher_server_name(&format!(
+                        "@publisher:{server}"
+                    ))
+                    .is_none()
+            }) {
+                return None;
+            }
             let dialect = LiveKitAuthDialect::for_transport(transport, historical)?;
-            if selected.is_some_and(|held| held != dialect) { return None; }
+            if selected.is_some_and(|held| held != dialect) {
+                return None;
+            }
             selected = Some(dialect);
             endpoints.push((kind, endpoint, server_name));
         }
@@ -467,8 +508,12 @@ impl AuthGuard {
         // without guessing any publisher identity from the local auth choice.
         let mut tuple = Bindings::default();
         tuple.members.insert(member.into(), target.clone());
-        if !self.history.lock().expect("auth history mutex poisoned")
-            .extend_owners(&tuple, false) {
+        if !self
+            .history
+            .lock()
+            .expect("auth history mutex poisoned")
+            .extend_owners(&tuple, false)
+        {
             self.fail();
             return None;
         }
@@ -479,10 +524,12 @@ impl AuthGuard {
                 None => (self.dialect, "receive-only".to_owned()),
             }
         } else {
-            let entry = snapshot.iter().find(|entry| entry.sender == user
-                && entry.member_id == member
-                && entry.origin.sender_device_id() == Some(device)
-                && self.include_member(entry))?;
+            let entry = snapshot.iter().find(|entry| {
+                entry.sender == user
+                    && entry.member_id == member
+                    && entry.origin.sender_device_id() == Some(device)
+                    && self.include_member(entry)
+            })?;
             self.publication(user, &entry.transports)?
         };
         let identity = dialect.identity(user, device, member)?;
@@ -519,8 +566,14 @@ impl AuthGuard {
         {
             return None;
         }
-        if self.history.lock().expect("auth history mutex poisoned").current.get(&identity)
-            .is_none_or(|held| held.publication != publication) {
+        if self
+            .history
+            .lock()
+            .expect("auth history mutex poisoned")
+            .current
+            .get(&identity)
+            .is_none_or(|held| held.publication != publication)
+        {
             return None;
         }
         Some(identity)
@@ -572,7 +625,9 @@ mod tests {
         let (_tx, rx) = watch::channel(Vec::new());
         let guard = AuthGuard::new(
             LiveKitAuthDialect::LegacyService,
-            Some(RtcTransport::LiveKit(matrix_rtc_core::LiveKitTransport { livekit_service_url: "https://auth.example.org".into() })),
+            Some(RtcTransport::LiveKit(matrix_rtc_core::LiveKitTransport {
+                livekit_service_url: "https://auth.example.org".into(),
+            })),
             matrix_rtc_core::compat::MembershipFormat::Current,
             OwnMemberClaims {
                 user_id: "@alice:example.org".into(),
@@ -590,14 +645,29 @@ mod tests {
         let guard = guard();
         let bob = member("@bob:example.org", Some("BOB"), "bob");
         let mut carol = member("@carol:elsewhere.test", Some("CAROL"), "carol");
-        carol.transports = vec![RtcTransport::LiveKitCsApi(matrix_rtc_core::LiveKitCsApiTransport {
-            url: "wss://media.elsewhere.test".into(), server_name: None })];
+        carol.transports = vec![RtcTransport::LiveKitCsApi(
+            matrix_rtc_core::LiveKitCsApiTransport {
+                url: "wss://media.elsewhere.test".into(),
+                server_name: None,
+            },
+        )];
         let snapshot = vec![bob, carol];
         assert!(guard.on_core_snapshot(&snapshot));
-        assert_eq!(guard.map("@bob:example.org", "BOB", "bob", Some(&snapshot)), Some("@bob:example.org:BOB".into()));
-        assert_eq!(guard.map("@carol:elsewhere.test", "CAROL", "carol", Some(&snapshot)),
-            Some(matrix_rtc_transport::livekit::identity::csapi_identity("@carol:elsewhere.test", "carol")));
-        assert_eq!(guard.map("@carol:elsewhere.test", "WRONG", "carol", Some(&snapshot)), None);
+        assert_eq!(
+            guard.map("@bob:example.org", "BOB", "bob", Some(&snapshot)),
+            Some("@bob:example.org:BOB".into())
+        );
+        assert_eq!(
+            guard.map("@carol:elsewhere.test", "CAROL", "carol", Some(&snapshot)),
+            Some(matrix_rtc_transport::livekit::identity::csapi_identity(
+                "@carol:elsewhere.test",
+                "carol"
+            ))
+        );
+        assert_eq!(
+            guard.map("@carol:elsewhere.test", "WRONG", "carol", Some(&snapshot)),
+            None
+        );
     }
 
     #[test]
@@ -605,15 +675,23 @@ mod tests {
         let guard = guard();
         let first = member("@bob:example.org", Some("BOB"), "bob");
         assert!(guard.on_core_snapshot(std::slice::from_ref(&first)));
-        let old = guard.member_lease("@bob:example.org:BOB", "bob", None).unwrap();
+        let old = guard
+            .member_lease("@bob:example.org:BOB", "bob", None)
+            .unwrap();
         let mut next = first.clone();
         next.transports = vec![RtcTransport::LiveKit(matrix_rtc_core::LiveKitTransport {
             livekit_service_url: "https://other.example.org".into(),
         })];
         assert!(guard.on_core_snapshot(std::slice::from_ref(&next)));
         assert!(!old.active.load(Ordering::Acquire));
-        assert_eq!(guard.map("@bob:example.org", "BOB", "bob", Some(&[first])), None);
-        assert_eq!(guard.map("@bob:example.org", "BOB", "bob", Some(&[next])), Some("@bob:example.org:BOB".into()));
+        assert_eq!(
+            guard.map("@bob:example.org", "BOB", "bob", Some(&[first])),
+            None
+        );
+        assert_eq!(
+            guard.map("@bob:example.org", "BOB", "bob", Some(&[next])),
+            Some("@bob:example.org:BOB".into())
+        );
         assert!(guard.active.load(Ordering::Acquire));
     }
 
@@ -621,8 +699,12 @@ mod tests {
     fn ambiguous_publisher_contract_or_cross_device_member_reuse_is_terminal() {
         let guard = guard();
         let mut bob = member("@bob:example.org", Some("BOB"), "bob");
-        bob.transports.push(RtcTransport::LiveKitCsApi(matrix_rtc_core::LiveKitCsApiTransport {
-            url: "wss://other.example.org".into(), server_name: None }));
+        bob.transports.push(RtcTransport::LiveKitCsApi(
+            matrix_rtc_core::LiveKitCsApiTransport {
+                url: "wss://other.example.org".into(),
+                server_name: None,
+            },
+        ));
         assert!(!guard.on_core_snapshot(&[bob]));
         assert!(!guard.active.load(Ordering::Acquire));
     }
@@ -632,18 +714,37 @@ mod tests {
         let (_tx, rx) = watch::channel(Vec::new());
         let guard = AuthGuard::new(
             LiveKitAuthDialect::DirectDraft,
-            Some(RtcTransport::LiveKit(matrix_rtc_core::LiveKitTransport { livekit_service_url: "https://auth.example.org".into() })),
+            Some(RtcTransport::LiveKit(matrix_rtc_core::LiveKitTransport {
+                livekit_service_url: "https://auth.example.org".into(),
+            })),
             matrix_rtc_core::compat::MembershipFormat::Current,
-            OwnMemberClaims { user_id: "@alice:example.org".into(), device_id: "ALICE".into(), member_id: "alice-member".into() },
+            OwnMemberClaims {
+                user_id: "@alice:example.org".into(),
+                device_id: "ALICE".into(),
+                member_id: "alice-member".into(),
+            },
             rx,
         );
         assert!(guard.seed_initial());
         let bob = member("@bob:example.org", Some("BOB"), "bob");
         assert!(guard.on_core_snapshot(std::slice::from_ref(&bob)));
-        assert_eq!(guard.map("@bob:example.org", "BOB", "bob", Some(&[bob])),
-            Some(matrix_rtc_transport::livekit::identity::pseudonymous_identity("@bob:example.org", "BOB", "bob")));
+        assert_eq!(
+            guard.map("@bob:example.org", "BOB", "bob", Some(&[bob])),
+            Some(
+                matrix_rtc_transport::livekit::identity::pseudonymous_identity(
+                    "@bob:example.org",
+                    "BOB",
+                    "bob"
+                )
+            )
+        );
         let mut modern = member("@carol:elsewhere.test", Some("CAROL"), "carol");
-        modern.transports = vec![RtcTransport::LiveKitCsApi(matrix_rtc_core::LiveKitCsApiTransport { url: "wss://media.elsewhere.test".into(), server_name: None })];
+        modern.transports = vec![RtcTransport::LiveKitCsApi(
+            matrix_rtc_core::LiveKitCsApiTransport {
+                url: "wss://media.elsewhere.test".into(),
+                server_name: None,
+            },
+        )];
         assert!(!guard.on_core_snapshot(&[modern]));
         assert!(!guard.active.load(Ordering::Acquire));
     }
@@ -762,7 +863,9 @@ mod tests {
         let (tx, rx) = watch::channel(vec![first.clone()]);
         let guard = AuthGuard::new(
             LiveKitAuthDialect::LegacyService,
-            Some(RtcTransport::LiveKit(matrix_rtc_core::LiveKitTransport { livekit_service_url: "https://auth.example.org".into() })),
+            Some(RtcTransport::LiveKit(matrix_rtc_core::LiveKitTransport {
+                livekit_service_url: "https://auth.example.org".into(),
+            })),
             matrix_rtc_core::compat::MembershipFormat::Current,
             OwnMemberClaims {
                 user_id: "@alice:example.org".into(),

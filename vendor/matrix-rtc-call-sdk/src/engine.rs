@@ -1563,7 +1563,10 @@ impl Actor {
         if matches!(&reason, EndedReason::IdentityRejected) {
             self.identity_rejected = true;
         }
-        if matches!(&reason, EndedReason::AuthenticationRequired | EndedReason::AuthenticationExpired) {
+        if matches!(
+            &reason,
+            EndedReason::AuthenticationRequired | EndedReason::AuthenticationExpired
+        ) {
             // Revoke the same publication/key/capture authority immediately.
             // The actor's normal retirement closes adopted and late-successful
             // connections without replacing this typed terminal notification.

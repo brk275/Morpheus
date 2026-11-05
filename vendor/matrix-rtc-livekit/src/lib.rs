@@ -56,8 +56,8 @@ pub use token::{MemberClaims, SfuToken};
 // these in this crate's own signatures — a host implementing the token source
 // should not need a second dependency to do it.
 pub use matrix_rtc_core::{MatrixBackend, OpenIdToken};
-pub use transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
 pub use transport_impl::livekit_connection_key;
+pub use transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
 
 /// Android initialisation, re-exported so consumers (e.g. the FFI crate)
 /// don't need a direct `livekit`/`libwebrtc` dependency for it.

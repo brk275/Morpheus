@@ -114,7 +114,10 @@ mod tests {
     fn current_and_historical_identity_contracts_do_not_alias() {
         let current = csapi_identity("@user:example.org", "member");
         assert_eq!(current.len(), 43);
-        assert_ne!(current, pseudonymous_identity("@user:example.org", "DEVICE", "member"));
+        assert_ne!(
+            current,
+            pseudonymous_identity("@user:example.org", "DEVICE", "member")
+        );
         assert_ne!(current, csapi_identity("@other:example.org", "member"));
         assert_ne!(current, csapi_identity("@user:example.org", "other"));
     }

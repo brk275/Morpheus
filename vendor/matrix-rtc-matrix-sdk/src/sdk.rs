@@ -48,8 +48,8 @@ use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 
-mod slot_write;
 mod rtc_token;
+mod slot_write;
 
 // The sticky duration for `m.rtc.member` comes from the core
 // (`JoinSessionParams::sticky_duration_ms`), which re-sends the membership at
@@ -718,8 +718,17 @@ impl MatrixBackend for SdkMatrixBackend {
         })
     }
 
-    async fn livekit_token(&self, request: matrix_rtc_core::LiveKitTokenRequest) -> Result<String, BackendError> {
-        rtc_token::get(&self.client, request, &self.rtc_expired_access, &self.rtc_token_gate).await
+    async fn livekit_token(
+        &self,
+        request: matrix_rtc_core::LiveKitTokenRequest,
+    ) -> Result<String, BackendError> {
+        rtc_token::get(
+            &self.client,
+            request,
+            &self.rtc_expired_access,
+            &self.rtc_token_gate,
+        )
+        .await
     }
 
     /// Through the SDK's discovery: cached, with a bounded request, and

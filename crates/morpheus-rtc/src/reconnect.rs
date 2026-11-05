@@ -314,7 +314,9 @@ mod tests {
             RtcConnectionSignal::from_event(&matrix_rtc_call_sdk::CallEvent::Ended {
                 reason: matrix_rtc_call_sdk::EndedReason::AuthenticationRequired,
             }),
-            Some(RtcConnectionSignal::Ended(RtcCallEnd::AuthenticationRequired)),
+            Some(RtcConnectionSignal::Ended(
+                RtcCallEnd::AuthenticationRequired
+            )),
         );
     }
 
@@ -325,7 +327,9 @@ mod tests {
             RtcConnectionSignal::from_event(&matrix_rtc_call_sdk::CallEvent::Ended {
                 reason: matrix_rtc_call_sdk::EndedReason::AuthenticationExpired,
             }),
-            Some(RtcConnectionSignal::Ended(RtcCallEnd::AuthenticationExpired)),
+            Some(RtcConnectionSignal::Ended(
+                RtcCallEnd::AuthenticationExpired
+            )),
         );
     }
 

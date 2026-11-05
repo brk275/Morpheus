@@ -26,8 +26,7 @@ use serde_json::Value;
 
 use crate::{
     LiveKitDescriptor, RtcError, TransportSupport, VOICE_SPACE_EVENT_TYPE, VOICE_SPACE_STATE_KEY,
-    VoiceSpaceMarker,
-    classify_transports,
+    VoiceSpaceMarker, classify_transports,
 };
 
 /// The membership format to publish. Legacy formats exist for interoperation
@@ -111,19 +110,27 @@ impl CallOptions {
             ) => {
                 let room_slot = self.slot_id == "m.call#ROOM"
                     || (self.slot_id == "m.call#room"
-                        && matches!(self.interop_mode, InteropMode::Sticky2025 | InteropMode::RoomState));
+                        && matches!(
+                            self.interop_mode,
+                            InteropMode::Sticky2025 | InteropMode::RoomState
+                        ));
                 if self.auth_dialect != Some(LiveKitAuthDialect::DirectDraft) && !room_slot {
                     return Err(RtcError::Discovery(
-                        "the advertised legacy service cannot authorize this literal slot".to_owned(),
+                        "the advertised legacy service cannot authorize this literal slot"
+                            .to_owned(),
                     ));
                 }
                 Ok(RtcTransport::LiveKit(LiveKitTransport {
                     livekit_service_url: service_url,
                 }))
             }
-            (LiveKitDescriptor::CsApi { url, server_name }, None | Some(LiveKitAuthDialect::CsApi)) => {
-                Ok(RtcTransport::LiveKitCsApi(LiveKitCsApiTransport { url, server_name }))
-            }
+            (
+                LiveKitDescriptor::CsApi { url, server_name },
+                None | Some(LiveKitAuthDialect::CsApi),
+            ) => Ok(RtcTransport::LiveKitCsApi(LiveKitCsApiTransport {
+                url,
+                server_name,
+            })),
             _ => Err(RtcError::Discovery(
                 "the explicit auth dialect conflicts with the advertised LiveKit transport"
                     .to_owned(),
@@ -308,10 +315,15 @@ impl RtcService {
     }
 
     async fn room_transport(&self) -> Result<TransportSupport, RtcError> {
-        let transport = tokio::time::timeout(std::time::Duration::from_secs(15), self.discover_transport())
-            .await
-            .map_err(|_| RtcError::Discovery("room transport discovery timed out".to_owned()))??;
-        if !transport.is_supported() { return Err(RtcError::NoLiveKitTransport); }
+        let transport = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.discover_transport(),
+        )
+        .await
+        .map_err(|_| RtcError::Discovery("room transport discovery timed out".to_owned()))??;
+        if !transport.is_supported() {
+            return Err(RtcError::NoLiveKitTransport);
+        }
         Ok(transport)
     }
 
@@ -363,9 +375,20 @@ impl RtcService {
         mode: InteropMode,
         admit: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<(), RtcError> {
-        let options = CallOptions { interop_mode: mode, ..CallOptions::default() }.room_wide()?;
+        let options = CallOptions {
+            interop_mode: mode,
+            ..CallOptions::default()
+        }
+        .room_wide()?;
         let transport = self.room_transport().await?;
-        self.open_slot_inner(room_id, &options.slot_id, encrypted, Some((mode, admit)), Some(transport)).await
+        self.open_slot_inner(
+            room_id,
+            &options.slot_id,
+            encrypted,
+            Some((mode, admit)),
+            Some(transport),
+        )
+        .await
     }
 
     async fn open_slot_inner(
@@ -481,7 +504,8 @@ impl RtcService {
     ) -> Result<CallInfo, RtcError> {
         let options = options.room_wide()?;
         let transport = self.room_transport().await?;
-        self.join_inner(room_id, options, None, Some(transport)).await
+        self.join_inner(room_id, options, None, Some(transport))
+            .await
     }
 
     /// Outgoing room-wide intent with the same admission fence as a literal
@@ -494,7 +518,8 @@ impl RtcService {
     ) -> Result<CallInfo, RtcError> {
         let options = options.room_wide()?;
         let transport = self.room_transport().await?;
-        self.join_inner(room_id, options, Some(admit), Some(transport)).await
+        self.join_inner(room_id, options, Some(admit), Some(transport))
+            .await
     }
 
     async fn join_inner(
@@ -820,13 +845,21 @@ mod tests {
             auth_dialect: Some(LiveKitAuthDialect::DirectDraft),
             ..custom
         };
-        assert!(literal.transport(LiveKitDescriptor::LegacyService {
-            service_url: "https://auth.example.test".into(),
-        }).is_ok());
+        assert!(
+            literal
+                .transport(LiveKitDescriptor::LegacyService {
+                    service_url: "https://auth.example.test".into(),
+                })
+                .is_ok()
+        );
         assert_eq!(literal.slot_id, "m.call#standup");
-        assert!(CallOptions::default().transport(LiveKitDescriptor::LegacyService {
-            service_url: "https://auth.example.test".into(),
-        }).is_err());
+        assert!(
+            CallOptions::default()
+                .transport(LiveKitDescriptor::LegacyService {
+                    service_url: "https://auth.example.test".into(),
+                })
+                .is_err()
+        );
     }
 
     #[test]

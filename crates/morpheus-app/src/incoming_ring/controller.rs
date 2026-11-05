@@ -1268,7 +1268,9 @@ impl JoinTarget {
     pub(crate) fn options(&self) -> &CallOptions {
         &self.options
     }
-    pub(crate) fn profile(&self) -> RoomCallProfile { self.profile }
+    pub(crate) fn profile(&self) -> RoomCallProfile {
+        self.profile
+    }
     pub(crate) fn selection(&self) -> &AccountSelection {
         &self.selection
     }

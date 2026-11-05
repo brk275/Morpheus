@@ -53,7 +53,8 @@ use matrix_rtc_call::{
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{self, MembershipFormat};
 use matrix_rtc_core::{
-    BaseRtcRoom, EncryptionConfig, LeaveError, LiveKitTransport, MatrixBackend, RtcTransport, SlotEncryption,
+    BaseRtcRoom, EncryptionConfig, LeaveError, LiveKitTransport, MatrixBackend, RtcTransport,
+    SlotEncryption,
 };
 use matrix_rtc_matrix_sdk::SdkMatrixBackend;
 use matrix_rtc_transport::{
@@ -350,26 +351,53 @@ impl LiveKitCall {
         if options.rtc_transport.is_some() && options.livekit_transport.is_some() {
             return Err(signalling_error("conflicting LiveKit publication options"));
         }
-        let published = match options.rtc_transport.clone()
-            .or_else(|| options.livekit_transport.clone().map(RtcTransport::LiveKit)) {
+        let published = match options
+            .rtc_transport
+            .clone()
+            .or_else(|| options.livekit_transport.clone().map(RtcTransport::LiveKit))
+        {
             Some(transport) => transport,
             None => {
-                let advertised = room.backend().rtc_transports().await.map_err(signalling_error)?;
-                advertised.as_array().into_iter().flatten().find_map(|entry| {
-                    let raw: matrix_rtc_core::RawRtcTransport = serde_json::from_value(entry.clone()).ok()?;
-                    let typed = raw.into_typed();
-                    typed.is_livekit().then_some(typed)
-                }).ok_or_else(|| signalling_error("the homeserver advertises no supported LiveKit transport"))?
+                let advertised = room
+                    .backend()
+                    .rtc_transports()
+                    .await
+                    .map_err(signalling_error)?;
+                advertised
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find_map(|entry| {
+                        let raw: matrix_rtc_core::RawRtcTransport =
+                            serde_json::from_value(entry.clone()).ok()?;
+                        let typed = raw.into_typed();
+                        typed.is_livekit().then_some(typed)
+                    })
+                    .ok_or_else(|| {
+                        signalling_error("the homeserver advertises no supported LiveKit transport")
+                    })?
             }
         };
         let dialect = matrix_rtc_transport::livekit::LiveKitAuthDialect::for_transport(
-            &published, options.auth_dialect == Some(matrix_rtc_transport::livekit::LiveKitAuthDialect::DirectDraft),
-        ).ok_or_else(|| signalling_error("unsupported LiveKit publication contract"))?;
-        if options.auth_dialect.is_some_and(|explicit| explicit != dialect)
-            || matrix_rtc_livekit::livekit_connection_key(&published, &user_id).is_none() {
-            return Err(signalling_error("LiveKit authorization conflicts with its publication"));
+            &published,
+            options.auth_dialect
+                == Some(matrix_rtc_transport::livekit::LiveKitAuthDialect::DirectDraft),
+        )
+        .ok_or_else(|| signalling_error("unsupported LiveKit publication contract"))?;
+        if options
+            .auth_dialect
+            .is_some_and(|explicit| explicit != dialect)
+            || matrix_rtc_livekit::livekit_connection_key(&published, &user_id).is_none()
+        {
+            return Err(signalling_error(
+                "LiveKit authorization conflicts with its publication",
+            ));
         }
-        dialect.validate_slot(&crate::attach::token_slot_id(options.format, &options.slot_id))
+        dialect
+            .validate_slot(&crate::attach::token_slot_id(
+                options.format,
+                &options.slot_id,
+            ))
             .map_err(signalling_error)?;
 
         // The join picks the `member.id` this mode joins with (a fresh one per

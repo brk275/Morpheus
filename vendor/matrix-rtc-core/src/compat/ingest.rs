@@ -159,11 +159,19 @@ pub fn to_core_member_event(room_id: &str, event: RawMemberEventIn) -> Option<Ra
     // Preserve the explicit historical Claimed origin when no authenticated
     // device exists; encrypted-room admission still rejects that origin.
     if let Some(user) = value.pointer("/member/user_id") {
-        if user.as_str() != Some(event.sender.as_str()) { return None; }
+        if user.as_str() != Some(event.sender.as_str()) {
+            return None;
+        }
     }
     if let Some(device) = value.pointer("/member/device_id") {
-        let Some(device) = device.as_str().filter(|device| !device.is_empty()) else { return None; };
-        if event.sender_device_id.as_deref().is_some_and(|authenticated| authenticated != device) {
+        let Some(device) = device.as_str().filter(|device| !device.is_empty()) else {
+            return None;
+        };
+        if event
+            .sender_device_id
+            .as_deref()
+            .is_some_and(|authenticated| authenticated != device)
+        {
             return None;
         }
     }

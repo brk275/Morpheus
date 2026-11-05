@@ -111,9 +111,13 @@ struct ReceiverOwner {
 
 impl ReceiverOwner {
     fn of(member: &JoinedMembership) -> Self {
-        Self { member: member.member_id.clone(), sender: member.sender.clone(),
-            origin: member.origin.clone(), timestamp: member.membership_ts,
-            publications: member.transports.clone() }
+        Self {
+            member: member.member_id.clone(),
+            sender: member.sender.clone(),
+            origin: member.origin.clone(),
+            timestamp: member.membership_ts,
+            publications: member.transports.clone(),
+        }
     }
 }
 
@@ -590,13 +594,29 @@ impl MediaPool {
         // Publisher ownership is a membership + selected transport binding.
         // Install this view before mapping or replaying buffered receiver data.
         let previous = std::mem::replace(&mut self.members_snapshot, snapshot.to_vec());
-        let retired: Vec<_> = self.tracks.lock().expect("track map mutex poisoned")
-            .iter().filter_map(|((member_id, kind), pooled)| {
-                snapshot.iter().find(|member| &member.member_id == member_id)
-                    .filter(|member| select_transport(&self.transports, member)
-                        .is_none_or(|(_, key)| key != pooled.connection_key))
-                    .map(|_| (member_id.clone(), *kind, pooled.connection_key.clone(), pooled.generation))
-            }).collect();
+        let retired: Vec<_> = self
+            .tracks
+            .lock()
+            .expect("track map mutex poisoned")
+            .iter()
+            .filter_map(|((member_id, kind), pooled)| {
+                snapshot
+                    .iter()
+                    .find(|member| &member.member_id == member_id)
+                    .filter(|member| {
+                        select_transport(&self.transports, member)
+                            .is_none_or(|(_, key)| key != pooled.connection_key)
+                    })
+                    .map(|_| {
+                        (
+                            member_id.clone(),
+                            *kind,
+                            pooled.connection_key.clone(),
+                            pooled.generation,
+                        )
+                    })
+            })
+            .collect();
         for (member, kind, key, generation) in retired {
             self.remove_track(&member, kind, &key, generation);
         }
@@ -607,12 +627,17 @@ impl MediaPool {
             // earlier view). Knowing the member must not cache that refusal
             // forever. Retry only an absent mapping, through the same checked
             // backend; never retarget an already mapped member or infer an ID.
-            let publication_changed = previous.iter().find(|held| held.member_id == member.member_id)
+            let publication_changed = previous
+                .iter()
+                .find(|held| held.member_id == member.member_id)
                 .is_some_and(|held| ReceiverOwner::of(held) != ReceiverOwner::of(member));
             if publication_changed {
                 self.invalidate_member_mapping(&member.member_id);
             }
-            if first_seen || publication_changed || !self.member_identities.contains_key(&member.member_id) {
+            if first_seen
+                || publication_changed
+                || !self.member_identities.contains_key(&member.member_id)
+            {
                 self.map_member(member);
             }
         }
@@ -688,9 +713,17 @@ impl MediaPool {
         }
         if self.known_members.contains(&member_id)
             && !self.member_identities.contains_key(&member_id)
-            && self.members_snapshot.iter().find(|member| member.member_id == member_id)
-                .and_then(|member| self.transports.iter().find_map(|backend| backend.remote_identity(member)))
-                .as_deref() == Some(identity.as_str())
+            && self
+                .members_snapshot
+                .iter()
+                .find(|member| member.member_id == member_id)
+                .and_then(|member| {
+                    self.transports
+                        .iter()
+                        .find_map(|backend| backend.remote_identity(member))
+                })
+                .as_deref()
+                == Some(identity.as_str())
         {
             // The authenticated core can lead the actor's watch view. A guarded
             // import has already proved this exact current member and alias;
@@ -913,23 +946,37 @@ impl MediaPool {
         let identity = self.member_identities.remove(member_id);
         self.identity_map.retain(|_, owner| owner != member_id);
         if let Some(identity) = identity {
-            self.retired_member_identities.insert(member_id.to_owned(), identity.clone());
+            self.retired_member_identities
+                .insert(member_id.to_owned(), identity.clone());
             self.pending_tracks.remove(&identity);
             self.pending_keys.remove(&identity);
         }
         self.pending_tracks.retain(|_, tracks| {
-            tracks.retain(|(_, track)| track.owner.as_ref().is_none_or(|owner| owner.member != member_id));
+            tracks.retain(|(_, track)| {
+                track
+                    .owner
+                    .as_ref()
+                    .is_none_or(|owner| owner.member != member_id)
+            });
             !tracks.is_empty()
         });
         // Only independently guarded, still-live key generations can survive
         // a watch-view transition; unguarded pending key notices were removed.
-        self.member_pending_keys.retain(|_, (lease, _)| lease.load(Ordering::Acquire));
+        self.member_pending_keys
+            .retain(|_, (lease, _)| lease.load(Ordering::Acquire));
         for ((member, _), constraints) in &self.constraints {
-            if member == member_id { constraints.writer.invalidate(); }
+            if member == member_id {
+                constraints.writer.invalidate();
+            }
         }
-        let retired: Vec<_> = self.tracks.lock().expect("track map mutex poisoned").iter()
+        let retired: Vec<_> = self
+            .tracks
+            .lock()
+            .expect("track map mutex poisoned")
+            .iter()
             .filter(|((member, _), _)| member == member_id)
-            .map(|((_, kind), track)| (*kind, track.connection_key.clone(), track.generation)).collect();
+            .map(|((_, kind), track)| (*kind, track.connection_key.clone(), track.generation))
+            .collect();
         for (kind, key, generation) in retired {
             self.remove_track(member_id, kind, &key, generation);
         }
@@ -943,7 +990,8 @@ impl MediaPool {
             self.identity_map.remove(&previous);
             self.pending_tracks.remove(&previous);
             self.pending_keys.remove(&previous);
-            self.member_pending_keys.remove(&(previous, member_id.to_owned()));
+            self.member_pending_keys
+                .remove(&(previous, member_id.to_owned()));
         }
         self.identity_map
             .insert(identity.clone(), member_id.to_owned());
@@ -1090,9 +1138,21 @@ impl MediaPool {
     // ---- streams ------------------------------------------------------
 
     fn add_track(&mut self, member_id: &str, kind: MediaStreamKind, mut pooled: PooledTrack) {
-        let Some(member) = self.members_snapshot.iter().find(|member| member.member_id == member_id) else { return; };
+        let Some(member) = self
+            .members_snapshot
+            .iter()
+            .find(|member| member.member_id == member_id)
+        else {
+            return;
+        };
         let owner = ReceiverOwner::of(member);
-        if pooled.owner.as_ref().is_some_and(|previous| previous != &owner) { return; }
+        if pooled
+            .owner
+            .as_ref()
+            .is_some_and(|previous| previous != &owner)
+        {
+            return;
+        }
         pooled.owner = Some(owner);
         let replaced = self
             .tracks
@@ -1502,13 +1562,18 @@ impl MediaPool {
     }
 
     fn member_on_connection(&self, member_id: &str, key: &str) -> bool {
-        self.members_snapshot.iter().find(|member| member.member_id == member_id)
-            .is_some_and(|member| select_transport(&self.transports, member)
-                .is_some_and(|(_, selected)| selected == key))
+        self.members_snapshot
+            .iter()
+            .find(|member| member.member_id == member_id)
+            .is_some_and(|member| {
+                select_transport(&self.transports, member)
+                    .is_some_and(|(_, selected)| selected == key)
+            })
     }
 
     fn identity_on_connection(&self, identity: &str, key: &str) -> Option<&String> {
-        self.identity_map.get(identity)
+        self.identity_map
+            .get(identity)
             .filter(|member| self.member_on_connection(member, key))
     }
 
@@ -1520,7 +1585,10 @@ impl MediaPool {
     ) {
         match event {
             ConnectionEvent::RemoteJoined { identity } => {
-                if self.identity_on_connection(&identity, connection_key).is_none() {
+                if self
+                    .identity_on_connection(&identity, connection_key)
+                    .is_none()
+                {
                     // Either their membership is still propagating (buffered
                     // media will flush when it lands) or the participant does
                     // not belong to this session. Diagnostics only.
@@ -1546,13 +1614,24 @@ impl MediaPool {
                     encryption_state: None,
                     owner: None,
                 };
-                match self.identity_on_connection(&identity, connection_key).cloned() {
+                match self
+                    .identity_on_connection(&identity, connection_key)
+                    .cloned()
+                {
                     Some(member_id) => self.add_track(&member_id, kind, pooled),
                     None => {
                         // A known identity on another advertised transport is
                         // not an early membership. Do not buffer that receiver.
-                        if self.identity_map.contains_key(&identity) { return; }
-                        if self.retired_member_identities.values().any(|retired| retired == &identity) { return; }
+                        if self.identity_map.contains_key(&identity) {
+                            return;
+                        }
+                        if self
+                            .retired_member_identities
+                            .values()
+                            .any(|retired| retired == &identity)
+                        {
+                            return;
+                        }
                         log::debug!(
                             "buffering {kind:?} track of unknown identity {identity} on {connection_key}"
                         );
@@ -1564,7 +1643,10 @@ impl MediaPool {
                 }
             }
             ConnectionEvent::TrackRemoved { identity, kind } => {
-                match self.identity_on_connection(&identity, connection_key).cloned() {
+                match self
+                    .identity_on_connection(&identity, connection_key)
+                    .cloned()
+                {
                     Some(member_id) => {
                         self.remove_track(&member_id, kind, connection_key, generation);
                     }
@@ -1579,8 +1661,12 @@ impl MediaPool {
                     }
                 }
             }
-            ConnectionEvent::TrackMuted { identity, kind } => self.muted(connection_key, &identity, kind, true),
-            ConnectionEvent::TrackUnmuted { identity, kind } => self.muted(connection_key, &identity, kind, false),
+            ConnectionEvent::TrackMuted { identity, kind } => {
+                self.muted(connection_key, &identity, kind, true)
+            }
+            ConnectionEvent::TrackUnmuted { identity, kind } => {
+                self.muted(connection_key, &identity, kind, false)
+            }
             ConnectionEvent::ActiveSpeakers { speakers } => {
                 let speakers = speakers
                     .into_iter()
@@ -1618,7 +1704,10 @@ impl MediaPool {
                         }
                     }
                 }
-                match self.identity_on_connection(&identity, connection_key).cloned() {
+                match self
+                    .identity_on_connection(&identity, connection_key)
+                    .cloned()
+                {
                     Some(member_id) => self
                         .out
                         .push(PoolEvent::EncryptionStateChanged { member_id, state }),

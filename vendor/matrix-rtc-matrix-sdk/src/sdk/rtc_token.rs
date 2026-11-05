@@ -21,18 +21,27 @@ fn refused() -> BackendError {
 }
 
 fn expired() -> BackendError {
-    BackendError::with_matrix_error(Some("M_UNKNOWN_TOKEN".into()), Some(401),
-        "RTC authorization awaits SDK-managed session refresh")
+    BackendError::with_matrix_error(
+        Some("M_UNKNOWN_TOKEN".into()),
+        Some(401),
+        "RTC authorization awaits SDK-managed session refresh",
+    )
 }
 
 fn soft_logout() -> BackendError {
-    BackendError::with_matrix_error(Some("RTC_AUTH_SOFT_LOGOUT".into()), Some(401),
-        "RTC authorization requires sign in")
+    BackendError::with_matrix_error(
+        Some("RTC_AUTH_SOFT_LOGOUT".into()),
+        Some(401),
+        "RTC authorization requires sign in",
+    )
 }
 
 fn sign_in() -> BackendError {
-    BackendError::with_matrix_error(Some("RTC_AUTH_SIGN_IN_REQUIRED".into()), Some(401),
-        "sign in again before calling")
+    BackendError::with_matrix_error(
+        Some("RTC_AUTH_SIGN_IN_REQUIRED".into()),
+        Some(401),
+        "sign in again before calling",
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -44,25 +53,41 @@ pub(super) enum RejectedAccess {
 
 impl RejectedAccess {
     fn fingerprint(self) -> [u8; 32] {
-        match self { Self::Expired(hash) | Self::SignInRequired(hash) | Self::SoftLogout(hash) => hash }
+        match self {
+            Self::Expired(hash) | Self::SignInRequired(hash) | Self::SoftLogout(hash) => hash,
+        }
     }
     fn error(self) -> BackendError {
-        match self { Self::Expired(_) => expired(), Self::SignInRequired(_) => sign_in(), Self::SoftLogout(_) => soft_logout() }
+        match self {
+            Self::Expired(_) => expired(),
+            Self::SignInRequired(_) => sign_in(),
+            Self::SoftLogout(_) => soft_logout(),
+        }
     }
 }
 
 fn requires_sign_in(error: &matrix_sdk::RefreshTokenError) -> bool {
     use matrix_sdk::RefreshTokenError;
-    use matrix_sdk::authentication::oauth::error::{OAuthError, RequestTokenError, BasicErrorResponseType};
+    use matrix_sdk::authentication::oauth::error::{
+        BasicErrorResponseType, OAuthError, RequestTokenError,
+    };
     use matrix_sdk::ruma::api::client::error::ErrorKind;
     match error {
         RefreshTokenError::RefreshTokenRequired => true,
-        RefreshTokenError::MatrixAuth(error) => matches!(error.client_api_error_kind(),
-            Some(ErrorKind::UnknownToken { .. } | ErrorKind::Forbidden)),
+        RefreshTokenError::MatrixAuth(error) => matches!(
+            error.client_api_error_kind(),
+            Some(ErrorKind::UnknownToken { .. } | ErrorKind::Forbidden)
+        ),
         RefreshTokenError::OAuth(error) => match error.as_ref() {
-            OAuthError::NotAuthenticated | OAuthError::NotRegistered | OAuthError::SessionMismatch => true,
-            OAuthError::RefreshToken(RequestTokenError::ServerResponse(error)) => matches!(error.error(),
-                BasicErrorResponseType::InvalidGrant | BasicErrorResponseType::InvalidClient | BasicErrorResponseType::UnauthorizedClient),
+            OAuthError::NotAuthenticated
+            | OAuthError::NotRegistered
+            | OAuthError::SessionMismatch => true,
+            OAuthError::RefreshToken(RequestTokenError::ServerResponse(error)) => matches!(
+                error.error(),
+                BasicErrorResponseType::InvalidGrant
+                    | BasicErrorResponseType::InvalidClient
+                    | BasicErrorResponseType::UnauthorizedClient
+            ),
             _ => false,
         },
     }
@@ -73,16 +98,25 @@ fn fingerprint(token: &str) -> [u8; 32] {
 }
 
 fn loopback(url: &Url) -> bool {
-    url.host_str().is_some_and(|host| host == "localhost"
-        || host.trim_start_matches('[').trim_end_matches(']')
-            .parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()))
+    url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
 }
 
 fn authority(mut homeserver: Url) -> Result<Url, BackendError> {
-    if !homeserver.has_host() || !homeserver.username().is_empty()
-        || homeserver.password().is_some() || homeserver.query().is_some()
+    if !homeserver.has_host()
+        || !homeserver.username().is_empty()
+        || homeserver.password().is_some()
+        || homeserver.query().is_some()
         || homeserver.fragment().is_some()
-        || (homeserver.scheme() != "https" && !(homeserver.scheme() == "http" && loopback(&homeserver))) {
+        || (homeserver.scheme() != "https"
+            && !(homeserver.scheme() == "http" && loopback(&homeserver)))
+    {
         return Err(refused());
     }
     // Preserve legitimate delegated homeserver base paths. Never join against
@@ -93,8 +127,12 @@ fn authority(mut homeserver: Url) -> Result<Url, BackendError> {
 }
 
 fn same_account(client: &Client, request: &LiveKitTokenRequest) -> bool {
-    client.user_id().is_some_and(|id| id.as_str() == request.own_user_id)
-        && client.device_id().is_some_and(|id| id.as_str() == request.own_device_id)
+    client
+        .user_id()
+        .is_some_and(|id| id.as_str() == request.own_user_id)
+        && client
+            .device_id()
+            .is_some_and(|id| id.as_str() == request.own_device_id)
 }
 
 enum Answer {
@@ -103,15 +141,33 @@ enum Answer {
     SoftLogout,
 }
 
-async fn post_once(http: &reqwest::Client, endpoint: Url, token: &str, body: &Value) -> Result<Answer, BackendError> {
-    let mut response = http.post(endpoint).bearer_auth(token).json(body).send().await.map_err(|_| refused())?;
+async fn post_once(
+    http: &reqwest::Client,
+    endpoint: Url,
+    token: &str,
+    body: &Value,
+) -> Result<Answer, BackendError> {
+    let mut response = http
+        .post(endpoint)
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await
+        .map_err(|_| refused())?;
     let status = response.status();
     // Redirects and errors are not parsed into SDK errors that can retain or
     // log reflected credentials, response bodies, or Location headers.
-    if response.content_length().is_some_and(|n| n > MAX_RESPONSE as u64) { return Err(refused()); }
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE as u64)
+    {
+        return Err(refused());
+    }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| refused())? {
-        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE { return Err(refused()); }
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE {
+            return Err(refused());
+        }
         bytes.extend_from_slice(&chunk);
     }
     if status.as_u16() == 401 {
@@ -123,36 +179,65 @@ async fn post_once(http: &reqwest::Client, endpoint: Url, token: &str, body: &Va
             };
             return Ok(if soft_logout {
                 Answer::SoftLogout
-            } else { Answer::Expired });
+            } else {
+                Answer::Expired
+            });
         }
     }
-    if !status.is_success() { return Err(refused()); }
+    if !status.is_success() {
+        return Err(refused());
+    }
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| refused())?;
-    let jwt = value.get("jwt").and_then(Value::as_str).filter(|jwt| !jwt.is_empty()).ok_or_else(refused)?;
+    let jwt = value
+        .get("jwt")
+        .and_then(Value::as_str)
+        .filter(|jwt| !jwt.is_empty())
+        .ok_or_else(refused)?;
     Ok(Answer::Token(jwt.to_owned()))
 }
 
-pub(super) async fn get(client: &Client, request: LiveKitTokenRequest, expired_access: &std::sync::Mutex<Option<RejectedAccess>>, gate: &tokio::sync::Mutex<()>) -> Result<String, BackendError> {
+pub(super) async fn get(
+    client: &Client,
+    request: LiveKitTokenRequest,
+    expired_access: &std::sync::Mutex<Option<RejectedAccess>>,
+    gate: &tokio::sync::Mutex<()>,
+) -> Result<String, BackendError> {
     // Validate the fixed configured authority BEFORE reading account tokens.
     let endpoint = authority(client.homeserver())?;
     if !same_account(client, &request)
-        || [&request.url, &request.server_name, &request.room_id, &request.slot_id, &request.member_id]
-            .iter().any(|field| field.is_empty() || field.len() > 1024 || field.chars().any(char::is_control)) {
+        || [
+            &request.url,
+            &request.server_name,
+            &request.room_id,
+            &request.slot_id,
+            &request.member_id,
+        ]
+        .iter()
+        .any(|field| field.is_empty() || field.len() > 1024 || field.chars().any(char::is_control))
+    {
         return Err(refused());
     }
     // The transport boundary also validates these before calling us. Keep the
     // backend safe when independently called through its public trait.
     let locator = Url::parse(&request.url).map_err(|_| refused())?;
-    if !locator.has_host() || !locator.username().is_empty() || locator.password().is_some()
-        || locator.query().is_some() || locator.fragment().is_some()
-        || (locator.scheme() != "wss" && !(locator.scheme() == "ws" && loopback(&locator))) {
+    if !locator.has_host()
+        || !locator.username().is_empty()
+        || locator.password().is_some()
+        || locator.query().is_some()
+        || locator.fragment().is_some()
+        || (locator.scheme() != "wss" && !(locator.scheme() == "ws" && loopback(&locator)))
+    {
         return Err(refused());
     }
     matrix_sdk::ruma::ServerName::parse(&request.server_name).map_err(|_| refused())?;
     let body = json!({"url":&request.url,"server_name":&request.server_name,
         "room_id":&request.room_id,"slot_id":&request.slot_id,"member_id":&request.member_id});
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(DEADLINE);
-    if loopback(&endpoint) { builder = builder.no_proxy(); }
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(DEADLINE);
+    if loopback(&endpoint) {
+        builder = builder.no_proxy();
+    }
     let http = builder.build().map_err(|_| refused())?;
     let exchange = async {
         // One account-backend authorization at a time, across its clones.
@@ -161,25 +246,44 @@ pub(super) async fn get(client: &Client, request: LiveKitTokenRequest, expired_a
         if !same_account(client, &request) || authority(client.homeserver())? != endpoint {
             return Err(refused());
         }
-        let first = client.access_token().filter(|token| !token.is_empty()).ok_or_else(sign_in)?;
+        let first = client
+            .access_token()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(sign_in)?;
         let first_fingerprint = fingerprint(&first);
         {
-            let mut refused = expired_access.lock().expect("RTC auth state mutex poisoned");
-            if let Some(marker) = *refused && marker.fingerprint() == first_fingerprint { return Err(marker.error()); }
+            let mut refused = expired_access
+                .lock()
+                .expect("RTC auth state mutex poisoned");
+            if let Some(marker) = *refused
+                && marker.fingerprint() == first_fingerprint
+            {
+                return Err(marker.error());
+            }
             *refused = None;
         }
         match post_once(&http, endpoint.clone(), &first, &body).await? {
             Answer::Token(jwt) => {
-                if !same_account(client, &request) || authority(client.homeserver())? != endpoint
-                    || client.access_token().is_none() { return Err(refused()); }
+                if !same_account(client, &request)
+                    || authority(client.homeserver())? != endpoint
+                    || client.access_token().is_none()
+                {
+                    return Err(refused());
+                }
                 Ok(jwt)
             }
             Answer::SoftLogout => {
-                *expired_access.lock().expect("RTC auth state mutex poisoned") = Some(RejectedAccess::SoftLogout(first_fingerprint));
+                *expired_access
+                    .lock()
+                    .expect("RTC auth state mutex poisoned") =
+                    Some(RejectedAccess::SoftLogout(first_fingerprint));
                 Err(soft_logout())
             }
             Answer::Expired => {
-                *expired_access.lock().expect("RTC auth state mutex poisoned") = Some(RejectedAccess::Expired(first_fingerprint));
+                *expired_access
+                    .lock()
+                    .expect("RTC auth state mutex poisoned") =
+                    Some(RejectedAccess::Expired(first_fingerprint));
                 if !same_account(client, &request) || authority(client.homeserver())? != endpoint {
                     return Err(refused());
                 }
@@ -188,25 +292,44 @@ pub(super) async fn get(client: &Client, request: LiveKitTokenRequest, expired_a
                 // No refresh credential is read or persisted by this module.
                 if let Err(error) = client.refresh_access_token().await {
                     if requires_sign_in(&error) {
-                        *expired_access.lock().expect("RTC auth state mutex poisoned") = Some(RejectedAccess::SignInRequired(first_fingerprint));
+                        *expired_access
+                            .lock()
+                            .expect("RTC auth state mutex poisoned") =
+                            Some(RejectedAccess::SignInRequired(first_fingerprint));
                         return Err(sign_in());
                     }
                     return Err(expired());
                 }
-                if !same_account(client, &request) || authority(client.homeserver())? != endpoint { return Err(refused()); }
-                let fresh = client.access_token().filter(|token| !token.is_empty() && token != &first).ok_or_else(expired)?;
+                if !same_account(client, &request) || authority(client.homeserver())? != endpoint {
+                    return Err(refused());
+                }
+                let fresh = client
+                    .access_token()
+                    .filter(|token| !token.is_empty() && token != &first)
+                    .ok_or_else(expired)?;
                 // Exactly one retry, using the new snapshot only. A second
                 // rejection never refreshes or replays the expired token.
                 match post_once(&http, endpoint.clone(), &fresh, &body).await? {
-                    Answer::Token(jwt) if same_account(client, &request)
-                        && authority(client.homeserver())? == endpoint && client.access_token().is_some() => Ok(jwt),
+                    Answer::Token(jwt)
+                        if same_account(client, &request)
+                            && authority(client.homeserver())? == endpoint
+                            && client.access_token().is_some() =>
+                    {
+                        Ok(jwt)
+                    }
                     Answer::Token(_) => Err(refused()),
                     Answer::SoftLogout => {
-                        *expired_access.lock().expect("RTC auth state mutex poisoned") = Some(RejectedAccess::SoftLogout(fingerprint(&fresh)));
+                        *expired_access
+                            .lock()
+                            .expect("RTC auth state mutex poisoned") =
+                            Some(RejectedAccess::SoftLogout(fingerprint(&fresh)));
                         Err(soft_logout())
                     }
                     Answer::Expired => {
-                        *expired_access.lock().expect("RTC auth state mutex poisoned") = Some(RejectedAccess::Expired(fingerprint(&fresh)));
+                        *expired_access
+                            .lock()
+                            .expect("RTC auth state mutex poisoned") =
+                            Some(RejectedAccess::Expired(fingerprint(&fresh)));
                         Err(expired())
                     }
                 }
@@ -215,7 +338,9 @@ pub(super) async fn get(client: &Client, request: LiveKitTokenRequest, expired_a
     };
     // Includes refresh and both POSTs. Dropping a call's future drops our HTTP
     // operations; the SDK retains its own intentional refresh completion rules.
-    tokio::time::timeout(DEADLINE, exchange).await.map_err(|_| expired())?
+    tokio::time::timeout(DEADLINE, exchange)
+        .await
+        .map_err(|_| expired())?
 }
 
 #[cfg(test)]
@@ -225,7 +350,13 @@ mod tests {
     use tokio::net::TcpListener;
 
     async fn get(client: &Client, request: LiveKitTokenRequest) -> Result<String, BackendError> {
-        super::get(client, request, &std::sync::Mutex::new(None), &tokio::sync::Mutex::new(())).await
+        super::get(
+            client,
+            request,
+            &std::sync::Mutex::new(None),
+            &tokio::sync::Mutex::new(()),
+        )
+        .await
     }
 
     fn crypto() {
@@ -241,29 +372,58 @@ mod tests {
             bytes.extend_from_slice(&chunk[..n]);
             if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
                 let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
-                let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:").map(str::trim)).unwrap_or("0").parse().unwrap();
-                if bytes.len() >= end + 4 + length { return bytes; }
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:").map(str::trim))
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap();
+                if bytes.len() >= end + 4 + length {
+                    return bytes;
+                }
             }
         }
     }
 
     async fn client(endpoint: &str, refresh: bool) -> Client {
         crypto();
-        let client = Client::builder().homeserver_url(endpoint)
+        let client = Client::builder()
+            .homeserver_url(endpoint)
             .server_versions([matrix_sdk::ruma::api::MatrixVersion::V1_11])
-            .request_config(matrix_sdk::config::RequestConfig::new().disable_retry().timeout(Duration::from_secs(2)))
-            .build().await.unwrap();
-        client.restore_session(matrix_sdk::authentication::matrix::MatrixSession {
-            meta: matrix_sdk::SessionMeta { user_id: matrix_sdk::ruma::owned_user_id!("@alice:own.example.org"), device_id: matrix_sdk::ruma::owned_device_id!("ALICE") },
-            tokens: matrix_sdk::SessionTokens { access_token: "synthetic-old-token".into(), refresh_token: refresh.then(|| "synthetic-refresh-token".into()) },
-        }).await.unwrap();
+            .request_config(
+                matrix_sdk::config::RequestConfig::new()
+                    .disable_retry()
+                    .timeout(Duration::from_secs(2)),
+            )
+            .build()
+            .await
+            .unwrap();
+        client
+            .restore_session(matrix_sdk::authentication::matrix::MatrixSession {
+                meta: matrix_sdk::SessionMeta {
+                    user_id: matrix_sdk::ruma::owned_user_id!("@alice:own.example.org"),
+                    device_id: matrix_sdk::ruma::owned_device_id!("ALICE"),
+                },
+                tokens: matrix_sdk::SessionTokens {
+                    access_token: "synthetic-old-token".into(),
+                    refresh_token: refresh.then(|| "synthetic-refresh-token".into()),
+                },
+            })
+            .await
+            .unwrap();
         client
     }
 
     fn token_request() -> LiveKitTokenRequest {
-        LiveKitTokenRequest { url: "wss://media.foreign.example.org".into(), server_name: "foreign.example.org".into(),
-            room_id: "!room:own.example.org".into(), slot_id: "m.call#ROOM".into(), member_id: "participation".into(),
-            own_user_id: "@alice:own.example.org".into(), own_device_id: "ALICE".into() }
+        LiveKitTokenRequest {
+            url: "wss://media.foreign.example.org".into(),
+            server_name: "foreign.example.org".into(),
+            room_id: "!room:own.example.org".into(),
+            slot_id: "m.call#ROOM".into(),
+            member_id: "participation".into(),
+            own_user_id: "@alice:own.example.org".into(),
+            own_device_id: "ALICE".into(),
+        }
     }
 
     async fn answer(stream: &mut tokio::net::TcpStream, status: u16, body: &str) {
@@ -272,9 +432,19 @@ mod tests {
 
     #[test]
     fn authority_preserves_delegated_base_path_and_rejects_credential_destinations() {
-        let endpoint = authority(Url::parse("https://delegated.example.org/matrix/base/").unwrap()).unwrap();
-        assert_eq!(endpoint.as_str(), format!("https://delegated.example.org/matrix/base{TOKEN_PATH}"));
-        for url in ["http://foreign.example.org", "https://user:secret@example.org", "https://example.org?token=secret", "https://example.org#secret", "file:///tmp/token"] {
+        let endpoint =
+            authority(Url::parse("https://delegated.example.org/matrix/base/").unwrap()).unwrap();
+        assert_eq!(
+            endpoint.as_str(),
+            format!("https://delegated.example.org/matrix/base{TOKEN_PATH}")
+        );
+        for url in [
+            "http://foreign.example.org",
+            "https://user:secret@example.org",
+            "https://example.org?token=secret",
+            "https://example.org#secret",
+            "file:///tmp/token",
+        ] {
             assert!(authority(Url::parse(url).unwrap()).is_err());
         }
         assert!(authority(Url::parse("http://127.0.0.1:1234/base").unwrap()).is_ok());
@@ -296,7 +466,12 @@ mod tests {
                         assert!(received.starts_with(&format!("post {TOKEN_PATH} ")));
                         assert!(received.contains("authorization: bearer synthetic-old-token"));
                         assert!(received.contains("\"server_name\":\"foreign.example.org\""));
-                        answer(&mut stream, 401, r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":false}"#).await;
+                        answer(
+                            &mut stream,
+                            401,
+                            r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":false}"#,
+                        )
+                        .await;
                     }
                     1 => {
                         assert!(received.starts_with("post /_matrix/client/v3/refresh "));
@@ -310,16 +485,29 @@ mod tests {
                     }
                 }
             }
-            assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
         });
-        assert_eq!(get(&client, token_request()).await.unwrap(), "synthetic-sfu-jwt");
-        assert_eq!(client.access_token().as_deref(), Some("synthetic-fresh-token"));
+        assert_eq!(
+            get(&client, token_request()).await.unwrap(),
+            "synthetic-sfu-jwt"
+        );
+        assert_eq!(
+            client.access_token().as_deref(),
+            Some("synthetic-fresh-token")
+        );
         server.await.unwrap();
     }
 
     #[tokio::test]
     async fn soft_logout_and_malformed_soft_logout_never_request_a_refresh() {
-        for response in [r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":true}"#, r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":"false"}"#] {
+        for response in [
+            r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":true}"#,
+            r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":"false"}"#,
+        ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = client(&format!("http://{}", listener.local_addr().unwrap()), true).await;
             let server = tokio::spawn(async move {
@@ -327,10 +515,17 @@ mod tests {
                 request_bytes(&mut stream).await;
                 answer(&mut stream, 401, response).await;
                 drop(stream);
-                assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err()
+                );
             });
             assert!(get(&client, token_request()).await.is_err());
-            assert_eq!(client.access_token().as_deref(), Some("synthetic-old-token"));
+            assert_eq!(
+                client.access_token().as_deref(),
+                Some("synthetic-old-token")
+            );
             server.await.unwrap();
         }
     }
@@ -342,7 +537,11 @@ mod tests {
         let mut request = token_request();
         request.own_device_id = "OTHER-ACCOUNT-DEVICE".into();
         assert!(get(&client, request).await.is_err());
-        assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -355,11 +554,23 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             request_bytes(&mut stream).await;
-            answer(&mut stream, 401, r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":false}"#).await;
+            answer(
+                &mut stream,
+                401,
+                r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":false}"#,
+            )
+            .await;
             drop(stream);
-            assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
         });
-        let (first, second) = tokio::join!(backend.livekit_token(token_request()), other.livekit_token(token_request()));
+        let (first, second) = tokio::join!(
+            backend.livekit_token(token_request()),
+            other.livekit_token(token_request())
+        );
         let first = first.unwrap_err();
         assert_eq!(first.errcode.as_deref(), Some("RTC_AUTH_SIGN_IN_REQUIRED"));
         let second = second.unwrap_err();
@@ -380,7 +591,11 @@ mod tests {
             released.await.unwrap();
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 28\r\nConnection: close\r\n\r\n{\"jwt\":\"synthetic-late-jwt\"}").await;
             drop(stream);
-            assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
         });
         let task = tokio::spawn(async move { get(&client, token_request()).await });
         waiting.await.unwrap();
@@ -395,7 +610,9 @@ mod tests {
         crypto();
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let foreign = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = authority(Url::parse(&format!("http://{}", origin.local_addr().unwrap())).unwrap()).unwrap();
+        let endpoint =
+            authority(Url::parse(&format!("http://{}", origin.local_addr().unwrap())).unwrap())
+                .unwrap();
         let redirect = format!("http://{}/stolen", foreign.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let (mut stream, _) = origin.accept().await.unwrap();
@@ -405,11 +622,27 @@ mod tests {
             assert!(request.contains("authorization: bearer synthetic-account-token"));
             stream.write_all(format!("HTTP/1.1 307 Redirect\r\nLocation: {redirect}\r\nContent-Length: 16\r\nConnection: close\r\n\r\ncredential-echo!").as_bytes()).await.unwrap();
         });
-        let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).no_proxy().build().unwrap();
-        let error = post_once(&http, endpoint, "synthetic-account-token", &json!({"url":"wss://foreign.example.org", "server_name":"foreign.example.org"})).await.err().unwrap();
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap();
+        let error = post_once(
+            &http,
+            endpoint,
+            "synthetic-account-token",
+            &json!({"url":"wss://foreign.example.org", "server_name":"foreign.example.org"}),
+        )
+        .await
+        .err()
+        .unwrap();
         assert!(!error.to_string().contains("credential"));
         assert!(!error.to_string().contains("synthetic-account-token"));
-        assert!(tokio::time::timeout(Duration::from_millis(50), foreign.accept()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), foreign.accept())
+                .await
+                .is_err()
+        );
         server.await.unwrap();
     }
 

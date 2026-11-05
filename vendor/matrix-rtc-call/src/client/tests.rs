@@ -686,14 +686,13 @@ async fn a_typed_locator_crosses_the_actor_without_bypassing_admission_or_leave(
     let mock = mock();
     let client = RtcClient::new(mock.clone());
     let room = open(&client, &mock, ROOM).await;
-    let transport = matrix_rtc_core::RtcTransport::LiveKitCsApi(
-        matrix_rtc_core::LiveKitCsApiTransport {
+    let transport =
+        matrix_rtc_core::RtcTransport::LiveKitCsApi(matrix_rtc_core::LiveKitCsApiTransport {
             url: "wss://media.example.org/rtc".to_owned(),
             server_name: None,
-        },
-    );
-    let options = CallJoinOptions::new()
-        .transport(JoinTransport::PublishTransport(transport.clone()));
+        });
+    let options =
+        CallJoinOptions::new().transport(JoinTransport::PublishTransport(transport.clone()));
     let call = room.join_call(options.clone()).await.expect("typed join");
     assert!(matches!(
         call.transport(),

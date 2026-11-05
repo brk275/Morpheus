@@ -270,7 +270,11 @@ pub trait MediaTransport: MaybeSend {
     /// Publisher-aware grouping. A homeserver-mediated SFU locator belongs to
     /// the authenticated publishing user's Matrix server, which need not be
     /// this account's homeserver or the delegated HTTPS base URL.
-    fn connection_key_for_member(&self, _member: &JoinedMembership, transport: &RtcTransport) -> Option<String> {
+    fn connection_key_for_member(
+        &self,
+        _member: &JoinedMembership,
+        transport: &RtcTransport,
+    ) -> Option<String> {
         self.connection_key(transport)
     }
 

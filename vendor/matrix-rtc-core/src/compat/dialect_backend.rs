@@ -287,7 +287,10 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         self.inner.openid_token().await
     }
 
-    async fn livekit_token(&self, request: crate::LiveKitTokenRequest) -> Result<String, BackendError> {
+    async fn livekit_token(
+        &self,
+        request: crate::LiveKitTokenRequest,
+    ) -> Result<String, BackendError> {
         self.inner.livekit_token(request).await
     }
 

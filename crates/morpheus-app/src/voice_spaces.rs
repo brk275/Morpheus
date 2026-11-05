@@ -32,7 +32,9 @@ pub(crate) struct RoomCallProfile {
 }
 #[cfg(feature = "native-calls")]
 impl RoomCallProfile {
-    pub(crate) fn mode(self) -> RoomCallMode { self.mode }
+    pub(crate) fn mode(self) -> RoomCallMode {
+        self.mode
+    }
 }
 
 pub struct VoiceSpaces {
@@ -204,9 +206,15 @@ impl VoiceSpaces {
     }
 
     #[cfg(feature = "native-calls")]
-    pub(crate) fn room_call_profile(&self, account_id: &str, room_id: &str) -> Option<RoomCallProfile> {
+    pub(crate) fn room_call_profile(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Option<RoomCallProfile> {
         let config = self.config.read().expect("voice config lock poisoned");
-        let epoch = self.ring_policy_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let epoch = self
+            .ring_policy_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
         (epoch != u64::MAX).then(|| RoomCallProfile {
             epoch,
             mode: config.room_call_mode(account_id, room_id),
@@ -544,10 +552,18 @@ fn incoming_policy_changed(before: &Config, after: &Config) -> bool {
                     != new
                         .map(|value| value.local_voice_rooms.as_slice())
                         .unwrap_or_default()
-                || old.map(|value| value.legacy_element_call_rooms.as_slice()).unwrap_or_default()
-                    != new.map(|value| value.legacy_element_call_rooms.as_slice()).unwrap_or_default()
-                || old.map(|value| value.element_call_matrix_2_0_rooms.as_slice()).unwrap_or_default()
-                    != new.map(|value| value.element_call_matrix_2_0_rooms.as_slice()).unwrap_or_default()
+                || old
+                    .map(|value| value.legacy_element_call_rooms.as_slice())
+                    .unwrap_or_default()
+                    != new
+                        .map(|value| value.legacy_element_call_rooms.as_slice())
+                        .unwrap_or_default()
+                || old
+                    .map(|value| value.element_call_matrix_2_0_rooms.as_slice())
+                    .unwrap_or_default()
+                    != new
+                        .map(|value| value.element_call_matrix_2_0_rooms.as_slice())
+                        .unwrap_or_default()
         })
 }
 
@@ -561,17 +577,32 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let spaces = VoiceSpaces::new(ConfigStore::at(directory.path().join("config.toml")));
         let mut changes = spaces.subscribe_incoming_policy();
-        let original = spaces.room_call_profile("account-a", "!call:example.org").unwrap();
+        let original = spaces
+            .room_call_profile("account-a", "!call:example.org")
+            .unwrap();
         let mut config = Config::default();
-        config.set_room_call_mode("account-a", "!call:example.org", RoomCallMode::ElementCallMatrix2).unwrap();
+        config
+            .set_room_call_mode(
+                "account-a",
+                "!call:example.org",
+                RoomCallMode::ElementCallMatrix2,
+            )
+            .unwrap();
         spaces.apply_config(&config);
         assert!(changes.has_changed().unwrap());
         changes.borrow_and_update();
-        assert_ne!(spaces.room_call_profile("account-a", "!call:example.org"), Some(original));
-        config.set_room_call_mode("account-a", "!call:example.org", RoomCallMode::Standard).unwrap();
+        assert_ne!(
+            spaces.room_call_profile("account-a", "!call:example.org"),
+            Some(original)
+        );
+        config
+            .set_room_call_mode("account-a", "!call:example.org", RoomCallMode::Standard)
+            .unwrap();
         spaces.apply_config(&config);
         assert!(changes.has_changed().unwrap());
-        let restored = spaces.room_call_profile("account-a", "!call:example.org").unwrap();
+        let restored = spaces
+            .room_call_profile("account-a", "!call:example.org")
+            .unwrap();
         assert_eq!(restored.mode(), original.mode());
         assert_ne!(restored, original);
     }
@@ -593,14 +624,24 @@ mod tests {
             .set_room_call_mode(account, room, RoomCallMode::ElementCallMatrix2)
             .unwrap();
         spaces.apply_config(&config);
-        assert!(!admit(), "the pending state write must retain its original profile");
+        assert!(
+            !admit(),
+            "the pending state write must retain its original profile"
+        );
         config
             .set_room_call_mode(account, room, RoomCallMode::Standard)
             .unwrap();
         spaces.apply_config(&config);
-        assert!(!admit(), "restoring the mode must not authorize the old request");
+        assert!(
+            !admit(),
+            "restoring the mode must not authorize the old request"
+        );
         let fresh = spaces.room_call_profile(account, room).unwrap();
-        assert!(spaces.room_call_admission(account.into(), room.into(), fresh)());
+        assert!(spaces.room_call_admission(
+            account.into(),
+            room.into(),
+            fresh
+        )());
     }
 
     #[test]

@@ -2357,7 +2357,10 @@ fn run_application(
             let Some(selection) = call_live.manager.account_selection(&account_id) else {
                 return;
             };
-            let Some(profile) = call_live.voice_spaces.room_call_profile(&account_id, &room_id) else {
+            let Some(profile) = call_live
+                .voice_spaces
+                .room_call_profile(&account_id, &room_id)
+            else {
                 return;
             };
             let mode = CallJoinMode::from(profile.mode());
@@ -2722,7 +2725,10 @@ fn run_application(
             };
             // Read the account-scoped checked preferences, not a potentially
             // queued UI snapshot. The worker owns this immutable choice.
-            let Some(profile) = call_live.voice_spaces.room_call_profile(&account_id, &room_id) else {
+            let Some(profile) = call_live
+                .voice_spaces
+                .room_call_profile(&account_id, &room_id)
+            else {
                 return;
             };
             let mode = CallJoinMode::from(profile.mode());

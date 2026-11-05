@@ -306,10 +306,13 @@ impl IncomingOffer {
             require_client(&client, &account.user_id, &account.device_id)?;
             let room = client.get_room(room_id).ok_or(AdmissionFailure::Account)?;
             require_scope(manager, preferences, &selection, &room)?;
-            let profile = preferences.room_call_profile(&account.id, room_id.as_str())
+            let profile = preferences
+                .room_call_profile(&account.id, room_id.as_str())
                 .ok_or(AdmissionFailure::Policy)?;
             let mode = CallJoinMode::from(profile.mode()).options().interop_mode;
-            if mode == InteropMode::RoomState { return Err(AdmissionFailure::Membership); }
+            if mode == InteropMode::RoomState {
+                return Err(AdmissionFailure::Membership);
+            }
             // Subscription precedes the first snapshot. Even if a later full
             // snapshot looks useful, lag/generation changes revoke this attempt.
             let mut updates = room.sticky_events().subscribe_keyless();
@@ -401,10 +404,15 @@ impl IncomingOffer {
     pub(crate) fn mode(&self) -> InteropMode {
         self.membership.mode
     }
-    pub(crate) fn slot_id(&self) -> &str { &self.membership.slot_id }
+    pub(crate) fn slot_id(&self) -> &str {
+        &self.membership.slot_id
+    }
     fn require_profile(&self, preferences: &VoiceSpaces) -> Result<(), AdmissionFailure> {
         if preferences.room_call_profile(self.selection.account_id(), self.room.room_id().as_str())
-            != Some(self.profile) { return Err(AdmissionFailure::Policy); }
+            != Some(self.profile)
+        {
+            return Err(AdmissionFailure::Policy);
+        }
         Ok(())
     }
     pub(crate) fn deadline(&self) -> Instant {
@@ -635,7 +643,13 @@ impl IncomingOffer {
             policy::require_event_policy(&self.room, &received.encryption.sender, &received.raw)
                 .await
                 .map_err(|_| AdmissionFailure::Policy)?;
-        let referenced = fetch_membership(&self.room, &received.ring, &received.encryption, self.membership.mode).await?;
+        let referenced = fetch_membership(
+            &self.room,
+            &received.ring,
+            &received.encryption,
+            self.membership.mode,
+        )
+        .await?;
         if !same_join(&referenced, &self.membership) {
             return Err(AdmissionFailure::Membership);
         }
@@ -864,7 +878,14 @@ fn membership<T>(
         .as_str();
     let envelope: Value =
         serde_json::from_str(raw.json().get()).map_err(|_| AdmissionFailure::Membership)?;
-    membership_envelope(&envelope, room, event, encryption.sender.as_str(), device, mode)
+    membership_envelope(
+        &envelope,
+        room,
+        event,
+        encryption.sender.as_str(),
+        device,
+        mode,
+    )
 }
 
 fn membership_fields<'a>(
@@ -899,7 +920,9 @@ fn membership_fields<'a>(
                 && !id.chars().any(|c| c.is_control() || c.is_whitespace())
         })
         .ok_or(AdmissionFailure::Membership)?;
-    let slot = content.get("slot_id").and_then(Value::as_str)
+    let slot = content
+        .get("slot_id")
+        .and_then(Value::as_str)
         .filter(|slot| matches!(*slot, "m.call#room" | "m.call#ROOM"))
         .ok_or(AdmissionFailure::Membership)?;
     Ok((content, logical_id, slot))
@@ -958,7 +981,9 @@ fn membership_envelope(
     mode: InteropMode,
 ) -> Result<Membership, AdmissionFailure> {
     let (content, logical_id, slot) = membership_fields(envelope, room, event, user)?;
-    if slot != wire_slot(mode) { return Err(AdmissionFailure::Membership); }
+    if slot != wire_slot(mode) {
+        return Err(AdmissionFailure::Membership);
+    }
     if !matches_membership(
         MembershipEvidence {
             sender: user,
@@ -988,8 +1013,12 @@ fn membership_envelope(
 }
 
 fn same_join(a: &Membership, b: &Membership) -> bool {
-    a.user == b.user && a.device == b.device && a.logical_id == b.logical_id && a.mode == b.mode
-        && a.slot_id == b.slot_id && a.wire_slot_id == b.wire_slot_id
+    a.user == b.user
+        && a.device == b.device
+        && a.logical_id == b.logical_id
+        && a.mode == b.mode
+        && a.slot_id == b.slot_id
+        && a.wire_slot_id == b.wire_slot_id
 }
 
 fn wire_slot(mode: InteropMode) -> &'static str {
@@ -1164,7 +1193,10 @@ mod tests {
         assert!(parse(&value).is_err());
         value["content"]["slot_id"] = json!("m.call#ROOM");
         assert!(parse(&value).is_err());
-        assert_eq!(parse_mode(&value, InteropMode::Sticky2025).unwrap().mode, InteropMode::Sticky2025);
+        assert_eq!(
+            parse_mode(&value, InteropMode::Sticky2025).unwrap().mode,
+            InteropMode::Sticky2025
+        );
         value["content"]["slot_id"] = json!("m.call#Room");
         assert!(parse(&value).is_err());
     }

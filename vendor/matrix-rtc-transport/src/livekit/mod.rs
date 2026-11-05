@@ -21,11 +21,16 @@ pub mod token;
 /// Matrix server identity from an authenticated Matrix sender. It is not a
 /// URL and must never be used as an account-token HTTP destination.
 pub fn publisher_server_name(user: &str) -> Option<&str> {
-    if !user.starts_with('@') { return None; }
+    if !user.starts_with('@') {
+        return None;
+    }
     let (_, server) = user.split_once(':')?;
-    (!server.is_empty() && server.len() <= 1024
-        && !server.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '#' | '@')))
-        .then_some(server)
+    (!server.is_empty()
+        && server.len() <= 1024
+        && !server.chars().any(|c| {
+            c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '#' | '@')
+        }))
+    .then_some(server)
 }
 
 pub use token::{MemberClaims, SfuToken, TokenServiceError};
@@ -140,14 +145,19 @@ impl LiveKitAuthDialect {
     /// Exact publisher contract for a checked advertised transport. Historical
     /// direct draft is a separately selected call scope, never inferred from
     /// membership format, slot spelling, failed auth, or a second identity.
-    pub fn for_transport(transport: &matrix_rtc_core::RtcTransport, historical_direct: bool) -> Option<Self> {
+    pub fn for_transport(
+        transport: &matrix_rtc_core::RtcTransport,
+        historical_direct: bool,
+    ) -> Option<Self> {
         match transport {
             matrix_rtc_core::RtcTransport::LiveKit(_) => Some(if historical_direct {
                 Self::DirectDraft
             } else {
                 Self::LegacyService
             }),
-            matrix_rtc_core::RtcTransport::LiveKitCsApi(_) if !historical_direct => Some(Self::CsApi),
+            matrix_rtc_core::RtcTransport::LiveKitCsApi(_) if !historical_direct => {
+                Some(Self::CsApi)
+            }
             _ => None,
         }
     }

@@ -118,8 +118,17 @@ impl RawRtcTransport {
                 // as an OpenID credential destination.
                 if locator.is_some_and(|v| v.as_str().is_none_or(str::is_empty))
                     || service.is_some_and(|v| v.as_str().is_none_or(str::is_empty))
-                    || server.is_some_and(|v| v.as_str().is_none_or(|s| s.is_empty() || s.len() > 1024
-                        || s.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '#' | '@'))))
+                    || server.is_some_and(|v| {
+                        v.as_str().is_none_or(|s| {
+                            s.is_empty()
+                                || s.len() > 1024
+                                || s.chars().any(|c| {
+                                    c.is_control()
+                                        || c.is_whitespace()
+                                        || matches!(c, '/' | '\\' | '?' | '#' | '@')
+                                })
+                        })
+                    })
                 {
                     return RtcTransport::Unsupported(UnsupportedTransport {
                         transport_type: self.transport_type,
@@ -185,9 +194,15 @@ mod tests {
     fn standard_locator_and_service_keep_distinct_contracts() {
         let raw: RawRtcTransport = serde_json::from_value(json!({
             "type": "livekit", "url": "wss://sfu.example.org"
-        })).unwrap();
-        assert_eq!(raw.into_typed(), RtcTransport::LiveKitCsApi(LiveKitCsApiTransport {
-            url: "wss://sfu.example.org".into(), server_name: None }));
+        }))
+        .unwrap();
+        assert_eq!(
+            raw.into_typed(),
+            RtcTransport::LiveKitCsApi(LiveKitCsApiTransport {
+                url: "wss://sfu.example.org".into(),
+                server_name: None
+            })
+        );
         let raw: RawRtcTransport = serde_json::from_value(json!({
             "type": "livekit", "url": "wss://sfu.example.org", "livekit_service_url": "https://auth.example.org"
         })).unwrap();
@@ -196,9 +211,19 @@ mod tests {
             "type": "livekit", "url": "wss://sfu.example.org", "server_name": "operator.example.org:8448"
         })).unwrap();
         let typed = raw.into_typed();
-        assert_eq!(crate::own_membership::transport_to_json(&typed)["server_name"], "operator.example.org:8448");
-        for server in [json!(null), json!(false), json!("https://operator.example.org")] {
-            let raw: RawRtcTransport = serde_json::from_value(json!({"type":"livekit", "url":"wss://sfu.example.org", "server_name":server})).unwrap();
+        assert_eq!(
+            crate::own_membership::transport_to_json(&typed)["server_name"],
+            "operator.example.org:8448"
+        );
+        for server in [
+            json!(null),
+            json!(false),
+            json!("https://operator.example.org"),
+        ] {
+            let raw: RawRtcTransport = serde_json::from_value(
+                json!({"type":"livekit", "url":"wss://sfu.example.org", "server_name":server}),
+            )
+            .unwrap();
             assert!(matches!(raw.into_typed(), RtcTransport::Unsupported(_)));
         }
     }

@@ -51,7 +51,9 @@ fn publish(transport: RtcTransport) -> Result<TransportIntent, CommandError> {
     if transport.is_livekit() {
         Ok(TransportIntent::Publish(transport))
     } else {
-        Err(CommandError::from_message("the selected transport is not livekit"))
+        Err(CommandError::from_message(
+            "the selected transport is not livekit",
+        ))
     }
 }
 

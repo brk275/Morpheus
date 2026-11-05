@@ -44,8 +44,9 @@ pub use encryption::{
 pub use error::{CommandError, JoinError, LeaveError};
 pub use host::application::ApplicationIntake;
 pub use host::backend::{
-    BackendError, EventEncryption, EventIn, LiveKitTokenRequest, MatrixBackend, OpenIdToken, RoomSink, RoomSubjects,
-    Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient, ToDeviceSink,
+    BackendError, EventEncryption, EventIn, LiveKitTokenRequest, MatrixBackend, OpenIdToken,
+    RoomSink, RoomSubjects, Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient,
+    ToDeviceSink,
 };
 pub use host::event::{
     EventConversionError, EventOrigin, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
@@ -70,7 +71,8 @@ pub use slot::{
     SLOT_EVENT_TYPE, SlotEncryption, SlotState, SlotStatus,
 };
 pub use transport::{
-    LiveKitCsApiTransport, LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport,
+    LiveKitCsApiTransport, LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport,
+    UnsupportedTransport,
 };
 pub use wire::wire_event_type;
 
@@ -1035,7 +1037,9 @@ mod tests {
                             "https://example.com/livekit/jwt"
                         );
                     }
-                    RtcTransport::LiveKitCsApi(_) | RtcTransport::Unsupported(_) => panic!("Expected LiveKit transport"),
+                    RtcTransport::LiveKitCsApi(_) | RtcTransport::Unsupported(_) => {
+                        panic!("Expected LiveKit transport")
+                    }
                 }
             }
             RtcMembershipEvent::Left(_) => panic!("Expected Joined membership"),

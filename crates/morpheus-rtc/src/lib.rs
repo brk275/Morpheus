@@ -127,8 +127,13 @@ pub const fn local_device_support() -> LocalDeviceSupport {
 /// The advertised transport that the native call stack can use.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LiveKitDescriptor {
-    LegacyService { service_url: String },
-    CsApi { url: String, server_name: Option<String> },
+    LegacyService {
+        service_url: String,
+    },
+    CsApi {
+        url: String,
+        server_name: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,7 +149,9 @@ impl TransportSupport {
 
     pub fn livekit_service_url(&self) -> Option<&str> {
         match self {
-            Self::LiveKit { transport: LiveKitDescriptor::LegacyService { service_url } } => Some(service_url),
+            Self::LiveKit {
+                transport: LiveKitDescriptor::LegacyService { service_url },
+            } => Some(service_url),
             _ => None,
         }
     }
@@ -170,8 +177,16 @@ pub fn classify_transports(transports: &Value) -> TransportSupport {
                 None => None,
                 Some(value) => {
                     let server = value.as_str()?;
-                    if server.is_empty() || server.len() > 1024
-                        || server.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '#' | '@')) { return None; }
+                    if server.is_empty()
+                        || server.len() > 1024
+                        || server.chars().any(|c| {
+                            c.is_control()
+                                || c.is_whitespace()
+                                || matches!(c, '/' | '\\' | '?' | '#' | '@')
+                        })
+                    {
+                        return None;
+                    }
                     Some(server.to_owned())
                 }
             };
@@ -185,7 +200,8 @@ pub fn classify_transports(transports: &Value) -> TransportSupport {
             };
             // Both standard fields select the legacy publisher flow, matching
             // current stock Element Call; no endpoint probing or fallback.
-            service.map(|service_url| LiveKitDescriptor::LegacyService { service_url })
+            service
+                .map(|service_url| LiveKitDescriptor::LegacyService { service_url })
                 .or_else(|| locator.map(|url| LiveKitDescriptor::CsApi { url, server_name }))
         })
         .map(|transport| TransportSupport::LiveKit { transport })
@@ -224,7 +240,11 @@ fn valid_transport_url(raw: &str, media: bool) -> Option<String> {
         Some(url::Host::Ipv6(address)) => address.is_loopback(),
         _ => false,
     };
-    let (secure, local) = if media { ("wss", "ws") } else { ("https", "http") };
+    let (secure, local) = if media {
+        ("wss", "ws")
+    } else {
+        ("https", "http")
+    };
     if url.scheme() != secure && !(url.scheme() == local && loopback) {
         return None;
     }
@@ -297,9 +317,9 @@ impl From<matrix_rtc_call_sdk::LiveKitCallError> for RtcError {
         match error {
             LiveKitCallError::Attach(AttachError::IdentityRejected) => Self::IdentityRejected,
             LiveKitCallError::Attach(AttachError::Transport(TransportError::SignInRequired))
-                | LiveKitCallError::Media(TransportError::SignInRequired) => Self::SignInRequired,
+            | LiveKitCallError::Media(TransportError::SignInRequired) => Self::SignInRequired,
             LiveKitCallError::Attach(AttachError::Transport(TransportError::AuthExpired))
-                | LiveKitCallError::Media(TransportError::AuthExpired) => Self::AuthExpired,
+            | LiveKitCallError::Media(TransportError::AuthExpired) => Self::AuthExpired,
             other => Self::Call(other),
         }
     }
@@ -331,24 +351,44 @@ mod tests {
         assert_eq!(
             classify_transports(&transports),
             TransportSupport::LiveKit {
-                transport: LiveKitDescriptor::LegacyService { service_url: "https://first.example/rtc".into() },
+                transport: LiveKitDescriptor::LegacyService {
+                    service_url: "https://first.example/rtc".into()
+                },
             }
         );
     }
 
     #[test]
     fn modern_locator_and_mixed_descriptor_are_typed_without_openid_reinterpretation() {
-        assert_eq!(classify_transports(&json!([{"type":"livekit", "url":"wss://sfu.example.org"}])),
-            TransportSupport::LiveKit { transport: LiveKitDescriptor::CsApi { url: "wss://sfu.example.org".into(), server_name: None } });
-        assert_eq!(classify_transports(&json!([{"type":"livekit", "url":"wss://sfu.example.org", "livekit_service_url":"https://auth.example.org"}])),
-            TransportSupport::LiveKit { transport: LiveKitDescriptor::LegacyService { service_url: "https://auth.example.org".into() } });
+        assert_eq!(
+            classify_transports(&json!([{"type":"livekit", "url":"wss://sfu.example.org"}])),
+            TransportSupport::LiveKit {
+                transport: LiveKitDescriptor::CsApi {
+                    url: "wss://sfu.example.org".into(),
+                    server_name: None
+                }
+            }
+        );
+        assert_eq!(
+            classify_transports(
+                &json!([{"type":"livekit", "url":"wss://sfu.example.org", "livekit_service_url":"https://auth.example.org"}])
+            ),
+            TransportSupport::LiveKit {
+                transport: LiveKitDescriptor::LegacyService {
+                    service_url: "https://auth.example.org".into()
+                }
+            }
+        );
         for value in [
             json!({"type":"livekit", "url":null, "livekit_service_url":"https://auth.example.org"}),
             json!({"type":"livekit", "url":"ws://remote.example.org"}),
             json!({"type":"livekit", "url":"wss://user:secret@sfu.example.org"}),
             json!({"type":"livekit", "url":"wss://sfu.example.org?token=secret"}),
         ] {
-            assert_eq!(classify_transports(&json!([value])), TransportSupport::NoLiveKitTransport);
+            assert_eq!(
+                classify_transports(&json!([value])),
+                TransportSupport::NoLiveKitTransport
+            );
         }
     }
 
