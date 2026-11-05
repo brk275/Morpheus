@@ -834,7 +834,7 @@ class NativeLifecycleTests(unittest.TestCase):
                                  b"[extend]\nuseDefault = true\n")
                 self.assertEqual(Path(argv[argv.index("--gitleaks-ignore-path") + 1]).read_bytes(), b"")
                 self.assertIn("--ignore-gitleaks-allow", argv)
-                M.client.write_new(Path(argv[argv.index("--report-path") + 1]), b"[]\n")
+                Path(argv[argv.index("--report-path") + 1]).write_bytes(b"[]\n")
                 count = sum(map(len, values))
                 result = 0, b"", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
                                    "3:04PM INF no leaks found\n").encode()
@@ -882,7 +882,7 @@ class NativeLifecycleTests(unittest.TestCase):
                 scanned.extend(values)
                 self.assertEqual(sorted(values), [b"", b"acquisition output", b"assembly output"])
                 self.assertNotIn(b"source fixture is not a private command log", values)
-                M.client.write_new(Path(argv[argv.index("--report-path") + 1]), b"[]\n")
+                Path(argv[argv.index("--report-path") + 1]).write_bytes(b"[]\n")
                 count = sum(map(len, values))
                 result = 0, b"", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
                                    "3:04PM INF no leaks found\n").encode()
@@ -931,7 +931,7 @@ class NativeLifecycleTests(unittest.TestCase):
                     self.assertEqual(argv[argv.index("--max-target-megabytes") + 1], "0")
                     self.assertEqual(argv[argv.index("--log-level") + 1], "info")
                     scans.append(config.parent)
-                    M.client.write_new(Path(argv[argv.index("--report-path") + 1]), b"[]\n")
+                    Path(argv[argv.index("--report-path") + 1]).write_bytes(b"[]\n")
                     count = len(b"synthetic private diagnostic")
                     return status, b"", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
                                          "3:04PM INF no leaks found\n").encode()

@@ -54,8 +54,9 @@ def write_private(path: Path, content: str, *, create: bool = False) -> None:
 
 
 class PrivateLogScanError(ValueError):
-    def __init__(self, *, process_stopped=True):
+    def __init__(self, *, process_stopped=True, interruption=None):
         self.process_stopped = process_stopped is True
+        self.interruption = interruption if isinstance(interruption, (KeyboardInterrupt, SystemExit)) else None
         super().__init__("Private log scan failed")
 
 
@@ -109,9 +110,9 @@ def _run_log_scanner(arguments, *, cwd, deadline):
                 process.stdout.close()
                 process.stderr.close()
     if failure is not None or not stopped or time.monotonic() >= deadline:
-        if isinstance(failure, (KeyboardInterrupt, SystemExit)):
-            raise failure
-        raise PrivateLogScanError(process_stopped=stopped) from None
+        # Carry interruption identity with the owned child's final stop receipt.
+        # The snapshot owner must clean its exact files before re-raising it.
+        raise PrivateLogScanError(process_stopped=stopped, interruption=failure) from None
     return result, bytes(output), bytes(errors)
 
 
@@ -128,7 +129,7 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
         end = min(end, deadline)
     root, scanner = Path(root).absolute(), Path(scanner).absolute()
     snapshot = None
-    root_fd = data_fd = source_fd = None
+    root_fd = data_fd = source_fd = report_fd = None
     created = {}
     can_cleanup = True
     primary = None
@@ -256,6 +257,15 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
             result[name] = file_info(os.stat(name, dir_fd=data_fd, follow_symlinks=False))
         return result
 
+    def refresh_owned_report():
+        # os.Create in pinned Gitleaks truncates the precreated regular inode.
+        # A retained descriptor anchors that inode even across interruption.
+        details = identity(os.fstat(report_fd))
+        if (details[:6] != report_anchor[:6] or not 0 <= details[6] <= 4096
+                or identity(os.stat("report.json", dir_fd=root_fd, follow_symlinks=False)) != details):
+            raise PrivateLogScanError()
+        created["report.json"] = details
+
     def cleanup():
         # First validate the WHOLE exact temporary inventory before any unlink.
         if snapshot is None:
@@ -347,6 +357,10 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
             if copy_or_hash(snapshot / "data" / name, details) != hashes[name]:
                 raise PrivateLogScanError()
         check_time()
+        report_fd = os.open("report.json", os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK,
+                            0o600, dir_fd=root_fd)
+        report_anchor = identity(os.fstat(report_fd))
+        created["report.json"] = report_anchor
         try:
             result, output, errors = _run_log_scanner(
                 [str(scanner), "dir", str(snapshot / "data"), "--config", str(snapshot / "gitleaks.toml"),
@@ -362,35 +376,32 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
             can_cleanup = False
             raise
         report = snapshot / "report.json"
-        report_fd = os.open("report.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root_fd)
-        try:
-            info = os.fstat(report_fd)
-            # Pinned Gitleaks creates its report inside the private directory.
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o022:
-                raise PrivateLogScanError()
-            created["report.json"] = identity(info)
-            # Pinned Gitleaks counts raw fragments once, before decoding/rules.
-            # Its directory source can otherwise silently skip a failed file open.
-            # Accept only the two fixed no-color INFO footer lines and the exact
-            # captured byte total; a clean report alone is not coverage evidence.
-            messages = errors.decode("utf-8").splitlines()
-            stamp = r"(?:[1-9]|1[0-2]):[0-5][0-9](?:AM|PM) INF "
-            summary = re.fullmatch(
-                stamp + r"scanned ~([0-9]{1,20}) bytes "
-                r"\((?:0|[0-9]+(?:\.[0-9]{2})? (?:bytes|KB|MB|GB))\) in "
-                r"(?:[0-9]+(?:\.[0-9]+)?(?:ns|µs|ms|s|m|h)){1,4}",
-                messages[0] if len(messages) == 2 else "")
-            if (summary is None or summary[1] != str(sum(details[6] for details in copies.values()))
-                    or re.fullmatch(stamp + "no leaks found", messages[1]) is None):
-                raise PrivateLogScanError()
-            if result != 0 or output or not 0 < info.st_size <= 4096:
-                raise PrivateLogScanError()
-            raw = os.read(report_fd, 4097)
-            if (len(raw) != info.st_size or identity(os.fstat(report_fd)) != created["report.json"]
-                    or identity(os.stat("report.json", dir_fd=root_fd, follow_symlinks=False)) != created["report.json"] or json.loads(raw) != []):
-                raise PrivateLogScanError()
-        finally:
-            os.close(report_fd)
+        refresh_owned_report()
+        info = os.fstat(report_fd)
+        # Pinned Gitleaks creates its report inside the private directory.
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o022:
+            raise PrivateLogScanError()
+        created["report.json"] = identity(info)
+        # Pinned Gitleaks counts raw fragments once, before decoding/rules.
+        # Its directory source can otherwise silently skip a failed file open.
+        # Accept only the two fixed no-color INFO footer lines and the exact
+        # captured byte total; a clean report alone is not coverage evidence.
+        messages = errors.decode("utf-8").splitlines()
+        stamp = r"(?:[1-9]|1[0-2]):[0-5][0-9](?:AM|PM) INF "
+        summary = re.fullmatch(
+            stamp + r"scanned ~([0-9]{1,20}) bytes "
+            r"\((?:0|[0-9]+(?:\.[0-9]{2})? (?:bytes|KB|MB|GB))\) in "
+            r"(?:[0-9]+(?:\.[0-9]+)?(?:ns|µs|ms|s|m|h)){1,4}",
+            messages[0] if len(messages) == 2 else "")
+        if (summary is None or summary[1] != str(sum(details[6] for details in copies.values()))
+                or re.fullmatch(stamp + "no leaks found", messages[1]) is None):
+            raise PrivateLogScanError()
+        if result != 0 or output or not 0 < info.st_size <= 4096:
+            raise PrivateLogScanError()
+        raw = os.read(report_fd, 4097)
+        if (len(raw) != info.st_size or identity(os.fstat(report_fd)) != created["report.json"]
+                or identity(os.stat("report.json", dir_fd=root_fd, follow_symlinks=False)) != created["report.json"] or json.loads(raw) != []):
+            raise PrivateLogScanError()
         if snapshot_inventory() != copies:
             raise PrivateLogScanError()
         if inventory() != (original, invalid_original):
@@ -411,7 +422,14 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
     except BaseException as error:
         primary = error
     finally:
+        if report_fd is not None and can_cleanup:
+            try:
+                refresh_owned_report()
+            except BaseException:
+                can_cleanup = False
         cleaned = cleanup()
+        if report_fd is not None:
+            os.close(report_fd)
         if root_fd is not None:
             os.close(root_fd)
         if data_fd is not None:
@@ -419,6 +437,8 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
         if source_fd is not None:
             os.close(source_fd)
     if primary is not None:
+        if type(primary) is PrivateLogScanError and primary.interruption is not None:
+            raise primary.interruption
         if isinstance(primary, (KeyboardInterrupt, SystemExit)):
             raise primary
         raise PrivateLogScanError() from None

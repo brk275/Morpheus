@@ -134,9 +134,10 @@ class ProcessTests(unittest.TestCase):
                     if action == "process_cleanup":
                         raise F.PrivateLogScanError(process_stopped=False)
                     if action == "report_fifo":
+                        report.unlink()
                         F.os.mkfifo(report, 0o600)
                     if action not in {"missing", "report_fifo"}:
-                        P.client.write_new(report, b"{bad" if action == "malformed" else
+                        report.write_bytes(b"{bad" if action == "malformed" else
                                            b'[{"RuleID":"synthetic"}]' if action == "finding" else b"[]\n")
                     if action == "source_changed": (root / "a.log").write_bytes(b"changed source")
                     if action == "source_added": P.client.write_new(root / "c.log", b"new unscanned original")
@@ -196,6 +197,88 @@ class ProcessTests(unittest.TestCase):
                 P.scan_private_logs(Path(temporary).resolve(), "/scanner", deadline=10)
             scanner.assert_not_called()
 
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux private scanner ownership")
+    def test_private_scanner_interrupt_carries_original_and_known_stop_receipt(self):
+        import fixture_paths as F
+        for interruption in (KeyboardInterrupt(), SystemExit(7)):
+            for stop_fails in (False, True):
+                with self.subTest(kind=type(interruption).__name__, stop_fails=stop_fails):
+                    process = mock.Mock(stdout=FakePipe(81), stderr=FakePipe(82))
+                    process.poll.return_value = None
+                    process.wait.return_value = 0
+                    if stop_fails:
+                        process.kill.side_effect = OSError("synthetic private stop refusal")
+                    with mock.patch("subprocess.Popen", return_value=process), \
+                            mock.patch("select.select", side_effect=interruption), \
+                            mock.patch("time.monotonic", return_value=10), \
+                            self.assertRaises(F.PrivateLogScanError) as caught:
+                        F._run_log_scanner(["/unused-scanner"], cwd=Path("/tmp"), deadline=40)
+                    self.assertIs(caught.exception.interruption, interruption)
+                    self.assertIs(caught.exception.process_stopped, not stop_fails)
+                    process.kill.assert_called_once_with()
+                    if not stop_fails:
+                        self.assertGreaterEqual(process.wait.call_count, 1)
+                    self.assertTrue(process.stdout.closed and process.stderr.closed)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux private snapshot cleanup")
+    def test_interrupted_snapshot_cleanup_requires_stopped_scanner_and_exact_report_anchor(self):
+        import fixture_paths as F
+        allocate_real = tempfile.mkdtemp
+        for kind in (KeyboardInterrupt, SystemExit):
+            for mode in ("empty", "partial", "complete", "unknown_stop", "unknown_interrupt",
+                         "replaced", "symlink", "oversize"):
+                with self.subTest(kind=kind.__name__, mode=mode), tempfile.TemporaryDirectory() as temporary:
+                    fixture = Path(temporary).resolve()
+                    root = fixture / "source"
+                    root.mkdir(mode=0o700)
+                    log = root / "private.log"
+                    P.client.write_new(log, b"synthetic private log")
+                    foreign = fixture / "foreign"
+                    P.client.write_new(foreign, b"preserve unrelated bytes")
+                    snapshots = []
+                    interruption = kind()
+                    def allocate(*args, **options):
+                        path = Path(allocate_real(prefix=options["prefix"], dir=fixture))
+                        snapshots.append(path)
+                        return str(path)
+                    def scanner(arguments, *, cwd, deadline):
+                        report = Path(arguments[arguments.index("--report-path") + 1])
+                        before = report.lstat()
+                        self.assertEqual(before.st_size, 0)
+                        self.assertEqual(before.st_nlink, 1)
+                        if mode in {"partial", "complete"}:
+                            report.write_bytes(b"[" if mode == "partial" else b"[]\n")
+                        if mode in {"replaced", "symlink"}:
+                            report.unlink()
+                            if mode == "symlink":
+                                report.symlink_to(foreign)
+                            else:
+                                P.client.write_new(report, b"preserve unknown replacement")
+                        if mode == "oversize":
+                            report.write_bytes(b"x" * 4097)
+                        if mode == "unknown_interrupt":
+                            raise interruption
+                        raise F.PrivateLogScanError(process_stopped=mode != "unknown_stop",
+                                                    interruption=interruption)
+                    with mock.patch.object(F.tempfile, "mkdtemp", side_effect=allocate), \
+                            mock.patch.object(F, "_run_log_scanner", side_effect=scanner), \
+                            self.assertRaises(kind) as caught:
+                        F.scan_owned_logs(root, Path("/scanner"))
+                    self.assertIs(caught.exception, interruption)
+                    self.assertEqual(len(snapshots), 1)
+                    retained = mode not in {"empty", "partial", "complete"}
+                    self.assertEqual(snapshots[0].exists(), retained)
+                    self.assertEqual(log.read_bytes(), b"synthetic private log")
+                    self.assertEqual(foreign.read_bytes(), b"preserve unrelated bytes")
+                    if retained:
+                        self.assertEqual((snapshots[0] / "data/00000000.log").read_bytes(),
+                                         b"synthetic private log")
+                    if mode == "replaced":
+                        self.assertEqual((snapshots[0] / "report.json").read_bytes(),
+                                         b"preserve unknown replacement")
+                    if mode == "symlink":
+                        self.assertTrue((snapshots[0] / "report.json").is_symlink())
 
     def invoke(self, root, *, stdout=b"okay", stderr=b"private", limit=4096, binary=False,
                timeout=10, status=0, cleanup_error=None, interrupt=False, progress=None,
