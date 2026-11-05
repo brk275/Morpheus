@@ -556,6 +556,14 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
         NicknameAlignment::Left => 0,
         NicknameAlignment::Right => 1,
     });
+}
+
+/// Project accepted font names without replacing an unsubmitted four-field form.
+/// Preview rendering never calls this; explicit font saves/reset resynchronize it.
+pub(super) fn project_font_inputs(ui: &AppWindow, config: &Config) {
+    if ui.get_appearance_fonts_dirty() {
+        return;
+    }
     ui.set_appearance_ui_font_input(config.appearance.font_family.as_str().into());
     ui.set_appearance_message_font_input(
         config
@@ -735,7 +743,7 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
     let store_for_fonts = store.clone();
     ui.on_set_style_fonts(move |interface, messages, composer, monospace| {
         if let Some(ui) = weak.upgrade() {
-            let _ = save_config_change(&ui, &store_for_fonts, |config| {
+            if let Some(config) = save_config_change(&ui, &store_for_fonts, |config| {
                 config.appearance.font_family = interface.trim().to_owned();
                 config.typography.message_font_family =
                     (!messages.trim().is_empty()).then(|| messages.trim().to_owned());
@@ -743,7 +751,12 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
                 config.typography.composer_font_family =
                     (!composer.trim().is_empty()).then(|| composer.trim().to_owned());
                 config.typography.monospace_font_family = monospace.trim().to_owned();
-            });
+            }) {
+                // Saving can re-enter appearance projection before returning.
+                // Retire the draft only after success, using the saved/staged look.
+                ui.set_appearance_fonts_dirty(false);
+                project_font_inputs(&ui, &config);
+            }
         }
     });
 
@@ -753,12 +766,15 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
         if let Some(ui) = weak.upgrade() {
             // Only the font families; every other preference is kept.
             let defaults = Config::default();
-            let _ = save_config_change(&ui, &store_for_font_reset, |config| {
+            if let Some(config) = save_config_change(&ui, &store_for_font_reset, |config| {
                 config.appearance.font_family = defaults.appearance.font_family;
                 config.typography.message_font_family = defaults.typography.message_font_family;
                 config.typography.composer_font_family = defaults.typography.composer_font_family;
                 config.typography.monospace_font_family = defaults.typography.monospace_font_family;
-            });
+            }) {
+                ui.set_appearance_fonts_dirty(false);
+                project_font_inputs(&ui, &config);
+            }
         }
     });
 

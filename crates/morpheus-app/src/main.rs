@@ -1043,6 +1043,7 @@ fn apply_appearance(
     appearance::apply_config(ui, config);
     appearance::apply_theme(ui, config, theme);
     if project_editors {
+        appearance::project_font_inputs(ui, config);
         // After the theme, so the workspace reads the colors now shown.
         appearance_editor::project(ui, config, theme);
         metric_editor::project(ui, config);

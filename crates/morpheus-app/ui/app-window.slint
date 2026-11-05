@@ -2072,6 +2072,7 @@ component StyleNumberSetting inherits Rectangle {
 component StyleFontSetting inherits Rectangle {
     in property <string> label;
     in-out property <string> family;
+    callback edited();
     in property <color> ink;
     in property <color> surface;
     in property <color> accent;
@@ -2088,6 +2089,7 @@ component StyleFontSetting inherits Rectangle {
             input := ThemedTextInput {
                 x: StyleTokens.input-padding; width: max(0px, parent.width - 2 * StyleTokens.input-padding); height: parent.height;
                 text <=> root.family; single-line: true;
+                edited => { root.edited(); }
                 color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
                 accessible-label: root.label;
             }
@@ -3773,6 +3775,8 @@ export component AppWindow inherits Window {
     in-out property <string> appearance-message-font-input;
     in-out property <string> appearance-mono-font-input;
     in-out property <string> appearance-composer-font-input;
+    // One unsaved form; only real text edits mark it, never config projection.
+    in-out property <bool> appearance-fonts-dirty: false;
     callback choose-style-preset(int);
     // Interface, message, composer and monospaced families.
     callback set-style-fonts(string, string, string, string);
@@ -9408,6 +9412,7 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "Fonts"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         StyleFontSetting { label: "Interface font family"; family <=> root.appearance-ui-font-input;
+                            edited => { root.appearance-fonts-dirty = true; }
                             property <int> reveal-request: root.reveal-request("appearance.fonts");
                             // Keyboard focus and search share the same bounded reveal.
                             changed has-focus => {
@@ -9424,11 +9429,18 @@ export component AppWindow inherits Window {
                             }
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
                         StyleFontSetting { label: "Message font family · blank follows interface"; family <=> root.appearance-message-font-input;
+                            edited => { root.appearance-fonts-dirty = true; }
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
                         StyleFontSetting { label: "Composer font family · blank follows messages"; family <=> root.appearance-composer-font-input;
+                            edited => { root.appearance-fonts-dirty = true; }
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
                         StyleFontSetting { label: "Monospaced font family · timestamps and security codes"; family <=> root.appearance-mono-font-input;
+                            edited => { root.appearance-fonts-dirty = true; }
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
+                        if root.appearance-fonts-dirty: Text {
+                            text: "Unapplied font changes";
+                            color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
+                        }
                         HorizontalLayout {
                             spacing: 8px;
                             alignment: start;
