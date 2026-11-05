@@ -703,7 +703,7 @@ async fn a_typed_locator_crosses_the_actor_without_bypassing_admission_or_leave(
         let sticky = mock.sticky_events.lock().unwrap();
         let (room_id, event_type, content, _) = sticky.last().expect("membership");
         assert_eq!(room_id, ROOM);
-        assert_eq!(event_type, "m.rtc.member");
+        assert_eq!(event_type, "org.matrix.msc4143.rtc.member");
         assert_eq!(content["slot_id"], SLOT);
         assert_eq!(content["member"]["membership"], "join");
         assert_eq!(
