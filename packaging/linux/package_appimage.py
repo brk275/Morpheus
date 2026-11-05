@@ -637,9 +637,16 @@ def _temporary_seal_package(root, plan_path, plan, runner, progress, failed, sca
                               "streams": streams}, separators=(",", ":")).encode("ascii")
         if not 0 < len(payload) <= 65536:
             return scan_passed
-        auxiliary = client.private_directory(root / "sealed-package")
-        home = client.private_directory(auxiliary / "home")
-        temporary = client.private_directory(auxiliary / "tmp")
+        # These are new exclusive directories; private_directory validates only.
+        auxiliary = root / "sealed-package"
+        auxiliary.mkdir(mode=0o700)
+        client.private_directory(auxiliary)
+        home = auxiliary / "home"
+        home.mkdir(mode=0o700)
+        client.private_directory(home)
+        temporary = auxiliary / "tmp"
+        temporary.mkdir(mode=0o700)
+        client.private_directory(temporary)
         observed = diagnostics.Progress(auxiliary)
         encoder = OwnedRunner(auxiliary / "command-logs", progress=observed)
         environment = {"PATH": "/usr/bin:/bin", "HOME": str(home), "TMPDIR": str(temporary),

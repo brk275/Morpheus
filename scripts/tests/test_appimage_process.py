@@ -74,10 +74,23 @@ class ProcessTests(unittest.TestCase):
 
     @unittest.skipUnless(P.os.name == "posix", "Linux private package log capture")
     def test_temporary_inner_package_seal_owns_one_child_scans_all_output_and_refuses_failed_gates(self):
-        for action in ("valid", "scan_refusal", "aux_cleanup", "malformed", "child_exit"):
+        for action in ("valid", "scan_refusal", "aux_cleanup", "malformed", "child_exit",
+                       "preexisting_aux", "linked_aux"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
                 root = P.client.private_directory(Path(directory).resolve())
-                logs = P.client.private_directory(root / "command-logs")
+                logs = root / "command-logs"
+                logs.mkdir(mode=0o700)
+                P.client.private_directory(logs)
+                sentinel = None
+                auxiliary = root / "sealed-package"
+                if action in {"preexisting_aux", "linked_aux"}:
+                    foreign = auxiliary if action == "preexisting_aux" else root / "untracked-directory"
+                    foreign.mkdir(mode=0o700)
+                    sentinel = foreign / "existing-value"
+                    sentinel.write_bytes(b"preserve this existing directory")
+                    if action == "linked_aux":
+                        auxiliary.symlink_to(foreign, target_is_directory=True)
+                    foreign_mode = foreign.lstat().st_mode
                 stdout = b"synthetic-private-stdout" * 1000
                 stderr = b"synthetic-private-stderr" * 1000
                 for kind, body in (("stdout", stdout), ("stderr", stderr)):
@@ -101,7 +114,9 @@ class ProcessTests(unittest.TestCase):
                     return provider if str(value) == str(provider) else Path(value)
                 class Encoder:
                     def __init__(self, log_root, progress):
-                        self.log_root = P.client.private_directory(log_root)
+                        self.log_root = Path(log_root)
+                        self.log_root.mkdir(mode=0o700)  # Same exclusive allocation as OwnedRunner.
+                        P.client.private_directory(self.log_root)
                         self.progress = progress
                     def run(self, stage, argv, **options):
                         events.append("child")
@@ -150,10 +165,14 @@ class ProcessTests(unittest.TestCase):
                         mock.patch.object(P, "OwnedRunner", Encoder), \
                         mock.patch.object(P, "scan_private_logs", side_effect=scan):
                     scanned = P._temporary_seal_package(root, plan_path, plan, runner, progress, refusal, True, "/scanner")
-                self.assertEqual(events, ["child", "scan"])
+                self.assertEqual(events, [] if sentinel is not None else ["child", "scan"])
                 self.assertEqual(scanned, action not in {"scan_refusal", "aux_cleanup"})
                 self.assertEqual((root / "sealed-package.json").exists(), action == "valid")
                 self.assertEqual(progress.value["failure"], original_failure)
+                if sentinel is not None:
+                    self.assertEqual(sentinel.read_bytes(), b"preserve this existing directory")
+                    self.assertEqual(foreign.lstat().st_mode, foreign_mode)
+                    self.assertEqual(auxiliary.is_symlink(), action == "linked_aux")
 
 
     def invoke(self, root, *, stdout=b"okay", stderr=b"private", limit=4096, binary=False,
