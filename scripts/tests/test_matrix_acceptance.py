@@ -61,6 +61,33 @@ class TimelineFailureForwardingTests(unittest.TestCase):
 
 
 class FocusedSuiteTests(unittest.TestCase):
+    def test_rtc_media_requires_all_three_existing_cases_without_claiming_full_acceptance(self):
+        labels = acceptance_module.RTC_LABELS
+        self.assertEqual(acceptance_module.SUITES["rtc-media"], labels)
+        self.assertEqual(acceptance_module.SUITES["full"], acceptance_module.PLANNED_CHECKS)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="rtc-media")
+            for missing in labels:
+                runner.results = [{"check": label, "passed": 1, "seconds": 1}
+                                  for label in labels if label != missing]
+                with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                    runner.finish_checks()
+            runner.results = [{"check": label, "passed": 1, "seconds": 1} for label in labels]
+            runner.finish_checks()
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "rtc-media")
+            self.assertEqual(report["not_run"], {})
+            self.assertNotIn(acceptance_module.ELEMENT_LABEL, {item["check"] for item in report["passed"]})
+            text = summary.read_text()
+            self.assertIn("three existing synthetic encrypted native cases", text)
+            self.assertIn("No stock Element", text)
+            self.assertIn("not full acceptance", text)
+            self.assertNotIn("Full suite:", text)
+
     def test_element_interop_requires_its_only_case_and_cannot_claim_full_acceptance(self):
         label = acceptance_module.ELEMENT_LABEL
         self.assertEqual(acceptance_module.SUITES["element-interop"], (label,))
@@ -693,6 +720,45 @@ class FinalizationTests(unittest.TestCase):
         runner.rtc_cases.assert_not_called()
         runner.element_case.assert_not_called()
         self.assert_both_cleanups(runner)
+
+    def test_rtc_media_runs_only_existing_native_cases_and_preserves_cleanup_on_failure(self):
+        for failure_at in (None, "rtc_cases", "finish_checks"):
+            with self.subTest(failure_at=failure_at), self.mocked_main() as (runner, _):
+                failure = RuntimeError("fixed incomplete native RTC result")
+                if failure_at:
+                    getattr(runner, failure_at).side_effect = failure
+                with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                               "--suite", "rtc-media"]):
+                    if failure_at:
+                        with self.assertRaises(RuntimeError) as caught:
+                            acceptance_module.main()
+                        self.assertIs(caught.exception, failure)
+                    else:
+                        self.assertIsNone(acceptance_module.main())
+                runner.group.assert_called_once()
+                self.assertEqual(runner.group.call_args.args[0], acceptance_module.RTC_LABELS)
+                runner.rtc_cases.assert_called_once_with()
+                if failure_at == "rtc_cases":
+                    runner.finish_checks.assert_not_called()
+                else:
+                    runner.finish_checks.assert_called_once_with()
+                self.assertEqual([call.args for call in runner.script.call_args_list], [
+                    ("local_matrix_env", "up"), ("local_matrix_rtc", "up"),
+                    ("local_matrix_rtc", "probe"), ("local_matrix_rtc", "down"),
+                    ("local_matrix_env", "down"),
+                ])
+                runner.start_keyring.assert_called_once_with()
+                runner.require_containment.assert_called_once_with()
+                runner.test.assert_not_called()
+                runner.app_timeline.assert_not_called()
+                runner.app_recovery.assert_not_called()
+                runner.oauth_cases.assert_not_called()
+                runner.outgoing_ring_cases.assert_not_called()
+                runner.element_case.assert_not_called()
+                runner.rtc_recovery_cases.assert_not_called()
+                runner.draft_recovery_cases.assert_not_called()
+                runner.timeline_read_cases.assert_not_called()
+                self.assert_both_cleanups(runner)
 
     def test_element_interop_runs_only_the_existing_case_and_preserves_cleanup_on_failure(self):
         for failure_at in (None, "element_case", "finish_checks"):

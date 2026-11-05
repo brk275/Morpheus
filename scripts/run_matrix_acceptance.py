@@ -617,7 +617,7 @@ SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
           "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS,
           "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS), "oauth-only": OAUTH_LABELS,
-          "rtc-recovery": OUTAGE_LABELS, "element-interop": (ELEMENT_LABEL,)}
+          "rtc-recovery": OUTAGE_LABELS, "rtc-media": RTC_LABELS, "element-interop": (ELEMENT_LABEL,)}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -1885,6 +1885,12 @@ class Acceptance:
                 if self.suite == "full":
                     output.write("Full suite: real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
                                  "synthetic call media and OAuth browser-form protocol automation.\n\n")
+                elif self.suite == "rtc-media":
+                    output.write("Focused native RTC media checks: the three existing synthetic encrypted native cases, "
+                                 "including historical Current/direct and fresh-device Current/direct and Sticky2025 late joining. "
+                                 "Disposable Synapse, OS Secret Service and LiveKit services retain their original checks and cleanup. "
+                                 "No stock Element, app invitation/recovery, physical-device or installed-package acceptance is implied; "
+                                 "this is not full acceptance.\n\n")
                 elif self.suite == "rtc-recovery":
                     output.write("Standard Sticky2025 owned SFU kill/restart checks: actual app automatic bounded rejoin, "
                                  "two DM participants and three room participants, fresh membership/key-import ownership with stable legacy publisher identities, "
@@ -2018,6 +2024,14 @@ def main():
             return
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
+        if args.suite == "rtc-media":
+            def rtc_media_checks():
+                acceptance.script("local_matrix_rtc", "up")
+                acceptance.script("local_matrix_rtc", "probe")
+                acceptance.rtc_cases()
+            acceptance.group(RTC_LABELS, rtc_media_checks)
+            acceptance.finish_checks()
+            return
         if args.suite == "element-interop":
             def element_interop_checks():
                 acceptance.script("local_matrix_rtc", "up")
