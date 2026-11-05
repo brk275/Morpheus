@@ -427,7 +427,11 @@ impl AuthGuard {
                 .find(|entry| entry.member_id == member)?
                 .membership_ts
         };
-        if (!own && !present) || self.member_lease(&identity, member, membership_ts).is_none() {
+        if (!own && !present)
+            || self
+                .member_lease(&identity, member, membership_ts)
+                .is_none()
+        {
             return None;
         }
         Some(identity)
@@ -702,7 +706,9 @@ mod tests {
         let guard = guard();
         let first = member("@bob:example.org", Some("BOB"), "first");
         assert!(guard.on_core_snapshot(&[first]));
-        let old = guard.member_lease("@bob:example.org:BOB", "first", None).unwrap();
+        let old = guard
+            .member_lease("@bob:example.org:BOB", "first", None)
+            .unwrap();
         let second = member("@bob:example.org", Some("BOB"), "second");
         let ghost = member("@alice:example.org", Some("ALICE"), "old-alice");
         assert!(!guard.include_member(&ghost));
@@ -746,10 +752,14 @@ mod tests {
         let mut bob = member("@bob:example.org", Some("BOB"), "bob");
         bob.membership_ts = Some(1);
         assert!(guard.on_core_snapshot(std::slice::from_ref(&bob)));
-        let first = guard.member_lease("@bob:example.org:BOB", "bob", Some(1)).unwrap();
+        let first = guard
+            .member_lease("@bob:example.org:BOB", "bob", Some(1))
+            .unwrap();
         bob.origin_server_ts = Some(2);
         assert!(guard.on_core_snapshot(&[bob]));
-        let refreshed = guard.member_lease("@bob:example.org:BOB", "bob", Some(1)).unwrap();
+        let refreshed = guard
+            .member_lease("@bob:example.org:BOB", "bob", Some(1))
+            .unwrap();
         assert!(Arc::ptr_eq(&first.active, &refreshed.active));
         assert!(first.active.load(Ordering::Acquire));
     }
@@ -774,7 +784,9 @@ mod tests {
         first.membership_ts = Some(1_000);
         let guard = guard();
         assert!(guard.on_core_snapshot(std::slice::from_ref(&first)));
-        let old = guard.member_lease("@bob:example.org:BOB", "stable", Some(1_000)).unwrap();
+        let old = guard
+            .member_lease("@bob:example.org:BOB", "stable", Some(1_000))
+            .unwrap();
         let ring = Arc::new(Ring(Mutex::new(Vec::new())));
         let checked = Arc::clone(&guard);
         let handler = MediaKeyHandler::with_ring(ring.clone())
@@ -788,28 +800,50 @@ mod tests {
             rtc_backend_identity: "@bob:example.org:BOB".into(),
             use_after_ms: delay,
         };
-        handler.on_new_key_material_for_member(signal(1, 0), "stable", Some(1_000)).await;
-        handler.on_new_key_material_for_member(signal(3, 5_000), "stable", Some(1_000)).await;
+        handler
+            .on_new_key_material_for_member(signal(1, 0), "stable", Some(1_000))
+            .await;
+        handler
+            .on_new_key_material_for_member(signal(3, 5_000), "stable", Some(1_000))
+            .await;
         let mut second = first.clone();
         second.membership_ts = Some(4_000);
         assert!(guard.on_core_snapshot(std::slice::from_ref(&second)));
-        let current = guard.member_lease("@bob:example.org:BOB", "stable", Some(4_000)).unwrap();
+        let current = guard
+            .member_lease("@bob:example.org:BOB", "stable", Some(4_000))
+            .unwrap();
         assert!(!old.active.load(Ordering::Acquire));
         assert!(!Arc::ptr_eq(&old.active, &current.active));
         assert!(Arc::ptr_eq(&old.serial, &current.serial));
-        assert!(guard.member_lease("@bob:example.org:BOB", "stable", Some(1_000)).is_none());
+        assert!(
+            guard
+                .member_lease("@bob:example.org:BOB", "stable", Some(1_000))
+                .is_none()
+        );
         assert!(handler.keys().is_empty());
-        assert_eq!(guard.map("@bob:example.org", "BOB", "stable", Some(&[first])), None);
-        handler.on_new_key_material_for_member(signal(4, 0), "stable", Some(1_000)).await;
-        handler.on_new_key_material_for_member(signal(2, 0), "stable", Some(4_000)).await;
+        assert_eq!(
+            guard.map("@bob:example.org", "BOB", "stable", Some(&[first])),
+            None
+        );
+        handler
+            .on_new_key_material_for_member(signal(4, 0), "stable", Some(1_000))
+            .await;
+        handler
+            .on_new_key_material_for_member(signal(2, 0), "stable", Some(4_000))
+            .await;
         tokio::time::sleep(std::time::Duration::from_millis(5_100)).await;
         assert_eq!(*ring.0.lock().unwrap(), vec![1, 2]);
-        assert_eq!(handler.key_for("@bob:example.org:BOB").unwrap().key, vec![2]);
+        assert_eq!(
+            handler.key_for("@bob:example.org:BOB").unwrap().key,
+            vec![2]
+        );
         // Missing and explicit timestamps are different verified generations.
         second.membership_ts = None;
         assert!(guard.on_core_snapshot(std::slice::from_ref(&second)));
         assert!(!current.active.load(Ordering::Acquire));
-        let without_time = guard.member_lease("@bob:example.org:BOB", "stable", None).unwrap();
+        let without_time = guard
+            .member_lease("@bob:example.org:BOB", "stable", None)
+            .unwrap();
         assert!(Arc::ptr_eq(&current.serial, &without_time.serial));
         assert!(handler.keys().is_empty());
         assert!(guard.active.load(Ordering::Acquire));

@@ -3823,14 +3823,20 @@ mod tests {
             Some(format!("{user}:{device}"))
         }));
         manager.receive_key(bob_key(vec![1; 32], 0)).await.unwrap();
-        assert_eq!(*handler.membership_timestamps.lock().unwrap(), vec![Some(1_000)]);
+        assert_eq!(
+            *handler.membership_timestamps.lock().unwrap(),
+            vec![Some(1_000)]
+        );
         handler.signals.lock().unwrap().clear();
         handler.membership_timestamps.lock().unwrap().clear();
         // A heartbeat changes no participation and still permits held replay.
         memberships.lock().unwrap()[0].origin_server_ts = Some(2_000);
         manager.replay_keys_to_handler().await;
         assert_eq!(handler.signals.lock().unwrap().len(), 1);
-        assert_eq!(*handler.membership_timestamps.lock().unwrap(), vec![Some(1_000)]);
+        assert_eq!(
+            *handler.membership_timestamps.lock().unwrap(),
+            vec![Some(1_000)]
+        );
         handler.signals.lock().unwrap().clear();
         handler.membership_timestamps.lock().unwrap().clear();
         memberships.lock().unwrap()[0].membership_ts = Some(4_000);
@@ -3853,13 +3859,19 @@ mod tests {
         // The same bytes/index newly verified against the current join are
         // fresh admission, not an old-generation duplicate or implicit replay.
         manager.receive_key(bob_key(vec![1; 32], 0)).await.unwrap();
-        assert_eq!(*handler.membership_timestamps.lock().unwrap(), vec![Some(4_000)]);
+        assert_eq!(
+            *handler.membership_timestamps.lock().unwrap(),
+            vec![Some(4_000)]
+        );
         assert_eq!(manager.get_inbound_keys(&first.member_id).len(), 1);
         handler.signals.lock().unwrap().clear();
         handler.membership_timestamps.lock().unwrap().clear();
         manager.replay_keys_to_handler().await;
         assert_eq!(handler.signals.lock().unwrap().len(), 1);
-        assert_eq!(*handler.membership_timestamps.lock().unwrap(), vec![Some(4_000)]);
+        assert_eq!(
+            *handler.membership_timestamps.lock().unwrap(),
+            vec![Some(4_000)]
+        );
         memberships.lock().unwrap()[0].membership_ts = None;
         handler.signals.lock().unwrap().clear();
         manager.replay_keys_to_handler().await;

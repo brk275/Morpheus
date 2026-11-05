@@ -611,7 +611,8 @@ impl EncryptionKeySignalHandler for MediaKeyHandler {
         member_id: &str,
         membership_ts: Option<u64>,
     ) {
-        self.accept_member_key(signal, member_id, membership_ts).await;
+        self.accept_member_key(signal, member_id, membership_ts)
+            .await;
     }
 
     /// Forwards a refusal straight through: there is nothing to install, and the
