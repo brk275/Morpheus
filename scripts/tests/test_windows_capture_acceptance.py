@@ -519,6 +519,100 @@ class WindowsCaptureTests(unittest.TestCase):
 
 
 class InstalledWindowsUpdateTests(unittest.TestCase):
+    def test_temporary_sealed_build_payload_keeps_only_bounded_owned_head_tail_and_context(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();logs=root/"logs";logs.mkdir();log=logs/"0001.log"
+            body=b"synthetic-private-compiler-error-and-path\n"*1000
+            log.write_bytes(body);log.chmod(0o600)
+            commands=types.SimpleNamespace(root=root,logs=logs,cleanup_failed=False,
+                build_substage="cargo_build",failed_command=(log,101,len(body)))
+            with patch.object(update.notice_source,"checked",side_effect=lambda path,**kw:Path(path)), \
+                    patch.object(update.notices,"read_regular",side_effect=lambda path,*args,**kw:Path(path).read_bytes()):
+                payload=update._temporary_sealed_build_payload(commands,"a"*40,123,True)
+                value=json.loads(payload);stream=value["streams"]["combined"]
+                self.assertEqual(value["base_revision"],"f76dddae14048fc346362ba7e45abd9571004b8b")
+                self.assertEqual((value["source_revision"],value["run_id"],value["status"]),("a"*40,123,101))
+                self.assertEqual(set(value["streams"]),{"combined"})
+                self.assertTrue(stream["truncated"])
+                self.assertEqual(update.base64.b64decode(stream["head_base64"]),body[:8192])
+                self.assertEqual(update.base64.b64decode(stream["tail_base64"]),body[-8192:])
+                self.assertLessEqual(len(payload),65536)
+                self.assertNotIn(str(root).encode(),payload)
+                self.assertNotIn(b"synthetic-private-compiler",payload)
+                for bad in ((root/"foreign.log",101,len(body)),(log,True,len(body)),
+                            (log,101,8*1024**2+1),(log,101,len(body)+1)):
+                    commands.failed_command=bad
+                    with self.assertRaises(update.Failure):
+                        update._temporary_sealed_build_payload(commands,"a"*40,123,True)
+                commands.failed_command=(log,101,len(body))
+                for scanned in (False,1):
+                    with self.assertRaises(update.Failure):
+                        update._temporary_sealed_build_payload(commands,"a"*40,123,scanned)
+                commands.cleanup_failed=True
+                with self.assertRaises(update.Failure):
+                    update._temporary_sealed_build_payload(commands,"a"*40,123,True)
+
+    def test_temporary_sealed_build_transport_has_no_plaintext_argv_or_output_before_fresh_scan_and_cleanup(self):
+        payload=b"synthetic-private-compiler-input"
+        for scan_fails,parent_scan_fails,malformed,retained,incomplete in (
+                (False,False,False,False,False),(True,False,False,False,False),
+                (False,True,False,False,False),(False,False,True,False,False),
+                (False,False,False,True,False),(False,False,False,False,True)):
+            with self.subTest(scan_fails=scan_fails,parent_scan_fails=parent_scan_fails,
+                             malformed=malformed,retained=retained,incomplete=incomplete), tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve();output=io.StringIO();events=[]
+                encoder=types.SimpleNamespace(logs_complete=True,cleanup_failed=False,retained=[],logs=root/"sealed-cargo/logs")
+                main_logs=root/"logs";main_logs.mkdir();bounds=[]
+                commands=types.SimpleNamespace(root=root,logs=main_logs,environment={},cleanup_failed=False,
+                    deadline=update.time.monotonic()+1000,bounded_logs=lambda:bounds.append(True))
+                def encrypt(*args,**options):
+                    if args[0] in {"scan", "scan-main"}:
+                        events.append("encoder_scan" if args[0]=="scan" else "parent_scan")
+                        self.assertEqual(output.getvalue(),"");self.assertEqual(options["timeout"],120)
+                        self.assertNotIn("stdin_bytes",options)
+                        self.assertEqual(args[1][-1],str(encoder.logs if args[0]=="scan" else commands.logs))
+                        if scan_fails and args[0]=="scan" or parent_scan_fails and args[0]=="scan-main":
+                            raise ValueError("private-scan-failure")
+                        return b""
+                    events.append("encrypt");self.assertEqual(output.getvalue(),"")
+                    self.assertEqual(options["stdin_bytes"],payload)
+                    self.assertEqual(options["timeout"],30)
+                    self.assertEqual(options["output_limit"],192*1024)
+                    self.assertEqual(options["stderr_limit"],65536)
+                    self.assertNotIn(payload.decode(),str(args))
+                    self.assertNotIn(payload.decode(),str(options["env"]))
+                    if retained:encoder.retained=[object()];encoder.cleanup_failed=True
+                    if incomplete:encoder.logs_complete=False
+                    return b"private-malformed-output" if malformed else b"0:1:"+b"A"*768+b"\n"
+                def private_directory(path, **options):
+                    Path(path).mkdir(**options);return Path(path)
+                encoder.run=encrypt
+                host=types.SimpleNamespace(name="nt",environ={"PROGRAMFILES":str(root/"protected"),"GITHUB_RUN_ID":"123"})
+                with patch.object(update,"os",host), \
+                        patch.object(update,"sys",types.SimpleNamespace(platform="win32",stderr=output)), \
+                        patch.object(update,"_temporary_sealed_build_payload",return_value=payload), \
+                        patch.object(update.notice_source,"checked",side_effect=lambda path,**kw:Path(path)), \
+                        patch.object(update.notice_source,"private_directory",side_effect=private_directory), \
+                        patch.object(update.notice_source,"Commands",return_value=encoder):
+                    sealed,scanned=update._temporary_seal_failed_build(commands,root/"scanner","a"*40,"build-old",True)
+                    self.assertEqual(output.getvalue(),"")
+                    update._temporary_emit_sealed_build(sealed,commands,"a"*40,scanned,False)
+                    self.assertEqual(output.getvalue(),"")
+                    update._temporary_emit_sealed_build(sealed,commands,"a"*40,scanned,True)
+                self.assertEqual(events,["encrypt","encoder_scan"]+([] if scan_fails or retained or incomplete else ["parent_scan"]))
+                self.assertEqual(bounds,[] if scan_fails or retained or incomplete else [True])
+                self.assertEqual(scanned,not scan_fails and not parent_scan_fails and not retained and not incomplete)
+                self.assertEqual(commands.cleanup_failed,scan_fails or parent_scan_fails or retained or incomplete)
+                self.assertNotIn("synthetic-private",output.getvalue())
+                self.assertNotIn("private-malformed",output.getvalue())
+                if scan_fails or parent_scan_fails or malformed or retained or incomplete:self.assertEqual(output.getvalue(),"")
+                else:
+                    line,=output.getvalue().splitlines()
+                    frame=json.loads(line.removeprefix("MORPHEUS_WINDOWS_UPDATE_SEALED_CARGO "))
+                    self.assertEqual(frame,{"schema":1,"recipient":update._SEALED_RECIPIENT,
+                        "base_revision":update._SEALED_BASE_SOURCE,"source_revision":"a"*40,"run_id":123,
+                        "sequence":0,"count":1,"ciphertext_hex":"A"*768})
+
     @staticmethod
     def _provider_msvc_fixture(root, generation="18"):
         program = root / "Program Files"

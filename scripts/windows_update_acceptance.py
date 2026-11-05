@@ -6,6 +6,7 @@ UI or media are used. Shipping activation and broader beta gates stay closed.
 """
 from __future__ import annotations
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -475,6 +476,126 @@ def cargo_failure_diagnostic(commands, stage, scanned):
     except BaseException:
         # A missing/changed/unsafe log is not a replacement failure or raw text.
         return None
+
+
+# TEMPORARY ONE-SHOT DIAGNOSTIC. NEVER MERGE this public-recipient transport.
+_SEALED_BASE_SOURCE = "f76dddae14048fc346362ba7e45abd9571004b8b"
+_SEALED_RECIPIENT = '981b3084f72673f04254de615651b7c8847f1c7823070c981bf92868c16fb70a'
+_SEALED_POWERSHELL = "$ErrorActionPreference='Stop'\n$ProgressPreference='SilentlyContinue'\n$PSModuleAutoLoadingPreference='None'\n$rsa=$null\ntry {\n  $parameters=[System.Security.Cryptography.RSAParameters]::new()\n  $parameters.Modulus=[Convert]::FromBase64String('o87QianqKagsPqe7OXHtChurVX8CiCBNJBWylbmuGhs3xMsgy/MfO+9Y/gCbguGk53rDsXHcefhiSns2WoXq+KVAG/14+zSzIF+H33M+yUo4wFwH/kBKMz2/VYq6MEFOJwmjgrtNW8gJ3VK1KGjTMjJBK8aBwsrfM0ACgYBwQIwZi3Rmt94z27tAqL6KE3EfsRk3TGnZr1IeLGv8/gtRT3sJVPwH6CP1/VTl3kAd+IBh69rduTFNnZeUZEz+c6QvYA7ijzhxuOEIiJFLJYRidgRlLg/t8lcI9BNLAhmq2ngxCoUvkcAs6TJ/EuzU8crJGw7KV09tVpY70X6ukphAMoPngwm74pvwp2yN3B5P2VrylFUZAZv9RrcpKKl9VF+TkttIjSEws/chyJYrxqcLiqo3BfjTdNUBqxYjOPsRjkNTLHeJFFHdU3lkNWNK7qGdINAhMN+HQLcCwT0N4y0dqpls45sCHkkOvj27PI6H1tQFQX/FsjOFN90J/3riEaCd')\n  $parameters.Exponent=[Convert]::FromBase64String('AQAB')\n  if ($parameters.Modulus.Length -ne 384) { exit 2 }\n  $rsa=[System.Security.Cryptography.RSACng]::new()\n  $rsa.ImportParameters($parameters)\n  if ($rsa.KeySize -ne 3072) { exit 2 }\n  $reader=[System.IO.BinaryReader]::new([Console]::OpenStandardInput())\n  $data=$reader.ReadBytes(65537)\n  if ($data.Length -eq 0 -or $data.Length -gt 65536) { exit 2 }\n  $count=[int][Math]::Ceiling($data.Length/318.0)\n  for ($i=0;$i -lt $count;$i++) {\n    $length=[Math]::Min(318,$data.Length-$i*318)\n    $chunk=[byte[]]::new($length)\n    [Array]::Copy($data,$i*318,$chunk,0,$length)\n    $sealed=$rsa.Encrypt($chunk,[System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)\n    if ($sealed.Length -ne 384) { exit 2 }\n    [Console]::Out.WriteLine(('{0}:{1}:{2}' -f $i,$count,[Convert]::ToHexString($sealed)))\n  }\n} catch { exit 2 } finally { if ($null -ne $rsa) { $rsa.Dispose() } }\n"
+
+
+def _temporary_sealed_build_payload(commands, reviewed, run_id, scanned):
+    require(scanned is True and commands.cleanup_failed is False
+            and commands.build_substage == "cargo_build"
+            and type(reviewed) is str and re.fullmatch(r"[0-9a-f]{40}", reviewed)
+            and type(run_id) is int and 0 < run_id < 2**63)
+    failure = commands.failed_command
+    require(type(failure) is tuple and len(failure) == 3)
+    path, status, size = failure
+    require(type(status) is int and 0 < status <= 0xffffffff
+            and type(size) is int and 0 <= size <= 8*1024**2)
+    path = Path(path)
+    require(commands.logs == commands.root/"logs" and path.parent == commands.logs
+            and re.fullmatch(r"[0-9]{4}\.log", path.name))
+    notice_source.checked(path, private=True)
+    data = notices.read_regular(path, 8*1024**2, allow_empty=True)
+    require(len(data) == size)
+    stream = {"size":size, "truncated":size > 16384,
+              "head_base64":base64.b64encode(data[:8192]).decode("ascii"),
+              "tail_base64":base64.b64encode(data[-8192:] if size > 8192 else b"").decode("ascii")}
+    payload = json.dumps({"schema":1, "canary":"morpheus-private-cargo-build-diagnostic-20261104",
+        "base_revision":_SEALED_BASE_SOURCE, "source_revision":reviewed, "run_id":run_id,
+        "status":status, "streams":{"combined":stream}},sort_keys=True,separators=(",",":")).encode("ascii")
+    require(0 < len(payload) <= 65536)
+    return payload
+
+
+def _temporary_seal_failed_build(commands, scanner, reviewed, stage, scanned):
+    sealed = None
+    encoder = None
+    try:
+        require(scanned is True and os.name == "nt" and sys.platform == "win32"
+                and stage in {"build-old", "build-new"})
+        run_text = os.environ.get("GITHUB_RUN_ID", "")
+        require(re.fullmatch(r"[1-9][0-9]{0,19}", run_text))
+        run_id = int(run_text)
+        payload = _temporary_sealed_build_payload(commands, reviewed, run_id, scanned)
+        powershell = Path(os.environ["PROGRAMFILES"])/"PowerShell/7/pwsh.exe"
+        notice_source.checked(powershell)
+        # Keep the existing parent deadline. Every new owned child below is
+        # clamped to its remaining work budget; no scan TTL may extend it.
+        require(commands.deadline - time.monotonic() >= 150)
+        root = notice_source.private_directory(commands.root/"sealed-cargo")
+        for name in ("logs", "temp"):
+            notice_source.private_directory(root/name)
+        environment = dict(commands.environment)
+        environment.update(POWERSHELL_TELEMETRY_OPTOUT="1", DOTNET_CLI_TELEMETRY_OPTOUT="1",
+                           POWERSHELL_UPDATECHECK="Off")
+        encoder = notice_source.Commands(root, environment)
+        encoder.deadline = min(commands.deadline, time.monotonic()+30)
+        encoded = base64.b64encode(_SEALED_POWERSHELL.encode("utf-16le")).decode("ascii")
+        scanned = False  # New child/logs require fresh full scans before output.
+        try:
+            raw = encoder.run("seal-build", [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive",
+                "-EncodedCommand", encoded], cwd=root, env=environment, timeout=30,
+                output_limit=192*1024, stderr_limit=65536, stdin_bytes=payload)
+            lines = raw.decode("ascii").splitlines()
+            count = (len(payload)+317)//318
+            require(len(lines) == count and 1 <= count <= 207)
+            blocks = []
+            for index, line in enumerate(lines):
+                match = re.fullmatch(r"([0-9]{1,3}):([0-9]{1,3}):([0-9A-F]{768})", line)
+                require(match is not None and int(match[1]) == index and int(match[2]) == count)
+                blocks.append(match[3])
+            sealed = {"source_revision":reviewed, "run_id":run_id, "blocks":blocks,
+                      "child_cleanup_verified":True}
+        finally:
+            try:
+                # Exact existing source-scanner command/caps, with the parent
+                # deadline retained instead of scan()'s normal TTL extension.
+                config, ignore = root/"scanner.toml", root/"scanner.ignore"
+                notice_source.write_new(config, b"[extend]\nuseDefault = true\n")
+                notice_source.write_new(ignore, b"")
+                scan_logs = notice_source.private_directory(root/"scanner-logs")
+                encoder.deadline = commands.deadline
+                encoder.run("scan", [str(scanner), "dir", "--no-banner", "--config", str(config),
+                    "--gitleaks-ignore-path", str(ignore), "--ignore-gitleaks-allow", "--redact=100",
+                    "--max-target-megabytes", "0", str(encoder.logs)], cwd=root, env=environment,
+                    timeout=120, output_limit=65536, stderr_limit=1024*1024, log_root=scan_logs)
+                require(encoder.logs_complete is True and encoder.cleanup_failed is False and encoder.retained == [])
+                commands.bounded_logs()
+                require(set(commands.logs.iterdir()) == set(commands.logs.glob("*.log")))
+                encoder.run("scan-main", [str(scanner), "dir", "--no-banner", "--config", str(config),
+                    "--gitleaks-ignore-path", str(ignore), "--ignore-gitleaks-allow", "--redact=100",
+                    "--max-target-megabytes", "0", str(commands.logs)], cwd=root, env=environment,
+                    timeout=120, output_limit=65536, stderr_limit=1024*1024, log_root=scan_logs)
+                require(encoder.logs_complete is True and encoder.cleanup_failed is False and encoder.retained == []
+                        and commands.cleanup_failed is False and time.monotonic() <= commands.deadline)
+                scanned = True
+            finally:
+                if (encoder.logs_complete is not True or encoder.cleanup_failed or encoder.retained
+                        or scanned is not True):
+                    commands.cleanup_failed = True  # Retain unscanned/live auxiliary evidence.
+    except BaseException:
+        sealed = None  # Never print raw refusal text or replace the Cargo error.
+    return sealed, scanned
+
+
+def _temporary_emit_sealed_build(sealed, commands, reviewed, scanned, cleaned):
+    if (scanned is not True or cleaned is not True or commands.cleanup_failed is not False
+            or type(sealed) is not dict or set(sealed) != {"source_revision", "run_id", "blocks", "child_cleanup_verified"}):
+        return
+    require(type(reviewed) is str and re.fullmatch(r"[0-9a-f]{40}", reviewed)
+            and sealed["source_revision"] == reviewed and sealed["child_cleanup_verified"] is True
+            and type(sealed["run_id"]) is int and 0 < sealed["run_id"] < 2**63)
+    blocks = sealed["blocks"]
+    require(type(blocks) is list and 1 <= len(blocks) <= 207
+            and all(type(value) is str and re.fullmatch(r"[0-9A-F]{768}", value) for value in blocks))
+    for index, block in enumerate(blocks):
+        print("MORPHEUS_WINDOWS_UPDATE_SEALED_CARGO " + json.dumps({"schema":1,
+            "recipient":_SEALED_RECIPIENT, "base_revision":_SEALED_BASE_SOURCE,
+            "source_revision":reviewed, "run_id":sealed["run_id"], "sequence":index,
+            "count":len(blocks), "ciphertext_hex":block},sort_keys=True),file=sys.stderr,flush=True)
 
 
 def export_source(commands, source, archive, version, label):
@@ -948,6 +1069,7 @@ def execute(args):
     stage,results,scan,clean="source-export",[],False,False
     failed, failure_site = False, None
     cargo_failure = None
+    sealed_cargo = None
     cleanup_refusal = None
     keys = {}
     try:
@@ -997,6 +1119,8 @@ def execute(args):
                 commands.scan(scanner); scan=True
                 if failed:
                     cargo_failure = cargo_failure_diagnostic(commands, stage, scan)
+                    if stage in {"build-old", "build-new"} and commands.build_substage == "cargo_build":
+                        sealed_cargo, scan = _temporary_seal_failed_build(commands, scanner, reviewed, stage, scan)
             finally:
                 cleanup_phase = "credentials"
                 # Generated fixture credentials are removed even if a transaction
@@ -1039,6 +1163,10 @@ def execute(args):
                     if cargo_failure is not None:
                         print("MORPHEUS_WINDOWS_UPDATE_CARGO_DIAGNOSTIC "
                               + json.dumps(cargo_failure, sort_keys=True), file=sys.stderr, flush=True)
+                try:
+                    _temporary_emit_sealed_build(sealed_cargo, commands, reviewed, scan, clean)
+                except BaseException:
+                    pass  # Optional ciphertext transport never replaces failure.
         finally:
             # This channel contains no private content and never substitutes
             # for the original full-scan/cleanup gates on source/compiler hints.
