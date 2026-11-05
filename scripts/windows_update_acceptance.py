@@ -218,13 +218,30 @@ class Commands:
         self.sequence = 0
         self.build_substage = "unavailable"
         self.failed_command = None
+        # Closed observations only; never retain command text or private output.
+        self.command_phase = "unavailable"
+        self.close_state = "unattempted"
+        self.close_refusal = None
+        self.scan_phase = "unattempted"
+        self.scan_counts = dict(success=0, exit_one=0, other_exit=0, timeout=0, refusal=0)
         self.cleanup_failed = False
         self.deadline = time.monotonic() + 6900
     def close_job(self, job):
+        self.close_state = "attempted"
+        self.close_refusal = None
         try:
             job.close()
-        except BaseException:
+            self.close_state = "complete"
+        except BaseException as error:
             self.cleanup_failed = True
+            try:
+                self.close_state = "failed"
+                if (type(error) is capture.Failure and type(error.code) is str
+                        and error.code in capture.FAILURES and type(error.operation) is str
+                        and error.operation in capture.OPERATIONS):
+                    self.close_refusal = {"code": error.code, "operation": error.operation}
+            except BaseException:
+                pass  # Optional observations cannot replace failed Job containment.
             raise
     def start(self, job, args, environment=None, cwd=ROOT):
         # Only the fixed protected system Git may retain provider hardlinks.
@@ -251,7 +268,9 @@ class Commands:
     def wait(self, job, handle, seconds):
         end = min(self.deadline, time.monotonic() + seconds)
         while True:
+            self.command_phase = "wait_log_bounds"
             self.bounded_logs()
+            self.command_phase = "process_wait"
             state = job.kernel.WaitForSingleObject(handle, 0)
             if state == 0:
                 return job.wait(handle, 0)
@@ -259,22 +278,34 @@ class Commands:
             time.sleep(.025)
     def empty(self, job, seconds=30):
         end = min(self.deadline, time.monotonic()+seconds)
+        self.command_phase = "job_query"
         while job.active():
+            self.command_phase = "drain_log_bounds"
             self.bounded_logs()
+            self.command_phase = "drain_deadline"
             require(time.monotonic() < end)
             time.sleep(.025)
+            self.command_phase = "job_query"
+        self.command_phase = "drained_log_bounds"
         self.bounded_logs()
     def run(self, args, *, environment=None, cwd=ROOT, seconds=180):
         self.failed_command = None
         status = None
+        self.command_phase = "job_create"
         job = capture.WindowsJob()
         try:
+            self.command_phase = "start"
             handle, log = self.start(job,args,environment,cwd)
             status = self.wait(job, handle, seconds)
+            self.command_phase = "exit_status"
             require(status == 0)
             self.empty(job)
+            self.command_phase = "result_log_bounds"
             require(log.stat().st_size <= 8*1024*1024)
-            return log.read_bytes()
+            self.command_phase = "result_log_read"
+            result = log.read_bytes()
+            self.command_phase = "complete"
+            return result
         finally:
             self.close_job(job)
             if type(status) is int and status != 0:
@@ -283,21 +314,35 @@ class Commands:
                 except OSError:
                     pass  # Optional metadata must not replace the refusal.
     def scan(self, scanner):
+        self.scan_phase = "configuration"
         config, ignore = self.root/"default-gitleaks.toml", self.root/"empty.ignore"
         write_new(config,b"[extend]\nuseDefault = true\n"); write_new(ignore,b"")
         failed = False
+        self.scan_phase = "enumeration"
         for log in sorted(self.logs.glob("*.log")):
             try:
+                self.scan_phase = "owned_log_read"
                 require(log.stat().st_size <= 8*1024*1024)
                 with checked(log).open("rb") as stream:
+                    self.scan_phase = "scanner"
                     result = subprocess.run([str(scanner),"stdin","--config",str(config),"--gitleaks-ignore-path",str(ignore),
                         "--ignore-gitleaks-allow","--redact=100","--no-banner"],stdin=stream,
                         stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,cwd=self.root,
                         env=self.environment,timeout=60,check=False)
-                if result.returncode: failed = True
-            except (Failure,OSError,subprocess.SubprocessError):
+                if result.returncode:
+                    failed = True
+                    self.scan_counts["exit_one" if result.returncode == 1 else "other_exit"] += 1
+                else:
+                    self.scan_counts["success"] += 1
+            except subprocess.TimeoutExpired:
+                self.scan_counts["timeout"] += 1
                 failed = True
+            except (Failure,OSError,subprocess.SubprocessError):
+                self.scan_counts["refusal"] += 1
+                failed = True
+        self.scan_phase = "result"
         require(not failed)
+        self.scan_phase = "complete"
 
 # Closed source-location metadata only. Never inspect command output, exception
 # messages, arguments, paths, fixture keys or transaction contents here.
@@ -305,6 +350,42 @@ _FAILURE_STAGES = frozenset(("source-export", "build-old", "build-new", "signing
 _BUILD_SUBSTAGES = frozenset(("unavailable", "source_export", "notices_prepare", "cargo_build",
                              "payload", "config", "producer", "cargo_packager"))
 
+
+
+def gate_failure_diagnostic(commands, stage, cleanup_phase, scanned, cleaned):
+    """Own fixed observations only; not a log scan or transaction verdict."""
+    if scanned is True and cleaned is True:
+        return None
+    command = getattr(commands, "command_phase", None)
+    close = getattr(commands, "close_state", None)
+    scan = getattr(commands, "scan_phase", None)
+    counts = getattr(commands, "scan_counts", None)
+    refusal = getattr(commands, "close_refusal", None)
+    if (type(stage) is not str or stage not in _FAILURE_STAGES | {"complete"}
+            or type(cleanup_phase) is not str or cleanup_phase not in {
+                "scan", "credentials", "job_gate", "registry", "workspace", "complete"}
+            or type(command) is not str or command not in {
+                "unavailable", "job_create", "start", "wait_log_bounds", "process_wait",
+                "exit_status", "job_query", "drain_log_bounds", "drain_deadline",
+                "drained_log_bounds", "result_log_bounds", "result_log_read", "complete"}
+            or type(close) is not str or close not in {"unattempted", "attempted", "complete", "failed"}
+            or type(scan) is not str or scan not in {
+                "unattempted", "configuration", "enumeration", "owned_log_read", "scanner", "result", "complete"}
+            or (refusal is not None and (type(refusal) is not dict or set(refusal) != {"code", "operation"}
+                or type(refusal["code"]) is not str or refusal["code"] not in capture.FAILURES
+                or type(refusal["operation"]) is not str or refusal["operation"] not in capture.OPERATIONS))
+            or type(counts) is not dict or set(counts) != {"success", "exit_one", "other_exit", "timeout", "refusal"}
+            or any(type(value) is not int or not 0 <= value <= 128 for value in counts.values())
+            or sum(counts.values()) > 128 or type(scanned) is not bool or type(cleaned) is not bool
+            or type(getattr(commands, "cleanup_failed", None)) is not bool):
+        return None
+    return {"schema": 1, "check": "windows_update_gate_diagnostic", "stage": stage,
+            "command_phase": command, "job_close": close, "job_close_refusal": None if refusal is None else dict(refusal),
+            "scan_phase": scan,
+            "scan_counts": dict(counts), "cleanup_phase": cleanup_phase,
+            "job_cleanup_failed": commands.cleanup_failed,
+            "private_log_scan_passed": scanned, "cleanup_passed": cleaned,
+            "passed": False, "distribution_ready": False}
 
 def failure_diagnostic(commands, stage, site, scanned, cleaned):
     if (scanned is not True or cleaned is not True
@@ -865,35 +946,52 @@ def execute(args):
         failure_site = notice_source._notice_failure_site(error)
         raise
     finally:
+        cleanup_phase = "scan"
         try:
-            commands.scan(scanner); scan=True
+            try:
+                commands.scan(scanner); scan=True
+                if failed:
+                    cargo_failure = cargo_failure_diagnostic(commands, stage, scan)
+            finally:
+                cleanup_phase = "credentials"
+                # Generated fixture credentials are removed even if a transaction
+                # remains pending; never remove a changed/foreign file or registry.
+                key_failure = False
+                for path, (identity_key, expected_hash) in keys.items():
+                    try:
+                        info = checked(path).stat()
+                        require((info.st_dev,info.st_ino)==identity_key and digest(path,4096)==expected_hash)
+                        path.unlink()
+                    except (Failure,OSError):
+                        key_failure = True
+                require(not key_failure)
+                # A pending/foreign registration retains this owned tree privately;
+                # such a cleanup is a failure, never an installed acceptance pass.
+                cleanup_phase = "job_gate"
+                require(not commands.cleanup_failed)
+                cleanup_phase = "registry"
+                absent_registry()
+                cleanup_phase = "workspace"
+                remove_owned_workspace(workspace,workspace_identity,root,identity); clean=True
+                cleanup_phase = "complete"
             if failed:
-                cargo_failure = cargo_failure_diagnostic(commands, stage, scan)
+                diagnostic = failure_diagnostic(commands, stage, failure_site, scan, clean)
+                if diagnostic is not None:
+                    print("MORPHEUS_WINDOWS_UPDATE_FAILURE_DIAGNOSTIC " + json.dumps(diagnostic, sort_keys=True),
+                          file=sys.stderr, flush=True)
+                    if cargo_failure is not None:
+                        print("MORPHEUS_WINDOWS_UPDATE_CARGO_DIAGNOSTIC "
+                              + json.dumps(cargo_failure, sort_keys=True), file=sys.stderr, flush=True)
         finally:
-            # Generated fixture credentials are removed even if a transaction
-            # remains pending; never remove a changed/foreign file or registry.
-            key_failure = False
-            for path, (identity_key, expected_hash) in keys.items():
-                try:
-                    info = checked(path).stat()
-                    require((info.st_dev,info.st_ino)==identity_key and digest(path,4096)==expected_hash)
-                    path.unlink()
-                except (Failure,OSError):
-                    key_failure = True
-            require(not key_failure)
-            # A pending/foreign registration retains this owned tree privately;
-            # such a cleanup is a failure, never an installed acceptance pass.
-            require(not commands.cleanup_failed)
-            absent_registry()
-            remove_owned_workspace(workspace,workspace_identity,root,identity); clean=True
-        if failed:
-            diagnostic = failure_diagnostic(commands, stage, failure_site, scan, clean)
-            if diagnostic is not None:
-                print("MORPHEUS_WINDOWS_UPDATE_FAILURE_DIAGNOSTIC " + json.dumps(diagnostic, sort_keys=True),
-                      file=sys.stderr, flush=True)
-                if cargo_failure is not None:
-                    print("MORPHEUS_WINDOWS_UPDATE_CARGO_DIAGNOSTIC "
-                          + json.dumps(cargo_failure, sort_keys=True), file=sys.stderr, flush=True)
+            # This channel contains no private content and never substitutes
+            # for the original full-scan/cleanup gates on source/compiler hints.
+            try:
+                gate = gate_failure_diagnostic(commands, stage, cleanup_phase, scan, clean)
+                if gate is not None:
+                    print("MORPHEUS_WINDOWS_UPDATE_GATE_DIAGNOSTIC " + json.dumps(gate, sort_keys=True),
+                          file=sys.stderr, flush=True)
+            except BaseException:
+                pass  # Observation failure must not replace the original refusal.
     require(stage=="complete" and len(results)==len(CASES) and scan and clean)
     print(json.dumps({"check":"windows_installed_update_mechanism","passed":True,"source_revision":reviewed,
         "cohort":old["identity"]["persistence"],"old_source":old["source"],"new_source":new["source"],

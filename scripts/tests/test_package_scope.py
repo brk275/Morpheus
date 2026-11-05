@@ -90,8 +90,78 @@ class PackageScopeTests(unittest.TestCase):
 
 
 class NativeUpdateScopeTests(unittest.TestCase):
+    def test_mac_architecture_aliases_select_one_existing_worker_without_cross_platform_modes(self):
+        expected = {"macos-arm64":{"os":"macos-15","label":"macos-arm64","formats":"dmg"},
+                    "macos-x64":{"os":"macos-15-intel","label":"macos-x64","formats":"dmg"}}
+        for selector, row in expected.items():
+            for formats in ("appimage", "deb", "both"):
+                with self.subTest(selector=selector, formats=formats):
+                    self.assertEqual(package_matrix(selector, formats), {"include":[row]})
+            self.assertEqual(package_matrix(selector, "appimage", native_updates=True), {"include":[row]})
+            for updates, capture, source, native in ((True,False,False,False),
+                    (False,True,False,False), (False,False,True,False),
+                    (True,False,False,True), (False,True,False,True), (False,False,True,True)):
+                with self.subTest(selector=selector, updates=updates, capture=capture, source=source, native=native), self.assertRaises(ValueError):
+                    package_matrix(selector, "appimage", updates, capture, source, native)
+            for formats in ("deb", "both"):
+                with self.assertRaises(ValueError):
+                    package_matrix(selector, formats, native_updates=True)
+        self.assertEqual(package_matrix("macos", "appimage")["include"], list(expected.values()))
+        self.assertEqual(package_matrix("all", "appimage")["include"][:2], list(expected.values()))
+        self.assertEqual(len(package_matrix("all", "appimage")["include"]), 4)
+
+    def test_mac_architecture_outputs_keep_original_revision_cache_and_typed_mode_guards(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output=Path(temporary)/"outputs"
+            original={"GITHUB_OUTPUT":str(output),"GITHUB_SHA":"a"*40,
+                "PACKAGE_SOURCE_REVISION":"b"*40,"LINUX_FORMATS":"appimage","APPIMAGE_UPDATES":"false",
+                "APPIMAGE_CAPTURE":"false","SOURCE_BUNDLE":"false","NATIVE_UPDATES":"true"}
+            for selector, runner in (("macos-arm64","macos-15"),("macos-x64","macos-15-intel")):
+                environment=original|{"PACKAGE_PLATFORM":selector}
+                with mock.patch.dict(os.environ, environment, clear=True):package_scope.main()
+                fields=dict(line.split("=",1) for line in output.read_text().splitlines())
+                self.assertEqual(json.loads(fields["matrix"])["include"],[{"os":runner,"label":selector,"formats":"dmg"}])
+                self.assertEqual(fields["source_revision"],"b"*40)
+                self.assertEqual((fields["cache_write"],fields["native_updates"],fields["source_bundle"]),("false","true","false"))
+                output.unlink()
+                with mock.patch.dict(os.environ,environment|{"PACKAGE_SOURCE_REVISION":"","NATIVE_UPDATES":"false"},clear=True):
+                    package_scope.main()
+                fields=dict(line.split("=",1) for line in output.read_text().splitlines())
+                self.assertEqual((fields["source_revision"],fields["cache_write"]),("a"*40,"true"))
+                for change in ({"NATIVE_UPDATES":"yes"},{"SOURCE_BUNDLE":"true"},
+                               {"LINUX_FORMATS":"both"},{"PACKAGE_PLATFORM":"macos-15"}):
+                    output.unlink(missing_ok=True)
+                    with mock.patch.dict(os.environ,environment|change,clear=True),self.assertRaises(ValueError):
+                        package_scope.main()
+                    self.assertFalse(output.exists())
+
+    def test_native_notice_guard_revalidates_raw_architecture_selector_against_actual_host(self):
+        from scripts import native_notice_source as acquisition
+        context={"owner_id":42,"sender_id":42,"private":False,
+            "inputs":{"source_revision":"a"*40,"platform":"macos-x64","linux_formats":"appimage",
+                      "appimage_updates":False,"appimage_capture":False,"source_bundle":False,"native_updates":True}}
+        environment={"GITHUB_ACTIONS":"true","RUNNER_ENVIRONMENT":"github-hosted",
+            "GITHUB_REPOSITORY":"brk275/Morpheus","GITHUB_REF":"refs/heads/main",
+            "GITHUB_EVENT_NAME":"workflow_dispatch","GITHUB_ACTOR":"brk275",
+            "GITHUB_TRIGGERING_ACTOR":"brk275","RUNNER_OS":"macOS","ImageOS":"macos15",
+            "GITHUB_SHA":"b"*40,"MORPHEUS_PACKAGE_SOURCE_REVISION":"a"*40,
+            "GITHUB_EVENT_PATH":"/unsafe/shared/event.json"}
+        workflow=(Path(__file__).resolve().parents[2]/".github/workflows/package-qa.yml").read_text()
+        self.assertEqual(workflow.count('"platform":${{ toJSON(inputs.platform) }}'),2)
+        for selector, matching, foreign in (("macos-arm64","arm64","x86_64"),("macos-x64","x86_64","arm64")):
+            context["inputs"]["platform"]=selector
+            selected=environment|{"MORPHEUS_NATIVE_PACKAGE_CONTEXT":json.dumps(context)}
+            with mock.patch.object(acquisition.platform,"machine",return_value=matching), \
+                    mock.patch.object(acquisition.sys,"version_info",(3,12)), \
+                    mock.patch.object(acquisition.N,"read_regular",side_effect=AssertionError("unsafe event file opened")) as read:
+                acquisition.guard(selected,system="darwin")
+                with mock.patch.object(acquisition.platform,"machine",return_value=foreign),self.assertRaises(ValueError):
+                    acquisition.guard(selected,system="darwin")
+                read.assert_not_called()
+
     def test_only_explicit_mac_or_windows_select_existing_standard_targets(self):
-        for platform, labels in (("macos", ["macos-arm64", "macos-x64"]), ("windows", ["windows-x64"])):
+        for platform, labels in (("macos", ["macos-arm64", "macos-x64"]), ("macos-arm64", ["macos-arm64"]),
+                                 ("macos-x64", ["macos-x64"]), ("windows", ["windows-x64"])):
             with self.subTest(platform=platform):
                 self.assertEqual(package_matrix(platform, "appimage", native_updates=True),
                                  package_matrix(platform, "appimage"))
@@ -99,7 +169,7 @@ class NativeUpdateScopeTests(unittest.TestCase):
         for platform in ("linux", "all", "unknown"):
             with self.subTest(platform=platform), self.assertRaises(ValueError):
                 package_matrix(platform, "appimage", native_updates=True)
-        for platform in ("macos", "windows"):
+        for platform in ("macos", "macos-arm64", "macos-x64", "windows"):
             for formats, updates, capture, source in (("deb", False, False, False), ("both", False, False, False),
                     ("appimage", True, False, False), ("appimage", False, True, False), ("appimage", False, False, True)):
                 with self.subTest(platform=platform, formats=formats, updates=updates, capture=capture, source=source), self.assertRaises(ValueError):

@@ -741,6 +741,106 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
         update.remove_owned_workspace(workspace,workspace_identity,root,identity)
         self.assertFalse(workspace.exists())
 
+    def test_installed_update_gate_observations_preserve_wait_drain_close_refusals(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            commands=update.Commands(Path(temporary).resolve(),{})
+            job=Mock(); job.kernel.WaitForSingleObject.return_value=258
+            commands.bounded_logs=Mock(); commands.deadline=0
+            with patch.object(update.time,"monotonic",return_value=1):
+                with self.assertRaises(update.Failure):commands.wait(job,17,5)
+            self.assertEqual(commands.command_phase,"process_wait")
+            job.kernel.WaitForSingleObject.assert_called_once_with(17,0)
+            job.active.return_value=1
+            with patch.object(update.time,"monotonic",return_value=1):
+                with self.assertRaises(update.Failure):commands.empty(job)
+            self.assertEqual(commands.command_phase,"drain_deadline")
+            job.active.assert_called_once_with()
+            error=capture.Failure("cleanup",operation="job_drain")
+            job.close.side_effect=error
+            with self.assertRaises(capture.Failure) as caught:commands.close_job(job)
+            self.assertIs(caught.exception,error);job.close.assert_called_once_with()
+            self.assertTrue(commands.cleanup_failed)
+            facts=update.gate_failure_diagnostic(commands,"build-old","job_gate",False,False)
+            self.assertEqual(facts["job_close_refusal"],{"code":"cleanup","operation":"job_drain"})
+            class Foreign(capture.Failure):pass
+            job.close.side_effect=Foreign("cleanup",operation="job_drain")
+            with self.assertRaises(Foreign):commands.close_job(job)
+            self.assertIsNone(commands.close_refusal)
+            class BrokenMembership:
+                def __contains__(self,value):raise MemoryError("private-observer-refusal")
+            job.close.side_effect=error
+            commands.cleanup_failed=False
+            with patch.object(capture,"FAILURES",BrokenMembership()):
+                with self.assertRaises(capture.Failure) as caught:commands.close_job(job)
+            self.assertIs(caught.exception,error)
+            self.assertTrue(commands.cleanup_failed)
+
+    def test_installed_update_gate_scan_counts_literal_exits_timeout_and_refusal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            commands=update.Commands(Path(temporary).resolve(),{})
+            for index in range(5):(commands.logs/(str(index)+".log")).write_bytes(b"private-canary-never-emitted")
+            outcomes=[types.SimpleNamespace(returncode=0),types.SimpleNamespace(returncode=1),
+                types.SimpleNamespace(returncode=2),subprocess.TimeoutExpired("private-argv",60),OSError("private-error")]
+            with patch.object(update,"checked",side_effect=lambda p,**kw:Path(p)), \
+                    patch.object(update.subprocess,"run",side_effect=outcomes) as scanner:
+                with self.assertRaises(update.Failure):commands.scan(Path("scanner"))
+            self.assertEqual(scanner.call_count,5)
+            for call in scanner.call_args_list:
+                self.assertEqual(call.kwargs["timeout"],60)
+                self.assertEqual(call.kwargs["stdout"],subprocess.DEVNULL)
+                self.assertEqual(call.kwargs["stderr"],subprocess.DEVNULL)
+            facts=update.gate_failure_diagnostic(commands,"build-old","complete",False,True)
+            self.assertEqual(facts["scan_counts"],dict(success=1,exit_one=1,other_exit=1,timeout=1,refusal=1))
+            self.assertFalse(facts["private_log_scan_passed"])
+            self.assertNotIn("private-",json.dumps(facts))
+            self.assertIsNone(update.failure_diagnostic(commands,"build-old",None,False,True))
+            commands.command_phase="private-path-or-body"
+            self.assertIsNone(update.gate_failure_diagnostic(commands,"build-old","complete",False,True))
+            commands.command_phase="complete";commands.scan_counts["success"]=True
+            self.assertIsNone(update.gate_failure_diagnostic(commands,"build-old","complete",False,True))
+
+    def test_installed_update_gate_finalization_emits_only_closed_metadata_after_refusal(self):
+        for scan_fails,cleanup_fails in ((True,False),(False,True)):
+            with self.subTest(scan_fails=scan_fails),tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve();output=io.StringIO();events=[]
+                commands=update.Commands(root,{"RUSTUP_HOME":str(root)})
+                error=OSError("private-refusal-body")
+                commands.run=Mock(side_effect=[b"cargo-packager 0.11.8",update.Failure()])
+                def scan(scanner):
+                    events.append("scan");commands.scan_phase="result"
+                    if scan_fails:
+                        commands.scan_counts["other_exit"]=1
+                        raise error
+                    commands.scan_phase="complete"
+                commands.scan=scan
+                def cleanup(*args):
+                    events.append("cleanup")
+                    if cleanup_fails:raise error
+                args=types.SimpleNamespace(source=root/"reviewed",gitleaks=root/"scanner.exe",
+                    gitleaks_sha256="b"*64,execute_on_free_hosted_runner=True)
+                def reserve(nonce):
+                    return root,(1,2),root,(3,4)
+                with contextlib.redirect_stderr(output),patch.object(update,"guard"), \
+                        patch.object(update,"checked",side_effect=lambda p,**kw:Path(p)), \
+                        patch.object(update.revision,"expected_revision",return_value="c"*40), \
+                        patch.object(update.revision,"verify_checkout",return_value="c"*40), \
+                        patch.object(update,"digest",return_value="b"*64), \
+                        patch.object(update,"private_environment",return_value={"RUSTUP_HOME":str(root)}), \
+                        patch.object(update,"reserve_workspace",side_effect=reserve), \
+                        patch.object(update,"Commands",return_value=commands), \
+                        patch.object(update.notice_source,"system_git",return_value=root/"git.exe"), \
+                        patch.object(update,"absent_registry"),patch.object(update,"remove_owned_workspace",side_effect=cleanup):
+                    with self.assertRaises(OSError) as caught:update.execute(args)
+                self.assertIs(caught.exception,error);self.assertEqual(events,["scan","cleanup"])
+                line,=output.getvalue().splitlines()
+                facts=json.loads(line.removeprefix("MORPHEUS_WINDOWS_UPDATE_GATE_DIAGNOSTIC "))
+                self.assertEqual(facts["cleanup_phase"],"complete" if scan_fails else "workspace")
+                self.assertEqual(facts["private_log_scan_passed"],not scan_fails)
+                self.assertEqual(facts["cleanup_passed"],not cleanup_fails)
+                self.assertFalse(facts["passed"])
+                self.assertNotIn("private-",output.getvalue())
+                self.assertNotIn("CARGO_DIAGNOSTIC",output.getvalue())
+
     def test_installed_update_failure_diagnostic_keeps_only_scanned_clean_closed_stage_and_owned_site(self):
         commands=types.SimpleNamespace(cleanup_failed=False,build_substage="notices_prepare")
         site={"module":"native_notices","line":171}
