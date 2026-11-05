@@ -4,7 +4,7 @@
 // so the window passes its resolved semantic colors and appearance
 // preferences (corners, line and focus widths, padding) in.
 
-import { ListView } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 
 export struct AttachmentItem {
     // Stable while the item exists; zero is never an item.
@@ -91,6 +91,8 @@ component QueueAction inherits Rectangle {
         accessible-role: none;
     }
     keyboard-focus := FocusScope {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        focus-on-click: true;
         key-pressed(event) => {
             if event.text == Key.Space || event.text == Key.Return {
                 root.activated();
@@ -174,118 +176,130 @@ export component AttachmentQueue inherits Rectangle {
         }
     }
 
-    if root.items.length > 0 : list := ListView {
+    // The owner caps this room's queue at ten items. Keep every action in
+    // the tab order even when only one row fits in the bounded viewport.
+    if root.items.length > 0 : list := ScrollView {
         y: root.header-height;
         height: root.needed-height - root.header-height;
+        content-width: max(self.visible-width, rows.min-width);
+        content-height: root.items.length * root.row-height;
         horizontal-scrollbar-policy: always-off;
-        for item in root.items : Rectangle {
-            width: list.visible-width;
-            height: root.row-height;
-            border-radius: root.style.row-radius;
-            border-width: root.style.row-line-width;
-            border-color: root.palette.divider;
-            background: root.palette.surface;
-            accessible-role: list-item;
-            accessible-label: item.name + ", " + item.detail + ", " + item.status;
-            HorizontalLayout {
-                padding-left: 8px;
-                padding-right: 6px;
-                padding-top: 3px;
-                padding-bottom: 3px;
-                spacing: 8px;
-                VerticalLayout {
-                    horizontal-stretch: 1;
-                    alignment: center;
-                    spacing: 2px;
-                    HorizontalLayout {
-                        spacing: 6px;
-                        Text {
-                            text: item.name;
-                            color: root.palette.ink;
-                            font-size: 11px * root.text-scale;
-                            font-weight: 700;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                            accessible-role: none;
+        accessible-role: list;
+        accessible-orientation: Orientation.vertical;
+        rows := VerticalLayout {
+            x: 0px; y: 0px;
+            width: list.content-width;
+            height: root.items.length * root.row-height;
+            padding-right: 16px;
+            spacing: 0px;
+            for item in root.items : Rectangle {
+                height: root.row-height;
+                border-radius: root.style.row-radius;
+                border-width: root.style.row-line-width;
+                border-color: root.palette.divider;
+                background: root.palette.surface;
+                accessible-role: list-item;
+                accessible-label: item.name + ", " + item.detail + ", " + item.status;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 6px;
+                    padding-top: 3px;
+                    padding-bottom: 3px;
+                    spacing: 8px;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        spacing: 2px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: item.name;
+                                color: root.palette.ink;
+                                font-size: 11px * root.text-scale;
+                                font-weight: 700;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                                accessible-role: none;
+                            }
+                            Text {
+                                text: item.detail;
+                                color: root.palette.muted;
+                                font-size: 10px * root.text-scale;
+                                overflow: elide;
+                                accessible-role: none;
+                            }
                         }
-                        Text {
-                            text: item.detail;
-                            color: root.palette.muted;
-                            font-size: 10px * root.text-scale;
-                            overflow: elide;
-                            accessible-role: none;
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: 6px;
-                        Text {
-                            text: item.status;
-                            color: item.state >= 6 ? root.palette.error : root.palette.muted;
-                            font-size: 10px * root.text-scale;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                            accessible-role: none;
-                        }
-                        if item.progress >= 0 : VerticalLayout {
-                            alignment: center;
-                            Rectangle {
-                                width: 72px;
-                                height: 5px;
-                                border-radius: 2.5px;
-                                background: root.palette.divider;
-                                accessible-role: progress-indicator;
-                                accessible-label: "Upload progress";
-                                accessible-value: round(item.progress * 100) + "%";
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: item.status;
+                                color: item.state >= 6 ? root.palette.error : root.palette.muted;
+                                font-size: 10px * root.text-scale;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                                accessible-role: none;
+                            }
+                            if item.progress >= 0 : VerticalLayout {
+                                alignment: center;
                                 Rectangle {
-                                    x: 0px;
-                                    width: parent.width * min(1, max(0, item.progress));
-                                    height: parent.height;
-                                    border-radius: parent.border-radius;
-                                    background: root.palette.accent;
+                                    width: 72px;
+                                    height: 5px;
+                                    border-radius: 2.5px;
+                                    background: root.palette.divider;
+                                    accessible-role: progress-indicator;
+                                    accessible-label: "Upload progress";
+                                    accessible-value: round(item.progress * 100) + "%";
+                                    Rectangle {
+                                        x: 0px;
+                                        width: parent.width * min(1, max(0, item.progress));
+                                        height: parent.height;
+                                        border-radius: parent.border-radius;
+                                        background: root.palette.accent;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                if item.can-move-up : QueueAction {
-                    text: "Up";
-                    label: "Send " + item.name + " earlier";
-                    palette: root.palette;
-                    style: root.style;
-                    text-scale: root.text-scale;
-                    activated => { root.action(item.id, 4); }
-                }
-                if item.can-move-down : QueueAction {
-                    text: "Down";
-                    label: "Send " + item.name + " later";
-                    palette: root.palette;
-                    style: root.style;
-                    text-scale: root.text-scale;
-                    activated => { root.action(item.id, 5); }
-                }
-                if item.can-retry : QueueAction {
-                    text: "Retry";
-                    label: "Retry " + item.name;
-                    palette: root.palette;
-                    style: root.style;
-                    text-scale: root.text-scale;
-                    activated => { root.action(item.id, 2); }
-                }
-                if item.can-cancel : QueueAction {
-                    text: "Cancel";
-                    label: "Cancel " + item.name;
-                    palette: root.palette;
-                    style: root.style;
-                    text-scale: root.text-scale;
-                    activated => { root.action(item.id, 1); }
-                }
-                if item.can-remove : QueueAction {
-                    text: item.state == 8 ? "Dismiss" : "Remove";
-                    label: (item.state == 8 ? "Dismiss " : "Remove ") + item.name;
-                    palette: root.palette;
-                    style: root.style;
-                    text-scale: root.text-scale;
-                    activated => { root.action(item.id, 0); }
+                    if item.can-move-up : QueueAction {
+                        text: "Up";
+                        label: "Send " + item.name + " earlier";
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.action(item.id, 4); }
+                    }
+                    if item.can-move-down : QueueAction {
+                        text: "Down";
+                        label: "Send " + item.name + " later";
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.action(item.id, 5); }
+                    }
+                    if item.can-retry : QueueAction {
+                        text: "Retry";
+                        label: "Retry " + item.name;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.action(item.id, 2); }
+                    }
+                    if item.can-cancel : QueueAction {
+                        text: "Cancel";
+                        label: "Cancel " + item.name;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.action(item.id, 1); }
+                    }
+                    if item.can-remove : QueueAction {
+                        text: item.state == 8 ? "Dismiss" : "Remove";
+                        label: (item.state == 8 ? "Dismiss " : "Remove ") + item.name;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.action(item.id, 0); }
+                    }
                 }
             }
         }
