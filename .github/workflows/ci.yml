@@ -4,12 +4,12 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: windows-tiny-msvc-ea5bbf7f4fa9dd1e0dc3e6e60cf4ee2a3652c250
+  group: windows-tiny-msvc-94d3b916b6a3c119db14d83e4a43b290d6bedabc
   cancel-in-progress: false
 env:
-  REVIEWED_TINY_SOURCE: ea5bbf7f4fa9dd1e0dc3e6e60cf4ee2a3652c250
-  REVIEWED_TINY_TREE: e01e849e85cc986dfb7d6e41778d0f515b25449d
-  MORPHEUS_PACKAGE_SOURCE_REVISION: ea5bbf7f4fa9dd1e0dc3e6e60cf4ee2a3652c250
+  REVIEWED_TINY_SOURCE: 94d3b916b6a3c119db14d83e4a43b290d6bedabc
+  REVIEWED_TINY_TREE: 6a08471fde73289f7670134522bad7f02f0db6c4
+  MORPHEUS_PACKAGE_SOURCE_REVISION: 94d3b916b6a3c119db14d83e4a43b290d6bedabc
 jobs:
   tiny:
     name: Synthetic protected Windows compiler and cleanup probe
@@ -60,7 +60,7 @@ jobs:
                   if self.tell()+len(value)>32768: raise ValueError('private test observation bound')
                   return super().write(value)
           scanner_root = None; scanner_identity = None; scanner_cleaned = False
-          result = None; observation = None; route_error = False
+          result = None; observation = None; route_error = False; privacy_names=()
           try:
               security=N.S.windows_security()
               scanner_root=security.create_root(security.path(Path.home().resolve(strict=True),directory=True))
@@ -80,10 +80,20 @@ jobs:
               os.environ['MORPHEUS_TINY_GITLEAKS']=str(scanner)
               # No unittest traceback, exception body or compiler output is public.
               observed, private_errors=Bounded(),Bounded()
-              name='scripts.tests.test_windows_capture_acceptance.InstalledWindowsUpdateTests.test_update_workspace_actual_windows_acl_source_reads_and_cleanup_preserve_actor_parent'
+              prefix='scripts.tests.test_windows_capture_acceptance.InstalledWindowsUpdateTests.'
+              privacy_names=(prefix+'test_update_cleanup_refusal_diagnostic_keeps_only_builtin_category_and_bounded_numeric_codes',
+                             prefix+'test_cargo_build_diagnostic_requires_complete_scanned_owned_log_and_closed_codes')
+              names=privacy_names+(prefix+'test_update_workspace_actual_windows_acl_source_reads_and_cleanup_preserve_actor_parent',)
+              class SelectedResults(unittest.TextTestResult):
+                  def __init__(self,*args,**kwargs):
+                      super().__init__(*args,**kwargs); self.successful_ids=set()
+                  def addSuccess(self,test):
+                      super().addSuccess(test); self.successful_ids.add(test.id())
               with contextlib.redirect_stdout(observed),contextlib.redirect_stderr(private_errors):
-                  suite=unittest.defaultTestLoader.loadTestsFromName(name)
-                  result=unittest.TextTestRunner(stream=private_errors,verbosity=2).run(suite)
+                  selected=[unittest.defaultTestLoader.loadTestsFromName(name) for name in names]
+                  assert all(suite.countTestCases()==1 and [case.id() for case in suite]==[name] for suite,name in zip(selected,names))
+                  suite=unittest.TestSuite(selected)
+                  result=unittest.TextTestRunner(stream=private_errors,verbosity=2,resultclass=SelectedResults).run(suite)
               lines=observed.getvalue().splitlines()
               assert len(lines)==1 and lines[0].startswith('MORPHEUS_WINDOWS_TINY_MSVC ')
               observation=json.loads(lines[0].split(' ',1)[1])
@@ -102,13 +112,17 @@ jobs:
                   if 'predicate' in refusal: assert refusal['category']=='guard' and refusal['predicate'] in {'root_identity','inventory_limit','inventory_symlink','inventory_reparse','callback_scope','callback_root_identity','inner_removed','workspace_scope','workspace_identity','workspace_empty','workspace_removed'}
                   if 'reparse' in refusal:
                       fixed=refusal['reparse']
-                      assert refusal.get('predicate')=='inventory_reparse' and type(fixed) is dict and set(fixed)=={'role','kind','attributes','tag'}
+                      assert refusal.get('predicate')=='inventory_reparse' and type(fixed) is dict and set(fixed)=={'role','kind','attributes','tag','subcomponent','compatibility_name','depth'}
                       assert type(fixed['role']) is str and fixed['role'] in {'native-target','tools-home','tiny-source','synthetic-git','logs','other'}
                       assert type(fixed['kind']) is str and fixed['kind'] in {'directory','regular','other'}
                       assert all(fixed[k] is None or type(fixed[k]) is int and 0<=fixed[k]<=0xffffffff for k in ('attributes','tag'))
+                      assert type(fixed['subcomponent']) is str and fixed['subcomponent'] in {'not-tools-home','home','roaming','local','temp','other','none'}
+                      assert type(fixed['compatibility_name']) is str and fixed['compatibility_name'] in {'not-tools-home','application-data','local-settings','history','cookies','temporary-internet-files','my-documents','nethood','printhood','recent','sendto','templates','start-menu','other'}
+                      assert fixed['depth'] is None or type(fixed['depth']) is int and 1<=fixed['depth']<=64
+                      assert (fixed['role']=='tools-home' and fixed['subcomponent']!='not-tools-home' and fixed['compatibility_name']!='not-tools-home') or (fixed['role']!='tools-home' and fixed['subcomponent']==fixed['compatibility_name']=='not-tools-home')
               hint=observation['compiler_hint']
               if hint is not None:
-                  assert observation['cleanup_passed'] is True and observation['private_scan_passed'] is True
+                  assert observation['private_scan_passed'] is True and observation['job_closed'] is True and observation['job_cleanup_failed'] is False
                   assert type(hint) is dict and set(hint)=={'schema','check','status','error_codes','stderr_classes','private_log_scan_passed','passed','distribution_ready'}
                   assert hint['schema']==1 and hint['check']=='windows_update_cargo_failure' and type(hint['status']) is int and 0<hint['status']<=0xffffffff
                   assert hint['private_log_scan_passed'] is True and hint['passed'] is False and hint['distribution_ready'] is False
@@ -127,7 +141,8 @@ jobs:
                   except BaseException: route_error=True; observation=None
           if observation is not None and scanner_cleaned:
               print('MORPHEUS_WINDOWS_TINY_MSVC '+json.dumps(observation,sort_keys=True))
-          exact_test=result is not None and result.testsRun==1 and not result.skipped
-          passed=bool(not route_error and scanner_cleaned and exact_test and result.wasSuccessful() and observation is not None and all(observation[k] is True for k in ('build_passed','binary_passed','private_scan_passed','cleanup_passed','job_closed')) and observation['job_cleanup_failed'] is False and observation['readonly_retries']==2)
-          print('MORPHEUS_WINDOWS_TINY_ROUTE '+json.dumps({'schema':1,'source_revision':source,'source_tree':tree,'selected_tests':1,'tests_run':result.testsRun if result else 0,'skipped':len(result.skipped) if result else 0,'scanner_root_cleanup_passed':scanner_cleaned,'closed_observation_available':observation is not None,'passed':passed,'synthetic_only':True,'installed_update_qualified':False},sort_keys=True))
+          exact_test=result is not None and result.testsRun==3 and not result.skipped
+          privacy_regressions_passed=bool(result is not None and len(privacy_names)==2 and set(privacy_names)<=result.successful_ids)
+          passed=bool(not route_error and scanner_cleaned and exact_test and privacy_regressions_passed and result.wasSuccessful() and observation is not None and all(observation[k] is True for k in ('build_passed','binary_passed','private_scan_passed','cleanup_passed','job_closed')) and observation['job_cleanup_failed'] is False and observation['readonly_retries']==2)
+          print('MORPHEUS_WINDOWS_TINY_ROUTE '+json.dumps({'schema':1,'source_revision':source,'source_tree':tree,'selected_tests':3,'privacy_regressions_passed':privacy_regressions_passed,'tests_run':result.testsRun if result else 0,'skipped':len(result.skipped) if result else 0,'scanner_root_cleanup_passed':scanner_cleaned,'closed_observation_available':observation is not None,'passed':passed,'synthetic_only':True,'installed_update_qualified':False},sort_keys=True))
           raise SystemExit(0 if passed else 1)
