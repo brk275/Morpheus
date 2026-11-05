@@ -474,62 +474,70 @@ def qualified_vendor_main_reuse(paths, event, event_name, force_all=False):
         return False
 
 
-# One exact reviewed UI checkpoint: all four native desktop jobs passed on F.
-# C differs from F only in the three separately checked Windows helper blobs.
-# Helpers and complete-history scanning remain on. The frozen receipt records
-# actual source/job/log identities; no artifact or release acceptance is reused.
-APPEARANCE_REUSE_SOURCE = "129770747c8a7f5c58ce9f7e83e0274eb29fd690"
-APPEARANCE_REUSE_TREE = "ee1c64a1d02e124f9828a4919136b2d9c549abff"
-APPEARANCE_REUSE_NATIVE_SOURCE = "51afad97a59ed148cef1e0604bdcca46614de771"
-APPEARANCE_REUSE_NATIVE_TREE = "d96584a69de8d2dfc0786164dfbc6bbf13dd8fef"
-APPEARANCE_REUSE_WINDOWS_SOURCE = "4bc8f829ed8d096cdb9c7e7629438ed5bf5fdb1b"
-APPEARANCE_REUSE_WINDOWS_TREE = "550006fc419ec10b6a268b74ec6f374bd55a410f"
-APPEARANCE_REUSE_RECEIPT = "758b64e61103890a89214e74d5b2163667be6f3396e69b1f67b2a433f55e1a83"
+# One exact reviewed font checkpoint, bound to immutable complete desktop4
+# evidence and the separately qualified Mac Python helper inputs.
+# Whole compiled inputs must match the native source; only these two exact
+# separately qualified Python leaves may differ. No release gate is reused.
+APPEARANCE_REUSE_ACCEPTED = True
+APPEARANCE_REUSE_SOURCE = '74b340f39accd4f503214de43e69cb2a9caf33ae'
+APPEARANCE_REUSE_TREE = 'a2ed0bc7932749a8a02e0dd0d435e539b102e213'
+APPEARANCE_REUSE_NATIVE_SOURCE = "dd8827bb0b7431a97e4201f719bc3fe72ac93363"
+APPEARANCE_REUSE_NATIVE_TREE = "3ec6d37e0422b9fff6a5094a85a04e4619ad131e"
+APPEARANCE_REUSE_SUPPLEMENTAL_SOURCE = "8df2790dd711fadde1f4187cd93976627f4e8bc7"
+APPEARANCE_REUSE_SUPPLEMENTAL_TREE = "1667fd2954593245121fd53027c48a40ca80d2fc"
+APPEARANCE_REUSE_RECEIPT = '804ee7534f50e05d8b420d6df5f0b1b04b1bd9838495e574da67e02a7949b559'
 APPEARANCE_REUSE_JOBS = (
-    ("ubuntu-24.04", 40795707711, 123191954281),
-    ("macos-15", 40795707711, 123191954274),
-    ("macos-15-intel", 40795707711, 123191954327),
-    ("windows-2025", 40795707711, 123191954286),
+    ('macos-15', 41977769991, 127080956131),
+    ('macos-15-intel', 41977769991, 127080956110),
+    ('ubuntu-24.04', 41977769991, 127080956247),
+    ('windows-2025', 41977769991, 127080956176),
 )
-APPEARANCE_REUSE_WINDOWS_INPUTS = (
-    ('.github/workflows/native-webrtc-windows-source.yml', '612e561da24ae578583f4006405a64e783d7b319'),
-    ('scripts/native_webrtc/windows_preflight.ps1', 'ea9762ca83a5047502c696e2d2504716f453f158'),
-    ('scripts/tests/test_native_webrtc_windows_inputs.py', '4091e940ebfffcae8644f0a1bb405fd94c813199'),
+APPEARANCE_REUSE_SUPPLEMENTAL_INPUTS = (
+    ("scripts/macos_update_acceptance.py", "d4ed3c3c9eada86ca6f49a14148633cd6c5a2548"),
+    ("scripts/tests/test_macos_package_ui.py", "513a78b4dd8baca3536adab41b4baa6ef31dabfc"),
 )
-# Only the two exact PR61 compiled UI inputs. Whole remaining-tree equality
-# and all existing fixed owner/event/workflow/source/Windows gates still decide.
+# Path membership alone never grants reuse: complete actual synthetic merge
+# equality below includes every non-selector leaf, mode and dependency input.
 APPEARANCE_REUSE_INPUTS = (
     "crates/morpheus-app/src/account_access_ui_tests.rs",
+    "crates/morpheus-app/src/appearance.rs",
+    "crates/morpheus-app/src/main.rs",
     "crates/morpheus-app/ui/app-window.slint",
 )
 APPEARANCE_REUSE_QUALIFICATION = {
+    "accepted": APPEARANCE_REUSE_ACCEPTED,
     "source": APPEARANCE_REUSE_SOURCE, "tree": APPEARANCE_REUSE_TREE,
     "native_source": APPEARANCE_REUSE_NATIVE_SOURCE, "native_tree": APPEARANCE_REUSE_NATIVE_TREE,
-    "windows_source": APPEARANCE_REUSE_WINDOWS_SOURCE, "windows_tree": APPEARANCE_REUSE_WINDOWS_TREE,
+    "supplemental_source": APPEARANCE_REUSE_SUPPLEMENTAL_SOURCE,
+    "supplemental_tree": APPEARANCE_REUSE_SUPPLEMENTAL_TREE,
     "workflow_sha256": REVIEWED_CONTROL_WORKFLOW_SHA256,
     "receipt_sha256": APPEARANCE_REUSE_RECEIPT, "route": "desktop",
-    "jobs": APPEARANCE_REUSE_JOBS, "windows_inputs": APPEARANCE_REUSE_WINDOWS_INPUTS,
+    "jobs": APPEARANCE_REUSE_JOBS, "supplemental_inputs": APPEARANCE_REUSE_SUPPLEMENTAL_INPUTS,
 }
 
 
 def qualified_appearance_input_reuse(paths, event, event_name, force_all=False):
     qualified = APPEARANCE_REUSE_QUALIFICATION
     if (force_all is not False or event_name not in ("push", "pull_request")
+            or APPEARANCE_REUSE_ACCEPTED is not True
             or type(qualified) is not dict or set(qualified) != {
-                "source", "tree", "native_source", "native_tree", "windows_source", "windows_tree",
-                "workflow_sha256", "receipt_sha256", "route", "jobs", "windows_inputs"}):
+                "accepted", "source", "tree", "native_source", "native_tree", "supplemental_source", "supplemental_tree",
+                "workflow_sha256", "receipt_sha256", "route", "jobs", "supplemental_inputs"}
+            or qualified["accepted"] is not True):
         return False
     frozen = (APPEARANCE_REUSE_SOURCE, APPEARANCE_REUSE_TREE,
               APPEARANCE_REUSE_NATIVE_SOURCE, APPEARANCE_REUSE_NATIVE_TREE,
-              APPEARANCE_REUSE_WINDOWS_SOURCE, APPEARANCE_REUSE_WINDOWS_TREE)
+              APPEARANCE_REUSE_SUPPLEMENTAL_SOURCE, APPEARANCE_REUSE_SUPPLEMENTAL_TREE)
     revisions = tuple(qualified[key] for key in (
-        "source", "tree", "native_source", "native_tree", "windows_source", "windows_tree"))
+        "source", "tree", "native_source", "native_tree", "supplemental_source", "supplemental_tree"))
     if (revisions != frozen or any(type(value) is not str or re.fullmatch(r"[0-9a-f]{40}", value) is None
                                    for value in revisions)
             or qualified["workflow_sha256"] != REVIEWED_CONTROL_WORKFLOW_SHA256
+            or type(qualified["receipt_sha256"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", qualified["receipt_sha256"]) is None
             or qualified["receipt_sha256"] != APPEARANCE_REUSE_RECEIPT or qualified["route"] != "desktop"
             or qualified["jobs"] != APPEARANCE_REUSE_JOBS
-            or qualified["windows_inputs"] != APPEARANCE_REUSE_WINDOWS_INPUTS):
+            or qualified["supplemental_inputs"] != APPEARANCE_REUSE_SUPPLEMENTAL_INPUTS):
         return False
     jobs = qualified["jobs"]
     if (type(jobs) is not tuple or len(jobs) != 4
@@ -598,7 +606,7 @@ def qualified_appearance_input_reuse(paths, event, event_name, force_all=False):
             return False
         for source, tree in ((qualified["source"], qualified["tree"]),
                              (qualified["native_source"], qualified["native_tree"]),
-                             (qualified["windows_source"], qualified["windows_tree"])):
+                             (qualified["supplemental_source"], qualified["supplemental_tree"])):
             if (output(["cat-file", "-t", source]) != b"commit\n"
                     or output(["rev-parse", "--verify", source + "^{tree}"]) != tree.encode() + b"\n"):
                 return False
@@ -607,16 +615,16 @@ def qualified_appearance_input_reuse(paths, event, event_name, force_all=False):
                 rb"100644 blob [0-9a-f]{40}\tscripts/ci_scope\.py\x00"
                 rb"100644 blob [0-9a-f]{40}\tscripts/tests/test_ci_scope\.py\x00", selectors) is None):
             return False
-        windows_paths = tuple(path for path, _ in APPEARANCE_REUSE_WINDOWS_INPUTS)
+        supplemental_paths = tuple(path for path, _ in APPEARANCE_REUSE_SUPPLEMENTAL_INPUTS)
         expected = b"".join(b"100644 blob " + blob.encode() + b"\t" + path.encode() + b"\0"
-                            for path, blob in APPEARANCE_REUSE_WINDOWS_INPUTS)
-        for source in (qualified["source"], qualified["windows_source"]):
-            if output(["ls-tree", "--full-tree", "-z", source, "--", *windows_paths]) != expected:
+                            for path, blob in APPEARANCE_REUSE_SUPPLEMENTAL_INPUTS)
+        for source in (qualified["source"], qualified["supplemental_source"]):
+            if output(["ls-tree", "--full-tree", "-z", source, "--", *supplemental_paths]) != expected:
                 return False
         differences = output(["diff-tree", "--no-commit-id", "--name-only", "-z", "--no-ext-diff",
             "--no-textconv", "--no-renames", "--ignore-submodules=none", "-r",
             qualified["native_source"], qualified["source"]])
-        if differences != b"".join(path.encode() + b"\0" for path in windows_paths):
+        if differences != b"".join(path.encode() + b"\0" for path in supplemental_paths):
             return False
         spec = qualified["source"] + ":.github/workflows/ci.yml"
         if output(["cat-file", "-s", spec]) != str(REVIEWED_CONTROL_WORKFLOW_BYTES).encode() + b"\n":

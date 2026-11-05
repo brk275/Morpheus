@@ -852,32 +852,37 @@ class ScopeTests(unittest.TestCase):
                 return source, tree
 
             ui = "crates/morpheus-app/src/main.rs"
-            windows = tuple(path for path, _ in ci_scope.APPEARANCE_REUSE_WINDOWS_INPUTS)
+            supplemental = tuple(path for path, _ in ci_scope.APPEARANCE_REUSE_SUPPLEMENTAL_INPUTS)
             selectors = ci_scope.NATIVE_REUSE_SELECTORS
             workflow = b"name: controlled frozen workflow\n"
             native_entries = {ui: ("100644", b"reviewed UI"), "Cargo.lock": ("100644", b"reviewed lock"),
                               ".github/workflows/ci.yml": ("100644", workflow),
                               **{path: ("100644", b"old selector") for path in selectors},
-                              **{path: ("100644", b"old Windows input") for path in windows}}
-            composed_entries = native_entries | {path: ("100644", b"qualified " + path.encode()) for path in windows}
+                              **{path: ("100644", b"old Mac helper input") for path in supplemental}}
+            composed_entries = native_entries | {path: ("100644", b"qualified " + path.encode()) for path in supplemental}
             independent_entries = composed_entries | {ui: ("100644", b"independent source has no UI qualification")}
             native, native_tree = commit(native_entries, "native execution")
             source, tree = commit(composed_entries, "reviewed composition")
-            independent, independent_tree = commit(independent_entries, "independent Windows execution")
-            window_blobs = tuple((path, git("rev-parse", independent + ":" + path).decode().strip()) for path in windows)
+            independent, independent_tree = commit(independent_entries, "independent Mac helper execution")
+            supplemental_blobs = tuple((path, git("rev-parse", independent + ":" + path).decode().strip()) for path in supplemental)
+            jobs = tuple((platform, 42, 100 + index) for index, platform in enumerate(PLATFORMS))
             globals_changed = {
+                "APPEARANCE_REUSE_ACCEPTED": True,
+                "APPEARANCE_REUSE_RECEIPT": "a" * 64,
+                "APPEARANCE_REUSE_JOBS": jobs,
                 "APPEARANCE_REUSE_SOURCE": source, "APPEARANCE_REUSE_TREE": tree,
                 "APPEARANCE_REUSE_NATIVE_SOURCE": native, "APPEARANCE_REUSE_NATIVE_TREE": native_tree,
-                "APPEARANCE_REUSE_WINDOWS_SOURCE": independent, "APPEARANCE_REUSE_WINDOWS_TREE": independent_tree,
-                "APPEARANCE_REUSE_WINDOWS_INPUTS": window_blobs,
+                "APPEARANCE_REUSE_SUPPLEMENTAL_SOURCE": independent, "APPEARANCE_REUSE_SUPPLEMENTAL_TREE": independent_tree,
+                "APPEARANCE_REUSE_SUPPLEMENTAL_INPUTS": supplemental_blobs,
                 "APPEARANCE_REUSE_INPUTS": (ui,),
                 "REVIEWED_CONTROL_WORKFLOW_SHA256": hashlib.sha256(workflow).hexdigest(),
                 "REVIEWED_CONTROL_WORKFLOW_BYTES": len(workflow),
             }
             qualification = ci_scope.APPEARANCE_REUSE_QUALIFICATION | {
+                "accepted": True, "jobs": jobs, "receipt_sha256": "a" * 64,
                 "source": source, "tree": tree, "native_source": native, "native_tree": native_tree,
-                "windows_source": independent, "windows_tree": independent_tree,
-                "windows_inputs": window_blobs, "workflow_sha256": hashlib.sha256(workflow).hexdigest(),
+                "supplemental_source": independent, "supplemental_tree": independent_tree,
+                "supplemental_inputs": supplemental_blobs, "workflow_sha256": hashlib.sha256(workflow).hexdigest(),
             }
             repository = {"full_name": "brk275/Morpheus", "private": False, "owner": {"login": "brk275"}}
             trusted_env = {"GITHUB_ACTOR": "brk275", "GITHUB_TRIGGERING_ACTOR": "brk275",
@@ -946,12 +951,18 @@ class ScopeTests(unittest.TestCase):
             for paths in ([], list(selectors), ["README.md"], [ui, "Cargo.lock"], [ui, "vendor/sdk.rs"],
                           [ui, ".github/workflows/ci.yml"], [ui, "unknown.rs"], [ui, ui]):
                 self.assertFalse(compare(paths=paths)); self.assertEqual(calls, [])
-            for field in ("source", "tree", "native_source", "native_tree", "windows_source", "windows_tree", "workflow_sha256"):
+            for accepted in (None, False, 1, "true"):
+                self.assertFalse(compare(changed_qualification=qualification | {"accepted": accepted}))
+                self.assertEqual(calls, [])
+            for receipt in (None, "", "A" * 64, "b" * 64):
+                self.assertFalse(compare(changed_qualification=qualification | {"receipt_sha256": receipt}))
+                self.assertEqual(calls, [])
+            for field in ("source", "tree", "native_source", "native_tree", "supplemental_source", "supplemental_tree", "workflow_sha256"):
                 self.assertFalse(compare(changed_qualification=qualification | {field: "f" * 40})); self.assertEqual(calls, [])
             jobs = qualification["jobs"]
             for bad in (jobs[:3], (jobs[0],) * 4, (jobs[0][:2] + (jobs[0][2] + 1,),) + jobs[1:]):
                 self.assertFalse(compare(changed_qualification=qualification | {"jobs": bad})); self.assertEqual(calls, [])
-            for field in (ui, "Cargo.lock", ".github/workflows/ci.yml", windows[0]):
+            for field in (ui, "Cargo.lock", ".github/workflows/ci.yml", supplemental[0]):
                 changed = candidate_entries | {field: ("100644", b"unqualified change")}
                 self.assertFalse(compare(changed))
                 # A PR head still matching the checkpoint cannot hide an
