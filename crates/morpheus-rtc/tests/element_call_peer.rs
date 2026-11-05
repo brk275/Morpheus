@@ -884,6 +884,7 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
             CallOptions {
                 slot_id: ELEMENT_ROOM_SLOT_ID.to_owned(),
                 interop_mode,
+                auth_dialect: Some(morpheus_rtc::LiveKitAuthDialect::DirectDraft),
             }
         }
     };

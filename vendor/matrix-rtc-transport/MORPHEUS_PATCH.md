@@ -105,3 +105,29 @@ pre-track observations, and track/connection retirement. The call SDK's existing
 engine test module also checks that a same-ID restoration can resume an eligible
 hidden key probe without a repeated failure event, preserving explicit release
 and low-bandwidth constraints. These source tests still require hosted execution.
+
+## Authentication dialect and irreversible call retirement
+
+`LiveKitAuthDialect` pairs the legacy `/sfu/get` service with its user/device
+identity contract, or the explicit direct-draft `/get_token` route with its
+user/device/member identity contract. Legacy service admission accepts only
+the standard upper-case room slot; direct draft retains custom-slot support.
+The sticky compatibility profile keeps its draft default even for that room
+slot. Callers can explicitly select a verified service dialect before the
+request; no URL-field inference or endpoint fallback is added.
+
+Member-attributed imports carry the authoritative participation lease through
+ring application, delayed activation and sender registration. Retired leases
+cannot activate queued keys or reopen pending member notifications. The pool's
+call-retirement path closes its inbox, releases membership/track/key state,
+returns adopted and queued successful connections for closure, and closes
+late successful connections instead of admitting them. This does not promise
+that an arbitrary already-entered external backend operation can be cancelled
+or that every native resource has synchronously stopped.
+
+Existing constraint ordering and receiver-generation rules remain. Focused
+source cases cover contract selection, held-import handover, delayed-key and
+pending-notification retirement, and late connection ownership. Hosted native
+and integration acceptance remain separate requirements; no stock-peer,
+package or release result is claimed. Dependency selectors, retained upstream
+preimages, license declarations and provenance inventories remain unchanged.

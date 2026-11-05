@@ -22,6 +22,7 @@
 //! call; a peer focus is the pool's to reconnect.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -147,6 +148,12 @@ enum ActorMessage {
         identity: String,
         key_index: u8,
     },
+    MemberKeyImported {
+        identity: String,
+        member_id: String,
+        key_index: u8,
+        active: Arc<AtomicBool>,
+    },
     KeyDiscarded(DiscardedKey),
     /// A local publication went up; the roster must show it and peers were
     /// already told by the transport. `muted` is the state it was published
@@ -199,6 +206,8 @@ enum ActorMessage {
     SetDetailWindow(DetailWindow),
     /// Rank only above this many tiles; see [`CallEngine::set_ranking_threshold`].
     SetRankingThreshold(u32),
+    /// A latched identity/auth refusal: close all media and terminate.
+    RejectIdentity,
     /// Close every pooled connection and stop.
     Shutdown {
         ack: oneshot::Sender<()>,
@@ -213,6 +222,10 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
+    pub(crate) fn reject_identity_contract(&self) {
+        let _ = self.messages.send(ActorMessage::RejectIdentity);
+    }
+
     /// See [`CallEngine::notify_key_imported`]. No-op once the engine is gone.
     pub fn notify_key_imported(&self, identity: impl Into<String>, key_index: u8) {
         let _ = self.messages.send(ActorMessage::KeyImported {
@@ -225,6 +238,30 @@ impl EngineHandle {
     pub fn notify_key_discarded(&self, report: DiscardedKey) {
         let _ = self.messages.send(ActorMessage::KeyDiscarded(report));
     }
+
+    pub(crate) fn notify_member_key_imported(
+        &self,
+        identity: String,
+        member_id: String,
+        key_index: u8,
+        active: Arc<AtomicBool>,
+    ) {
+        let _ = self.messages.send(ActorMessage::MemberKeyImported {
+            identity,
+            member_id,
+            key_index,
+            active,
+        });
+    }
+}
+
+/// Admission is call-scoped and latched by its owner; no retry can reset it.
+#[derive(Clone)]
+pub(crate) struct CallAdmission {
+    pub active: Arc<AtomicBool>,
+    pub check: Arc<dyn Fn(&[JoinedMembership]) -> bool + Send + Sync>,
+    pub include: Arc<dyn Fn(&JoinedMembership) -> bool + Send + Sync>,
+    pub bind: Arc<dyn Fn(EngineHandle) + Send + Sync>,
 }
 
 /// One MatrixRTC call as a flat set of participants with media streams.
@@ -263,7 +300,20 @@ impl CallEngine {
         config: EngineConfig,
         memberships: watch::Receiver<Vec<JoinedMembership>>,
     ) -> CallEngine {
+        Self::new_guarded(config, memberships, None)
+    }
+
+    pub(crate) fn new_guarded(
+        config: EngineConfig,
+        memberships: watch::Receiver<Vec<JoinedMembership>>,
+        admission: Option<CallAdmission>,
+    ) -> CallEngine {
         let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+        if let Some(admission) = &admission {
+            (admission.bind)(EngineHandle {
+                messages: messages_tx.clone(),
+            });
+        }
         let (events_tx, first_events_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (participants_tx, participants_rx) = watch::channel(Vec::new());
         let (tiles_tx, tiles_rx) = watch::channel(TileRoster::default());
@@ -276,6 +326,8 @@ impl CallEngine {
         let tracks = pool.remote_tracks();
 
         let actor = Actor {
+            admission,
+            identity_rejected: false,
             pool,
             own_member_id: config.own_member_id,
             events_tx: events_tx.clone(),
@@ -406,9 +458,16 @@ impl CallEngine {
         connection: Box<dyn TransportConnection>,
         events: mpsc::UnboundedReceiver<ConnectionEvent>,
     ) {
-        let _ = self
+        if let Err(error) = self
             .messages
-            .send(ActorMessage::AdoptConnection { connection, events });
+            .send(ActorMessage::AdoptConnection { connection, events })
+        {
+            if let ActorMessage::AdoptConnection { connection, .. } = error.0 {
+                rt::spawn(async move {
+                    let _ = connection.close().await;
+                });
+            }
+        }
     }
 
     /// Report that a media decryption key for `identity` was imported, so the
@@ -587,6 +646,8 @@ impl CallEngine {
 }
 
 struct Actor {
+    admission: Option<CallAdmission>,
+    identity_rejected: bool,
     /// The call's media connections, and the identity mapping over them.
     pool: MediaPool,
     own_member_id: String,
@@ -708,6 +769,11 @@ impl Actor {
     ) {
         // The watch channels always have a value; start from it.
         let initial = memberships.borrow_and_update().clone();
+        if !self.admit_snapshot(&initial) {
+            self.end_identity(&mut messages, &mut pool_inbox, None)
+                .await;
+            return;
+        }
         self.apply_snapshot(initial);
         if let Some(hands) = raised_hands.as_mut() {
             let initial = hands.borrow_and_update().clone();
@@ -716,10 +782,23 @@ impl Actor {
 
         let mut memberships_open = true;
         loop {
+            if self
+                .admission
+                .as_ref()
+                .is_some_and(|guard| !guard.active.load(Ordering::Acquire))
+            {
+                self.end_identity(&mut messages, &mut pool_inbox, None)
+                    .await;
+                break;
+            }
             tokio::select! {
                 changed = memberships.changed(), if memberships_open => match changed {
                     Ok(()) => {
                         let snapshot = memberships.borrow_and_update().clone();
+                        if !self.admit_snapshot(&snapshot) {
+                            self.end_identity(&mut messages, &mut pool_inbox, None).await;
+                            break;
+                        }
                         self.apply_snapshot(snapshot);
                     }
                     // The core session is gone; media may outlive it briefly,
@@ -748,10 +827,30 @@ impl Actor {
                 }
                 // Never closes: the pool holds a sender for its own timers.
                 Some(message) = pool_inbox.recv() => {
+                    if !self.admission_active() {
+                        MediaPool::discard_retired(message);
+                        self.end_identity(&mut messages, &mut pool_inbox, None).await;
+                        break;
+                    }
                     let events = self.pool.handle(message);
                     self.apply_pool_events(events);
                 }
                 message = messages.recv() => match message {
+                    Some(ActorMessage::Shutdown { ack }) if !self.admission_active() => {
+                        self.end_identity(&mut messages, &mut pool_inbox, Some(ack)).await;
+                        break;
+                    }
+                    Some(message) if !self.admission_active() => {
+                        if let ActorMessage::AdoptConnection { connection, .. } = message {
+                            rt::spawn(async move { let _ = connection.close().await; });
+                        }
+                        self.end_identity(&mut messages, &mut pool_inbox, None).await;
+                        break;
+                    }
+                    Some(ActorMessage::RejectIdentity) => {
+                        self.end_identity(&mut messages, &mut pool_inbox, None).await;
+                        break;
+                    }
                     Some(ActorMessage::Shutdown { ack }) => {
                         self.end(EndedReason::Left);
                         let _ = ack.send(());
@@ -775,6 +874,17 @@ impl Actor {
                 key_index,
             } => {
                 let events = self.pool.key_imported(identity, key_index);
+                self.apply_pool_events(events);
+            }
+            ActorMessage::MemberKeyImported {
+                identity,
+                member_id,
+                key_index,
+                active,
+            } => {
+                let events = self
+                    .pool
+                    .member_key_imported(identity, member_id, key_index, active);
                 self.apply_pool_events(events);
             }
             ActorMessage::KeyDiscarded(report) => {
@@ -938,6 +1048,8 @@ impl Actor {
                 self.ranking_threshold = threshold;
                 self.publish_tiles();
             }
+            // Handled only by the terminating run-loop branch.
+            ActorMessage::RejectIdentity => {}
             // Handled in the run loop (it must break).
             ActorMessage::Shutdown { ack } => {
                 let _ = ack.send(());
@@ -947,7 +1059,10 @@ impl Actor {
 
     // ---- roster ----------------------------------------------------------
 
-    fn apply_snapshot(&mut self, snapshot: Vec<JoinedMembership>) {
+    fn apply_snapshot(&mut self, mut snapshot: Vec<JoinedMembership>) {
+        if let Some(admission) = &self.admission {
+            snapshot.retain(|member| (admission.include)(member));
+        }
         // Departures first, so a member_id rejoining in the same snapshot
         // (new membership, same key space) starts clean.
         let current_ids: Vec<String> = snapshot
@@ -1363,6 +1478,67 @@ impl Actor {
         self.publish_roster();
     }
 
+    fn admission_active(&self) -> bool {
+        self.admission
+            .as_ref()
+            .is_none_or(|guard| guard.active.load(Ordering::Acquire))
+    }
+
+    fn admit_snapshot(&self, snapshot: &[JoinedMembership]) -> bool {
+        self.admission
+            .as_ref()
+            .is_none_or(|guard| (guard.check)(snapshot))
+    }
+
+    async fn end_identity(
+        &mut self,
+        messages: &mut mpsc::UnboundedReceiver<ActorMessage>,
+        pool_inbox: &mut mpsc::UnboundedReceiver<PoolMessage>,
+        acknowledgement: Option<oneshot::Sender<()>>,
+    ) {
+        if let Some(guard) = &self.admission {
+            guard.active.store(false, Ordering::Release);
+        }
+        messages.close();
+        let mut connections = self.pool.retire(pool_inbox);
+        let mut acknowledgements: Vec<_> = acknowledgement.into_iter().collect();
+        while let Ok(message) = messages.try_recv() {
+            match message {
+                ActorMessage::AdoptConnection { connection, .. } => {
+                    connections.push(Arc::from(connection));
+                }
+                ActorMessage::Shutdown { ack } => acknowledgements.push(ack),
+                _ => {}
+            }
+        }
+        // Spawn closure before publishing the terminal event: dropping the
+        // engine during host cleanup must not cancel transport retirement.
+        let closing: Vec<_> = connections
+            .into_iter()
+            .map(|connection| {
+                rt::spawn(async move {
+                    let _ = connection.close().await;
+                })
+            })
+            .collect();
+        self.ended = true;
+        self.roster.clear();
+        self.local_tracks.clear();
+        self.installed_keys.clear();
+        self.encryption_states.clear();
+        self.publish_roster();
+        if !self.identity_rejected {
+            self.identity_rejected = true;
+            self.emit(CallEvent::Ended {
+                reason: EndedReason::IdentityRejected,
+            });
+        }
+        futures_util::future::join_all(closing).await;
+        for acknowledgement in acknowledgements {
+            let _ = acknowledgement.send(());
+        }
+    }
+
     // ---- end ---------------------------------------------------------------
 
     /// Emit [`CallEvent::Ended`] once and close all pooled peer-focus
@@ -1373,6 +1549,14 @@ impl Actor {
             return;
         }
         self.ended = true;
+        let reason = if self.admission_active() {
+            reason
+        } else {
+            EndedReason::IdentityRejected
+        };
+        if matches!(&reason, EndedReason::IdentityRejected) {
+            self.identity_rejected = true;
+        }
         self.emit(CallEvent::Ended { reason });
         self.pool.close();
     }
@@ -1865,12 +2049,19 @@ mod tests {
     /// A fixture whose `events` is a placeholder: nothing has subscribed to
     /// the engine yet, so the first `subscribe_events` is still to come.
     fn unsubscribed_fixture(stability: StabilityConfig) -> Fixture {
+        unsubscribed_fixture_guarded(stability, None)
+    }
+
+    fn unsubscribed_fixture_guarded(
+        stability: StabilityConfig,
+        admission: Option<CallAdmission>,
+    ) -> Fixture {
         let state = Arc::new(TransportState::default());
         let (memberships, memberships_rx) = watch::channel(Vec::new());
         let (raised_hands, raised_hands_rx) = watch::channel(Vec::new());
         let (reactions, reactions_rx) = broadcast::channel(8);
         let (ended, ended_rx) = watch::channel(None);
-        let engine = CallEngine::new(
+        let engine = CallEngine::new_guarded(
             EngineConfig {
                 transports: vec![Arc::new(FakeTransport {
                     state: state.clone(),
@@ -1892,6 +2083,7 @@ mod tests {
                 stability,
             },
             memberships_rx,
+            admission,
         );
         Fixture {
             engine,
@@ -3874,6 +4066,81 @@ mod tests {
         wait_until(|| fx.state.applied.lock().unwrap().len() == 3).await;
         assert_eq!(last().unwrap(), limited.resolve(MediaStreamKind::Camera));
         fx.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn excluded_stale_own_members_never_reach_roster_or_peer_connections() {
+        let active = Arc::new(AtomicBool::new(true));
+        let fx = unsubscribed_fixture_guarded(
+            StabilityConfig::default(),
+            Some(CallAdmission {
+                active,
+                check: Arc::new(|_| true),
+                include: Arc::new(|member| member.member_id != "old-own"),
+                bind: Arc::new(|_| {}),
+            }),
+        );
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member_on("old-own", "@alice:example.org", PEER_FOCUS),
+            ])
+            .unwrap();
+        wait_until(|| fx.engine.participants().len() == 1).await;
+        assert_eq!(fx.engine.participants()[0].member_id, "own");
+        assert!(
+            !fx.state
+                .connects
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|key| key == PEER_FOCUS)
+        );
+        fx.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn identity_refusal_retires_own_peers_and_late_adoptions() {
+        let active = Arc::new(AtomicBool::new(true));
+        let mut fx = unsubscribed_fixture_guarded(
+            StabilityConfig::default(),
+            Some(CallAdmission {
+                active: Arc::clone(&active),
+                check: Arc::new(|snapshot| {
+                    !snapshot.iter().any(|member| member.member_id == "refused")
+                }),
+                include: Arc::new(|_| true),
+                bind: Arc::new(|_| {}),
+            }),
+        );
+        fx.events = fx.engine.subscribe_events();
+        fx.memberships
+            .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
+            .unwrap();
+        wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
+        let own = adopt(&fx);
+        fx.memberships
+            .send(vec![member("refused", "@bob:example.org")])
+            .unwrap();
+        loop {
+            if let CallEvent::Ended { reason } = next_event(&mut fx.events).await {
+                assert_eq!(reason, EndedReason::IdentityRejected);
+                break;
+            }
+        }
+        fx.engine.shutdown().await;
+        assert!(!active.load(Ordering::Acquire));
+        wait_until(|| closed(&fx, OWN_FOCUS) && closed(&fx, PEER_FOCUS)).await;
+        let before = fx.state.connects.lock().unwrap().len();
+        let _ = fx
+            .memberships
+            .send(vec![member_on("carol", "@carol:example.org", PEER_FOCUS)]);
+        let (late, events) = fake_connection(&fx.state, "https://late.example.org");
+        fx.engine.adopt_own_connection(late, events);
+        wait_until(|| closed(&fx, "https://late.example.org")).await;
+        assert_eq!(fx.state.connects.lock().unwrap().len(), before);
+        assert!(fx.engine.participants().is_empty());
+        drop(own);
     }
 
     #[tokio::test(start_paused = true)]

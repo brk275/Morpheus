@@ -544,6 +544,12 @@ impl Scenario {
             copy_requests.requests() == copy_after_positive,
             "a same-ID renewed account cannot revive the original registered Copy callback"
         );
+        let _ = Self::copy_token(&copy_aba_model, &root);
+        assert_eq!(
+            crate::timeline_model::cached_text_count(&copy_aba_model),
+            0,
+            "same-ID fresh account selection cannot refill the original model's parsed cache"
+        );
         check!(message_copy_account_aba);
 
         let late_room = marker("live-timeline-late-room");
@@ -655,6 +661,30 @@ impl Scenario {
             ));
         }
         let token = Self::copy_token(&ui.get_messages(), root);
+        let current = ui.get_messages();
+        let parsed = crate::timeline_model::parsed_text_count(&current);
+        let _ = Self::copy_token(&current, root);
+        observations.push((
+            "actual row_data caches only the displayed original owner and exact row",
+            crate::timeline_model::cached_text_count(&current) == 1
+                && crate::timeline_model::parsed_text_count(&current) == parsed,
+        ));
+        // The cached value contains parsed text, never typography/layout.
+        // Change actual generated-window preferences without a new feed.
+        let font = ui.get_message_font_family();
+        let size = ui.get_message_font_size();
+        ui.set_message_font_family("monospace".into());
+        ui.set_message_font_size(size + 3);
+        let _ = Self::copy_token(&current, root);
+        observations.push((
+            "font preferences stay live while the same immutable text parse is reused",
+            ui.get_message_font_family().as_str() == "monospace"
+                && ui.get_message_font_size() == size + 3
+                && crate::timeline_model::cached_text_count(&current) == 1
+                && crate::timeline_model::parsed_text_count(&current) == parsed,
+        ));
+        ui.set_message_font_family(font);
+        ui.set_message_font_size(size);
         let before = recording.requests();
         ui.invoke_copy_message_text(token.clone().into(), false);
         observations.push((
@@ -721,6 +751,10 @@ impl Scenario {
         ));
         let before = recording.requests();
         ui.invoke_navigate_page(1);
+        observations.push((
+            "canonical protection drops cached plaintext before any deferred handler",
+            crate::timeline_model::cached_text_count(&ui.get_messages()) == 0,
+        ));
         ui.invoke_copy_message_text(page_token.clone().into(), false);
         ui.invoke_navigate_page(0);
         ui.invoke_copy_message_text(page_token.into(), false);
@@ -732,6 +766,10 @@ impl Scenario {
         // Withdrawal still rejects the old token above; renewal may reuse only
         // this exact row's original account, room and view authority.
         let returned = Self::copy_token(&ui.get_messages(), root);
+        observations.push((
+            "same original context resumes caching without waiting for a new SDK event",
+            crate::timeline_model::cached_text_count(&ui.get_messages()) == 1,
+        ));
         let before = recording.requests();
         ui.invoke_copy_message_text(returned.into(), false);
         observations.push((
@@ -765,6 +803,70 @@ impl Scenario {
             "fresh current callback remains usable after withdrawal",
             recording.requests() == before + 1
                 && recording.last_matches("Synthetic replacement display"),
+        ));
+
+        let retained = ui.get_messages();
+        let displayed_source =
+            crate::timeline_model::info_of_event(&retained, root).expect("actual displayed source");
+        let _ = Self::copy_token(&retained, root);
+        let same_target_scope = crate::message_copy::capture_publication(ui, &selection, false);
+        if selection.is_current() && self.shows_scope(ui) {
+            ui.set_messages(crate::timeline_model::update_scoped(
+                ModelRc::default(),
+                vec![displayed_source.clone()],
+                same_target_scope,
+            ));
+        }
+        let _ = Self::copy_token(&ui.get_messages(), root);
+        let _ = Self::copy_token(&retained, root);
+        observations.push((
+            "retained old model cannot cache after a same-target shown-model replacement",
+            retained != ui.get_messages()
+                && crate::timeline_model::cached_text_count(&retained) == 0
+                && crate::timeline_model::cached_text_count(&ui.get_messages()) == 1,
+        ));
+        let owner_model = ui.get_messages();
+        let owner_scope = crate::message_copy::capture_publication(ui, &selection, false);
+        let owner_rc: std::rc::Rc<dyn slint::Model<Data = MessageItem>> = owner_model
+            .clone()
+            .try_into()
+            .ok()
+            .expect("actual timeline model owner");
+        let owner_weak = std::rc::Rc::downgrade(&owner_rc);
+        let owner_allowed = crate::message_copy::text_projection_cache_allowed(
+            owner_scope.as_ref(),
+            owner_weak.clone(),
+            0,
+            &displayed_source,
+        );
+        // Keep the old LiveUi, account selection, exact row and UI model alive;
+        // IDs and view counters still match. Only the actual registered owner
+        // epoch changes, so an ID-only or stale-owner cache guard would fail.
+        crate::message_copy::register(ui, &self.live);
+        let _ = Self::copy_token(&owner_model, root);
+        observations.push((
+            "replacing the actual Copy owner rejects the retained original cache scope",
+            owner_allowed
+                && !crate::message_copy::text_projection_cache_allowed(
+                    owner_scope.as_ref(),
+                    owner_weak,
+                    0,
+                    &displayed_source,
+                )
+                && crate::timeline_model::cached_text_count(&owner_model) == 0,
+        ));
+        let fresh_scope = crate::message_copy::capture_publication(ui, &selection, false);
+        if selection.is_current() && self.shows_scope(ui) {
+            ui.set_messages(crate::timeline_model::update_scoped(
+                ModelRc::default(),
+                vec![displayed_source],
+                fresh_scope,
+            ));
+        }
+        let _ = Self::copy_token(&ui.get_messages(), root);
+        observations.push((
+            "fresh original owner publication caches the same target after replacement",
+            crate::timeline_model::cached_text_count(&ui.get_messages()) == 1,
         ));
 
         // Restore real owned feeds and their actual source before assertions;

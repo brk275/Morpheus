@@ -4,7 +4,7 @@
 //! through Slint's numeric representation. Config reload can then switch the
 //! existing rows immediately, without fetching messages or rewriting history.
 
-use chrono::{Local, NaiveTime, TimeZone};
+use chrono::{Local, NaiveTime, TimeZone, Timelike};
 use morpheus_matrix::MessageSendState;
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -42,10 +42,21 @@ impl ClockLabels {
     }
 
     fn from_time(time: NaiveTime) -> Self {
+        // Every requested timeline row needs these labels, even when its rich
+        // text is cached. Format the fixed numeric fields directly instead of
+        // parsing three Chrono format strings on every projection. The Local
+        // conversion remains fresh in for_message; no clock or account cache.
+        let hour = time.hour();
+        let minute = time.minute();
+        let (afternoon, hour12) = time.hour12();
+        let period = if afternoon { "PM" } else { "AM" };
+        // Chrono represents a leap second as second 59 plus >= 1e9 nanos;
+        // its %S formatter displays 60, which the direct projection preserves.
+        let second = time.second() + time.nanosecond() / 1_000_000_000;
         Self {
-            twelve_hour: time.format("%-I:%M %p").to_string(),
-            twenty_four_hour: time.format("%H:%M").to_string(),
-            twenty_four_hour_seconds: time.format("%H:%M:%S").to_string(),
+            twelve_hour: format!("{hour12}:{minute:02} {period}"),
+            twenty_four_hour: format!("{hour:02}:{minute:02}"),
+            twenty_four_hour_seconds: format!("{hour:02}:{minute:02}:{second:02}"),
         }
     }
 }
@@ -68,6 +79,31 @@ mod tests {
             assert_eq!(labels.twelve_hour, twelve);
             assert_eq!(labels.twenty_four_hour, twenty_four);
             assert_eq!(labels.twenty_four_hour_seconds, seconds);
+        }
+    }
+
+    #[test]
+    fn direct_clock_fields_match_chrono_formats_at_boundaries_and_leap_seconds() {
+        for (hour, minute, second, nanos) in [
+            (0, 0, 0, 0),
+            (0, 59, 59, 999_999_999),
+            (1, 2, 3, 4),
+            (9, 4, 5, 500_000_000),
+            (11, 59, 59, 0),
+            (12, 0, 0, 0),
+            (12, 59, 59, 999_999_999),
+            (13, 0, 0, 0),
+            (23, 59, 59, 999_999_999),
+            (11, 59, 59, 1_000_000_000),
+            (23, 59, 59, 1_999_999_999),
+        ] {
+            let time = NaiveTime::from_hms_nano_opt(hour, minute, second, nanos).unwrap();
+            let expected = ClockLabels {
+                twelve_hour: time.format("%-I:%M %p").to_string(),
+                twenty_four_hour: time.format("%H:%M").to_string(),
+                twenty_four_hour_seconds: time.format("%H:%M:%S").to_string(),
+            };
+            assert_eq!(ClockLabels::from_time(time), expected);
         }
     }
 
