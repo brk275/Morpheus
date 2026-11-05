@@ -69,10 +69,11 @@ MANUAL_NATIVE_VAULT_INPUTS = {
     "crates/morpheus-matrix/tests/native_vault.rs",
     ".github/workflows/native-vault-qa.yml",
 }
+# The Python unit module is covered by the always-on helpers. Only the
+# native capture driver, real fixture and Rust acceptance input select Windows.
 WINDOWS_ACCEPTANCE_INPUTS = {
     "scripts/run_windows_capture_acceptance.py",
     "scripts/windows_capture_window.ps1",
-    "scripts/tests/test_windows_capture_acceptance.py",
     "crates/morpheus-rtc/tests/windows_capture.rs",
 }
 LINUX_ACCEPTANCE_INPUTS = {
