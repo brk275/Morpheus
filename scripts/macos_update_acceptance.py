@@ -825,7 +825,16 @@ def wait_helper_event(root, token, observer):
 
 
 def scan_logs(commands, scanner):
+    # Closed execution counters only: never retain scanner output, log names,
+    # exception text or child data. The final call replaces earlier snapshots.
+    state = {"phase": "scanner_identity", "scanner_identity_verified": False, "log_enumeration_completed": False,
+             "logs_seen": 0, "logs_read_complete": 0, "log_read_refused": 0,
+             "scanner_attempts": 0, "scanner_exit_zero": 0, "scanner_exit_one": 0,
+             "scanner_exit_other": 0, "scanner_timeouts": 0, "scanner_launch_errors": 0}
+    commands.log_scan_state = state
     require(digest(scanner) == SCANNER_SHA256[platform.machine()])
+    state["scanner_identity_verified"] = True
+    state["phase"] = "scanner_config"
     # External default rules and an empty ignore file: no repository scanner
     # suppression or allow comment may admit private command/app output.
     config, ignore = commands.root / "default-gitleaks.toml", commands.root / "empty-gitleaksignore"
@@ -833,32 +842,82 @@ def scan_logs(commands, scanner):
         private_write(config, b"[extend]\nuseDefault = true\n")
         private_write(ignore, b"")
     passed = True
-    for log in sorted(commands.logs.iterdir()):
+    state["phase"] = "log_enumeration"
+    logs = sorted(commands.logs.iterdir())
+    state["log_enumeration_completed"] = True
+    state["phase"] = "log_scan"
+    for log in logs:
+        state["logs_seen"] += 1
         try:
             data = bounded(log, MAX_LOG)
+        except Exception:
+            state["log_read_refused"] += 1
+            passed = False
+            continue
+        state["logs_read_complete"] += 1
+        state["scanner_attempts"] += 1
+        try:
             result = subprocess.run([str(scanner), "stdin", "--no-banner", "--config", str(config),
                                      "--gitleaks-ignore-path", str(ignore), "--ignore-gitleaks-allow", "--redact=100"],
                                     input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     cwd=commands.root, timeout=30, check=False)
+            state["scanner_exit_zero" if result.returncode == 0 else
+                  "scanner_exit_one" if result.returncode == 1 else "scanner_exit_other"] += 1
             passed = result.returncode == 0 and passed
+        except subprocess.TimeoutExpired:
+            state["scanner_timeouts"] += 1
+            passed = False
         except Exception:
-            # One over-bound/unreadable log must not prevent scan attempts for
-            # the remaining bounded logs. No prefix scan is called a full scan.
+            state["scanner_launch_errors"] += 1
             passed = False
     require(passed)
+    state["phase"] = "complete"
 
 
 def scan_final_logs(commands, scanner, report):
     report["checks"]["bounded_log_scan_attempted"] = True
+    scan_clean = False
     try:
         scan_logs(commands, scanner)
+        scan_clean = True
         final = not commands.pending and not commands.helper_observers and not commands.cleanup_failed
     except Exception:
         final = False
+    commands.final_log_scan_clean = scan_clean
     # With live/unproved ownership these are snapshots, never final log or
     # private-cleanup acceptance. The fixture is retained on every such failure.
     report["checks"]["default_log_scan"] = final
     return final
+
+
+def log_gate_failure_diagnostic(commands, report):
+    """Separate closed scanner execution facts from owned-process acceptance.
+
+    An exit status of one is only that status, not proof of a secret finding.
+    No command/log/compiler data is inspected when the complete scan fails.
+    """
+    if (report.get("status") != "failed" or report.get("stage") not in STAGES
+            or report.get("checks", {}).get("bounded_log_scan_attempted") is not True
+            or report["checks"].get("default_log_scan") is not False):
+        return None
+    state = getattr(commands, "log_scan_state", None)
+    booleans = {"scanner_identity_verified", "log_enumeration_completed"}
+    counts = {"logs_seen", "logs_read_complete", "log_read_refused", "scanner_attempts",
+              "scanner_exit_zero", "scanner_exit_one", "scanner_exit_other", "scanner_timeouts",
+              "scanner_launch_errors"}
+    require(type(state) is dict and set(state) == booleans | counts | {"phase"}
+            and type(state["phase"]) is str
+            and state["phase"] in {"scanner_identity", "scanner_config", "log_enumeration", "log_scan", "complete"}
+            and all(type(state[key]) is bool for key in booleans)
+            and all(type(state[key]) is int and 0 <= state[key] <= 2**20 for key in counts))
+    clean = getattr(commands, "final_log_scan_clean", None)
+    require(type(clean) is bool and type(commands.cleanup_failed) is bool
+            and type(commands.pending) is list and type(commands.helper_observers) is list
+            and len(commands.pending) <= 2**20 and len(commands.helper_observers) <= 2**20)
+    return {"schema": 1, "check": "macos_update_log_gate_diagnostic", "stage": report["stage"],
+            "scan_completed_clean": clean, "pending_commands": len(commands.pending),
+            "pending_helpers": len(commands.helper_observers), "cleanup_failed": commands.cleanup_failed,
+            **state}
 
 
 
@@ -1064,6 +1123,12 @@ def main():
             except Exception:
                 report["status"] = "failed"
     if commands is not None:
+        try:
+            log_gate = log_gate_failure_diagnostic(commands, report)
+            if log_gate is not None:
+                print("MORPHEUS_MAC_UPDATE_LOG_GATE_DIAGNOSTIC " + json.dumps(log_gate, sort_keys=True))
+        except Exception:
+            pass
         try:
             diagnostic = build_failure_diagnostic(commands, report)
             if diagnostic is not None:

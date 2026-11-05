@@ -24,6 +24,96 @@ PID = 4242
 
 
 class InstalledUpdateTransactionBoundaryTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX private scanner log contract")
+    def test_log_gate_diagnostic_separates_all_scanner_outcomes_without_child_text(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            logs = root / "logs"
+            logs.mkdir(mode=0o700)
+            for index in range(7):
+                (logs / f"{index:03d}.log").write_bytes(b"private fixture body")
+            commands = types.SimpleNamespace(root=root, logs=logs, pending=[], helper_observers=[],
+                                             cleanup_failed=False)
+            result = {"status":"failed", "stage":"build_old", "checks":{}}
+            outcomes = [Mock(returncode=0), Mock(returncode=1), Mock(returncode=2),
+                        update_qa.subprocess.TimeoutExpired(["private-argument"], 30),
+                        OSError("private-scanner-error"), Mock(returncode=0)]
+            reads = [b"private fixture body"] * 5 + [update_qa.Refused("private-read-error"), b"private fixture body"]
+            with patch.object(update_qa, "digest", return_value=update_qa.SCANNER_SHA256["arm64"]), \
+                    patch.object(update_qa.platform, "machine", return_value="arm64"), \
+                    patch.object(update_qa, "bounded", side_effect=reads), \
+                    patch.object(update_qa.subprocess, "run", side_effect=outcomes) as scanner:
+                self.assertFalse(update_qa.scan_final_logs(commands, Path("/fixed/scanner"), result))
+            self.assertEqual(scanner.call_count, 6)
+            self.assertTrue(all(call.kwargs["stdout"] == update_qa.subprocess.DEVNULL
+                                and call.kwargs["stderr"] == update_qa.subprocess.DEVNULL
+                                and call.kwargs["timeout"] == 30 for call in scanner.call_args_list))
+            diagnostic = update_qa.log_gate_failure_diagnostic(commands, result)
+            self.assertEqual({key:diagnostic[key] for key in commands.log_scan_state},
+                             {"phase":"log_scan", "scanner_identity_verified":True, "log_enumeration_completed":True,
+                              "logs_seen":7, "logs_read_complete":6, "log_read_refused":1,
+                              "scanner_attempts":6, "scanner_exit_zero":2, "scanner_exit_one":1,
+                              "scanner_exit_other":1, "scanner_timeouts":1, "scanner_launch_errors":1})
+            self.assertFalse(diagnostic["scan_completed_clean"])
+            self.assertEqual(diagnostic["pending_commands"], 0)
+            self.assertIsNone(update_qa.build_failure_diagnostic(commands, result))
+            encoded = json.dumps(diagnostic)
+            for withheld in ("private", "argument", "error", str(root)):
+                self.assertNotIn(withheld, encoded.replace("scanner_launch_errors", ""))
+            self.assertEqual(result["checks"], {"bounded_log_scan_attempted":True, "default_log_scan":False})
+
+    @unittest.skipUnless(os.name == "posix", "POSIX private scanner log contract")
+    def test_log_gate_diagnostic_distinguishes_clean_scan_from_unsettled_ownership(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            logs = root / "logs"
+            logs.mkdir(mode=0o700)
+            for pending, helpers, cleanup in [([object()], [], False), ([], [object()], False),
+                                               ([], [], True), ([], [], False)]:
+                commands = types.SimpleNamespace(root=root, logs=logs, pending=pending,
+                                                 helper_observers=helpers, cleanup_failed=cleanup)
+                result = {"status":"failed", "stage":"build_old", "checks":{}}
+                with patch.object(update_qa, "digest", return_value=update_qa.SCANNER_SHA256["arm64"]), \
+                        patch.object(update_qa.platform, "machine", return_value="arm64"):
+                    accepted = update_qa.scan_final_logs(commands, Path("/fixed/scanner"), result)
+                self.assertEqual(accepted, not pending and not helpers and not cleanup)
+                diagnostic = update_qa.log_gate_failure_diagnostic(commands, result)
+                if accepted:
+                    self.assertIsNone(diagnostic)
+                else:
+                    self.assertTrue(diagnostic["scan_completed_clean"])
+                    self.assertEqual(diagnostic["pending_commands"], len(pending))
+                    self.assertEqual(diagnostic["pending_helpers"], len(helpers))
+                    self.assertEqual(diagnostic["cleanup_failed"], cleanup)
+                    self.assertIsNone(update_qa.build_failure_diagnostic(commands, result))
+
+    def test_log_gate_diagnostic_identity_and_enumeration_failures_remain_closed(self):
+        for identity_ok in (False, True):
+            commands = types.SimpleNamespace(root=Path(tempfile.gettempdir()).resolve()/"morpheus-closed-scan-fixture",
+                                             logs=Mock(), pending=[], helper_observers=[],
+                                             cleanup_failed=False)
+            commands.logs.iterdir.side_effect = OSError("private-enumeration-error")
+            result = {"status":"failed", "stage":"build_old", "checks":{}}
+            with patch.object(update_qa, "digest", return_value=update_qa.SCANNER_SHA256["arm64"] if identity_ok else "wrong"), \
+                    patch.object(update_qa.platform, "machine", return_value="arm64"), \
+                    patch.object(update_qa.subprocess, "run") as scanner, \
+                    patch.object(update_qa, "private_write"):
+                self.assertFalse(update_qa.scan_final_logs(commands, Path("/fixed/scanner"), result))
+            scanner.assert_not_called()
+            diagnostic = update_qa.log_gate_failure_diagnostic(commands, result)
+            self.assertEqual(diagnostic["scanner_identity_verified"], identity_ok)
+            self.assertFalse(diagnostic["log_enumeration_completed"])
+            self.assertEqual(diagnostic["phase"], "log_enumeration" if identity_ok else "scanner_identity")
+            self.assertEqual(diagnostic["scanner_attempts"], 0)
+            self.assertNotIn("private-enumeration-error", json.dumps(diagnostic))
+            for field, bad in [("scanner_exit_zero", True), ("logs_seen", 2**20+1),
+                               ("unexpected_private_field", "private-value")]:
+                original = commands.log_scan_state.copy()
+                commands.log_scan_state[field] = bad
+                with self.assertRaises(update_qa.Refused):
+                    update_qa.log_gate_failure_diagnostic(commands, result)
+                commands.log_scan_state = original
+
     def test_notice_rejection_site_requires_complete_scan_and_retains_only_owned_code_location(self):
         marker = "synthetic-private-notice-body"
         config = {"before-packaging-command":"cargo build --release --locked -p morpheus-app --features native-calls",

@@ -785,6 +785,160 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
             with self.assertRaises(update.Failure):
                 update.guard(environment | {"RUNNER_ENVIRONMENT":"self-hosted"},"win32")
 
+    def test_build_home_longpaths_is_fixed_private_idempotent_and_keeps_ambient_git_disabled(self):
+        class HostOS:
+            name = "nt"
+            def __getattr__(self, name):return getattr(update.os_original, name)
+        original_os = update.os
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve();home=root/"isolated"
+            inherited={"USERPROFILE":str(root/"original"),"RUNNER_TEMP":str(root),
+                       "GIT_CONFIG_GLOBAL":"foreign config", "GIT_CONFIG_COUNT":"2"}
+            checked=[]
+            def admit(path, **options):checked.append((Path(path),options));return Path(path)
+            def private_directory(path, **options):
+                Path(path).mkdir(**options);return Path(path)
+            with patch.object(update,"os_original",original_os,create=True), \
+                    patch.object(update.notice_source,"private_directory",side_effect=private_directory), \
+                    patch.object(update,"os",HostOS()), \
+                    patch.object(update.notice_source,"checked",side_effect=admit), \
+                    patch.object(update.notices,"read_regular",side_effect=lambda path,bound:Path(path).read_bytes()):
+                environment=update.private_environment(inherited,home)
+                config=home/"home/.gitconfig";identity=config.stat().st_ino
+                self.assertEqual(config.read_bytes(),b"[core]\n\tlongpaths = true\n")
+                self.assertIn((config,{"private":True}),checked)
+                self.assertEqual(checked[:2],[(config.parent,{"directory":True,"private":True}),
+                                             (config,{"private":True})])
+                self.assertEqual(update.private_environment(inherited,home),environment)
+                self.assertEqual(config.stat().st_ino,identity)
+                self.assertEqual(environment["GIT_CONFIG_GLOBAL"],original_os.devnull)
+                self.assertNotIn("GIT_CONFIG_COUNT",environment)
+                self.assertEqual(environment["CARGO_HOME"],str(root/"original/.cargo"))
+                self.assertEqual(environment["RUSTUP_HOME"],str(root/"original/.rustup"))
+                config.write_bytes(b"foreign credential helper must stay untouched")
+                with self.assertRaises(update.Failure):update.private_environment(inherited,home)
+                self.assertEqual(config.read_bytes(),b"foreign credential helper must stay untouched")
+                with patch.object(update.notice_source,"checked",side_effect=ValueError("unsafe")):
+                    with self.assertRaises(ValueError):update.private_environment(inherited,home)
+                refused=root/"refused"
+                with patch.object(update.notice_source,"checked",side_effect=ValueError("unsafe parent")), \
+                        patch.object(update,"write_new") as write:
+                    with self.assertRaises(ValueError):update.private_environment(inherited,refused)
+                    write.assert_not_called()
+                self.assertFalse((refused/"home/.gitconfig").exists())
+                with patch.object(update.notice_source,"private_directory",side_effect=ValueError("unsafe directory")), \
+                        patch.object(update,"write_new") as write:
+                    with self.assertRaises(ValueError):update.private_environment(inherited,root/"alias")
+                    write.assert_not_called()
+
+    def test_cargo_build_diagnostic_requires_complete_scanned_owned_log_and_closed_codes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();logs=root/"logs";logs.mkdir();log=logs/"0001.log"
+            body=(b"private path and body must not escape: error[E0308]\n"
+                  b"fatal error C1083: private header\nerror LNK1104: private lib\n"
+                  b"path too long\nNative SDK download request failed\n")
+            log.write_bytes(body);log.chmod(0o600)
+            commands=types.SimpleNamespace(root=root,logs=logs,cleanup_failed=False,
+                build_substage="cargo_build",failed_command=(log,1,len(body)))
+            with patch.object(update.notice_source,"checked",side_effect=lambda p,**kw:Path(p)) as admission, \
+                    patch.object(update.notices,"read_regular",side_effect=lambda p,bound,**kw:Path(p).read_bytes()):
+                facts=update.cargo_failure_diagnostic(commands,"build-old",True)
+                self.assertEqual(facts,{"schema":1,"check":"windows_update_cargo_failure","status":1,
+                    "error_codes":["C1083","E0308","LNK1104"],"stderr_classes":["checkout","native_sdk"],
+                    "private_log_scan_passed":True,"passed":False,"distribution_ready":False})
+                admission.assert_called_with(log,private=True)
+                self.assertNotIn("private",json.dumps({k:v for k,v in facts.items() if k!="private_log_scan_passed"}))
+                for scanned in (False,1):
+                    self.assertIsNone(update.cargo_failure_diagnostic(commands,"build-old",scanned))
+                for failure in ((root/"0001.log",1,len(body)),(log,True,len(body)),(log,0,len(body)),
+                                (log,1,len(body)+1),(log,1,8*1024*1024+1)):
+                    commands.failed_command=failure
+                    self.assertIsNone(update.cargo_failure_diagnostic(commands,"build-old",True))
+                commands.failed_command=(log,1,len(body));commands.cleanup_failed=True
+                self.assertIsNone(update.cargo_failure_diagnostic(commands,"build-old",True))
+                commands.cleanup_failed=False;commands.build_substage="cargo_packager"
+                self.assertIsNone(update.cargo_failure_diagnostic(commands,"build-old",True))
+                commands.build_substage="cargo_build"
+                self.assertIsNone(update.cargo_failure_diagnostic(commands,"signing",True))
+                log.write_bytes(b" ".join(("error[E%04d]" % n).encode() for n in range(17)))
+                commands.failed_command=(log,1,log.stat().st_size)
+                self.assertIsNone(update.cargo_failure_diagnostic(commands,"build-old",True))
+
+    def test_failed_build_command_metadata_is_retained_only_after_owned_job_close(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();commands=update.Commands(root,{})
+            log=commands.logs/"0001.log";log.write_bytes(b"error[E0308]")
+            job=Mock()
+            def closed():self.assertIsNone(commands.failed_command)
+            job.close.side_effect=closed
+            with patch.object(update.capture,"WindowsJob",return_value=job), \
+                    patch.object(commands,"start",return_value=(17,log)),patch.object(commands,"wait",return_value=1):
+                with self.assertRaises(update.Failure):commands.run(["never-executed"])
+            job.close.assert_called_once_with()
+            self.assertEqual(commands.failed_command,(log,1,log.stat().st_size))
+            job.close.side_effect=update.Failure()
+            with patch.object(update.capture,"WindowsJob",return_value=job), \
+                    patch.object(commands,"start",return_value=(17,log)),patch.object(commands,"wait",return_value=1):
+                with self.assertRaises(update.Failure):commands.run(["never-executed"])
+            self.assertIsNone(commands.failed_command);self.assertTrue(commands.cleanup_failed)
+
+    def test_cargo_diagnostic_is_captured_after_scan_and_published_only_after_owned_cleanup(self):
+        class PrivateFailure(Exception):pass
+        facts={"schema":1,"check":"windows_update_cargo_failure","status":1,
+               "error_codes":["E0308"],"stderr_classes":["other"],"private_log_scan_passed":True,
+               "passed":False,"distribution_ready":False}
+        for scan_fails,cleanup_fails in ((False,False),(True,False),(False,True)):
+            with self.subTest(scan_fails=scan_fails,cleanup_fails=cleanup_fails), tempfile.TemporaryDirectory() as temporary:
+                parent=Path(temporary).resolve();workspace=parent/"owned";workspace.mkdir()
+                root=workspace/"run";root.mkdir();source=parent/"reviewed"
+                manifest=source/"crates/morpheus-app/Cargo.toml";manifest.parent.mkdir(parents=True)
+                manifest.write_text('[package]\nversion="0.1.0"\n')
+                output=io.StringIO();events=[];failure=PrivateFailure("private-original-error")
+                commands=Mock(root=root,cleanup_failed=False,build_substage="unavailable",
+                              environment={"RUSTUP_HOME":str(root/"rustup")})
+                def run(args,**options):
+                    if args[1:]==["packager","--version"]:return b"cargo-packager 0.11.8"
+                    self.assertEqual(args[1],"archive")
+                    (root/"source.tar").write_bytes(b"synthetic archive not executed")
+                    return b""
+                commands.run.side_effect=run
+                def build(*args):
+                    commands.build_substage="cargo_build";events.append("build");raise failure
+                def scan(scanner):
+                    self.assertEqual(output.getvalue(),"");events.append("scan")
+                    if scan_fails:raise PrivateFailure("private-scan-error")
+                commands.scan.side_effect=scan
+                def diagnostic(*args):
+                    self.assertEqual(events,["build","scan"]);self.assertEqual(output.getvalue(),"")
+                    events.append("metadata");return facts
+                def cleanup(*args):
+                    self.assertEqual(output.getvalue(),"");events.append("cleanup")
+                    if cleanup_fails:raise PrivateFailure("private-cleanup-error")
+                args=types.SimpleNamespace(source=source,gitleaks=parent/"scanner.exe",gitleaks_sha256="b"*64,
+                    execute_on_free_hosted_runner=True,native_source_bundle=parent/"bundle",native_source_receipt=parent/"receipt")
+                with contextlib.redirect_stderr(output), patch.object(update,"guard"), \
+                        patch.object(update,"checked",side_effect=lambda p,**kw:Path(p)), \
+                        patch.object(update.revision,"expected_revision",return_value="c"*40), \
+                        patch.object(update.revision,"verify_checkout",return_value="c"*40), \
+                        patch.object(update,"digest",return_value="b"*64), \
+                        patch.object(update,"reserve_workspace",return_value=(workspace,(1,2),root,(3,4))), \
+                        patch.object(update,"private_environment",return_value=commands.environment), \
+                        patch.object(update,"Commands",return_value=commands),patch.object(update,"build",side_effect=build), \
+                        patch.object(update.notice_source,"system_git",return_value=parent/"git.exe"), \
+                        patch.object(update.notice_source,"_notice_failure_site",return_value=None), \
+                        patch.object(update,"cargo_failure_diagnostic",side_effect=diagnostic) as metadata, \
+                        patch.object(update,"absent_registry"),patch.object(update,"remove_owned_workspace",side_effect=cleanup):
+                    with self.assertRaises(PrivateFailure) as caught:update.execute(args)
+                self.assertEqual(events,["build","scan"]+([] if scan_fails else ["metadata"])+["cleanup"])
+                self.assertNotIn("private-original-error",output.getvalue())
+                if scan_fails or cleanup_fails:self.assertEqual(output.getvalue(),"")
+                else:
+                    self.assertIs(caught.exception,failure)
+                    lines=output.getvalue().splitlines();self.assertEqual(len(lines),2)
+                    self.assertTrue(lines[0].startswith("MORPHEUS_WINDOWS_UPDATE_FAILURE_DIAGNOSTIC "))
+                    self.assertEqual(json.loads(lines[1].removeprefix("MORPHEUS_WINDOWS_UPDATE_CARGO_DIAGNOSTIC ")),facts)
+                self.assertEqual(metadata.call_count,0 if scan_fails else 1)
+
     def test_private_environment_preserves_windows_toolchain_keys_without_forwarding_credentials(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -802,7 +956,17 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                 "CARGO_PACKAGER_SIGN_PRIVATE_KEY": "synthetic", "HTTPS_PROXY": "synthetic",
                 "RUSTC_WRAPPER": "synthetic", "UNREVIEWED_VARIABLE": "synthetic",
             }
-            selected = update.private_environment(source, root / "isolated")
+            # Ordinary temporary roots model only allocation/ACL boundaries;
+            # full read bounds/identity and environment assertions stay real.
+            def private_directory(path, **options):
+                Path(path).mkdir(**options);return Path(path)
+            security=types.SimpleNamespace(private_directory=private_directory,
+                path=lambda path,**options:Path(path),
+                open_read=lambda path,**options:update.os.open(path,update.os.O_RDONLY
+                    | getattr(update.os,"O_BINARY",0) | getattr(update.os,"O_NOINHERIT",0)))
+            with patch.object(update.notice_source.S,"windows_security",return_value=security), \
+                    patch.object(update.notices,"catalogue",return_value=update.notice_source.S):
+                selected = update.private_environment(source, root / "isolated")
             self.assertEqual({key: selected[key] for key in inherited}, inherited)
             for key in source.keys() - inherited.keys() - {"USERPROFILE", "RUNNER_TEMP"}:
                 self.assertNotIn(key, selected)
@@ -959,7 +1123,16 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             case = Path(temporary).resolve()
             base = {"USERPROFILE":str(case/"original"),"RUNNER_TEMP":str(case)}
-            environment = update.actor_environment(case,encoded,base)
+            # Keep this plan/hash fixture independent of actual Windows DACLs.
+            def private_directory(path, **options):
+                Path(path).mkdir(**options);return Path(path)
+            security=types.SimpleNamespace(private_directory=private_directory,
+                path=lambda path,**options:Path(path),
+                open_read=lambda path,**options:update.os.open(path,update.os.O_RDONLY
+                    | getattr(update.os,"O_BINARY",0) | getattr(update.os,"O_NOINHERIT",0)))
+            with patch.object(update.notice_source.S,"windows_security",return_value=security), \
+                    patch.object(update.notices,"catalogue",return_value=update.notice_source.S):
+                environment = update.actor_environment(case,encoded,base)
             raw = (case/"plan.json").read_bytes()
             self.assertEqual(json.loads(raw),encoded)
             self.assertEqual(environment[update.PLAN_HASH],update.hashlib.sha256(raw).hexdigest())
@@ -975,7 +1148,16 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
             base = {"USERPROFILE":str(case / "original"),"RUNNER_TEMP":str(case),
                     "CARGO_PACKAGER_SIGN_PRIVATE_KEY":"private fixture key","GITHUB_TOKEN":"private token"}
             plan = {"schema":1,"nonce":"a"*32,"case":"discard"}
-            environment = update.actor_environment(case,plan,base)
+            # Keep this plan/hash fixture independent of actual Windows DACLs.
+            def private_directory(path, **options):
+                Path(path).mkdir(**options);return Path(path)
+            security=types.SimpleNamespace(private_directory=private_directory,
+                path=lambda path,**options:Path(path),
+                open_read=lambda path,**options:update.os.open(path,update.os.O_RDONLY
+                    | getattr(update.os,"O_BINARY",0) | getattr(update.os,"O_NOINHERIT",0)))
+            with patch.object(update.notice_source.S,"windows_security",return_value=security), \
+                    patch.object(update.notices,"catalogue",return_value=update.notice_source.S):
+                environment = update.actor_environment(case,plan,base)
             self.assertEqual(environment[update.PLAN_HASH],update.hashlib.sha256((case/"plan.json").read_bytes()).hexdigest())
             self.assertNotIn("CARGO_PACKAGER_SIGN_PRIVATE_KEY",environment)
             self.assertNotIn("GITHUB_TOKEN",environment)

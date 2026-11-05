@@ -124,7 +124,20 @@ def private_environment(environment, home):
     result.setdefault("CARGO_HOME", str(original / ".cargo"))
     result.setdefault("RUSTUP_HOME", str(original / ".rustup"))
     for name in ("home", "roaming", "local", "temp"):
-        (home / name).mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            notice_source.private_directory(home / name, parents=True, exist_ok=True)
+        else:
+            (home / name).mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        # Cargo/libgit2 reads its own controlled HOME. The notice-fetch HOME
+        # is separate; do not inherit ambient Git configuration or credentials.
+        config = home / "home" / ".gitconfig"
+        expected = b"[core]\n\tlongpaths = true\n"
+        notice_source.checked(config.parent, directory=True, private=True)
+        if not config.exists():
+            write_new(config, expected)
+        notice_source.checked(config, private=True)
+        require(notices.read_regular(config, 128) == expected)
     result.update(HOME=str(home/"home"), USERPROFILE=str(home/"home"), APPDATA=str(home/"roaming"),
         LOCALAPPDATA=str(home/"local"), TEMP=str(home/"temp"), TMP=str(home/"temp"),
         RUST_LOG="warn", RUST_BACKTRACE="0", CARGO_INCREMENTAL="0", CARGO_BUILD_JOBS="2",
@@ -137,6 +150,7 @@ class Commands:
         self.logs = root / "logs"; self.logs.mkdir()
         self.sequence = 0
         self.build_substage = "unavailable"
+        self.failed_command = None
         self.cleanup_failed = False
         self.deadline = time.monotonic() + 6900
     def close_job(self, job):
@@ -184,15 +198,23 @@ class Commands:
             time.sleep(.025)
         self.bounded_logs()
     def run(self, args, *, environment=None, cwd=ROOT, seconds=180):
+        self.failed_command = None
+        status = None
         job = capture.WindowsJob()
         try:
             handle, log = self.start(job,args,environment,cwd)
-            require(self.wait(job, handle, seconds) == 0)
+            status = self.wait(job, handle, seconds)
+            require(status == 0)
             self.empty(job)
             require(log.stat().st_size <= 8*1024*1024)
             return log.read_bytes()
         finally:
             self.close_job(job)
+            if type(status) is int and status != 0:
+                try:
+                    self.failed_command = (log, status, log.stat().st_size)
+                except OSError:
+                    pass  # Optional metadata must not replace the refusal.
     def scan(self, scanner):
         config, ignore = self.root/"default-gitleaks.toml", self.root/"empty.ignore"
         write_new(config,b"[extend]\nuseDefault = true\n"); write_new(ignore,b"")
@@ -235,6 +257,53 @@ def failure_diagnostic(commands, stage, site, scanned, cleaned):
             "build_substage": substage, "site": site,
             "private_log_scan_passed": True, "cleanup_passed": True,
             "passed": False, "distribution_ready": False}
+
+
+def cargo_failure_diagnostic(commands, stage, scanned):
+    """Fixed build hints, captured after full scan and emitted after cleanup."""
+    try:
+        if (scanned is not True or getattr(commands, "cleanup_failed", None) is not False
+                or stage not in {"build-old", "build-new"}
+                or getattr(commands, "build_substage", None) != "cargo_build"):
+            return None
+        failure = getattr(commands, "failed_command", None)
+        if type(failure) is not tuple or len(failure) != 3:
+            return None
+        path, status, size = failure
+        if (type(status) is not int or status == 0 or not 0 <= status <= 0xffffffff
+                or type(size) is not int or not 0 <= size <= 8 * 1024 * 1024):
+            return None
+        path = Path(path)
+        if (commands.logs != commands.root / "logs" or path.parent != commands.logs
+                or re.fullmatch(r"[0-9]{4}\.log", path.name) is None):
+            return None
+        notice_source.checked(path, private=True)
+        data = notices.read_regular(path, 8 * 1024 * 1024, allow_empty=True)
+        if len(data) != size:
+            return None
+        codes = set()
+        for match in re.finditer(rb"\berror\[(E[0-9]{4})\]|\b(?:fatal error|error) (C[0-9]{4}|LNK[0-9]{4})\b", data):
+            codes.add((match[1] or match[2]).decode("ascii"))
+            if len(codes) > 16:
+                return None
+        classes = notice_source._cargo_stderr_classes(data)
+        lower = data.lower()
+        extra = set()
+        if any(token in lower for token in (b"native sdk download", b"native sdk archive",
+                                           b"no reviewed native sdk", b"cannot publish verified native sdk")):
+            extra.add("native_sdk")
+        if any(token in lower for token in (b"linking with", b"link.exe failed", b"linker `link.exe` not found")):
+            extra.add("linker")
+        if any(token in lower for token in (b"could not execute process", b"toolchain is not installed")):
+            extra.add("toolchain")
+        if extra:
+            classes = sorted(set(classes) - {"other"} | extra)
+        return {"schema": 1, "check": "windows_update_cargo_failure", "status": status,
+                "error_codes": sorted(codes), "stderr_classes": classes,
+                "private_log_scan_passed": True, "passed": False, "distribution_ready": False}
+    except BaseException:
+        # A missing/changed/unsafe log is not a replacement failure or raw text.
+        return None
 
 
 def export_source(commands, source, archive, version, label):
@@ -684,6 +753,7 @@ def execute(args):
         raise
     stage,results,scan,clean="source-export",[],False,False
     failed, failure_site = False, None
+    cargo_failure = None
     keys = {}
     try:
         # Use the already provisioned exact toolchain binary, not a rustup
@@ -728,6 +798,8 @@ def execute(args):
     finally:
         try:
             commands.scan(scanner); scan=True
+            if failed:
+                cargo_failure = cargo_failure_diagnostic(commands, stage, scan)
         finally:
             # Generated fixture credentials are removed even if a transaction
             # remains pending; never remove a changed/foreign file or registry.
@@ -750,6 +822,9 @@ def execute(args):
             if diagnostic is not None:
                 print("MORPHEUS_WINDOWS_UPDATE_FAILURE_DIAGNOSTIC " + json.dumps(diagnostic, sort_keys=True),
                       file=sys.stderr, flush=True)
+                if cargo_failure is not None:
+                    print("MORPHEUS_WINDOWS_UPDATE_CARGO_DIAGNOSTIC "
+                          + json.dumps(cargo_failure, sort_keys=True), file=sys.stderr, flush=True)
     require(stage=="complete" and len(results)==len(CASES) and scan and clean)
     print(json.dumps({"check":"windows_installed_update_mechanism","passed":True,"source_revision":reviewed,
         "cohort":old["identity"]["persistence"],"old_source":old["source"],"new_source":new["source"],
