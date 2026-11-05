@@ -47,15 +47,80 @@ pub fn identity_mapper(compat: MembershipFormat) -> matrix_rtc_core::RtcIdentity
 
     match compat {
         MembershipFormat::Current | MembershipFormat::Sticky2025 => {
-            Arc::new(identity::pseudonymous_identity)
+            Arc::new(|user, device, member, _memberships| {
+                Some(identity::pseudonymous_identity(user, device, member))
+            })
         }
         // That generation's authorisation service issues the unhashed
         // `{user}:{device}` string, and has no session component at all.
-        MembershipFormat::RoomState => {
-            Arc::new(|user_id: &str, device_id: &str, _member_id: &str| {
-                room_state::participant_identity(user_id, device_id)
-            })
+        MembershipFormat::RoomState => Arc::new(
+            |user_id: &str, device_id: &str, _member_id: &str, _memberships| {
+                Some(room_state::participant_identity(user_id, device_id))
+            },
+        ),
+    }
+}
+
+/// A complete OpenID authorisation and participant-identity contract.
+/// This is independent of the Matrix membership carrier. CSAPI `transport.url`
+/// is not an OpenID service and is deliberately not represented here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveKitAuthDialect {
+    /// Advertised `livekit_service_url`: `/sfu/get`, authenticated user/device.
+    /// This service addresses only the standard upper-case room call.
+    LegacyService,
+    /// Explicit deprecated direct `/get_token` draft: room+slot and triple hash.
+    /// Retained for existing custom-slot and draft peers; never auto-tried.
+    DirectDraft,
+}
+
+impl LiveKitAuthDialect {
+    /// Default the explicit 2025 sticky compatibility profile to its draft
+    /// token endpoint and triple-hashed identities, even for the upper room
+    /// slot. Membership carrier and slot spelling alone do not authorize a
+    /// switch to legacy identities. Callers can still explicitly select a
+    /// different verified service contract before any token request.
+    pub fn for_membership_profile(format: MembershipFormat, slot_id: &str) -> Self {
+        match format {
+            MembershipFormat::Sticky2025 => Self::DirectDraft,
+            MembershipFormat::Current | MembershipFormat::RoomState => {
+                Self::for_service_slot(slot_id)
+            }
         }
+    }
+
+    /// Resolve the advertised legacy room flow without collapsing custom slots.
+    /// The custom-slot default preserves the existing direct draft API route.
+    pub fn for_service_slot(slot_id: &str) -> Self {
+        if slot_id == "m.call#ROOM" {
+            Self::LegacyService
+        } else {
+            Self::DirectDraft
+        }
+    }
+
+    pub fn validate_slot(self, slot_id: &str) -> Result<(), &'static str> {
+        if slot_id.is_empty() || (self == Self::LegacyService && slot_id != "m.call#ROOM") {
+            return Err("the selected LiveKit auth dialect cannot address this slot");
+        }
+        Ok(())
+    }
+
+    pub fn token_endpoint(self) -> TokenEndpoint {
+        match self {
+            Self::LegacyService => TokenEndpoint::LegacyElementCall,
+            Self::DirectDraft => TokenEndpoint::Msc4195,
+        }
+    }
+
+    pub fn identity(self, user: &str, device: &str, member: &str) -> Option<String> {
+        if user.is_empty() || device.is_empty() || member.is_empty() {
+            return None;
+        }
+        Some(match self {
+            Self::LegacyService => room_state::participant_identity(user, device),
+            Self::DirectDraft => identity::pseudonymous_identity(user, device, member),
+        })
     }
 }
 
@@ -97,4 +162,85 @@ pub struct LiveKitTransportConfig {
     pub member: MemberClaims,
     /// Which authorisation-service dialect to speak. Defaults to MSC4195.
     pub token_endpoint: TokenEndpoint,
+}
+
+#[cfg(test)]
+mod auth_dialect_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_auth_and_identity_are_one_contract() {
+        let dialect = LiveKitAuthDialect::for_service_slot("m.call#ROOM");
+        assert_eq!(dialect, LiveKitAuthDialect::LegacyService);
+        assert_eq!(dialect.token_endpoint(), TokenEndpoint::LegacyElementCall);
+        assert_eq!(
+            dialect.identity("@alice:example.org", "DEVICE", "member"),
+            Some("@alice:example.org:DEVICE".into())
+        );
+        assert!(dialect.validate_slot("m.call#ROOM").is_ok());
+        assert!(dialect.validate_slot("m.call#custom").is_err());
+        assert_eq!(dialect.identity("@alice:example.org", "", "member"), None);
+        for format in [MembershipFormat::Current, MembershipFormat::RoomState] {
+            assert_eq!(
+                LiveKitAuthDialect::for_membership_profile(format, "m.call#ROOM"),
+                LiveKitAuthDialect::LegacyService
+            );
+        }
+        let sticky =
+            LiveKitAuthDialect::for_membership_profile(MembershipFormat::Sticky2025, "m.call#ROOM");
+        assert_eq!(sticky, LiveKitAuthDialect::DirectDraft);
+        assert_eq!(sticky.token_endpoint(), TokenEndpoint::Msc4195);
+        assert_eq!(
+            sticky.identity("@alice:example.org", "DEVICE", "member"),
+            Some(identity::pseudonymous_identity(
+                "@alice:example.org",
+                "DEVICE",
+                "member"
+            ))
+        );
+        assert!(sticky.validate_slot("m.call#ROOM").is_ok());
+        // An explicit legacy service can carry sticky memberships too. Its
+        // existing contract stays valid, but cannot address a custom slot.
+        assert!(
+            LiveKitAuthDialect::LegacyService
+                .validate_slot("m.call#ROOM")
+                .is_ok()
+        );
+        assert!(
+            LiveKitAuthDialect::LegacyService
+                .validate_slot("m.call#custom")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn custom_slot_retains_explicit_direct_draft_contract() {
+        let dialect = LiveKitAuthDialect::for_service_slot("m.call#custom");
+        assert_eq!(dialect, LiveKitAuthDialect::DirectDraft);
+        assert_eq!(dialect.token_endpoint(), TokenEndpoint::Msc4195);
+        assert!(dialect.validate_slot("m.call#custom").is_ok());
+        assert_eq!(
+            dialect.identity("@alice:example.org", "DEVICE", "member"),
+            Some(identity::pseudonymous_identity(
+                "@alice:example.org",
+                "DEVICE",
+                "member"
+            ))
+        );
+        assert_ne!(
+            dialect.identity("@alice:example.org", "DEVICE", "member"),
+            dialect.identity("@alice:example.org", "DEVICE", "another-member")
+        );
+        assert!(dialect.validate_slot("").is_err());
+        for format in [
+            MembershipFormat::Current,
+            MembershipFormat::Sticky2025,
+            MembershipFormat::RoomState,
+        ] {
+            assert_eq!(
+                LiveKitAuthDialect::for_membership_profile(format, "m.call#custom"),
+                LiveKitAuthDialect::DirectDraft
+            );
+        }
+    }
 }

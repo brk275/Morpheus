@@ -114,6 +114,11 @@ clap = { version = "4", features = ["derive", "env"] }
 # dev-dep gives us the provider module to call `install_default()`.
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
+# Standalone SDK tests do not inherit the adapter's dev-dependencies or
+# select morpheus-matrix, which enables this same bundled Windows SQLite policy.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+libsqlite3-sys = { version = "=0.38.2", features = ["bundled-windows"] }
+
 [[example]]
 name = "connect"
 required-features = ["matrix-sdk"]
