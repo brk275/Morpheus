@@ -565,6 +565,11 @@
       "fingerprint": "7fe071d9c45315d4c82cd9ebcf0071a114c83d6e:vendor/matrix-rtc-call-sdk/src/attach/tests.rs:generic-api-key:197",
       "blob_sha256": "afd7f29596790fd0fcf2250cc4044b6b0d3f64325c6083e6c1992181df9019e9",
       "provenance": "Public MatrixRTC mock media-key fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-call-sdk/src/attach/tests.rs; cfg(test) MockBackend, FakeTransport and RecordingRing use fixed synthetic data without network credentials."
+    },
+    {
+      "fingerprint": "3e558a2ff41ecb7d90b2809229e6b63620c99171:vendor/matrix-rtc-call/src/client/tests.rs:generic-api-key:113",
+      "blob_sha256": "5e3434e50f0219617bba230f0c3a40cb3b8089e67091593e09cb3abcf38af1ca",
+      "provenance": "Public matrix-rust-rtc fixed bytes 0 through 15 media-key fixture in bob_key; authenticated upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 crates/matrix-rtc-call/src/client/tests.rs blob 80f3bd15955cfa6a43d69081c51c8934839b6c47; candidate adds actor regression below the unchanged fixture."
     }
   ]
 }
