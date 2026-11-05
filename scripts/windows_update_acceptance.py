@@ -372,16 +372,34 @@ def _cleanup_reparse_metadata(root, path, info):
     kind = "directory" if stat.S_ISDIR(info.st_mode) else "regular" if stat.S_ISREG(info.st_mode) else "other"
     attributes = getattr(info, "st_file_attributes", None)
     tag = getattr(info, "st_reparse_tag", None)
+    subcomponent = "not-tools-home"
+    compatibility = "not-tools-home"
+    if role == "tools-home":
+        component = relative.parts[1].casefold() if len(relative.parts) > 1 else ""
+        subcomponent = component if component in {"home", "roaming", "local", "temp"} else "other" if component else "none"
+        compatibility = {"application data": "application-data", "local settings": "local-settings",
+                         "history": "history", "cookies": "cookies",
+                         "temporary internet files": "temporary-internet-files",
+                         "my documents": "my-documents", "nethood": "nethood", "printhood": "printhood",
+                         "recent": "recent", "sendto": "sendto", "templates": "templates",
+                         "start menu": "start-menu"}.get(relative.name.casefold(), "other")
     return {"role": role, "kind": kind,
             "attributes": attributes if type(attributes) is int and 0 <= attributes <= 0xffffffff else None,
-            "tag": tag if type(tag) is int and 0 <= tag <= 0xffffffff else None}
+            "tag": tag if type(tag) is int and 0 <= tag <= 0xffffffff else None,
+            "subcomponent": subcomponent, "compatibility_name": compatibility,
+            "depth": len(relative.parts) if 1 <= len(relative.parts) <= 64 else None}
 
 
 def _valid_cleanup_reparse(value):
-    return (type(value) is dict and set(value) == {"role", "kind", "attributes", "tag"}
+    return (type(value) is dict and set(value) == {"role", "kind", "attributes", "tag", "subcomponent", "compatibility_name", "depth"}
             and type(value["role"]) is str and value["role"] in {"native-target", "tools-home", "tiny-source", "synthetic-git", "logs", "other"}
             and type(value["kind"]) is str and value["kind"] in {"directory", "regular", "other"}
-            and all(value[k] is None or type(value[k]) is int and 0 <= value[k] <= 0xffffffff for k in ("attributes", "tag")))
+            and all(value[k] is None or type(value[k]) is int and 0 <= value[k] <= 0xffffffff for k in ("attributes", "tag"))
+            and type(value["subcomponent"]) is str and value["subcomponent"] in {"not-tools-home", "home", "roaming", "local", "temp", "other", "none"}
+            and type(value["compatibility_name"]) is str and value["compatibility_name"] in {"not-tools-home", "application-data", "local-settings", "history", "cookies", "temporary-internet-files", "my-documents", "nethood", "printhood", "recent", "sendto", "templates", "start-menu", "other"}
+            and (value["depth"] is None or type(value["depth"]) is int and 1 <= value["depth"] <= 64)
+            and ((value["role"] == "tools-home" and value["subcomponent"] != "not-tools-home" and value["compatibility_name"] != "not-tools-home")
+                 or (value["role"] != "tools-home" and value["subcomponent"] == value["compatibility_name"] == "not-tools-home")))
 
 
 def _cleanup_refusal_diagnostic(error):

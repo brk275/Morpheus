@@ -20,6 +20,15 @@ HOSTED = {"MORPHEUS_WINDOWS_CAPTURE_ACCEPTANCE": "1", "GITHUB_ACTIONS": "true",
           "RUNNER_ENVIRONMENT": "github-hosted", "RUNNER_OS": "Windows"}
 
 
+def _temporary_tiny_compiler_hint(commands, scanned, hint):
+    # Diagnostic metadata only: failed workspace cleanup does not undo a full
+    # scan of stopped logs. Never publish if Job containment/scan is uncertain.
+    if (scanned is not True or getattr(commands, "close_state", None) != "complete"
+            or getattr(commands, "cleanup_failed", None) is not False):
+        return None
+    return hint
+
+
 def _temporary_tiny_msvc_workspace(test):
     """Opt-in fresh-host synthetic compiler probe; never a native acceptance gate."""
     import os
@@ -150,7 +159,7 @@ def _temporary_tiny_msvc_workspace(test):
                   "job_closed":commands is not None and commands.close_state == "complete",
                   "job_cleanup_failed":commands is not None and commands.cleanup_failed,
                   "readonly_retries":readonly_retries,
-                  "compiler_hint":compiler_hint if cleaned else None,
+                  "compiler_hint":_temporary_tiny_compiler_hint(commands, scanned, compiler_hint),
                   "native_failure_cause_proven":False, "installed_update_qualified":False}
         print("MORPHEUS_WINDOWS_TINY_MSVC " + json.dumps(record, sort_keys=True), flush=True)
     if cleanup_failure is not None:
@@ -969,7 +978,9 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                     self.assertEqual(observed.call_count,2)
                     deleted.assert_not_called()
                 fixed={"role":role if role in {"native-target","tools-home"} else "other",
-                       "kind":kind,"attributes":0x400,"tag":tag}
+                       "kind":kind,"attributes":0x400,"tag":tag,
+                       "subcomponent":"none" if role=="tools-home" else "not-tools-home",
+                       "compatibility_name":"other" if role=="tools-home" else "not-tools-home","depth":1}
                 refusal=update._cleanup_refusal_diagnostic(caught.exception)
                 self.assertEqual(refusal,{"category":"guard","errno":None,"winerror":None,
                                           "predicate":"inventory_reparse","reparse":fixed})
@@ -977,9 +988,18 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                 self.assertEqual(update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,refusal)["cleanup_refusal"],refusal)
                 for changed in (fixed|{"role":"private-path"},fixed|{"kind":True},
                                 fixed|{"tag":True},fixed|{"attributes":0x100000000},
-                                fixed|{"target":"private-path"}):
+                                fixed|{"target":"private-path"},fixed|{"depth":True},fixed|{"depth":65},
+                                fixed|{"subcomponent":"private-path"},fixed|{"compatibility_name":"private-path"}):
                     self.assertIsNone(update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,refusal|{"reparse":changed}))
                 self.assertIsNone(update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,refusal|{"predicate":"inventory_limit"}))
+            info=types.SimpleNamespace(st_mode=update.stat.S_IFDIR,st_file_attributes=0x2416,st_reparse_tag=0xa0000003)
+            for parts,component,category in ((("tools-home","home","AppData","Local","Application Data"),"home","application-data"),
+                    (("tools-home","local","History"),"local","history"),
+                    (("tools-home","roaming","private-unknown"),"roaming","other")):
+                value=update._cleanup_reparse_metadata(root,root.joinpath(*parts),info)
+                self.assertTrue(update._valid_cleanup_reparse(value))
+                self.assertEqual((value["subcomponent"],value["compatibility_name"],value["depth"]),(component,category,len(parts)))
+                self.assertNotIn("private-",json.dumps(value))
 
     @unittest.skipUnless(sys.platform=="win32","actual Windows protected update workspace and source ACL reads")
     def test_update_workspace_actual_windows_acl_source_reads_and_cleanup_preserve_actor_parent(self):
@@ -1348,6 +1368,19 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                     "private_log_scan_passed":True,"passed":False,"distribution_ready":False})
                 admission.assert_called_with(log,private=True)
                 self.assertNotIn("private",json.dumps({k:v for k,v in facts.items() if k!="private_log_scan_passed"}))
+                # The TEMP observation may retain only this parsed metadata
+                # despite a separate cleanup refusal; acceptance remains false.
+                commands.close_state="complete"
+                self.assertEqual(_temporary_tiny_compiler_hint(commands,True,facts),facts)
+                self.assertFalse(facts["passed"])
+                for scanned in (False,1):
+                    self.assertIsNone(_temporary_tiny_compiler_hint(commands,scanned,facts))
+                for close in ("unattempted","attempted","failed",None):
+                    commands.close_state=close
+                    self.assertIsNone(_temporary_tiny_compiler_hint(commands,True,facts))
+                commands.close_state="complete";commands.cleanup_failed=True
+                self.assertIsNone(_temporary_tiny_compiler_hint(commands,True,facts))
+                commands.cleanup_failed=False
                 for scanned in (False,1):
                     self.assertIsNone(update.cargo_failure_diagnostic(commands,"build-old",scanned))
                 for failure in ((root/"0001.log",1,len(body)),(log,True,len(body)),(log,0,len(body)),
