@@ -30,7 +30,7 @@ def _temporary_real_seal_provider(test):
                 "RUNNER_OS":"Linux", "RUNNER_ARCH":"X64", "GITHUB_REPOSITORY":"brk275/Morpheus",
                 "GITHUB_EVENT_NAME":"workflow_dispatch", "GITHUB_ACTOR":"brk275",
                 "GITHUB_TRIGGERING_ACTOR":"brk275",
-                "GITHUB_REF":"refs/heads/codex/temp-linux-batched-scan-regression-20261105"}
+                "GITHUB_REF":"refs/heads/codex/temp-linux-private-handoff-regression-20261105"}
     test.assertTrue(sys.platform == "linux" and all(env.get(k) == v for k, v in expected.items()))
     event = json.loads(P.client.read_regular(Path(env["GITHUB_EVENT_PATH"]), 1024 * 1024))
     test.assertIs(event["repository"]["private"], False)
@@ -141,6 +141,7 @@ def _temporary_real_seal_provider(test):
         root = Path(directory).resolve(strict=True)
         commands = A.Commands(root)
         commands.reviewed_revision = revision
+        (root / "artifacts").mkdir(mode=0o700)
         build_root = A.private_directory(root / "artifacts" / "0.1.0-updateqa.1")
         plan_path = build_root / "update-plan.json"
         A.write_private(plan_path, json.dumps({"schema":1, "reviewed_checkout":str(ROOT),
