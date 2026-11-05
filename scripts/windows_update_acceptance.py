@@ -313,6 +313,41 @@ class Commands:
                     self.failed_command = (log, status, log.stat().st_size)
                 except OSError:
                     pass  # Optional metadata must not replace the refusal.
+    def compile_app(self, cargo, exported, target, environment):
+        # A successful compiler driver may leave an owned helper running.
+        # Release that Job and prove zero descendants BEFORE reading results;
+        # ordinary installer/actor commands retain their natural-drain policy.
+        expected = checked(Path(self.environment["RUSTUP_HOME"]) /
+                           "toolchains/1.99.0-x86_64-pc-windows-msvc/bin/cargo.exe")
+        require(Path(cargo) == expected and Path(target) == self.root / "native-target"
+                and Path(exported).parent == self.root and Path(exported).name in {"old-source", "new-source"})
+        self.failed_command = None
+        status = None
+        self.command_phase = "job_create"
+        job = capture.WindowsJob()
+        try:
+            self.command_phase = "start"
+            handle, log = self.start(job, [expected, "build", "--release", "--locked", "-p", "morpheus-app",
+                "--features", "native-calls", "--target-dir", target], environment, exported)
+            status = self.wait(job, handle, 3600)
+            self.command_phase = "exit_status"
+            require(status == 0)
+        finally:
+            self.close_job(job)  # Verified kill/drain/handle close; failure cannot return success.
+            if type(status) is int and status != 0:
+                try:
+                    self.failed_command = (log, status, log.stat().st_size)
+                except OSError:
+                    pass  # Preserve the existing production diagnostic contract.
+        self.command_phase = "result_log_bounds"
+        require(time.monotonic() < self.deadline)
+        self.bounded_logs()
+        require(log.stat().st_size <= 8*1024*1024)
+        self.command_phase = "result_log_read"
+        result = log.read_bytes()
+        require(time.monotonic() < self.deadline)
+        self.command_phase = "complete"
+        return result
     def scan(self, scanner):
         self.scan_phase = "configuration"
         config, ignore = self.root/"default-gitleaks.toml", self.root/"empty.ignore"
@@ -542,8 +577,7 @@ def build(commands, source, archive, version, nonce, label, cargo, notice_bundle
     environment = msvc_build_environment(commands.environment)
     environment.update(MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD=nonce, MORPHEUS_PACKAGE_FORMAT="nsis-payload-v2")
     commands.build_substage = "cargo_build"
-    commands.run([cargo,"build","--release","--locked","-p","morpheus-app","--features","native-calls",
-        "--target-dir",target],environment=environment,cwd=exported,seconds=3600)
+    commands.compile_app(cargo,exported,target,environment)
     commands.build_substage = "payload"
     require(revision.verify_versioned_export(exported,archive,version) == proof)
     binary = exported/"target/release/morpheus-app.exe"
@@ -844,14 +878,48 @@ def run_case(commands, case_name, old, new, nonce, signatures):
             require(environment is not None and uninstall_hash is not None)
             cleanup_case(commands,case,old,new,uninstall_hash,environment)
 
-def remove_owned_root(root, identity, workspace, workspace_identity):
+def remove_owned_root(root, identity, workspace, workspace_identity, *, deadline=None):
+    if deadline is not None:
+        require(type(deadline) in (int,float) and 0 < deadline-time.monotonic() <= 6900)
     info=root.lstat(); require((info.st_dev,info.st_ino)==identity)
+    def unreadable_subtree(_error):
+        raise Failure() from None  # No filesystem path or exception body is reflected.
     count=0
-    for directory, dirs, files in os.walk(root,followlinks=False):
+    junctions=[]
+    profile=root/"tools-home/home"
+    for directory, dirs, files in os.walk(root,followlinks=False,onerror=unreadable_subtree):
         for name in dirs+files:
+            if deadline is not None: require(time.monotonic()<deadline)
             path=Path(directory)/name; info=path.lstat(); count+=1
-            require(count<=300000 and not stat.S_ISLNK(info.st_mode)
-                    and not getattr(info,"st_file_attributes",0)&0x400)
+            require(count<=300000 and not stat.S_ISLNK(info.st_mode))
+            if getattr(info,"st_file_attributes",0)&0x400:
+                # Do not descend or delete during the complete preflight. Only
+                # this private runtime-profile mount-point kind can be queued.
+                require(os.name=="nt" and name in dirs and stat.S_ISDIR(info.st_mode)
+                        and getattr(info,"st_reparse_tag",0)==0xa0000003
+                        and path!=profile and path.is_relative_to(profile))
+                require(len(junctions)<64)  # Bound new handle work independently of ordinary files.
+                token=(info.st_dev,info.st_ino,info.st_birthtime_ns,info.st_mtime_ns,
+                       info.st_file_attributes,info.st_reparse_tag,info.st_nlink,info.st_size)
+                require(all(type(value) is int for value in token) and token[0]>=0 and token[1]>0
+                        and token[2]>0 and token[3]>=0 and 0<=token[4]<=0xffffffff
+                        and token[4]&0x410==0x410 and token[6]==1 and token[7]==0)
+                junctions.append((path,token));dirs.remove(name)
+    if junctions:
+        security=notice_source.S.windows_security()
+        for path,token in junctions:
+            security.unlink_private_profile_junction(workspace,workspace_identity,root,identity,
+                                                     path,token,deadline=deadline)
+        # A replacement or a newly appearing reparse point still cannot enter
+        # generic recursive removal, including Windows directory junctions.
+        count=0
+        for directory,dirs,files in os.walk(root,followlinks=False,onerror=unreadable_subtree):
+            for name in dirs+files:
+                require(time.monotonic()<deadline)
+                info=(Path(directory)/name).lstat();count+=1
+                require(count<=300000 and not stat.S_ISLNK(info.st_mode)
+                        and not getattr(info,"st_file_attributes",0)&0x400)
+    if deadline is not None: require(time.monotonic()<deadline)
     if os.name == "nt":
         def readonly(function, path, error):
             # Only the known readonly-unlink failure can authorize a retry.
@@ -912,14 +980,14 @@ def reserve_workspace(nonce):
         raise
 
 
-def remove_owned_workspace(workspace, workspace_identity, root, identity):
+def remove_owned_workspace(workspace, workspace_identity, root, identity, *, deadline=None):
     require(root.parent==workspace and re.fullmatch(r"morpheus-windows-updateqa-[0-9a-f]{32}",root.name))
     require(workspace.parent==Path.home().resolve(strict=True) and re.fullmatch(r"morpheus-native-source-[0-9a-f]{32}",workspace.name))
     security=notice_source.S.windows_security()
     security.path(workspace,directory=True,private=True)
     info=workspace.lstat();require((info.st_dev,info.st_ino)==workspace_identity)
     security.path(root,directory=True,private=True)
-    remove_owned_root(root,identity,workspace,workspace_identity)
+    remove_owned_root(root,identity,workspace,workspace_identity,deadline=deadline)
     security.path(workspace,directory=True,private=True)
     info=workspace.lstat();require((info.st_dev,info.st_ino)==workspace_identity and not any(workspace.iterdir()))
     workspace.rmdir();require(not workspace.exists())
@@ -1023,7 +1091,7 @@ def execute(args):
                 if scan is True:
                     cleanup_phase = "workspace"
                     try:
-                        remove_owned_workspace(workspace,workspace_identity,root,identity); clean=True
+                        remove_owned_workspace(workspace,workspace_identity,root,identity,deadline=commands.deadline); clean=True
                     except BaseException as error:
                         try:
                             cleanup_refusal = _cleanup_refusal_diagnostic(error)

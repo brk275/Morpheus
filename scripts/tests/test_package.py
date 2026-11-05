@@ -1805,6 +1805,111 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
                         security.private_directory(path,**options)
                 self.assertEqual(len(created),3)
             self.assertTrue(all(directory and private for _,directory,private in validations))
+        # Exercise the dedicated no-follow deletion primitive through its real
+        # handle/identity logic, without loading Windows APIs on this host.
+        for action in ("valid","outside","expired","wrong_tag","parent_reparse","leaf_replaced",
+                       "parent_mutated","acl","sharing","dispose","replacement_after_close","close","device","lexical_escape","late_acl"):
+            with self.subTest(profile_unlink=action):
+                home=Path(tempfile.gettempdir()).resolve()/"synthetic-fresh-home"
+                workspace=home/("morpheus-native-source-"+"a"*32)
+                root=workspace/("morpheus-windows-updateqa-"+"b"*32)
+                profile=root/"tools-home/home"
+                leaf=profile/"AppData/Local/Microsoft/Windows/cache/junction"
+                chain=list(reversed(leaf.parents)); paths=chain+[leaf]
+                metadata={path:SimpleNamespace(st_dev=7,st_ino=index+100,st_birthtime_ns=10**12,
+                    st_mtime_ns=2*10**12,st_file_attributes=0x2416 if path==leaf else 0x10,
+                    st_reparse_tag=0xa0000003 if path==leaf else 0,st_nlink=1,st_size=0)
+                    for index,path in enumerate(paths)}
+                opened,closed,disposals,checks,created_paths=[],[],[],[],[]
+                handles={};state={"pending":False,"deleted":False,"deny":False,"late_acl_reached":False};queries={}
+                deleted_names=set();foreign_canary={"data":b"outside synthetic target remains unchanged"}
+                state["target_traversed"]=False
+                def named(path):
+                    path=Path(path)
+                    if path in deleted_names:
+                        if action=="replacement_after_close":
+                            return SimpleNamespace(**(vars(metadata[path])|{"st_ino":99999}))
+                        raise FileNotFoundError()
+                    return metadata[path]
+                def create(path,access,share,security,creation,flags,template):
+                    path=Path(path);created_paths.append(path)
+                    if path==leaf and not flags&0x00200000:state["target_traversed"]=True
+                    self.assertIn(path,paths);self.assertEqual((security,creation,flags,template),(None,3,0x02200000,None))
+                    self.assertEqual((access,share),(0x30080,1) if path==leaf else (0x20080,3))
+                    if action=="sharing" and path==leaf:return None
+                    handle=len(opened)+10;opened.append(handle);handles[handle]=path;return handle
+                def information(handle,kind,output,size):
+                    path=handles[handle];value=metadata[path];pointer=output._obj
+                    inode,attrs,tag=value.st_ino,value.st_file_attributes,value.st_reparse_tag
+                    if kind==18:queries[handle]=queries.get(handle,0)+1
+                    if action=="parent_mutated" and path==root and queries.get(handle,0)>1:inode+=99
+                    if action=="leaf_replaced" and path==leaf:inode+=99
+                    if action=="parent_reparse" and path==profile:attrs,tag=0x410,0xa0000003
+                    if action=="wrong_tag" and path==leaf:tag=0xa000000c
+                    if kind==18:
+                        self.assertEqual(size,24);pointer.volume=7;pointer.identifier[:]=inode.to_bytes(16,"little")
+                    elif kind==0:
+                        self.assertEqual(size,40);pointer.created=116444736000000000+10**10
+                        pointer.written=116444736000000000+2*10**10;pointer.changed=123;pointer.attributes=attrs
+                    elif kind==9:
+                        self.assertEqual(size,8);pointer.attributes=attrs;pointer.tag=tag
+                    elif kind==1:
+                        self.assertEqual(size,24);pointer.size=0;pointer.links=1;pointer.pending=0;pointer.directory=1
+                    else:raise AssertionError("unexpected metadata query")
+                    return True
+                def acl(selected_handle,*,handle=False,private=False,ancestor=False):
+                    self.assertTrue(handle);path=handles[selected_handle]
+                    self.assertEqual(private,path==workspace or path.is_relative_to(workspace))
+                    self.assertEqual(ancestor,not private);checks.append(path)
+                    if action=="late_acl" and state["deny"] and path==leaf:
+                        state["late_acl_reached"]=True
+                        raise ValueError("synthetic later private ACL refusal")
+                    if action=="acl" and path==leaf:raise ValueError("synthetic private ACL refusal")
+                def dispose(handle,kind,output,size):
+                    self.assertEqual((handles[handle],kind,size,output._obj.delete),(leaf,4,1,1))
+                    disposals.append(handle)
+                    if state["target_traversed"]:foreign_canary["data"]=b"deleted through wrong handle"
+                    if action=="dispose":return False
+                    state["pending"]=True;return True
+                def close(handle):
+                    self.assertNotIn(handle,closed);closed.append(handle)
+                    if handles[handle]==leaf and state["pending"]:
+                        state["deleted"]=True;deleted_names.add(leaf)
+                    return not (action=="close" and handles[handle]==workspace)
+                security=windows.Security.__new__(windows.Security)
+                security.k=SimpleNamespace(GetDriveTypeW=lambda anchor:3,CreateFileW=create,
+                    GetFileInformationByHandleEx=information,SetFileInformationByHandle=dispose,CloseHandle=close)
+                security.acl=acl
+                expected=metadata[leaf]
+                token=tuple(getattr(expected,name) for name in ("st_dev","st_ino","st_birthtime_ns","st_mtime_ns","st_file_attributes","st_reparse_tag","st_nlink","st_size"))
+                selected=(root/"outside-profile" if action=="outside" else profile/"NUL.txt" if action=="device"
+                          else profile/".."/"escape" if action=="lexical_escape" else leaf)
+                with mock.patch.object(Path,"home",return_value=home),mock.patch.object(Path,"lstat",named), \
+                        mock.patch.object(windows.time,"monotonic",return_value=10):
+                    if action in {"valid","late_acl"}:
+                        security.unlink_private_profile_junction(workspace,(7,metadata[workspace].st_ino),root,(7,metadata[root].st_ino),selected,token,deadline=40)
+                        if action=="late_acl":
+                            first=leaf;self.assertIn(first,deleted_names)
+                            leaf=leaf.with_name("later-junction");paths.append(leaf)
+                            metadata[leaf]=SimpleNamespace(**(vars(expected)|{"st_ino":99990}))
+                            token=tuple(getattr(metadata[leaf],name) for name in ("st_dev","st_ino","st_birthtime_ns","st_mtime_ns","st_file_attributes","st_reparse_tag","st_nlink","st_size"))
+                            state.update(pending=False,deleted=False,deny=True)
+                            with self.assertRaises(ValueError):
+                                security.unlink_private_profile_junction(workspace,(7,metadata[workspace].st_ino),root,(7,metadata[root].st_ino),leaf,token,deadline=40)
+                            self.assertTrue(state["late_acl_reached"])
+                            self.assertEqual(deleted_names,{first})
+                            self.assertEqual(named(leaf).st_ino,99990)
+                    else:
+                        with self.assertRaises(ValueError):
+                            security.unlink_private_profile_junction(workspace,(7,metadata[workspace].st_ino),root,(7,metadata[root].st_ino),selected,token,deadline=9 if action=="expired" else 40)
+                self.assertCountEqual(closed,opened)
+                self.assertEqual(len(disposals),1 if action in {"valid","dispose","replacement_after_close","close","late_acl"} else 0)
+                self.assertEqual(state["deleted"],action in {"valid","replacement_after_close","close"})
+                if action in {"outside","expired","device","lexical_escape"}:self.assertEqual(created_paths,[])
+                self.assertTrue(set(created_paths)<=set(paths))
+                self.assertFalse(state["target_traversed"])
+                self.assertEqual(foreign_canary["data"],b"outside synthetic target remains unchanged")
+                if action=="valid":self.assertEqual(set(handles.values()),set(paths))
 
     @unittest.skipUnless(os.name == "nt", "actual Windows private child ACL and inherited file reads")
     def test_private_nested_children_keep_user_system_reads_and_refuse_stdlib_admin_acl(self):

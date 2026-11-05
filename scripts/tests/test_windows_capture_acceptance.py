@@ -779,6 +779,61 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                     self.assertTrue(target.exists())
                     target.chmod(update.stat.S_IWRITE)
 
+        for action in ("too_many","invalid_last"):
+            with self.subTest(profile_preflight=action),tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve()/"synthetic-run";profile=root/"tools-home/home"
+                entries=[(profile,["j"+str(index) for index in range(65 if action=="too_many" else 64)],[])]
+                if action=="invalid_last":entries.append((root/"old-source",["unknown-junction"],[]))
+                root_info=types.SimpleNamespace(st_dev=1,st_ino=2)
+                leaf_info=types.SimpleNamespace(st_dev=1,st_ino=3,st_mode=update.stat.S_IFDIR,
+                    st_birthtime_ns=100,st_mtime_ns=100,st_file_attributes=0x410,st_reparse_tag=0xa0000003,
+                    st_nlink=1,st_size=0)
+                def named(path):return root_info if path==root else leaf_info
+                security=Mock()
+                with patch.object(update,"os",WindowsOS()),patch.object(update_os,"walk",return_value=entries), \
+                        patch.object(Path,"lstat",named),patch.object(update.notice_source.S,"windows_security",return_value=security), \
+                        patch.object(update.shutil,"rmtree") as removed,self.assertRaises(update.Failure):
+                    update.remove_owned_root(root,(1,2),root.parent,(1,1),deadline=None)
+                security.unlink_private_profile_junction.assert_not_called();removed.assert_not_called()
+
+        for action in ("first_walk_error","post_unlink_walk_error"):
+            with self.subTest(profile_enumeration=action),tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve()/"synthetic-run";root.mkdir()
+                remaining=root/"remaining";remaining.write_bytes(b"retain after refused cleanup")
+                foreign=Path(temporary).resolve()/"foreign-canary";foreign.write_bytes(b"untouched")
+                profile=root/"tools-home/home";junction=profile/"junction"
+                root_info=types.SimpleNamespace(st_dev=1,st_ino=2)
+                leaf_info=types.SimpleNamespace(st_dev=1,st_ino=3,st_mode=update.stat.S_IFDIR,
+                    st_birthtime_ns=100,st_mtime_ns=100,st_file_attributes=0x410,st_reparse_tag=0xa0000003,
+                    st_nlink=1,st_size=0)
+                def named(path):return root_info if path==root else leaf_info
+                walks=[];observed=[];security=Mock()
+                def enumerate_tree(path,*,followlinks,onerror):
+                    self.assertEqual(path,root);self.assertIs(followlinks,False)
+                    walks.append(path)
+                    if len(walks)==1:
+                        yield profile,[junction.name],[]
+                        if action=="first_walk_error":
+                            observed.append("preflight_error")
+                            onerror(PermissionError(13,"private subtree must not be reflected"))
+                    else:
+                        observed.append("recensus_error")
+                        onerror(OSError(5,"private subtree must not be reflected"))
+                with patch.object(update,"os",WindowsOS()),patch.object(update_os,"walk",side_effect=enumerate_tree), \
+                        patch.object(Path,"lstat",named),patch.object(update.notice_source.S,"windows_security",return_value=security), \
+                        patch.object(update.shutil,"rmtree") as removed,self.assertRaises(update.Failure):
+                    update.remove_owned_root(root,(1,2),root.parent,(1,1),deadline=update.time.monotonic()+30)
+                removed.assert_not_called()
+                self.assertEqual(observed,["preflight_error" if action=="first_walk_error" else "recensus_error"])
+                if action=="first_walk_error":
+                    security.unlink_private_profile_junction.assert_not_called();self.assertEqual(len(walks),1)
+                else:
+                    security.unlink_private_profile_junction.assert_called_once()
+                    self.assertEqual(security.unlink_private_profile_junction.call_args.args[4],junction)
+                    self.assertEqual(len(walks),2)  # One authorized unlink cannot qualify a failed recensus.
+                self.assertEqual(remaining.read_bytes(),b"retain after refused cleanup")
+                self.assertEqual(foreign.read_bytes(),b"untouched")
+
     def test_update_cleanup_refusal_diagnostic_keeps_only_builtin_category_and_bounded_numeric_codes(self):
         for code in (5,32,206):
             error=PermissionError(13,"private-path-and-error-body");error.winerror=code
@@ -822,9 +877,39 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
             update.os.chmod(target,update.stat.S_IREAD)
             security.path(target,private=True)
             self.assertTrue(target.lstat().st_file_attributes & 1)
+        # A real junction points at a separate protected canary root. Unlink
+        # only the junction object; never enumerate or delete through it.
+        external=security.create_root(security.path(Path.home().resolve(),directory=True))
+        external_info=external.lstat();external_identity=(external_info.st_dev,external_info.st_ino)
+        canary=external/"canary.txt";canary.write_bytes(b"external synthetic target must survive")
+        security.path(canary,private=True)
+        junction=security.private_directory(root/"tools-home/home/AppData/Local/Microsoft/Windows/cache/junction",parents=True)
+        substitute=("\\??\\"+str(external)).encode("utf-16le")
+        display=str(external).encode("utf-16le")
+        payload=struct.pack("<HHHH",0,len(substitute),len(substitute)+2,len(display))+substitute+b"\0\0"+display+b"\0\0"
+        buffer=struct.pack("<IHH",0xa0000003,len(payload),0)+payload
+        self.assertLessEqual(len(buffer),16384)
+        control=security.k.DeviceIoControl
+        control.argtypes=[ctypes.c_void_p,ctypes.c_uint32,ctypes.c_void_p,ctypes.c_uint32,ctypes.c_void_p,ctypes.c_uint32,ctypes.POINTER(ctypes.c_uint32),ctypes.c_void_p]
+        control.restype=ctypes.c_int
+        opened=security.k.CreateFileW(str(junction),0x40000000|0x20000,0,None,3,0x02200000,None)
+        self.assertNotIn(opened,(None,ctypes.c_void_p(-1).value))
+        try:
+            storage=ctypes.create_string_buffer(buffer);returned=ctypes.c_uint32()
+            self.assertTrue(control(opened,0x000900a4,storage,len(buffer),None,0,ctypes.byref(returned),None))
+        finally:
+            self.assertTrue(security.k.CloseHandle(opened))
+        observed=junction.lstat()
+        self.assertEqual(observed.st_reparse_tag,0xa0000003)
+        self.assertTrue(observed.st_file_attributes&0x400)
         with patch.object(update.notice_source,"_remove_readonly_owned_leaf",
                           wraps=update.notice_source._remove_readonly_owned_leaf) as retried:
-            update.remove_owned_workspace(workspace,workspace_identity,root,identity)
+            update.remove_owned_workspace(workspace,workspace_identity,root,identity,deadline=update.time.monotonic()+30)
+        self.assertEqual(canary.read_bytes(),b"external synthetic target must survive")
+        security.path(external,directory=True,private=True)
+        self.assertEqual((external.lstat().st_dev,external.lstat().st_ino),external_identity)
+        self.assertEqual({path.name for path in external.iterdir()},{"canary.txt"})
+        security.path(canary,private=True);canary.unlink();external.rmdir()
         self.assertCountEqual([Path(call.args[3]) for call in retried.call_args_list],readonly)
         self.assertTrue(all(call.args[:2]==(workspace,workspace_identity) for call in retried.call_args_list))
         self.assertFalse(workspace.exists())
@@ -903,7 +988,7 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                         raise error
                     commands.scan_phase="complete"
                 commands.scan=scan
-                def cleanup(*args):
+                def cleanup(*args,deadline=None):
                     events.append("cleanup")
                     if cleanup_fails:raise error
                 args=types.SimpleNamespace(source=root/"reviewed",gitleaks=root/"scanner.exe",
@@ -985,7 +1070,7 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                         patch.object(update,"Commands",return_value=commands), \
                         patch.object(update.notice_source,"system_git",return_value=root/"git.exe"), \
                         patch.object(update.notice_source,"_notice_failure_site",return_value={"module":"native_notices","line":171}), \
-                        patch.object(update,"absent_registry"),patch.object(update,"remove_owned_workspace",side_effect=lambda workspace,workspace_identity,run,identity:cleanup(run,identity)):
+                        patch.object(update,"absent_registry"),patch.object(update,"remove_owned_workspace",side_effect=lambda workspace,workspace_identity,run,identity,deadline=None:cleanup(run,identity)):
                     with self.assertRaises(PrivateFailure) as caught:update.execute(args)
                 self.assertEqual(events,["scan"] if scan_fails else ["scan","cleanup"])
                 self.assertNotIn("private-",output.getvalue())
@@ -1229,7 +1314,7 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                 def diagnostic(*args):
                     self.assertEqual(events,["build","scan"]);self.assertEqual(output.getvalue(),"")
                     events.append("metadata");return facts
-                def cleanup(*args):
+                def cleanup(*args,deadline=None):
                     self.assertEqual(output.getvalue(),"");events.append("cleanup")
                     if cleanup_fails:raise PrivateFailure("private-cleanup-error")
                 args=types.SimpleNamespace(source=source,gitleaks=parent/"scanner.exe",gitleaks_sha256="b"*64,
@@ -1390,6 +1475,62 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
             with patch.object(update,"digest") as digest, self.assertRaises(update.Failure):
                 update.cleanup_case(commands,Path(temporary),{}, {},"uninstaller",{})
             digest.assert_not_called()
+        # The compiler route must close/drain helpers before any result read,
+        # while ordinary commands still require natural Job exhaustion.
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();rustup=root/"rustup"
+            cargo=rustup/"toolchains/1.99.0-x86_64-pc-windows-msvc/bin/cargo.exe"
+            cargo.parent.mkdir(parents=True);cargo.write_bytes(b"synthetic compiler path")
+            commands=update.Commands(root,{"RUSTUP_HOME":str(rustup)})
+            exported=root/"old-source";exported.mkdir()
+            log=commands.logs/"0001.log";log.write_bytes(b"fixed compiler result")
+            kernel=Kernel();kernel.terminated.add(20)
+            owned=job_with(kernel);owned.handles=[20];owned.active.side_effect=[1,0]
+            original_read=Path.read_bytes
+            def read_after_closed(path):
+                self.assertIsNone(owned.job)
+                self.assertEqual(owned.handles,[])
+                self.assertIn(("terminate_job",10),kernel.calls)
+                self.assertEqual([call for call in kernel.calls if call[0]=="close"],[("close",20),("close",10)])
+                return original_read(path)
+            with patch.object(update.capture,"WindowsJob",return_value=owned), \
+                    patch.object(commands,"start",return_value=(20,log)) as start, \
+                    patch.object(commands,"wait",return_value=0) as waited, \
+                    patch.object(commands,"empty",side_effect=AssertionError("compiler helpers need owned release")), \
+                    patch.object(update.time,"sleep"),patch.object(Path,"read_bytes",read_after_closed):
+                self.assertEqual(commands.compile_app(cargo,exported,root/"native-target",{}),b"fixed compiler result")
+            waited.assert_called_once_with(owned,20,3600)
+            self.assertEqual(start.call_args.args[1],[cargo,"build","--release","--locked","-p","morpheus-app","--features","native-calls","--target-dir",root/"native-target"])
+            self.assertEqual(owned.active.call_count,2)
+            for outcome in ("timeout","nonzero","close","oversized"):
+                with self.subTest(outcome=outcome):
+                    log.write_bytes(b"fixed compiler result")
+                    failed=Mock()
+                    def finish():
+                        if outcome=="close":raise RuntimeError("fixed close refusal")
+                        if outcome=="oversized":
+                            with log.open("r+b") as stream:stream.truncate(8*1024*1024+1)
+                    failed.close.side_effect=finish
+                    commands.cleanup_failed=False
+                    with patch.object(update.capture,"WindowsJob",return_value=failed), \
+                            patch.object(commands,"start",return_value=(20,log)), \
+                            patch.object(commands,"wait",side_effect=update.Failure() if outcome=="timeout" else None,return_value=101 if outcome=="nonzero" else 0), \
+                            patch.object(Path,"read_bytes") as read_result, \
+                            self.assertRaises((update.Failure,RuntimeError)):
+                        commands.compile_app(cargo,exported,root/"native-target",{})
+                    failed.close.assert_called_once();read_result.assert_not_called()
+                    self.assertEqual(commands.cleanup_failed,outcome=="close")
+            alias=root/"cargo.exe";alias.write_bytes(b"not the selected compiler")
+            with patch.object(update.capture,"WindowsJob") as created,self.assertRaises(update.Failure):
+                commands.compile_app(alias,exported,root/"native-target",{})
+            created.assert_not_called()
+            for source,target in ((root/"foreign-source",root/"native-target"),
+                                  (root.parent/"old-source",root/"native-target"),
+                                  (exported,root/"foreign-target")):
+                with self.subTest(source_scope=source.name,target_scope=target.name), \
+                        patch.object(update.capture,"WindowsJob") as created,self.assertRaises(update.Failure):
+                    commands.compile_app(cargo,source,target,{})
+                created.assert_not_called()
 
     def test_foreign_registry_fixture_requires_exact_retained_values_before_cleanup(self):
         fixture = update.ManufacturerFixture.__new__(update.ManufacturerFixture)

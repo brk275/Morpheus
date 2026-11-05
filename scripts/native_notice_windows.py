@@ -1,6 +1,6 @@
 """Windows file/ACL primitives for the source-only notice acquisition route.
 
-Never used on Linux. No shell, impersonation, registry or profile access. Private
+Never used on Linux. No shell, impersonation, registry or owner-profile access. Private
 roots are born with a protected inheritable current-user + SYSTEM DACL. Reads
 reject remote volumes/reparse points and deny concurrent write/delete sharing.
 """
@@ -11,6 +11,9 @@ import os
 from pathlib import Path
 import secrets
 import stat
+import math
+import re
+import time
 
 
 def require(value):
@@ -30,6 +33,8 @@ class Security:
             (self.k, "GetDriveTypeW", [W.LPCWSTR], W.UINT),
             (self.k, "CreateDirectoryW", [W.LPCWSTR, ctypes.c_void_p], W.BOOL),
             (self.k, "GetFileInformationByHandle", [W.HANDLE, ctypes.c_void_p], W.BOOL),
+            (self.k, "GetFileInformationByHandleEx", [W.HANDLE, ctypes.c_int, ctypes.c_void_p, W.DWORD], W.BOOL),
+            (self.k, "SetFileInformationByHandle", [W.HANDLE, ctypes.c_int, ctypes.c_void_p, W.DWORD], W.BOOL),
             (self.k, "CreateFileW", [W.LPCWSTR, W.DWORD, W.DWORD, ctypes.c_void_p, W.DWORD, W.DWORD, W.HANDLE], W.HANDLE),
             (self.a, "OpenProcessToken", [W.HANDLE, W.DWORD, ctypes.POINTER(W.HANDLE)], W.BOOL),
             (self.a, "GetTokenInformation", [W.HANDLE, ctypes.c_int, ctypes.c_void_p, W.DWORD, ctypes.POINTER(W.DWORD)], W.BOOL),
@@ -195,6 +200,164 @@ class Security:
             raise ValueError("Native source private root collision")
         finally:
             require(self.k.LocalFree(descriptor) is None)
+
+    def unlink_private_profile_junction(self, workspace, workspace_identity, root, root_identity,
+                                        path, expected_leaf, *, deadline):
+        """Delete only a captured private runtime-profile junction, never its target.
+
+        Callers have stopped every owned Job and completely scanned its logs.
+        The generic path/read policy remains unchanged and rejects all reparse points.
+        """
+        workspace, root, path = Path(workspace), Path(root), Path(path)
+        profile = root / "tools-home" / "home"
+        require(workspace.is_absolute() and workspace.parent == Path.home()
+                and re.fullmatch(r"morpheus-native-source-[0-9a-f]{32}", workspace.name)
+                and root.parent == workspace
+                and re.fullmatch(r"morpheus-windows-updateqa-[0-9a-f]{32}", root.name)
+                and path.is_absolute() and path != profile and path.is_relative_to(profile)
+                and not str(path).startswith(("\\\\", "//")) and len(path.parts) <= 128)
+        for part in path.parts[1:]:
+            require(part not in {"", ".", ".."} and not part.endswith((" ", "."))
+                    and not any(character in part for character in '<>:"/\\|?*\0'))
+            device = part.partition(".")[0].rstrip(" ").casefold()
+            require(device not in {"con", "prn", "aux", "nul", "clock$", "conin$", "conout$"}
+                    and re.fullmatch(r"(?:com|lpt)[1-9¹²³]", device) is None)
+        require(type(deadline) in (int, float) and math.isfinite(deadline)
+                and 0 < deadline - time.monotonic() <= 6900)
+        for value in (workspace_identity, root_identity):
+            require(type(value) is tuple and len(value) == 2
+                    and all(type(number) is int and number >= 0 for number in value) and value[1] > 0)
+        require(type(expected_leaf) is tuple and len(expected_leaf) == 8
+                and all(type(number) is int for number in expected_leaf)
+                and expected_leaf[0] >= 0 and expected_leaf[1] > 0 and expected_leaf[2] > 0
+                and expected_leaf[3] >= 0 and 0 <= expected_leaf[4] <= 0xffffffff
+                and expected_leaf[4] & (0x400 | 0x10) == 0x410
+                and expected_leaf[5] == 0xa0000003 and expected_leaf[6] == 1 and expected_leaf[7] == 0)
+        require(self.k.GetDriveTypeW(path.anchor) == 3)
+
+        class IdInfo(ctypes.Structure):
+            _fields_ = [("volume", ctypes.c_uint64), ("identifier", ctypes.c_ubyte * 16)]
+        class BasicInfo(ctypes.Structure):
+            _fields_ = [("created", ctypes.c_int64), ("accessed", ctypes.c_int64),
+                        ("written", ctypes.c_int64), ("changed", ctypes.c_int64),
+                        ("attributes", ctypes.c_uint32)]
+        class TagInfo(ctypes.Structure):
+            _fields_ = [("attributes", ctypes.c_uint32), ("tag", ctypes.c_uint32)]
+        class StandardInfo(ctypes.Structure):
+            _fields_ = [("allocation", ctypes.c_int64), ("size", ctypes.c_int64),
+                        ("links", ctypes.c_uint32), ("pending", ctypes.c_ubyte), ("directory", ctypes.c_ubyte)]
+        class Disposition(ctypes.Structure):
+            _fields_ = [("delete", ctypes.c_ubyte)]  # Windows BOOLEAN, not BOOL.
+        require(tuple(map(ctypes.sizeof, (IdInfo, BasicInfo, TagInfo, StandardInfo, Disposition)))
+                == (24, 40, 8, 24, 1))
+        def check_time():
+            require(time.monotonic() < deadline)
+        def inspect(handle):
+            check_time()
+            identity, basic, tag, standard = IdInfo(), BasicInfo(), TagInfo(), StandardInfo()
+            for kind, value in ((18, identity), (0, basic), (9, tag), (1, standard)):
+                check_time()
+                require(self.k.GetFileInformationByHandleEx(handle, kind, ctypes.byref(value), ctypes.sizeof(value)))
+            require(not standard.pending and standard.directory and standard.links == 1
+                    and basic.attributes == tag.attributes and tag.attributes & 0x10)
+            born = (basic.created - 116444736000000000) * 100
+            written = (basic.written - 116444736000000000) * 100
+            require(basic.created >= 0 and basic.written >= 0)
+            # Trusted drive/system ancestors can predate the Unix epoch; exact
+            # IDs/timestamps still bind them. Fresh private objects are checked below.
+            # Matches CPython's FileIdInfo/lstat mapping without conflating
+            # Windows CreationTime and ChangeTime.
+            value = (identity.volume, int.from_bytes(bytes(identity.identifier), "little"),
+                     born, written, tag.attributes, tag.tag, standard.links, standard.size)
+            return value, basic.changed
+        def named_identity(selected):
+            check_time()
+            value = selected.lstat()  # Every ancestor is held no-delete/no-reparse.
+            return (value.st_dev, value.st_ino, value.st_birthtime_ns, value.st_mtime_ns,
+                    value.st_file_attributes, value.st_reparse_tag, value.st_nlink, value.st_size)
+        handles, parents = [], []
+        failure = None
+        leaf = None
+        try:
+            # Lock from the fixed drive down: a checked ancestor cannot be
+            # renamed into a junction between validation and opening its child.
+            current = Path(path.anchor)
+            chain = [current]
+            for part in path.parts[1:-1]:
+                current = current / part
+                chain.append(current)
+            for current in chain:
+                check_time()
+                handle = self.k.CreateFileW(str(current), 0x20000 | 0x80, 3, None, 3, 0x02200000, None)
+                require(handle not in (None, ctypes.c_void_p(-1).value))
+                handles.append(handle)
+                value = inspect(handle)
+                require(not value[0][4] & 0x400 and value[0][5] == 0
+                        and value[0] == named_identity(current))
+                private = current == workspace or current.is_relative_to(workspace)
+                if private: require(value[0][2] > 0 and value[0][3] >= 0)
+                check_time()
+                self.acl(handle, handle=True, private=private, ancestor=not private)
+                if current == workspace: require(value[0][:2] == workspace_identity)
+                if current == root: require(value[0][:2] == root_identity)
+                parents.append((current, handle, value, private))
+            require(any(current == workspace for current, *_ in parents)
+                    and any(current == root for current, *_ in parents)
+                    and parents[-1][0] == path.parent)
+            check_time()
+            require(named_identity(path) == expected_leaf)
+            leaf = self.k.CreateFileW(str(path), 0x10000 | 0x20000 | 0x80, 1, None, 3, 0x02200000, None)
+            require(leaf not in (None, ctypes.c_void_p(-1).value))
+            handles.append(leaf)
+            observed = inspect(leaf)
+            require(observed[0] == expected_leaf)
+            check_time()
+            self.acl(leaf, handle=True, private=True)
+            # All authority remains handle-bound until the one deletion.
+            for current, handle, previous, private in parents:
+                require(inspect(handle) == previous and named_identity(current) == previous[0])
+                check_time()
+                self.acl(handle, handle=True, private=private, ancestor=not private)
+            require(inspect(leaf) == observed)
+            check_time()
+            self.acl(leaf, handle=True, private=True)
+            check_time()
+            disposition = Disposition(1)
+            require(self.k.SetFileInformationByHandle(leaf, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)))
+            handles.pop()
+            require(self.k.CloseHandle(leaf))
+            leaf = None
+            check_time()
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("Native profile junction name was replaced")
+            for current, handle, previous, private in parents:
+                checked_now = inspect(handle)
+                now = checked_now[0]
+                if current == path.parent:
+                    # This one directory's write/change times may advance for
+                    # our authorized unlink; its object/type/ACL cannot change.
+                    require(now[:3] == previous[0][:3] and now[4:] == previous[0][4:])
+                else:
+                    require(checked_now == previous)
+                require(named_identity(current) == now)
+                check_time()
+                self.acl(handle, handle=True, private=private, ancestor=not private)
+        except BaseException as error:
+            failure = error
+        finally:
+            for handle in reversed(handles):
+                try:
+                    require(self.k.CloseHandle(handle))
+                except BaseException as error:
+                    if failure is None: failure = error
+        if failure is not None:
+            if isinstance(failure, (KeyboardInterrupt, SystemExit)) or type(failure) is ValueError:
+                raise failure
+            raise ValueError("Native notice Windows ownership rejected") from None
 
     def open_read(self, path, *, private=False):
         import msvcrt
