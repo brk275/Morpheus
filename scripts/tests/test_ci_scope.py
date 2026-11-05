@@ -225,10 +225,29 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(actual, list(MACOS))
 
     def test_windows_capture_fixture_only_selects_windows(self):
+        helper = "scripts/tests/test_windows_capture_acceptance.py"
+        self.assertEqual(classify([helper]), {
+            "native": False, "native_matrix": {"os": []}, "config": False, "wayland": False,
+        })
         for path in ("scripts/run_windows_capture_acceptance.py", "scripts/windows_capture_window.ps1",
-                     "scripts/tests/test_windows_capture_acceptance.py", "crates/morpheus-rtc/tests/windows_capture.rs"):
+                     "crates/morpheus-rtc/tests/windows_capture.rs"):
             with self.subTest(path=path):
                 self.assertEqual(classify([path])["native_matrix"]["os"], ["windows-2025"])
+                self.assertEqual(classify([helper, path])["native_matrix"]["os"], ["windows-2025"])
+        # A helper edit never suppresses an affected platform or shared input.
+        for path, platforms in (("packaging/linux.toml", ["ubuntu-24.04"]),
+                                ("packaging/macos/Info.plist", list(MACOS)),
+                                ("packaging/windows/installer.nsi", ["windows-2025"]),
+                                ("Cargo.lock", list(PLATFORMS)),
+                                ("crates/morpheus-app/src/main.rs", list(PLATFORMS)),
+                                (".github/workflows/ci.yml", list(PLATFORMS)),
+                                ("new-build-input.conf", list(PLATFORMS))):
+            with self.subTest(mixed=path):
+                self.assertEqual(classify([helper, path])["native_matrix"]["os"], platforms)
+        # Explicit full/release verification remains an unconditional matrix.
+        forced = classify([helper], force_all=True)
+        self.assertEqual(forced["native_matrix"]["os"], list(PLATFORMS))
+        self.assertTrue(forced["wayland"])
         # Native workflow changes remain shared inputs.
         self.assertEqual(classify([".github/workflows/ci.yml"])["native_matrix"]["os"], list(PLATFORMS))
 
@@ -267,8 +286,7 @@ class ScopeTests(unittest.TestCase):
                 self.assertFalse(classify([path])["native"])
                 self.assertEqual(classify([path, "scripts/run_windows_capture_acceptance.py"])
                                  ["native_matrix"]["os"], ["windows-2025"])
-                self.assertEqual(classify([path, "scripts/tests/test_windows_capture_acceptance.py"])
-                                 ["native_matrix"]["os"], ["windows-2025"])
+                self.assertFalse(classify([path, "scripts/tests/test_windows_capture_acceptance.py"])["native"])
                 for shared in ("crates/morpheus-matrix/src/lib.rs", "Cargo.lock",
                                ".github/workflows/ci.yml", "crates/morpheus-matrix/tests/unknown.rs"):
                     self.assertEqual(classify([path, shared])["native_matrix"]["os"], list(PLATFORMS))
