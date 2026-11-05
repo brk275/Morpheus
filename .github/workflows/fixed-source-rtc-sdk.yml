@@ -1,0 +1,279 @@
+# TEMP owner-only fixed-source validation adapter. NEVER MERGE this workflow.
+# Only the exact non-main branch below may trigger it. Results are partial.
+# HELD: rebind the reviewed cfg(test) child source/tree before root admission.
+name: TEMP RTC Matrix SDK library (partial)
+
+on:
+  push:
+    branches: [codex/temp-rtc-sdk-refresh-error-20261105]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temp-fixed-source-rtc-sdk-library-39d8621ec3c89fc4d214f7bc430b8c09ef3a62ab
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  scope:
+    name: TEMP fixed-source security and SDK library selection (partial)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/temp-rtc-sdk-refresh-error-20261105' && github.repository == 'brk275/Morpheus' && github.repository_owner == 'brk275' && github.event.repository.private == false && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.login == 'brk275' && github.event.sender.id > 0 && github.event.sender.id == github.event.repository.owner.id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      native: ${{ steps.scope.outputs.native }}
+      native_matrix: ${{ steps.scope.outputs.native_matrix }}
+      check_route: ${{ steps.scope.outputs.check_route }}
+      library_packages: ${{ steps.scope.outputs.library_packages }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 39d8621ec3c89fc4d214f7bc430b8c09ef3a62ab
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out fixed reviewed validation inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 39d8621ec3c89fc4d214f7bc430b8c09ef3a62ab
+          path: trusted
+          persist-credentials: false
+      - name: Verify fixed source and record truthful workflow provenance
+        shell: bash
+        env:
+          FIXED_SOURCE: 39d8621ec3c89fc4d214f7bc430b8c09ef3a62ab
+          FIXED_TREE: a77eeab1b6725cfa59d20569e232e70337bea9c3
+          WORKFLOW_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          test "$WORKFLOW_HEAD" != "$FIXED_SOURCE"
+          test "$(git -C candidate rev-parse HEAD)" = "$FIXED_SOURCE"
+          test "$(git -C trusted rev-parse HEAD)" = "$FIXED_SOURCE"
+          test "$(git -C candidate rev-parse 'HEAD^{tree}')" = "$FIXED_TREE"
+          test "$(git -C trusted rev-parse 'HEAD^{tree}')" = "$FIXED_TREE"
+          printf 'Actual event: push; workflow head: %s; fixed source: %s; fixed tree: %s\n' "$WORKFLOW_HEAD" "$FIXED_SOURCE" "$FIXED_TREE"
+      - name: Scan committed history for credentials
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
+          mkdir "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          # Scanner code and exact fixture manifest come from the reviewed base.
+          # The candidate's ignore files, attributes and config are not trusted.
+          python3 -I ../trusted/scripts/scan_history.py \
+            --candidate "$PWD" --scanner "$RUNNER_TEMP/gitleaks/gitleaks" \
+            --manifest ../trusted/scripts/public-fixtures.json \
+            --evidence "$RUNNER_TEMP/morpheus-history-scan"
+      - name: Select only the fixed Matrix SDK library (partial evidence)
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo 'native=true'
+            echo 'native_matrix={"os":["ubuntu-24.04"]}'
+            echo 'check_route=rtc-sdk-library'
+            echo 'library_packages=["matrix-rtc-matrix-sdk"]'
+          } >> "$GITHUB_OUTPUT"
+  compile:
+    name: RTC Matrix SDK library (partial)
+    needs: scope
+    outputs:
+      sdk_library: ${{ steps.rtc-sdk-library-tests.outcome }}
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/temp-rtc-sdk-refresh-error-20261105' && github.repository == 'brk275/Morpheus' && github.repository_owner == 'brk275' && github.event.repository.private == false && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.login == 'brk275' && github.event.sender.id > 0 && github.event.sender.id == github.event.repository.owner.id && needs.scope.outputs.native == 'true'
+    runs-on: ${{ matrix.os }}
+    concurrency:
+      group: native-39d8621ec3c89fc4d214f7bc430b8c09ef3a62ab-${{ matrix.os }}
+      cancel-in-progress: false
+    # Linux and Intel cold native graphs need compile room; test deadlines stay fixed.
+    timeout-minutes: ${{ (matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 39d8621ec3c89fc4d214f7bc430b8c09ef3a62ab
+          persist-credentials: false
+      - name: Verify fixed source and record truthful workflow provenance
+        shell: bash
+        env:
+          FIXED_SOURCE: 39d8621ec3c89fc4d214f7bc430b8c09ef3a62ab
+          FIXED_TREE: a77eeab1b6725cfa59d20569e232e70337bea9c3
+          WORKFLOW_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          test "$WORKFLOW_HEAD" != "$FIXED_SOURCE"
+          test "$(git rev-parse HEAD)" = "$FIXED_SOURCE"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$FIXED_TREE"
+          printf 'Actual event: push; workflow head: %s; fixed source: %s; fixed tree: %s\n' "$WORKFLOW_HEAD" "$FIXED_SOURCE" "$FIXED_TREE"
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path vendor/cpal/Cargo.toml -- --check
+      - name: Linux SDK library dependencies
+        if: runner.os == 'Linux'
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          # Use only the official Ubuntu archive for this step; the hosted
+          # image's Azure mirror can stall otherwise bounded provisioning.
+          [[ "${ImageOS:-}" == ubuntu24 ]]
+          [[ "$(dpkg --print-architecture)" == amd64 ]]
+          [[ "${RUNNER_TEMP:-}" == /* && -d "$RUNNER_TEMP" ]]
+          test -r /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          # APT resolves the disabled sourceparts value below to /etc/apt/-.
+          test ! -d /etc/apt/-
+          apt_sources="$(mktemp --tmpdir="$RUNNER_TEMP" --suffix=.sources morpheus-apt-XXXXXXXXXX)"
+          trap 'rm -f -- "$apt_sources"' EXIT
+          cat > "$apt_sources" <<'MORPHEUS_UBUNTU_SOURCES'
+          Types: deb
+          URIs: https://archive.ubuntu.com/ubuntu
+          Suites: noble noble-updates noble-backports
+          Components: main restricted universe multiverse
+          Architectures: amd64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: https://security.ubuntu.com/ubuntu
+          Suites: noble-security
+          Components: main restricted universe multiverse
+          Architectures: amd64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          MORPHEUS_UBUNTU_SOURCES
+          chmod 0644 "$apt_sources"
+          # Keep both invocations noninteractive and bounded; no global
+          # source files or package verification settings are changed.
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o "Dir::Etc::sourcelist=$apt_sources" -o Dir::Etc::sourceparts=-)
+          sudo -n env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get "${apt_options[@]}" update < /dev/null
+          sudo -n env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get "${apt_options[@]}" install -y \
+            libssl-dev libsqlite3-dev pkg-config < /dev/null
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Preserve compiled dependencies when a later acceptance check fails.
+          # The save guard still makes untrusted/PR executions restore-only.
+          # Older SDK extractions lack the verified downloader's receipt.
+          # The key separates both primary and fallback cache namespaces.
+          key: verified-sdk-archives-v1
+          cache-on-failure: true
+          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+      - name: Test RTC Matrix SDK library
+        id: rtc-sdk-library-tests
+        if: needs.scope.outputs.check_route == 'rtc-sdk-library'
+        timeout-minutes: 20
+        run: cargo test --locked -p matrix-rtc-matrix-sdk --lib
+
+  temp_acceptance:
+    name: TEMP fixed-source SDK library acceptance (partial; never merge)
+    needs: [scope, compile]
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/codex/temp-rtc-sdk-refresh-error-20261105' && github.repository == 'brk275/Morpheus' && github.repository_owner == 'brk275' && github.event.repository.private == false && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.login == 'brk275' && github.event.sender.id > 0 && github.event.sender.id == github.event.repository.owner.id
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 2
+    steps:
+      # This is a separate fixed owner-push aggregate, not canonical CI acceptance.
+      # No checkout, candidate import, cache, artifact or release operation.
+      - name: Require the exact fixed-source partial route and real owner push
+        env:
+          CHECK_RESULTS: ${{ toJSON(needs) }}
+          CHECK_EVENT: ${{ github.event_name }}
+          CHECK_REPOSITORY: ${{ github.repository }}
+          CHECK_REF: ${{ github.ref }}
+          CHECK_ACTOR: ${{ github.actor }}
+          CHECK_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          CHECK_WORKFLOW_HEAD: ${{ github.sha }}
+          CHECK_WORKFLOW_REF: ${{ github.workflow_ref }}
+          FIXED_SOURCE: 39d8621ec3c89fc4d214f7bc430b8c09ef3a62ab
+          FIXED_TREE: a77eeab1b6725cfa59d20569e232e70337bea9c3
+        shell: bash
+        run: |
+          python3 - <<'PY_TEMP_FIXED_ACCEPTANCE'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          def fixed_source_acceptance_error(needs, event, environment):
+              expected_ref = "refs/heads/codex/temp-rtc-sdk-refresh-error-20261105"
+              workflow_ref = "brk275/Morpheus/.github/workflows/fixed-source-rtc-sdk.yml@" + expected_ref
+              head = environment.get("CHECK_WORKFLOW_HEAD", "")
+              if (environment.get("CHECK_EVENT") != "push"
+                      or environment.get("GITHUB_EVENT_NAME") != "push"
+                      or environment.get("CHECK_REPOSITORY") != "brk275/Morpheus"
+                      or environment.get("CHECK_REF") != expected_ref
+                      or environment.get("CHECK_WORKFLOW_REF") != workflow_ref
+                      or environment.get("CHECK_ACTOR") != "brk275"
+                      or environment.get("CHECK_TRIGGERING_ACTOR") != "brk275"
+                      or not re.fullmatch(r"[0-9a-f]{40}", head)
+                      or environment.get("GITHUB_SHA") != head
+                      or head == "39d8621ec3c89fc4d214f7bc430b8c09ef3a62ab"
+                      or environment.get("FIXED_SOURCE") != "39d8621ec3c89fc4d214f7bc430b8c09ef3a62ab"
+                      or environment.get("FIXED_TREE") != "a77eeab1b6725cfa59d20569e232e70337bea9c3"):
+                  return "TEMP fixed-source workflow context is missing or malformed."
+              if not isinstance(event, dict):
+                  return "Actual push payload is missing or malformed."
+              repository, sender = event.get("repository"), event.get("sender")
+              if not isinstance(repository, dict) or not isinstance(sender, dict):
+                  return "Actual push owner identity is missing."
+              owner = repository.get("owner")
+              if (not isinstance(owner, dict)
+                      or repository.get("full_name") != "brk275/Morpheus"
+                      or repository.get("private") is not False
+                      or owner.get("login") != "brk275"
+                      or sender.get("login") != "brk275"
+                      or type(owner.get("id")) is not int or owner["id"] <= 0
+                      or type(sender.get("id")) is not int or sender["id"] != owner["id"]
+                      or event.get("ref") != expected_ref
+                      or event.get("after") != head
+                      or event.get("deleted") is not False):
+                  return "Actual push is not the exact public owner branch update."
+              if (not isinstance(needs, dict) or set(needs) != {"scope", "compile"}
+                      or any(not isinstance(value, dict) for value in needs.values())
+                      or any(value.get("result") != "success" for value in needs.values())):
+                  return "Fixed-source security and the Matrix SDK library must succeed."
+              expected_outputs = {"native": "true", "native_matrix": '{"os":["ubuntu-24.04"]}',
+                                  "check_route": "rtc-sdk-library",
+                                  "library_packages": '["matrix-rtc-matrix-sdk"]'}
+              if needs["scope"].get("outputs") != expected_outputs:
+                  return "Scope disagrees with the exact SDK-only library selection."
+              if needs["compile"].get("outputs") != {"sdk_library": "success"}:
+                  return "The actual Matrix SDK library test step must succeed."
+              return None
+
+          try:
+              needs = json.loads(os.environ["CHECK_RESULTS"])
+              event = json.loads(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+              error = fixed_source_acceptance_error(needs, event, os.environ)
+          except (KeyError, OSError, UnicodeError, ValueError, TypeError):
+              error = "TEMP fixed-source dependency conclusions or event data are malformed."
+          if error:
+              print(error, file=sys.stderr)
+              raise SystemExit(1)
+          print("TEMP SDK-only library validation succeeded; other native/live/release gates remain open.")
+          print(json.dumps({"actual_event": "push", "workflow_head": os.environ["CHECK_WORKFLOW_HEAD"],
+                            "fixed_source": os.environ["FIXED_SOURCE"], "fixed_tree": os.environ["FIXED_TREE"],
+                            "route": "rtc-sdk-library", "library_packages": ["matrix-rtc-matrix-sdk"],
+                            "library_outcome": needs["compile"]["outputs"]["sdk_library"],
+                            "platform": "ubuntu-24.04", "partial": True}, sort_keys=True))
+          PY_TEMP_FIXED_ACCEPTANCE
