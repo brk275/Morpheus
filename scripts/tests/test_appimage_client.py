@@ -70,11 +70,11 @@ def static_runtime():
 class ToolTests(unittest.TestCase):
     def test_official_pins_have_exact_identities(self):
         pins = C.pinned_tools()
-        self.assertEqual({p["asset_id"] for p in pins}, {602438599, 602435573})
+        self.assertEqual({p["asset_id"] for p in pins}, {699514588, 602435573})
         self.assertEqual(len({p["sha256"] for p in pins}), 2)
         expected = {
             "linuxdeploy-x86_64.AppImage":
-                "https://api.github.com/repos/linuxdeploy/linuxdeploy/releases/assets/602438599",
+                "https://api.github.com/repos/linuxdeploy/linuxdeploy/releases/assets/699514588",
             "linuxdeploy-plugin-appimage.AppImage":
                 "https://api.github.com/repos/linuxdeploy/linuxdeploy-plugin-appimage/releases/assets/602435573",
         }

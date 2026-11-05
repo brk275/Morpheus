@@ -5,12 +5,12 @@
     {
       "cache_name": "linuxdeploy-x86_64.AppImage",
       "url": "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage",
-      "asset_id": 602438599,
-      "release_id": 363379357,
+      "asset_id": 699514588,
+      "release_id": 430855031,
       "release_target": "07333c6e942c7d71782b66be924c5d867f9dfdfc",
-      "sha256": "8aea8da0f7f7039d2a2cecb14657d752a222a5e1d3825caeef186c82f751cdd1",
-      "size": 19806712,
-      "updated_at": "2026-10-01T04:32:50Z"
+      "sha256": "df908b19f1ed1cdafa79508d415aa12d6c56ce4d56d4149aa8c09286718706e5",
+      "size": 19855864,
+      "updated_at": "2026-11-01T21:01:48Z"
     },
     {
       "cache_name": "linuxdeploy-plugin-appimage.AppImage",
