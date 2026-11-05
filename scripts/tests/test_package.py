@@ -502,7 +502,7 @@ class MacUpdatePayloadTests(unittest.TestCase):
 
 class NativeNoticeEvidenceTests(unittest.TestCase):
     @staticmethod
-    def evidence(drop_license=False, registry=False, drop_alsa_provenance=False):
+    def evidence(drop_license=False, registry=False, drop_alsa_provenance=False, formfeed=False, source_overrides=None):
         source = native_notices.catalogue()
         files = {"Cargo.toml": b'[workspace]\nmembers = ["app", "vendor/cpal", "vendor/slint"]\nexclude = ["vendor/alsa"]\n[patch.crates-io]\nalsa = { path = "vendor/alsa" }\n',
                  "Cargo.lock": b'version = 4\n[[package]]\nname = "fixture"\nversion = "0.1.0"\n[[package]]\nname = "cpal"\nversion = "0.18.2"\n[[package]]\nname = "slint"\nversion = "1.18.1"\n[[package]]\nname = "alsa"\nversion = "0.11.0"\n',
@@ -520,8 +520,10 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                  "vendor/slint/Cargo.toml": b'[package]\nname = "slint"\nversion = "1.18.1"\nlicense = "GPL-3.0-only"\n',
                  "vendor/slint/LICENSE": b"Fixture Slint license\n",
                  "vendor/slint/LICENSES/extra.txt": b"Fixture extra source license\n"}
+        if source_overrides is not None:files.update(source_overrides)
         registry_files = {"Cargo.toml": b'[package]\nname = "fixture-registry"\nversion = "1.0.0"\nlicense = "MIT"\n',
                           "LICENSE": b"Fixture exact registry license\n"}
+        if formfeed:registry_files["LICENSE"] = b"Fixture registry license page one\n\fPage two\n"
         def packed(values):
             output = io.BytesIO()
             with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0) as zipped:
@@ -615,10 +617,10 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
 
     def test_notice_reader_keeps_windows_birth_identity_and_each_api_change_time(self):
         # Exercise the production reader with real file bytes/descriptor and
-        # genuine IDs/mode/size/mtime. Only model the authenticated CPython
-        # 3.12 split: named ctime=CreationTime, fd ctime=ChangeTime.
+        # genuine IDs/size/mtime. Model CPython 3.12's named CreationTime vs
+        # handle ChangeTime, plus filename-inferred execute bits on .exe only.
         with tempfile.TemporaryDirectory() as temporary:
-            target = Path(temporary).resolve() / "event.json"
+            target = Path(temporary).resolve() / "scanner.exe"
             target.write_bytes(b'{"fixture":"owned metadata"}')
             named_stat, handle_stat = Path.lstat, os.fstat
             fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
@@ -629,6 +631,13 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                     value = SimpleNamespace(**{key: getattr(real, key) for key in fields})
                     value.st_birthtime_ns = 1_000_000
                     value.st_ctime_ns = 1_000_000 if kind == "named" else 2_000_000
+                    value.st_mode = (value.st_mode & ~0o111) | (0o111 if kind == "named" else 0)
+                    if mutation == "protection_changed" and kind == "fd" and counts[kind] == 1: value.st_mode ^= 0o200
+                    if mutation == "fd_mode_changed" and kind == "fd" and counts[kind] == 2: value.st_mode ^= 0o200
+                    if mutation == "named_mode_changed" and kind == "named" and counts[kind] == 3: value.st_mode ^= 0o111
+                    if mutation == "fd_exec_changed" and kind == "fd" and counts[kind] == 2: value.st_mode ^= 0o111
+                    if mutation == "type_changed" and kind == "fd" and counts[kind] == 1:
+                        value.st_mode = (value.st_mode & ~0o170000) | 0o040000
                     if mutation == "missing_birth": del value.st_birthtime_ns
                     if mutation == "invalid_birth": value.st_birthtime_ns = True
                     if mutation == "fd_change" and kind == "fd" and counts[kind] == 2: value.st_ctime_ns += 1
@@ -656,7 +665,8 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                 return value, counts
             self.assertEqual(attempt(), (target.read_bytes(), {"named":3,"fd":2,"opened":1}))
             for mutation in ("missing_birth", "invalid_birth", "fd_change", "named_change", "birth_change",
-                             "path_replaced", "opened_replaced", "link_change", "mtime_change"):
+                             "path_replaced", "opened_replaced", "link_change", "mtime_change",
+                             "protection_changed", "fd_mode_changed", "named_mode_changed", "fd_exec_changed", "type_changed"):
                 with self.subTest(mutation=mutation), self.assertRaises((ValueError, AttributeError)):
                     attempt(mutation)
 
@@ -725,6 +735,75 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
             self.assertFalse((root / native_notices.INVENTORY).exists())
 
 
+    def test_empty_optional_nested_vendor_readme_remains_authenticated_source_but_not_notice_text(self):
+        name="vendor/slint/README.md"
+        source,files,manifest,revision,build=self.evidence(source_overrides={name:b""})
+        self.assertEqual(files[name],b"")
+        self.assertEqual(manifest["source"]["files"][name],
+            {"mode":"100644","oid":source.object_id("blob",b""),"bytes":0,
+             "sha256":hashlib.sha256(b"").hexdigest()})
+        contents=native_notices.prepare_bytes(*build(),revision,platform="darwin",version="0.1.0")
+        ledger=native_notices.verify_bytes(contents,revision=revision,platform="darwin",version="0.1.0")
+        self.assertEqual(ledger["source_tree"],manifest["source"]["tree"])
+        self.assertFalse(any(item["source_path"]==name for item in ledger["local_patch_provenance"]))
+        self.assertTrue(all(item["bytes"]>0 for item in ledger["texts"]))
+        for mandatory in ("vendor/cpal/OWNED_COREAUDIO.md","vendor/cpal/OWNED_ALSA.md"):
+            self.assertIn({"source_path":mandatory,"sha256":source.digest(files[mandatory])},
+                          ledger["local_patch_provenance"])
+        self.assertFalse(ledger["distribution_ready"])
+        self.assertFalse(ledger["license_compliance_verified"])
+        # A nonempty optional README still carries exact authenticated evidence.
+        _,_,_,revision,build=self.evidence(source_overrides={name:b"Upstream documentation\n"})
+        ledger=native_notices.verify_bytes(native_notices.prepare_bytes(*build(),revision,platform="win32",version="0.1.0"))
+        self.assertIn({"source_path":name,"sha256":source.digest(b"Upstream documentation\n")},ledger["local_patch_provenance"])
+
+
+    def test_empty_mandatory_provenance_license_and_nonempty_unsafe_readme_still_refuse(self):
+        cases=[("vendor/README.md",b""),("vendor/cpal/MORPHEUS_PATCH.md",b""),
+               ("vendor/cpal/OWNED_COREAUDIO.md",b""),("vendor/cpal/OWNED_ALSA.md",b""),
+               ("vendor/slint/LICENSE",b""),("vendor/slint/README.md",b"Bad\x00text"),
+               ("vendor/slint/README.md",b"Bad\x1btext")]
+        overrides=[{name:body} for name,body in cases]
+        # A README explicitly declared as license text remains mandatory.
+        overrides.append({"vendor/slint/README.md":b"",
+            "vendor/slint/Cargo.toml":b'[package]\nname = "slint"\nversion = "1.18.1"\nlicense-file = "README.md"\n'})
+        for changed in overrides:
+            with self.subTest(paths=sorted(changed)):
+                _,_,_,revision,build=self.evidence(source_overrides=changed)
+                with self.assertRaises(ValueError):
+                    native_notices.prepare_bytes(*build(),revision,platform="darwin",version="0.1.0")
+
+
+    def test_plain_license_preserves_formfeed_and_refuses_every_other_forbidden_control(self):
+        license_bytes=b"License page one\r\n\t\fPage two\n"
+        self.assertIs(native_notices.plain(license_bytes),license_bytes)
+        for code in (*range(32),127):
+            if code in (9,10,12,13):continue
+            with self.subTest(code=code), self.assertRaises(ValueError):
+                native_notices.plain(b"License prefix"+bytes([code])+b"suffix")
+        for data in (b"\xff",b"",b"too long"):
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                native_notices.plain(data,maximum=4)
+
+
+    def test_formfeed_license_prepare_verify_roundtrip_preserves_bytes_hashes_and_unresolved_flags(self):
+        source,files,manifest,revision,build=self.evidence(registry=True,formfeed=True)
+        expected=b"Fixture registry license page one\n\fPage two\n"
+        checksum=hashlib.sha256(expected).hexdigest()
+        for platform in ("darwin","win32"):
+            with self.subTest(platform=platform):
+                contents=native_notices.prepare_bytes(*build(),revision,platform=platform,version="0.1.0")
+                ledger=native_notices.verify_bytes(contents,revision=revision,platform=platform,version="0.1.0")
+                record=next(item for item in ledger["locked_packages"] if item["name"]=="fixture-registry")
+                self.assertIn({"source_path":"LICENSE","sha256":checksum},record["license_texts"])
+                span=next(item for item in ledger["texts"] if item["sha256"]==checksum)
+                self.assertEqual(contents[native_notices.TEXT][span["offset"]:span["offset"]+span["bytes"]],expected)
+                self.assertEqual(span["bytes"],len(expected))
+                self.assertFalse(ledger["distribution_ready"])
+                self.assertFalse(ledger["license_compliance_verified"])
+                self.assertEqual(ledger["unresolved_release_requirements"],list(native_notices.OPEN))
+
+
 class NativeSourceAcquisitionTests(unittest.TestCase):
     def test_isolated_file_entry_loads_only_reviewed_siblings_outside_the_checkout(self):
         import subprocess
@@ -761,8 +840,10 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
         with mock.patch.object(acquisition, "os", type("Windows",(),{"name":"nt"})()), \
                 mock.patch.object(acquisition.sys,"platform","win32"), \
                 mock.patch.object(acquisition.platform,"machine",return_value="AMD64"), \
-                mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)):
+                mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)), \
+                mock.patch.object(acquisition,"system_git",return_value=Path("/programs/Git/cmd/git.exe")) as selected:
             cargo,rustc,git,rustup=acquisition.tools({"RUSTUP_HOME":"/pinned/rustup","PROGRAMFILES":"/programs"})
+        selected.assert_called_once_with()
         self.assertEqual(cargo.name,"cargo.exe");self.assertEqual(rustc.name,"rustc.exe")
         self.assertEqual(rustup,Path("/pinned/rustup"))
         self.assertIn("1.99.0-x86_64-pc-windows-msvc",str(cargo))
@@ -970,10 +1051,537 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                     mock.patch.object(acquisition,"SCANNERS",{(sys.platform,acquisition.platform.machine()):hashlib.sha256(b"scanner").hexdigest()}), \
                     mock.patch.object(acquisition,"tools",return_value=(parent/"cargo",parent/"rustc",parent/"git",parent/"rustup")), \
                     mock.patch.object(acquisition,"environment_for_acquisition",return_value={}), \
+                    mock.patch.object(acquisition,"private_directory",side_effect=lambda path,**kwargs:Path(path).mkdir(mode=0o700,**kwargs)), \
                     mock.patch.object(acquisition,"Commands",side_effect=commands):
                 with self.assertRaises(RuntimeError):
                     acquisition.prepare({"MORPHEUS_PACKAGE_SOURCE_REVISION":"a"*40,"GITHUB_SHA":"b"*40},parent/"scanner")
             self.assertFalse((root/"state.json").exists())
+
+
+    def test_cargo_stderr_classification_is_bounded_fixed_and_does_not_reflect_private_bytes(self):
+        from scripts import native_notice_source as acquisition
+        samples = {"manifest":b"failed to parse manifest", "lockfile":b"needs to be updated but --locked was passed",
+                   "checkout":b"filename too long", "network":b"could not resolve host", "tls":b"certificate verify failed",
+                   "auth":b"authentication failed"}
+        for token, marker in samples.items():
+            with self.subTest(token=token):
+                body = marker.upper() + b" https://synthetic-private.invalid/path?key=private-body \xff"
+                self.assertEqual(acquisition._cargo_stderr_classes(body), [token])
+        self.assertEqual(acquisition._cargo_stderr_classes(b"unrecognized synthetic-private-body\x00\xff"), ["other"])
+        self.assertEqual(acquisition._cargo_stderr_classes(b""), ["other"])
+        self.assertEqual(acquisition._cargo_stderr_classes(b"path too long: synthetic-private-path"), ["checkout"])
+        self.assertEqual(acquisition._cargo_stderr_classes(b"authentication failed "*100), ["auth"])
+        with self.assertRaises(ValueError):
+            acquisition._cargo_stderr_classes(b"x"*(8*1024**2+1))
+
+
+    def test_cargo_fetch_diagnostic_requires_full_scan_cleanup_owned_complete_stderr_and_closed_status(self):
+        from scripts import native_notice_source as acquisition
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            logs = root/"logs"
+            path = logs/"00001.err"
+            body = b"error: failed to parse manifest at synthetic-private-path; certificate verify failed"
+            commands = SimpleNamespace(root=root, logs=logs, logs_complete=True, cleanup_failed=False,
+                                       retained=[], cargo_fetch_failure=(path,101,len(body)))
+            output = io.StringIO()
+            with mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)) as checked, \
+                    mock.patch.object(acquisition.N,"read_regular",return_value=body) as reader, \
+                    mock.patch.object(acquisition.sys,"stderr",output):
+                acquisition._notice_report_cargo_fetch_failure(commands, False)
+                reader.assert_not_called();checked.assert_not_called()
+                for name,value in (("logs_complete",False),("cleanup_failed",True),("retained",[object()])):
+                    with mock.patch.object(commands,name,value):
+                        acquisition._notice_report_cargo_fetch_failure(commands,True)
+                    reader.assert_not_called();checked.assert_not_called()
+                self.assertEqual(output.getvalue(), "")
+                acquisition._notice_report_cargo_fetch_failure(commands,True)
+                checked.assert_called_once_with(path,private=True)
+                reader.assert_called_once_with(path,8*1024**2,allow_empty=True)
+            facts = json.loads(output.getvalue().removeprefix("MORPHEUS_NATIVE_NOTICE_CARGO_FETCH "))
+            self.assertEqual(facts,{"schema":1,"check":"native_notice_cargo_fetch_failure","status":101,
+                                    "stderr_classes":["manifest","tls"]})
+            self.assertNotIn("synthetic-private",output.getvalue())
+            self.assertNotIn(str(root),output.getvalue())
+            for failure in ((root/"foreign.err",101,len(body)),(path,True,len(body)),(path,0,len(body)),
+                            (path,2**32,len(body)),(path,101,8*1024**2+1),(path,101,len(body)+1)):
+                output = io.StringIO()
+                with self.subTest(failure=str(failure[1:])), \
+                        mock.patch.object(commands,"cargo_fetch_failure",failure), \
+                        mock.patch.object(acquisition,"checked",return_value=path), \
+                        mock.patch.object(acquisition.N,"read_regular",return_value=body), \
+                        mock.patch.object(acquisition.sys,"stderr",output):
+                    acquisition._notice_report_cargo_fetch_failure(commands,True)
+                self.assertEqual(output.getvalue(), "")
+            with mock.patch.object(acquisition,"checked",side_effect=ValueError("synthetic-private-refusal")), \
+                    mock.patch.object(acquisition.N,"read_regular") as reader, \
+                    mock.patch.object(acquisition.sys,"stderr",io.StringIO()) as output:
+                acquisition._notice_report_cargo_fetch_failure(commands,True)
+                reader.assert_not_called()
+                self.assertEqual(output.getvalue(), "")
+
+
+    @unittest.skipIf(os.name == "nt", "mocked POSIX child pipes, no process execution")
+    def test_failed_cargo_fetch_retains_status_only_after_owned_stop_and_full_pipe_drain(self):
+        from scripts import native_notice_source as acquisition, package_smoke, macos_package_ui
+        body = b"error: failed to load manifest synthetic-private-body"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root/"logs").mkdir(mode=0o700);(root/"temp").mkdir(mode=0o700)
+            commands = acquisition.Commands(root,{})
+            events = []
+            def spawned(*args,**kwargs):
+                os.write(kwargs["stderr"].fileno(),body)
+                return SimpleNamespace(returncode=101)
+            def stopped(process):
+                self.assertIsNone(commands.cargo_fetch_failure)
+                events.append("stopped")
+            with mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)), \
+                    mock.patch.object(acquisition.subprocess,"Popen",side_effect=spawned), \
+                    mock.patch.object(package_smoke,"process_status",return_value=101), \
+                    mock.patch.object(macos_package_ui,"stop_group",side_effect=stopped), \
+                    self.assertRaises(ValueError):
+                commands.run("fetch",["/reviewed/cargo","fetch","--locked"],cwd=root,env={},timeout=1,
+                             output_limit=1024,stderr_limit=1024)
+            self.assertEqual(events,["stopped"])
+            self.assertTrue(commands.logs_complete)
+            self.assertFalse(commands.cleanup_failed)
+            self.assertEqual(commands.cargo_fetch_failure,(root/"logs/00001.err",101,len(body)))
+            self.assertEqual((root/"logs/00001.err").read_bytes(),body)
+
+
+    def test_notice_failure_site_uses_owned_caller_code_only_without_private_values(self):
+        from scripts import native_notice_source as acquisition
+        marker = "synthetic-private-diagnostic-value"
+        try:
+            acquisition.checked(Path("relative-source-site"), private=True)
+        except ValueError as error:
+            # Exception arguments/chain may contain secrets or paths. Neither
+            # is an input to the bounded code-location diagnostic.
+            error.args = (marker, {"private_body": marker})
+            output = io.StringIO()
+            with mock.patch.object(acquisition, "_NOTICE_FAILURE_PHASE", "git_export"), \
+                    mock.patch.object(acquisition.sys, "stderr", output):
+                acquisition._notice_report_failure(error)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        failure = json.loads(lines[0].removeprefix("MORPHEUS_NATIVE_NOTICE_FAILURE "))
+        self.assertEqual(failure, {"phase":"git_export", "exception":"value_error", "errno":None, "winerror":None})
+        site = json.loads(lines[1].removeprefix("MORPHEUS_NATIVE_NOTICE_SITE "))
+        self.assertEqual(set(site), {"module", "line"})
+        self.assertEqual(site["module"], "notice_source")
+        self.assertIs(type(site["line"]), int)
+        self.assertTrue(acquisition.checked.__code__.co_firstlineno <= site["line"]
+                        < acquisition.checked.__code__.co_firstlineno + 10)
+        self.assertNotEqual(site["line"], acquisition.require.__code__.co_firstlineno + 2)
+        self.assertNotIn(marker, output.getvalue())
+        self.assertNotIn("relative-source-site", output.getvalue())
+        self.assertNotIn("native_notice_source.py", output.getvalue())
+        self.assertNotIn("checked", output.getvalue())
+
+
+    def test_notice_failure_site_omits_unknown_inner_code_and_excess_trace_depth(self):
+        from scripts import native_notice_source as acquisition
+        marker = "synthetic-private-diagnostic-value"
+        foreign = "/synthetic-private-home/foreign-diagnostic.py"
+        namespace = {"__file__":foreign}
+        exec(compile("def foreign():\n    raise ValueError('synthetic-private-diagnostic-value')\n",
+                     foreign, "exec"), namespace)
+        def deep(depth):
+            if depth:
+                return deep(depth - 1)
+            return acquisition.checked(Path("relative-source-site"))
+        class UnavailableMetadata(ValueError):
+            def __getattribute__(self, name):
+                if name == "__traceback__":
+                    raise RuntimeError("synthetic-private-diagnostic-value")
+                return super().__getattribute__(name)
+        errors = []
+        for invoke in (namespace["foreign"], lambda:deep(40)):
+            try:
+                invoke()
+            except ValueError as error:
+                errors.append(error)
+        errors.append(UnavailableMetadata(marker))
+        for error in errors:
+            output = io.StringIO()
+            with self.subTest(kind=type(error).__name__), \
+                    mock.patch.object(acquisition, "_NOTICE_FAILURE_PHASE", "source"), \
+                    mock.patch.object(acquisition.sys, "stderr", output):
+                acquisition._notice_report_failure(error)
+            lines = output.getvalue().splitlines()
+            self.assertEqual(len(lines), 1)
+            failure = json.loads(lines[0].removeprefix("MORPHEUS_NATIVE_NOTICE_FAILURE "))
+            self.assertEqual(set(failure), {"phase", "exception", "errno", "winerror"})
+            self.assertEqual(failure["phase"], "source")
+            self.assertNotIn("MORPHEUS_NATIVE_NOTICE_SITE", output.getvalue())
+            self.assertNotIn(marker, output.getvalue())
+            self.assertNotIn(foreign, output.getvalue())
+
+
+    @unittest.skipIf(os.name == "nt", "Windows path/ACL admission is modeled without native calls")
+    def test_windows_system_git_hardlinks_keep_exact_path_and_all_acl_guards(self):
+        from scripts import native_notice_windows as windows
+        tool = Path("/programs/Git/cmd/git.exe")
+        unrelated = [Path("/programs/Git/bin/git.exe"),Path("/owned/scanner.exe"),
+                     Path("/owned/source.json"),Path("/owned/private.json")]
+        files = {tool,*unrelated}
+        security = object.__new__(windows.Security)
+        security.k = SimpleNamespace(GetDriveTypeW=mock.Mock(return_value=3))
+        security.acl = mock.Mock()
+        def metadata(path):
+            return SimpleNamespace(st_mode=0o100777 if path in files else 0o40777,
+                                   st_nlink=2 if path in files else 1,st_file_attributes=0)
+        with mock.patch.object(windows,"os",SimpleNamespace(name="nt",environ={"PROGRAMFILES":"/programs"})), \
+                mock.patch.object(Path,"resolve",autospec=True,side_effect=lambda path,strict:path) as resolved, \
+                mock.patch.object(Path,"lstat",autospec=True,side_effect=metadata) as inspected:
+            self.assertEqual(security.system_git(),tool)
+            self.assertEqual(security.acl.call_args_list,
+                [mock.call(str(path),private=False,ancestor=path!=tool) for path in (tool,*tool.parents)])
+            for path in [tool,*unrelated]:
+                for private in (False,True):
+                    with self.subTest(path=str(path),private=private),self.assertRaises(ValueError):
+                        security.path(path,private=private)
+            with self.assertRaises(TypeError):security.system_git(unrelated[0])
+            for changed_path,field,value in ((tool,"st_nlink",0),(tool,"st_mode",0o40777),
+                    (tool,"st_mode",0o120777),(tool,"st_file_attributes",0x400),
+                    (tool.parent,"st_mode",0o120777),(tool.parent,"st_file_attributes",0x400),
+                    (Path("/programs"),"st_file_attributes",0x400)):
+                def changed(path):
+                    info=metadata(path)
+                    if path==changed_path:setattr(info,field,value)
+                    return info
+                inspected.side_effect=changed
+                with self.subTest(path=str(changed_path),field=field,value=value),self.assertRaises(ValueError):
+                    security.system_git()
+            inspected.side_effect=metadata
+            for component in (tool,*tool.parents):
+                def changed_acl(path,**kwargs):
+                    if path==str(component):raise ValueError("ownership or write ACL changed")
+                security.acl.side_effect=changed_acl
+                with self.subTest(component=str(component)),self.assertRaises(ValueError):security.system_git()
+            security.acl.side_effect=None
+            security.k.GetDriveTypeW.return_value=4
+            with self.assertRaises(ValueError):security.system_git()
+            security.k.GetDriveTypeW.return_value=3
+            with mock.patch.object(Path,"resolve",return_value=unrelated[0]),self.assertRaises(ValueError):
+                security.system_git()
+            for program in ("relative","//server/share"):
+                resolved.reset_mock();inspected.reset_mock();security.acl.reset_mock()
+                with self.subTest(program=program), \
+                        mock.patch.object(windows,"os",SimpleNamespace(name="nt",environ={"PROGRAMFILES":program})), \
+                        self.assertRaises(ValueError):
+                    security.system_git()
+                resolved.assert_not_called();inspected.assert_not_called();security.acl.assert_not_called()
+            resolved.side_effect=lambda path,strict:Path("/redirect/Git/cmd/git.exe")
+            inspected.reset_mock();security.acl.reset_mock()
+            with mock.patch.object(windows,"os",SimpleNamespace(name="nt",environ={"PROGRAMFILES":"/programs/../redirect"})), \
+                    self.assertRaises(ValueError):
+                security.system_git()
+            inspected.assert_not_called();security.acl.assert_not_called()
+
+
+    @unittest.skipIf(os.name == "nt", "Windows launch admission is modeled without spawning native code")
+    def test_windows_system_git_rechecks_acl_at_tools_and_before_every_spawn(self):
+        from scripts import native_notice_source as acquisition, native_notice_windows as windows
+        from scripts import run_windows_capture_acceptance as capture
+        tool=Path("/programs/Git/cmd/git.exe")
+        host=SimpleNamespace(name="nt",environ={"PROGRAMFILES":"/programs"})
+        security=object.__new__(windows.Security)
+        security.k=SimpleNamespace(GetDriveTypeW=lambda anchor:3)
+        security.acl=mock.Mock()
+        def metadata(path):
+            regular=path.suffix==".exe"
+            return SimpleNamespace(st_mode=0o100777 if regular else 0o40777,
+                st_nlink=2 if regular and not str(path).startswith("/pinned/") else 1,st_file_attributes=0)
+        with mock.patch.object(acquisition,"os",host),mock.patch.object(windows,"os",host), \
+                mock.patch.object(acquisition.sys,"platform","win32"), \
+                mock.patch.object(acquisition.platform,"machine",return_value="AMD64"), \
+                mock.patch.object(acquisition.S,"windows_security",return_value=security), \
+                mock.patch.object(Path,"resolve",autospec=True,side_effect=lambda path,strict:path), \
+                mock.patch.object(Path,"lstat",autospec=True,side_effect=metadata), \
+                mock.patch.object(security,"system_git",wraps=security.system_git) as selected, \
+                mock.patch.object(acquisition.subprocess,"Popen") as posix_spawn, \
+                mock.patch.object(capture,"WindowsJob") as windows_spawn:
+            _,_,git,_=acquisition.tools({"RUSTUP_HOME":"/pinned/rustup"})
+            self.assertEqual(git,tool);selected.assert_called_once_with()
+            commands=acquisition.Commands(Path("/owned"),{})
+            security.acl.side_effect=ValueError("ownership or write ACL changed")
+            with self.assertRaises(ValueError):
+                commands.run("git",[git,"--version"],cwd=Path("/owned"),env={},timeout=1,output_limit=1024)
+            self.assertEqual(selected.call_args_list,[mock.call(),mock.call()])
+            self.assertEqual(commands.sequence,0)
+            security.acl.side_effect=None
+            for alias in ("/programs/Git/bin/git.exe","/owned/scanner.exe"):
+                with self.subTest(alias=alias),self.assertRaises(ValueError):
+                    commands.run("tool",[alias,"--version"],cwd=Path("/owned"),env={},timeout=1,output_limit=1024)
+            self.assertEqual(selected.call_count,2)
+            self.assertEqual(commands.sequence,0)
+            posix_spawn.assert_not_called();windows_spawn.assert_not_called()
+
+
+    def test_windows_workspace_repository_uses_fixed_private_https_source_without_checkout_config(self):
+        from scripts import native_notice_source as acquisition
+        root=Path("/private/owned/source");repository=root/"workspace.git";git=Path("/protected/Git/cmd/git.exe")
+        revision="a"*40;environment={"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40,"HOME":str(root/"home"),
+                                   "GIT_CONFIG_COUNT":"1","GIT_CONFIG_KEY_0":"url.foreign.insteadOf",
+                                   "GIT_CONFIG_VALUE_0":"https://github.com/","SSH_AUTH_SOCK":"foreign"}
+        commands=SimpleNamespace(run=mock.Mock(return_value=b""))
+        with mock.patch.object(acquisition,"os",SimpleNamespace(name="nt")), \
+                mock.patch.object(acquisition,"system_git",return_value=git), \
+                mock.patch.object(acquisition,"checked",side_effect=lambda path,**kwargs:Path(path)) as checked, \
+                mock.patch.object(acquisition,"private_directory",return_value=repository) as private, \
+                mock.patch.object(acquisition.S,"safe_git",return_value=[str(git),"-C",str(repository)]) as safe, \
+                mock.patch.object(acquisition,"check_cache") as inventory:
+            self.assertEqual(acquisition.workspace_repository(commands,root,revision,git,environment),repository)
+        private.assert_called_once_with(repository);safe.assert_called_once_with(str(git),repository)
+        self.assertEqual(checked.call_args_list,[mock.call(root,directory=True,private=True),
+            mock.call(root/"fetch",directory=True,private=True),mock.call(repository,directory=True,private=True),
+            mock.call(repository,directory=True,private=True)])
+        self.assertEqual(len(commands.run.call_args_list),2)
+        init,fetch=commands.run.call_args_list
+        self.assertEqual(init.args[0],"workspace-init");self.assertEqual(fetch.args[0],"workspace-fetch")
+        self.assertEqual(init.args[1][-4:],["init","--bare","--quiet","--template="])
+        self.assertEqual(fetch.args[1][-9:],["fetch","--quiet","--depth=1","--no-tags","--no-write-fetch-head",
+            "--no-recurse-submodules","--no-auto-maintenance","https://github.com/brk275/Morpheus.git",revision])
+        for call in (init,fetch):
+            argv=call.args[1]
+            for value in ("protocol.allow=never","protocol.https.allow=always","http.sslVerify=true",
+                          "http.followRedirects=false","http.extraHeader=","credential.helper=",
+                          "credential.interactive=never","core.askPass="):
+                self.assertIn(value,argv)
+            self.assertEqual(call.kwargs["cwd"],root/"fetch")
+            self.assertEqual(call.kwargs["output_limit"],65536)
+            for name in ("GIT_CONFIG_COUNT","GIT_CONFIG_KEY_0","GIT_CONFIG_VALUE_0","SSH_AUTH_SOCK"):
+                self.assertNotIn(name,call.kwargs["env"])
+        self.assertEqual(init.kwargs["env"]["GIT_ALLOW_PROTOCOL"],"")
+        self.assertEqual(fetch.kwargs["env"]["GIT_ALLOW_PROTOCOL"],"https")
+        self.assertEqual(fetch.kwargs["timeout"],1200);self.assertEqual(fetch.kwargs["stderr_limit"],65536)
+        inventory.assert_called_once_with(root)
+
+
+    def test_windows_workspace_repository_refuses_wrong_revision_existing_root_and_fetch_failure(self):
+        from scripts import native_notice_source as acquisition
+        root=Path("/private/owned/source");git=Path("/protected/Git/cmd/git.exe");revision="a"*40
+        commands=SimpleNamespace(run=mock.Mock(return_value=b""))
+        with mock.patch.object(acquisition,"os",SimpleNamespace(name="nt")), \
+                mock.patch.object(acquisition,"system_git",return_value=git), \
+                mock.patch.object(acquisition,"checked",side_effect=lambda path,**kwargs:Path(path)), \
+                mock.patch.object(acquisition,"private_directory",return_value=root/"workspace.git") as private, \
+                mock.patch.object(acquisition.S,"safe_git",return_value=[str(git)]), \
+                mock.patch.object(acquisition,"check_cache") as inventory:
+            for wrong in ("0"*40,"A"*40,"a"*39,"../revision","b"*40):
+                with self.subTest(revision=wrong),self.assertRaises(ValueError):
+                    acquisition.workspace_repository(commands,root,wrong,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40})
+            private.assert_not_called();commands.run.assert_not_called()
+            private.side_effect=FileExistsError("owned existing fixture")
+            with self.assertRaises(FileExistsError):
+                acquisition.workspace_repository(commands,root,revision,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40})
+            commands.run.assert_not_called();private.side_effect=None
+            commands.run.side_effect=[b"",ValueError("fixed fetch refusal")]
+            with self.assertRaises(ValueError):
+                acquisition.workspace_repository(commands,root,revision,git,{"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40})
+            inventory.assert_not_called()
+        with mock.patch.object(acquisition,"os",SimpleNamespace(name="posix")), \
+                mock.patch.object(acquisition,"private_directory") as private:
+            self.assertEqual(acquisition.workspace_repository(commands,root,"invalid",git,{}),acquisition.ROOT)
+            private.assert_not_called()
+
+
+    def test_windows_prepare_reuses_authenticated_private_repository_for_export_and_bundle(self):
+        from scripts import native_notice_source as acquisition
+        class WindowsOS:
+            name="nt"
+            def __getattr__(self,name):return getattr(os,name)
+        with tempfile.TemporaryDirectory() as temporary:
+            parent=Path(temporary).resolve();root=parent/"reserved";root.mkdir();(root/"owner.json").write_bytes(b"reservation")
+            revision="a"*40;repository=root/"workspace.git";tree="b"*40
+            commands=mock.Mock(cleanup_failed=False,logs_complete=True)
+            commands.run.side_effect=[b"cargo 1.99.0 fixture\n",b"rustc 1.99.0 fixture\n",b""]
+            with mock.patch.object(acquisition,"os",WindowsOS()),mock.patch.object(acquisition,"guard"), \
+                    mock.patch.object(acquisition,"owned_source_root",return_value=root), \
+                    mock.patch.object(acquisition,"checked",side_effect=lambda path,**kwargs:Path(path)), \
+                    mock.patch.object(acquisition.N,"read_regular",return_value=b"scanner"), \
+                    mock.patch.object(acquisition,"SCANNERS",{(sys.platform,acquisition.platform.machine()):hashlib.sha256(b"scanner").hexdigest()}), \
+                    mock.patch.object(acquisition,"tools",return_value=(parent/"cargo",parent/"rustc",parent/"git",parent/"rustup")), \
+                    mock.patch.object(acquisition,"environment_for_acquisition",return_value={"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40}), \
+                    mock.patch.object(acquisition,"private_directory",side_effect=lambda path,**kwargs:Path(path).mkdir(**kwargs)), \
+                    mock.patch.object(acquisition,"Commands",return_value=commands), \
+                    mock.patch.object(acquisition,"workspace_repository",return_value=repository) as select, \
+                    mock.patch.object(acquisition.S,"git_export",return_value=(b"",{"tree":tree},{})) as export, \
+                    mock.patch.object(acquisition,"source_inputs",return_value=[]), \
+                    mock.patch.object(acquisition,"fetch_export",return_value=root/"fetch-source"), \
+                    mock.patch.object(acquisition,"check_cache") as inventory, \
+                    mock.patch.object(acquisition,"input_plan",return_value={}), \
+                    mock.patch.object(acquisition.S,"build",return_value={"source_tree":tree}) as build:
+                acquisition.prepare({"MORPHEUS_PACKAGE_SOURCE_REVISION":revision,"GITHUB_SHA":"b"*40},parent/"scanner")
+            self.assertEqual(select.call_args.args[:3],(commands,root,revision))
+            self.assertEqual(export.call_args.args[1],repository)
+            self.assertEqual(build.call_args.args[2],repository)
+            self.assertNotEqual(repository,acquisition.ROOT)
+            inventory.assert_called_once_with(root)
+            commands.scan.assert_called_once_with(parent/"scanner")
+            self.assertTrue(json.loads((root/"state.json").read_text())["prepared"])
+
+
+    def test_owned_readonly_cleanup_clears_only_attribute_and_closes_handle_before_single_retry(self):
+        from scripts import native_notice_source as acquisition
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve()/("morpheus-native-source-"+"a"*32);root.mkdir()
+            target=root/"workspace.git/objects/pack/fixture.pack";target.parent.mkdir(parents=True)
+            target.write_bytes(b"owned synthetic Git pack");target.chmod(stat.S_IREAD)
+            root_info=root.lstat();born=target.lstat().st_ctime_ns;real_lstat=Path.lstat
+            descriptors=[];closed=[];mutations=[];deleted=[]
+            def metadata(info):
+                return SimpleNamespace(st_dev=info.st_dev,st_ino=info.st_ino,st_mode=info.st_mode,
+                    st_nlink=info.st_nlink,st_size=info.st_size,st_mtime_ns=info.st_mtime_ns,
+                    st_birthtime_ns=born,st_file_attributes=(0x10 if stat.S_ISDIR(info.st_mode)
+                        else 0x1 if not info.st_mode & stat.S_IWRITE else 0))
+            def opened(path,*,private):
+                self.assertTrue(private);fd=os.open(path,os.O_RDONLY);descriptors.append(fd);return fd
+            def retry(path):
+                self.assertEqual(closed,descriptors)
+                with self.assertRaises(OSError):os.fstat(descriptors[0])
+                deleted.append(Path(path));os.unlink(path)
+            class WindowsOS:
+                name="nt"
+                unlink=staticmethod(retry);remove=staticmethod(retry)
+                def __getattr__(self,name):return getattr(os,name)
+                def fstat(self,fd):return metadata(os.fstat(fd))
+                def chmod(self,path,mode):mutations.append((Path(path),mode));os.chmod(path,mode)
+                def close(self,fd):closed.append(fd);os.close(fd)
+            error=PermissionError(13,"owned readonly fixture");error.winerror=5
+            with mock.patch.object(acquisition,"os",WindowsOS()), \
+                    mock.patch.object(Path,"lstat",autospec=True,side_effect=lambda path:metadata(real_lstat(path))), \
+                    mock.patch.object(acquisition,"checked",side_effect=lambda path,**kwargs:Path(path)) as checked, \
+                    mock.patch.object(acquisition.S,"windows_security",return_value=SimpleNamespace(open_read=opened)):
+                acquisition._remove_readonly_owned_leaf(root,(root_info.st_dev,root_info.st_ino),retry,target,error)
+            self.assertEqual(mutations,[(target,stat.S_IWRITE)]);self.assertEqual(deleted,[target])
+            self.assertTrue(all(call.kwargs["private"] is True for call in checked.call_args_list))
+            self.assertFalse(target.exists());self.assertTrue(root.exists())
+
+
+    def test_owned_readonly_cleanup_refuses_unknown_errors_foreign_links_and_changed_handle_identity(self):
+        from scripts import native_notice_source as acquisition
+        temporary=Path(tempfile.gettempdir()).resolve()
+        root=temporary/("morpheus-native-source-"+"a"*32);target=root/"workspace.git/objects/fixture"
+        regular=dict(st_dev=1,st_ino=3,st_mode=stat.S_IFREG|0o444,st_nlink=1,st_size=8,
+                     st_mtime_ns=5,st_birthtime_ns=4,st_file_attributes=1)
+        root_info=SimpleNamespace(st_dev=1,st_ino=2)
+        retry=mock.Mock();chmod=mock.Mock();closed=mock.Mock()
+        security=SimpleNamespace(open_read=mock.Mock(return_value=42))
+        error=PermissionError(13,"owned readonly fixture");error.winerror=5
+        windows=SimpleNamespace(name="nt",unlink=retry,remove=retry,chmod=chmod,close=closed,
+                                fstat=mock.Mock(return_value=SimpleNamespace(**(regular|{"st_ino":99}))))
+        with mock.patch.object(acquisition,"os",windows), \
+                mock.patch.object(Path,"lstat",autospec=True,side_effect=lambda path:
+                    root_info if path==root else SimpleNamespace(**regular)), \
+                mock.patch.object(acquisition,"checked",side_effect=lambda path,**kwargs:Path(path)) as checked, \
+                mock.patch.object(acquisition.S,"windows_security",return_value=security):
+            for failure in (OSError(5,"unknown"),PermissionError(13,"no Win32 code")):
+                with self.assertRaises(OSError):
+                    acquisition._remove_readonly_owned_leaf(root,(1,2),retry,target,failure)
+            for changed in ({"st_nlink":2},{"st_file_attributes":0x401},{"st_file_attributes":0},
+                            {"st_mode":stat.S_IFDIR|0o444},{"st_size":acquisition.S.MAX_BUNDLE+1}):
+                original=dict(regular);regular.update(changed)
+                with self.assertRaises(PermissionError):
+                    acquisition._remove_readonly_owned_leaf(root,(1,2),retry,target,error)
+                regular.clear();regular.update(original)
+            for path,identity in ((temporary/"foreign-cleanup-file",(1,2)),(target,(1,99))):
+                with self.assertRaises(ValueError):
+                    acquisition._remove_readonly_owned_leaf(root,identity,retry,path,error)
+            security.open_read.assert_not_called();chmod.assert_not_called();retry.assert_not_called()
+            # A named-file/handle mismatch refuses before any attribute write,
+            # closes the exact retained descriptor, and never retries deletion.
+            with self.assertRaises(ValueError):
+                acquisition._remove_readonly_owned_leaf(root,(1,2),retry,target,error)
+            closed.assert_called_once_with(42);chmod.assert_not_called();retry.assert_not_called()
+            checked.side_effect=ValueError("private ACL refusal")
+            with self.assertRaises(ValueError):
+                acquisition._remove_readonly_owned_leaf(root,(1,2),retry,target,error)
+            chmod.assert_not_called();retry.assert_not_called()
+
+
+    def test_windows_owned_home_longpaths_config_is_fixed_private_new_and_precedes_commands(self):
+        from scripts import native_notice_source as acquisition
+        class StopAdmission(Exception): pass
+        class HostOS:
+            def __init__(self,name):self.name=name
+            def __getattr__(self,name):return getattr(os,name)
+        cases=[("nt",False),("nt",True)]
+        if os.name != "nt":cases.insert(1,("posix",False))  # fchmod is POSIX-only.
+        for host,existing in cases:
+            with self.subTest(host=host,existing=existing), tempfile.TemporaryDirectory() as temporary:
+                parent=Path(temporary).resolve();root=parent/"reserved";root.mkdir(mode=0o700)
+                (root/"owner.json").write_bytes(b"synthetic reservation")
+                config=root/"home/.gitconfig";checks=[];admitted=[]
+                def private(path,**options):
+                    Path(path).mkdir(mode=0o700,**options)
+                    if existing and Path(path)==root/"home":config.write_bytes(b"foreign config must remain untouched")
+                def checked(path,**options):checks.append((Path(path),options));return Path(path)
+                def commands(*args):
+                    admitted.append(True)
+                    self.assertEqual(config.exists(),host=="nt")
+                    if host=="nt":
+                        self.assertEqual(config.read_bytes(),b"[core]\n\tlongpaths = true\n")
+                        self.assertIn((config,{"private":True}),checks)
+                    raise StopAdmission()
+                with mock.patch.object(acquisition,"os",HostOS(host)), \
+                        mock.patch.object(acquisition,"guard"),mock.patch.object(acquisition,"owned_source_root",return_value=root), \
+                        mock.patch.object(acquisition,"checked",side_effect=checked), \
+                        mock.patch.object(acquisition.N,"read_regular",return_value=b"scanner"), \
+                        mock.patch.object(acquisition,"SCANNERS",{(sys.platform,acquisition.platform.machine()):hashlib.sha256(b"scanner").hexdigest()}), \
+                        mock.patch.object(acquisition,"tools",return_value=(parent/"cargo",parent/"rustc",parent/"git",parent/"rustup")), \
+                        mock.patch.object(acquisition,"environment_for_acquisition",return_value={}), \
+                        mock.patch.object(acquisition,"private_directory",side_effect=private), \
+                        mock.patch.object(acquisition,"Commands",side_effect=commands):
+                    with self.assertRaises(FileExistsError if existing else StopAdmission):
+                        acquisition.prepare({"MORPHEUS_PACKAGE_SOURCE_REVISION":"a"*40,"GITHUB_SHA":"b"*40},parent/"scanner")
+                self.assertEqual(admitted,[] if existing else [True])
+                if existing:self.assertEqual(config.read_bytes(),b"foreign config must remain untouched")
+
+
+    def test_windows_prepare_fetch_and_scan_use_private_directory_creation_for_every_child(self):
+        from scripts import native_notice_source as acquisition
+        class StopAdmission(Exception): pass
+        class WindowsOS:
+            name = "nt"
+            def __getattr__(self, name): return getattr(os,name)
+        with tempfile.TemporaryDirectory() as temporary:
+            parent=Path(temporary).resolve();root=parent/"reserved";root.mkdir()
+            (root/"owner.json").write_bytes(b"synthetic reservation")
+            calls=[]
+            def private(path,*,parents=False,exist_ok=False):
+                path=Path(path);calls.append((path,parents,exist_ok))
+                path.mkdir(parents=parents,exist_ok=exist_ok);return path
+            security=SimpleNamespace(private_directory=private)
+            with mock.patch.object(acquisition,"os",WindowsOS()), \
+                    mock.patch.object(acquisition.S,"windows_security",return_value=security), \
+                    mock.patch.object(acquisition,"guard"),mock.patch.object(acquisition,"owned_source_root",return_value=root), \
+                    mock.patch.object(acquisition,"checked",side_effect=lambda path,**kwargs:Path(path)), \
+                    mock.patch.object(acquisition.N,"read_regular",return_value=b"scanner"), \
+                    mock.patch.object(acquisition,"SCANNERS",{(sys.platform,acquisition.platform.machine()):hashlib.sha256(b"scanner").hexdigest()}), \
+                    mock.patch.object(acquisition,"tools",return_value=(parent/"cargo",parent/"rustc",parent/"git",parent/"rustup")), \
+                    mock.patch.object(acquisition,"environment_for_acquisition",return_value={}), \
+                    mock.patch.object(acquisition,"Commands",side_effect=StopAdmission):
+                with self.assertRaises(StopAdmission):
+                    acquisition.prepare({"GITHUB_SHA":"a"*40},parent/"scanner")
+            expected=[root/name for name in ("home","cargo","fetch","target","temp","logs","output")]
+            self.assertEqual(calls,[(path,False,False) for path in expected])
+            calls.clear()
+            with mock.patch.object(acquisition,"os",WindowsOS()), \
+                    mock.patch.object(acquisition.S,"windows_security",return_value=security):
+                commands=acquisition.Commands(root,{})
+                with mock.patch.object(commands,"run",return_value=b"") as run:
+                    commands.scan(parent/"scanner")
+                self.assertEqual(run.call_args.kwargs["log_root"],root/"scanner-logs")
+                data=b"synthetic source bytes"
+                files={"crates/example/Cargo.toml":data}
+                identity={"files":{name:{"mode":"100644","sha256":hashlib.sha256(data).hexdigest()} for name in files}}
+                exported=acquisition.fetch_export(root,files,identity)
+                self.assertEqual((exported/"crates/example/Cargo.toml").read_bytes(),data)
+            self.assertEqual(calls,[(root/"scanner-logs",False,True),(root/"fetch-source",False,False),
+                                    (root/"fetch-source/crates/example",True,True)])
 
 
 class NativeNoticeCommandOwnershipTests(unittest.TestCase):
@@ -1092,6 +1700,223 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
         with self.assertRaises(ValueError):security.acl("fixture",private=True)
         security.test_owner="S-1-5-32-544";security.a.mask=0x120089
         with self.assertRaises(ValueError):security.acl("fixture",private=True)
+        security.test_owner="current-user";security.test_writer="S-1-5-32-544";security.a.mask=0x2
+        with self.assertRaises(ValueError):security.acl("fixture",private=True)
+
+
+    @unittest.skipUnless(os.name=="nt","actual Windows protected readonly Git-object cleanup")
+    def test_owned_readonly_loose_and_pack_objects_remove_with_protected_root_and_original_acl_reader(self):
+        from scripts import native_notice_source as acquisition, native_notice_windows as windows
+        security=windows.security();root=security.create_root(security.path(Path.home().resolve(),directory=True))
+        security.private_directory(root/"workspace.git/objects/aa",parents=True)
+        security.private_directory(root/"workspace.git/objects/pack")
+        targets=[root/"workspace.git/objects/aa/fixture",root/"workspace.git/objects/pack/fixture.pack"]
+        for target in targets:
+            target.write_bytes(b"owned synthetic Git object");os.chmod(target,stat.S_IREAD)
+            security.path(target,private=True)
+            self.assertTrue(target.lstat().st_file_attributes & 1)
+        info=root.lstat();seen=[]
+        def readonly(function,path,error):
+            seen.append(Path(path))
+            acquisition._remove_readonly_owned_leaf(root,(info.st_dev,info.st_ino),function,path,error)
+        # On failure retain the protected synthetic fixture; never add a
+        # permissive cleanup fallback that could hide a real guard failure.
+        shutil.rmtree(root,onexc=readonly)
+        self.assertCountEqual(seen,targets);self.assertFalse(root.exists())
+
+
+    def test_private_child_creation_uses_protected_user_system_acl_and_rejects_existing_writers(self):
+        import ctypes
+        from scripts import native_notice_windows as windows
+        class WindowsOS:
+            name = "nt"
+            def __getattr__(self, name): return getattr(os, name)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            protected, created, descriptors, validations = {root}, [], [], []
+            security = windows.Security.__new__(windows.Security)
+            security.sid = "S-1-5-21-synthetic-user"
+            def validate(path, *, directory=False, private=False):
+                path = Path(path); validations.append((path,directory,private))
+                if not directory or not private or path not in protected or not path.is_dir():
+                    raise ValueError("synthetic private ACL refused")
+                return path
+            def descriptor(sddl, version, output, size):
+                descriptors.append(sddl); output._obj.value = 42; return True
+            def create(path, attributes):
+                path = Path(path); path.mkdir(); protected.add(path); created.append(path); return True
+            security.path = validate
+            security.a = SimpleNamespace(ConvertStringSecurityDescriptorToSecurityDescriptorW=descriptor)
+            security.k = SimpleNamespace(CreateDirectoryW=create, LocalFree=mock.Mock(return_value=None))
+            with mock.patch.object(windows,"os",WindowsOS()):
+                leaf = root/"nested"/"source"/"logs"
+                self.assertEqual(security.private_directory(leaf,parents=True),leaf)
+                self.assertEqual(created,[root/"nested",root/"nested/source",leaf])
+                self.assertEqual(descriptors,["O:"+security.sid+"D:P(A;OICI;FA;;;"+security.sid+")(A;OICI;FA;;;SY)"]*3)
+                self.assertEqual(security.k.LocalFree.call_count,3)
+                self.assertEqual(security.private_directory(leaf,parents=True,exist_ok=True),leaf)
+                bad = root/"admin-writable"; bad.mkdir()
+                for path,options in ((bad,{"exist_ok":True}),(bad/"child",{}),
+                                     (root/"nested/../escape",{"parents":True}),(Path("relative"),{})):
+                    with self.subTest(path=str(path)),self.assertRaises(ValueError):
+                        security.private_directory(path,**options)
+                self.assertEqual(len(created),3)
+            self.assertTrue(all(directory and private for _,directory,private in validations))
+        # Exercise the dedicated no-follow deletion primitive through its real
+        # handle/identity logic, without loading Windows APIs on this host.
+        for action in ("valid","outside","expired","wrong_tag","parent_reparse","leaf_replaced",
+                       "parent_mutated","acl","sharing","dispose","replacement_after_close","close","device","lexical_escape","late_acl"):
+            with self.subTest(profile_unlink=action):
+                home=Path(tempfile.gettempdir()).resolve()/"synthetic-fresh-home"
+                workspace=home/("morpheus-native-source-"+"a"*32)
+                root=workspace/("morpheus-windows-updateqa-"+"b"*32)
+                profile=root/"tools-home/home"
+                leaf=profile/"AppData/Local/Microsoft/Windows/cache/junction"
+                chain=list(reversed(leaf.parents)); paths=chain+[leaf]
+                metadata={path:SimpleNamespace(st_dev=7,st_ino=index+100,st_birthtime_ns=10**12,
+                    st_mtime_ns=2*10**12,st_file_attributes=0x2416 if path==leaf else 0x10,
+                    st_reparse_tag=0xa0000003 if path==leaf else 0,st_nlink=1,st_size=0)
+                    for index,path in enumerate(paths)}
+                opened,closed,disposals,checks,created_paths=[],[],[],[],[]
+                handles={};state={"pending":False,"deleted":False,"deny":False,"late_acl_reached":False};queries={}
+                deleted_names=set();foreign_canary={"data":b"outside synthetic target remains unchanged"}
+                state["target_traversed"]=False
+                def named(path):
+                    path=Path(path)
+                    if path in deleted_names:
+                        if action=="replacement_after_close":
+                            return SimpleNamespace(**(vars(metadata[path])|{"st_ino":99999}))
+                        raise FileNotFoundError()
+                    return metadata[path]
+                def create(path,access,share,security,creation,flags,template):
+                    path=Path(path);created_paths.append(path)
+                    if path==leaf and not flags&0x00200000:state["target_traversed"]=True
+                    self.assertIn(path,paths);self.assertEqual((security,creation,flags,template),(None,3,0x02200000,None))
+                    self.assertEqual((access,share),(0x30080,1) if path==leaf else (0x20080,3))
+                    if action=="sharing" and path==leaf:return None
+                    handle=len(opened)+10;opened.append(handle);handles[handle]=path;return handle
+                def information(handle,kind,output,size):
+                    path=handles[handle];value=metadata[path];pointer=output._obj
+                    inode,attrs,tag=value.st_ino,value.st_file_attributes,value.st_reparse_tag
+                    if kind==18:queries[handle]=queries.get(handle,0)+1
+                    if action=="parent_mutated" and path==root and queries.get(handle,0)>1:inode+=99
+                    if action=="leaf_replaced" and path==leaf:inode+=99
+                    if action=="parent_reparse" and path==profile:attrs,tag=0x410,0xa0000003
+                    if action=="wrong_tag" and path==leaf:tag=0xa000000c
+                    if kind==18:
+                        self.assertEqual(size,24);pointer.volume=7;pointer.identifier[:]=inode.to_bytes(16,"little")
+                    elif kind==0:
+                        self.assertEqual(size,40);pointer.created=116444736000000000+10**10
+                        pointer.written=116444736000000000+2*10**10;pointer.changed=123;pointer.attributes=attrs
+                    elif kind==9:
+                        self.assertEqual(size,8);pointer.attributes=attrs;pointer.tag=tag
+                    elif kind==1:
+                        self.assertEqual(size,24);pointer.size=0;pointer.links=1;pointer.pending=0;pointer.directory=1
+                    else:raise AssertionError("unexpected metadata query")
+                    return True
+                def acl(selected_handle,*,handle=False,private=False,ancestor=False):
+                    self.assertTrue(handle);path=handles[selected_handle]
+                    self.assertEqual(private,path==workspace or path.is_relative_to(workspace))
+                    self.assertEqual(ancestor,not private);checks.append(path)
+                    if action=="late_acl" and state["deny"] and path==leaf:
+                        state["late_acl_reached"]=True
+                        raise ValueError("synthetic later private ACL refusal")
+                    if action=="acl" and path==leaf:raise ValueError("synthetic private ACL refusal")
+                def dispose(handle,kind,output,size):
+                    self.assertEqual((handles[handle],kind,size,output._obj.delete),(leaf,4,1,1))
+                    disposals.append(handle)
+                    if state["target_traversed"]:foreign_canary["data"]=b"deleted through wrong handle"
+                    if action=="dispose":return False
+                    state["pending"]=True;return True
+                def close(handle):
+                    self.assertNotIn(handle,closed);closed.append(handle)
+                    if handles[handle]==leaf and state["pending"]:
+                        state["deleted"]=True;deleted_names.add(leaf)
+                    return not (action=="close" and handles[handle]==workspace)
+                security=windows.Security.__new__(windows.Security)
+                security.k=SimpleNamespace(GetDriveTypeW=lambda anchor:3,CreateFileW=create,
+                    GetFileInformationByHandleEx=information,SetFileInformationByHandle=dispose,CloseHandle=close)
+                security.acl=acl
+                expected=metadata[leaf]
+                token=tuple(getattr(expected,name) for name in ("st_dev","st_ino","st_birthtime_ns","st_mtime_ns","st_file_attributes","st_reparse_tag","st_nlink","st_size"))
+                selected=(root/"outside-profile" if action=="outside" else profile/"NUL.txt" if action=="device"
+                          else profile/".."/"escape" if action=="lexical_escape" else leaf)
+                with mock.patch.object(Path,"home",return_value=home),mock.patch.object(Path,"lstat",named), \
+                        mock.patch.object(windows.time,"monotonic",return_value=10):
+                    if action in {"valid","late_acl"}:
+                        security.unlink_private_profile_junction(workspace,(7,metadata[workspace].st_ino),root,(7,metadata[root].st_ino),selected,token,deadline=40)
+                        if action=="late_acl":
+                            first=leaf;self.assertIn(first,deleted_names)
+                            leaf=leaf.with_name("later-junction");paths.append(leaf)
+                            metadata[leaf]=SimpleNamespace(**(vars(expected)|{"st_ino":99990}))
+                            token=tuple(getattr(metadata[leaf],name) for name in ("st_dev","st_ino","st_birthtime_ns","st_mtime_ns","st_file_attributes","st_reparse_tag","st_nlink","st_size"))
+                            state.update(pending=False,deleted=False,deny=True)
+                            with self.assertRaises(ValueError):
+                                security.unlink_private_profile_junction(workspace,(7,metadata[workspace].st_ino),root,(7,metadata[root].st_ino),leaf,token,deadline=40)
+                            self.assertTrue(state["late_acl_reached"])
+                            self.assertEqual(deleted_names,{first})
+                            self.assertEqual(named(leaf).st_ino,99990)
+                    else:
+                        with self.assertRaises(ValueError):
+                            security.unlink_private_profile_junction(workspace,(7,metadata[workspace].st_ino),root,(7,metadata[root].st_ino),selected,token,deadline=9 if action=="expired" else 40)
+                self.assertCountEqual(closed,opened)
+                self.assertEqual(len(disposals),1 if action in {"valid","dispose","replacement_after_close","close","late_acl"} else 0)
+                self.assertEqual(state["deleted"],action in {"valid","replacement_after_close","close"})
+                if action in {"outside","expired","device","lexical_escape"}:self.assertEqual(created_paths,[])
+                self.assertTrue(set(created_paths)<=set(paths))
+                self.assertFalse(state["target_traversed"])
+                self.assertEqual(foreign_canary["data"],b"outside synthetic target remains unchanged")
+                if action=="valid":self.assertEqual(set(handles.values()),set(paths))
+
+
+    @unittest.skipUnless(os.name == "nt", "actual Windows private child ACL and inherited file reads")
+    def test_private_nested_children_keep_user_system_reads_and_refuse_stdlib_admin_acl(self):
+        from scripts import native_notice_windows as windows
+        security = windows.security()
+        root = security.create_root(security.path(Path.home().resolve(),directory=True))
+        identity = root.stat().st_dev,root.stat().st_ino
+        leaf, bad = root/"nested"/"logs", root/"stdlib700"
+        bad_identity = None
+        try:
+            security.private_directory(leaf,parents=True)
+            target = leaf/"version.out";target.write_bytes(b"synthetic tool version\n")
+            security.path(leaf,directory=True,private=True)
+            with os.fdopen(security.open_read(target,private=True),"rb") as stream:
+                self.assertEqual(stream.read(),b"synthetic tool version\n")
+            self.assertEqual(security.private_directory(leaf,parents=True,exist_ok=True),leaf)
+            if sys.version_info >= (3,12,4):
+                bad.mkdir(mode=0o700)
+                created = bad.lstat()
+                self.assertTrue(windows.stat.S_ISDIR(created.st_mode) and not windows.stat.S_ISLNK(created.st_mode)
+                                and not getattr(created,"st_file_attributes",0) & 0x400)
+                self.assertEqual(bad.resolve(strict=True),bad)
+                bad_identity = created.st_dev,created.st_ino,created.st_mode,getattr(created,"st_file_attributes",0)
+                with self.assertRaises(ValueError):security.path(bad,directory=True,private=True)
+                with self.assertRaises(ValueError):security.private_directory(bad,exist_ok=True)
+        finally:
+            security.path(root,directory=True,private=True)
+            self.assertEqual((root.stat().st_dev,root.stat().st_ino),identity)
+            (leaf/"version.out").unlink(missing_ok=True)
+            for path in (leaf,leaf.parent):
+                if path.exists():security.path(path,directory=True,private=True);path.rmdir()
+            if bad_identity is not None:
+                # This intentionally invalid ACL cannot enter the normal path
+                # validator (even its non-private policy rejects OWNER RIGHTS).
+                # Remove only our same empty negative fixture beneath the exact
+                # still-private reserved root; never repair or admit its ACL.
+                security.path(root,directory=True,private=True)
+                self.assertEqual((root.stat().st_dev,root.stat().st_ino),identity)
+                current = bad.lstat()
+                self.assertEqual(bad.parent,root)
+                self.assertEqual(bad.resolve(strict=True),bad)
+                self.assertTrue(windows.stat.S_ISDIR(current.st_mode) and not windows.stat.S_ISLNK(current.st_mode)
+                                and not getattr(current,"st_file_attributes",0) & 0x400)
+                self.assertEqual((current.st_dev,current.st_ino,current.st_mode,getattr(current,"st_file_attributes",0)),bad_identity)
+                self.assertEqual(list(bad.iterdir()),[])
+                bad.rmdir()
+            else:
+                self.assertFalse(bad.exists(),"unknown negative fixture must remain untouched")
+            security.path(root,directory=True,private=True);root.rmdir()
 
 
 if __name__ == "__main__":

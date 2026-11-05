@@ -68,12 +68,18 @@ def read_regular(path, maximum, *, allow_empty=False):
         # CPython 3.12 Windows named stat exposes CreationTime as ctime,
         # while fstat exposes ChangeTime. Birth time is the common identity;
         # retain both APIs' own change-time stability checks separately below.
+        mode = info.st_mode
         if os.name == "nt":
             born = info.st_birthtime_ns
             require(type(born) is int and born > 0)
+            # Named stat infers executable bits from .exe/.bat/.cmd/.com;
+            # fstat has no filename. These synthetic bits are not Windows ACL
+            # permissions. Compare real type/read/write bits across APIs, and
+            # retain each API's complete mode stability check below.
+            mode &= ~0o111
         else:
             born = info.st_ctime_ns
-        return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+        return (info.st_dev, info.st_ino, mode, info.st_nlink,
                 info.st_size, info.st_mtime_ns, born)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     descriptor = catalogue().windows_security().open_read(path) if os.name == "nt" else os.open(path, flags)
@@ -84,6 +90,7 @@ def read_regular(path, maximum, *, allow_empty=False):
         after = os.fstat(stream.fileno())
         named_after = path.lstat()
     require(stamp(before) == stamp(opened) == stamp(after) == stamp(named_after)
+            and before.st_mode == named_after.st_mode and opened.st_mode == after.st_mode
             and before.st_ctime_ns == named_after.st_ctime_ns
             and opened.st_ctime_ns == after.st_ctime_ns and len(data) == before.st_size)
     return data
@@ -166,7 +173,9 @@ def plain(data, maximum=MAX_FILE):
         text = data.decode("utf-8", "strict")
     except UnicodeError:
         raise ValueError(INVALID) from None
-    require(all(ord(c) >= 32 or c in "\r\n\t" for c in text) and "\x7f" not in text)
+    # Standard license pagination, observed byte-exact in libdbus COPYING.
+    # Keep only CR/LF/TAB/FF whitespace; every other C0 and DEL is refused.
+    require(all(ord(c) >= 32 or c in "\r\n\t\f" for c in text) and "\x7f" not in text)
     return data
 
 
@@ -288,6 +297,13 @@ def prepare_bytes(bundle, receipt_bytes, revision, *, platform, version, working
         if (name in {"vendor/README.md", "vendor/cpal/OWNED_ALSA.md"}
                 or name.startswith("vendor/") and path.name in
                 {"MORPHEUS_PATCH.md", "OWNED_COREAUDIO.md", "README.md"}):
+            # Empty upstream nested READMEs are optional documentation, not
+            # source notice text. Their bytes remain authenticated in the full
+            # source archive/manifest; mandatory patch/OWNED/top-level evidence
+            # and every license candidate still require nonempty plain bytes.
+            if (path.name == "README.md" and name != "vendor/README.md"
+                    and type(value) is bytes and value == b""):
+                continue
             checksum = digest(plain(value)); keep_text(checksum, value)
             provenance.append({"source_path": name, "sha256": checksum})
     require(any(r["name"] == "slint" and r["license_texts"] for r in records)
