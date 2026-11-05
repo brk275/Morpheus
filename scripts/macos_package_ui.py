@@ -24,6 +24,7 @@ proc_pidpath and compared with the installed bundle executable.
 
 import contextlib
 import ctypes
+import errno
 import json
 import os
 import plistlib
@@ -344,7 +345,7 @@ def executable_of(pid, library=None):
         return None
 
 
-def process_table(snapshot=None):
+def process_table(snapshot=None, *, seconds=5):
     """(pid, pgid, state) rows of a complete live process table.
 
     The session is deliberately not read from ps: Darwin's ps formats "sess" as
@@ -355,8 +356,10 @@ def process_table(snapshot=None):
     unparsed process is never mistaken for an absent one.
     """
     if snapshot is None:
+        if not 0 < seconds <= 5:
+            raise ValueError("Process table budget is outside its original bound")
         snapshot = subprocess.run(["ps", "-axo", "pid=,pgid=,stat="], check=True, capture_output=True,
-                                  text=True, timeout=5).stdout
+                                  text=True, timeout=seconds).stdout
     rows = []
     for line in snapshot.splitlines():
         parts = line.split()
@@ -417,18 +420,90 @@ def stop_group(process, read_table=None, seconds=STOP_SECONDS):
     process table is read; only a table with no live member left in the group
     lets the leader be reaped. A table that cannot be read, or a member still
     alive at the bound, is a bounded failure (process_remaining) that leaves
-    the leader anchored, so the smoke retains the profile.
+    the leader anchored, so the smoke retains the profile. Darwin alone may
+    reap its already-terminal anchored leader after exact killpg EPERM and a
+    full all-zombie census; success then additionally requires actual ESRCH
+    plus a fresh completely empty group census within the original deadline.
+    No TERM/KILL authority survives that exceptional reap.
     """
     read_table = process_table if read_table is None else read_table
+    recovery_deadline = time.monotonic() + seconds
+    signals_closed = False
+    recovered = False
+
+    def recovery_census():
+        remaining = recovery_deadline - time.monotonic()
+        require_ui(remaining > 0, "process_remaining")
+        # Default production reads share the original cleanup budget. Injected
+        # test readers are inert fixtures; the strict parser itself is unchanged.
+        return process_table(seconds=min(5, remaining)) if read_table is process_table else read_table()
+
+    def recover_terminal_group(error):
+        nonlocal signals_closed, recovered
+        if (type(error) is not PermissionError or error.errno != errno.EPERM
+                or time.monotonic() >= recovery_deadline
+                or process.returncode is not None
+                or smoke.process_status(process) is None):
+            return False
+        # This same retained child still anchors the original PGID. Require
+        # its own zombie row, and reject every live or unknown group member.
+        snapshot = recovery_census()
+        members = [row for row in snapshot if row[1] == process.pid]
+        leaders = [row for row in members if row[0] == process.pid]
+        if (len(leaders) != 1 or not leaders[0][2].startswith("Z")
+                or not all(row[2].startswith("Z") for row in members)
+                or time.monotonic() >= recovery_deadline):
+            return False
+        # Close mutation authority BEFORE wait can release the anchored PID,
+        # even if wait/probe/table validation subsequently fails or interrupts.
+        signals_closed = True
+        process.wait(timeout=recovery_deadline - time.monotonic())
+        require_ui(process.returncode is not None and time.monotonic() < recovery_deadline,
+                   "process_remaining")
+        # Signal zero only queries. A recycled/denied/still-existing group
+        # refuses cleanup; no TERM or KILL can ever follow this retained reap.
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError as absent:
+            require_ui(type(absent) is ProcessLookupError and absent.errno == errno.ESRCH,
+                       "process_remaining")
+        else:
+            raise DiagnosticFailure("process_remaining")
+        require_ui(not any(row[1] == process.pid for row in recovery_census())
+                   and time.monotonic() < recovery_deadline, "process_remaining")
+        recovered = True
+        return True
+
+    def signal_owned_group(sig):
+        if signals_closed:
+            return
+        if sys.platform != "darwin":
+            smoke.signal_process_group(process, sig)
+            return
+        # Keep the recovery origin exact: the generic smoke helper's legacy
+        # zombie fallback may itself raise from waitid or launching ps.
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError as error:
+            if not recover_terminal_group(error):
+                raise
+
     smoke.process_status(process)  # Reject an already-reaped, unowned PID.
     try:
-        smoke.signal_process_group(process, signal.SIGTERM)
+        signal_owned_group(signal.SIGTERM)
+        if recovered:
+            return
         deadline = time.monotonic() + seconds
         while smoke.process_status(process) is None and time.monotonic() < deadline:
             time.sleep(0.05)
     finally:
         # A leader may exit on TERM while descendants ignore it.
-        smoke.signal_process_group(process, signal.SIGKILL)
+        if not signals_closed:
+            signal_owned_group(signal.SIGKILL)
+    if recovered:
+        return
     deadline = time.monotonic() + seconds
     while True:
         try:

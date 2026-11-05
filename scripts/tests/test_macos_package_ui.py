@@ -1800,7 +1800,8 @@ class CloseAndCleanupTests(unittest.TestCase):
                 raise value
             return value
 
-        with patch.object(smoke, "process_status", side_effect=statuses), \
+        with patch.object(ui.sys, "platform", "linux"), \
+                patch.object(smoke, "process_status", side_effect=statuses), \
                 patch.object(smoke, "signal_process_group", side_effect=lambda target, sig: signals.append((target.pid, sig))), \
                 patch.object(ui.time, "sleep"):
             ui.stop_group(process, read_table, seconds=0.5)
@@ -1832,7 +1833,8 @@ class CloseAndCleanupTests(unittest.TestCase):
         # ps snapshot fails closed the same way, with the leader still unreaped.
         for stdout in (" 4242 4242 ffffff801a2b3c4d Z\n", " 4242 4242 Z\n 4243 4242\n", ""):
             process = Mock(pid=PID, returncode=None)
-            with self.subTest(stdout=stdout), patch.object(smoke, "process_status", side_effect=[None, 0]), \
+            with self.subTest(stdout=stdout), patch.object(ui.sys, "platform", "linux"), \
+                    patch.object(smoke, "process_status", side_effect=[None, 0]), \
                     patch.object(smoke, "signal_process_group"), patch.object(ui.time, "sleep"), \
                     patch.object(ui.subprocess, "run", return_value=Mock(stdout=stdout)), \
                     self.assertRaises(ui.DiagnosticFailure) as error:
@@ -1840,6 +1842,7 @@ class CloseAndCleanupTests(unittest.TestCase):
             self.assertEqual(error.exception.code, "process_remaining")
             process.wait.assert_not_called()
 
+    @patch.object(ui.sys, "platform", "linux")
     def test_stop_group_rejects_a_reaped_leader_and_a_leader_that_never_stops(self):
         # smoke.process_status itself refuses a reaped leader before any signal.
         process = Mock(pid=PID, returncode=0)
@@ -1851,6 +1854,153 @@ class CloseAndCleanupTests(unittest.TestCase):
         process.wait.side_effect = lambda timeout: None  # Reaping recorded no status.
         with self.assertRaises(RuntimeError):
             self.stop(lambda target: None, [table((PID, PID, "Z"))], process)
+
+    def test_mac_terminal_group_recovery_requires_actual_disappearance_and_never_signals_after_reap(self):
+        modes = ("normal", "normal_members", "term", "kill", "unknown_status", "live_member", "missing_leader", "wrong_errno",
+                 "reap_error", "expired_after_reap", "probe_permission", "probe_existing",
+                 "post_census_live", "post_census_zombie", "post_census_refused", "probe_wrong_errno",
+                 "expired_before_reap")
+        for mode in modes:
+            with self.subTest(mode=mode):
+                process = Mock(pid=PID, returncode=None)
+                clock = {"value":10.0}
+                calls = []
+                status = ([None, None, 0] if mode.startswith("normal") else [None, 0, 0]
+                          if mode == "kill" else [None, None if mode == "unknown_status" else 0])
+                denied = PermissionError(13 if mode == "wrong_errno" else 1, "private refusal")
+                snapshots = []
+
+                def reap(timeout):
+                    self.assertGreater(timeout, 0)
+                    self.assertLessEqual(timeout, 0.5)
+                    if mode == "reap_error":
+                        raise PermissionError(1, "private reap")
+                    process.returncode = 0
+                    if mode == "expired_after_reap":
+                        clock["value"] = 11.0
+
+                def signal_group(group, sig):
+                    self.assertEqual(group, PID)
+                    calls.append((sig, process.returncode))
+                    if sig != 0:
+                        self.assertIsNone(process.returncode, "never mutate a reaped numeric group")
+                        mutations = sum(previous != 0 for previous, _ in calls)
+                        if not mode.startswith("normal") and ((mode == "kill" and sig == ui.signal.SIGKILL)
+                                                            or (mode != "kill" and mutations == 1)):
+                            raise denied
+                    elif mode == "probe_permission":
+                        raise PermissionError(1, "private probe")
+                    elif mode == "probe_wrong_errno":
+                        raise ProcessLookupError(1, "private invalid lookup")
+                    elif mode != "probe_existing":
+                        raise ProcessLookupError(3, "private absent group")
+
+                def census():
+                    snapshots.append(True)
+                    if len(snapshots) == 1:
+                        if mode == "normal_members":
+                            return table((PID, PID, "Z"), (PID + 1, PID, "S"))
+                        if mode == "expired_before_reap":
+                            clock["value"] = 11.0
+                        if mode == "missing_leader":
+                            return []
+                        if mode == "live_member":
+                            return table((PID, PID, "Z"), (PID + 1, PID, "S"))
+                        return table((PID, PID, "Z"))
+                    if mode == "normal_members":
+                        return table((PID, PID, "Z"))
+                    if mode == "post_census_refused":
+                        raise ValueError("private invalid process table")
+                    if mode == "post_census_live":
+                        return table((PID + 1, PID, "S"))
+                    if mode == "post_census_zombie":
+                        return table((PID + 1, PID, "Z"))
+                    return []
+
+                process.wait.side_effect = reap
+                with patch.object(ui.sys, "platform", "darwin"), \
+                        patch.object(smoke, "process_status", side_effect=status), \
+                        patch.object(smoke, "signal_process_group") as generic, \
+                        patch.object(ui.os, "killpg", side_effect=signal_group), \
+                        patch.object(ui.time, "monotonic", side_effect=lambda: clock["value"]):
+                    if mode in {"normal", "normal_members", "term", "kill"}:
+                        ui.stop_group(process, census, seconds=0.5)
+                    else:
+                        with self.assertRaises((PermissionError, ui.DiagnosticFailure, ValueError)):
+                            ui.stop_group(process, census, seconds=0.5)
+                generic.assert_not_called()
+                process.poll.assert_not_called()
+                if mode in {"unknown_status", "live_member", "missing_leader", "wrong_errno", "expired_before_reap"}:
+                    process.wait.assert_not_called()
+                    self.assertFalse(any(sig == 0 for sig, _ in calls))
+                else:
+                    process.wait.assert_called_once()
+                    after_reap = [sig for sig, returncode in calls if returncode is not None]
+                    self.assertTrue(all(sig == 0 for sig in after_reap))
+                if mode.startswith("normal"):
+                    self.assertEqual(calls, [(ui.signal.SIGTERM, None), (ui.signal.SIGKILL, None)])
+                    self.assertEqual(process.returncode, 0)
+                if mode in {"term", "kill"}:
+                    self.assertEqual(calls[-1], (0, 0))
+                    self.assertEqual(len(snapshots), 2)
+                if process.returncode is not None:
+                    # A retained failed-cleanup owner cannot later resurrect
+                    # mutation authority for this already-reaped numeric PID.
+                    with patch.object(ui.sys, "platform", "darwin"), \
+                            patch.object(ui.os, "killpg") as no_later_signal:
+                        with self.assertRaises(RuntimeError):
+                            ui.stop_group(process)
+                    no_later_signal.assert_not_called()
+
+        with patch.object(ui.subprocess, "run", return_value=Mock(stdout=f"{PID} {PID} Z\n")) as command:
+            for seconds in (0, -1, 5.1):
+                with self.assertRaises(ValueError):
+                    ui.process_table(seconds=seconds)
+            command.assert_not_called()
+            self.assertEqual(ui.process_table(seconds=0.25), table((PID, PID, "Z")))
+            self.assertEqual(command.call_args.kwargs["timeout"], 0.25)
+
+
+    @unittest.skipUnless(ui.sys.platform == "darwin", "actual Darwin process-group API only")
+    def test_mac_real_terminal_leader_reaps_only_before_zero_signal_disappearance_probe(self):
+        process = ui.subprocess.Popen([ui.sys.executable, "-I", "-c", "pass"],
+                                      stdin=ui.subprocess.DEVNULL, stdout=ui.subprocess.DEVNULL,
+                                      stderr=ui.subprocess.DEVNULL, start_new_session=True)
+        real_signal = ui.os.killpg
+        observed = []
+
+        def signal_group(group, sig):
+            self.assertEqual(group, process.pid)
+            before = process.returncode
+            try:
+                result = real_signal(group, sig)
+            except PermissionError as error:
+                observed.append((sig, before, "denied" if error.errno == 1 else "other"))
+                raise
+            except ProcessLookupError:
+                observed.append((sig, before, "absent"))
+                raise
+            observed.append((sig, before, "sent"))
+            return result
+
+        try:
+            deadline = ui.time.monotonic() + 2
+            while smoke.process_status(process) is None and ui.time.monotonic() < deadline:
+                ui.time.sleep(0.01)
+            self.assertEqual(smoke.process_status(process), 0)
+            self.assertIsNone(process.returncode)
+            with patch.object(ui.os, "killpg", side_effect=signal_group):
+                ui.stop_group(process)
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(any(sig != 0 and status is None and result == "denied"
+                                for sig, status, result in observed))
+            self.assertEqual(observed[-1], (0, 0, "absent"))
+            self.assertTrue(all(sig == 0 for sig, status, _ in observed if status is not None))
+            self.assertFalse(any(row[1] == process.pid for row in ui.process_table()))
+        finally:
+            if process.returncode is None:
+                ui.stop_group(process)
+
 
     def test_bridge_close_and_acceptance_cleanup_stop_through_the_group_proof(self):
         source = SOURCE.read_text(encoding="utf-8")
