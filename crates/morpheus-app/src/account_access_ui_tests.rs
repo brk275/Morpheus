@@ -814,8 +814,80 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
         ui.get_appearance_ui_font_input().as_str(),
         defaults.appearance.font_family
     );
+    assert!(!ui.get_appearance_fonts_dirty());
+    // A real edit marks the atomic font form. Invalid external TOML refuses
+    // both Apply and Reset without erasing that edit or replacing the file.
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Interface font family"));
+    ui.set_appearance_ui_font_input("  ".into());
+    key(ui, Key::End);
+    type_text(ui, "serif  ");
+    ui.set_appearance_message_font_input(" monospace ".into());
+    ui.set_appearance_composer_font_input("".into());
+    ui.set_appearance_mono_font_input(" monospace ".into());
+    assert!(ui.get_appearance_fonts_dirty());
+    let font_draft = ui.get_appearance_ui_font_input();
+    let broken_fonts = "[appearance\nfont_family = \"serif\"\n";
+    std::fs::write(config_path, broken_fonts).unwrap();
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), broken_fonts);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(ui.get_appearance_ui_font_input(), font_draft);
+    tab_to_control(
+        ui,
+        "Use the default interface, message and monospaced fonts",
+    );
+    key(ui, Key::Space);
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), broken_fonts);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(ui.get_appearance_ui_font_input(), font_draft);
+    store.save(&reset).unwrap();
+    apply_config(ui, &reset, None);
+    assert_eq!(ui.get_appearance_ui_font_input(), font_draft);
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(ui.get_appearance_ui_font_input(), "serif");
+    assert_eq!(ui.get_appearance_message_font_input(), "monospace");
+    assert_eq!(ui.get_appearance_composer_font_input(), "");
+    assert_eq!(ui.get_appearance_mono_font_input(), "monospace");
+    assert_eq!(store.load().unwrap().appearance.font_family, "serif");
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    key(ui, Key::End);
+    type_text(ui, " draft");
+    assert!(ui.get_appearance_fonts_dirty());
+    tab_to_control(
+        ui,
+        "Use the default interface, message and monospaced fonts",
+    );
+    key(ui, Key::Space);
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(
+        ui.get_appearance_ui_font_input(),
+        defaults.appearance.font_family
+    );
+    assert_eq!(ui.get_appearance_message_font_input(), "");
+    assert_eq!(ui.get_appearance_composer_font_input(), "");
+    assert_eq!(ui.get_appearance_mono_font_input(), "monospace");
+    let reset_draft = store.load().unwrap();
+    assert_eq!(
+        reset_draft.appearance.font_family,
+        defaults.appearance.font_family
+    );
+    assert_eq!(reset_draft.typography.message_font_family, None);
+    assert_eq!(reset_draft.typography.composer_font_family, None);
+    assert_eq!(reset_draft.typography.monospace_font_family, "monospace");
+    assert_eq!(
+        reset_draft.typography.message_size, 17,
+        "font reset keeps other preferences"
+    );
     store.save(&defaults).unwrap();
     apply_config(ui, &defaults, None);
+    // Restore the original motion control before its unchanged refusal check.
+    tab_to_control(ui, "Reduce motion, off");
     let invalid = "[appearance\nreduce_motion = true\n";
     std::fs::write(config_path, invalid).unwrap();
     key(ui, Key::Space);
@@ -5769,6 +5841,39 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     settle(ui).await;
     assert!(!ui.get_style_profile_items().row_data(0).unwrap().current);
     ui.invoke_style_profile_chosen(item.key.clone());
+    // A typed four-field form remains local while a profile changes the look.
+    assert!(
+        !ui.get_appearance_fonts_dirty(),
+        "projection is not a user edit"
+    );
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Interface font family"));
+    ui.set_appearance_ui_font_input("Draft interface".into());
+    key(ui, Key::End);
+    type_text(ui, " typed");
+    ui.set_appearance_message_font_input("Draft messages".into());
+    ui.set_appearance_composer_font_input("Draft composer".into());
+    ui.set_appearance_mono_font_input("Draft monospace".into());
+    assert!(ui.get_appearance_fonts_dirty());
+    let font_drafts = (
+        ui.get_appearance_ui_font_input(),
+        ui.get_appearance_message_font_input(),
+        ui.get_appearance_composer_font_input(),
+        ui.get_appearance_mono_font_input(),
+    );
+    let assert_font_drafts = |ui: &AppWindow| {
+        assert!(ui.get_appearance_fonts_dirty());
+        assert_eq!(
+            (
+                ui.get_appearance_ui_font_input(),
+                ui.get_appearance_message_font_input(),
+                ui.get_appearance_composer_font_input(),
+                ui.get_appearance_mono_font_input(),
+            ),
+            font_drafts
+        );
+    };
     let preview = |ui: &AppWindow| {
         ui.invoke_style_profile_preview();
         assert!(ui.get_style_preview_active());
@@ -5778,10 +5883,13 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     settle(ui).await;
     assert_eq!(ui.get_message_font_size(), 15);
     assert_eq!(store.load().unwrap(), larger, "a preview saves nothing");
+    assert_font_drafts(ui);
     ui.invoke_style_profile_cancel_preview();
     settle(ui).await;
     assert!(!ui.get_style_preview_active());
     assert_eq!(ui.get_message_font_size(), 20);
+    assert_font_drafts(ui);
+    assert_eq!(store.load().unwrap(), larger, "cancel saves no font draft");
 
     // A save that would change the look is refused and ends the preview.
     preview(ui);
@@ -5879,6 +5987,12 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     assert!(!ui.get_style_preview_active());
     assert_eq!(ui.get_message_font_size(), 15);
     assert!(ui.get_style_profile_items().row_data(0).unwrap().current);
+    assert_font_drafts(ui);
+    assert_eq!(
+        applied.appearance.font_family,
+        config.appearance.font_family
+    );
+    assert_ne!(applied.appearance.font_family, font_drafts.0.as_str());
 
     // An invalid settings file is never overwritten by Apply.
     let broken = "schema_version = 1\n[typography]\nmessage_size = 999\n";
@@ -5901,6 +6015,8 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     assert_eq!(store.load().unwrap(), applied);
     assert_eq!(ui.get_style_profile_items().row_count(), 0);
 
+    // End only this synthetic window form before the next unrelated scenario.
+    ui.set_appearance_fonts_dirty(false);
     ui.set_page(0);
     apply_config(ui, &Config::default(), None);
     settle(ui).await;
@@ -14247,6 +14363,182 @@ async fn assert_font_browser(ui: &AppWindow, directory: &std::path::Path) {
     // Following the inherited font removes only that role's own value.
     ui.invoke_font_browser_inherit();
     assert_eq!(store.load().unwrap().typography.message_font_family, None);
+
+    // A browser choice replaces only its role in a dirty form. Applying
+    // that real form must keep the chosen family and the other three edits.
+    crate::appearance::install_callbacks(ui, &store);
+    let font_inputs = |ui: &AppWindow| {
+        [
+            ui.get_appearance_ui_font_input(),
+            ui.get_appearance_message_font_input(),
+            ui.get_appearance_composer_font_input(),
+            ui.get_appearance_mono_font_input(),
+        ]
+    };
+    for (role, family) in [
+        (0, "Literata"),
+        (1, "JetBrains Mono"),
+        (2, "Literata"),
+        (3, "JetBrains Mono"),
+    ] {
+        assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+        settle(ui).await;
+        assert!(focused_control_has_label(ui, "Interface font family"));
+        ui.set_appearance_ui_font_input("Draft interface".into());
+        key(ui, Key::End);
+        type_text(ui, " typed");
+        ui.set_appearance_message_font_input("Draft messages".into());
+        ui.set_appearance_composer_font_input("Draft composer".into());
+        ui.set_appearance_mono_font_input("Draft monospace".into());
+        assert!(ui.get_appearance_fonts_dirty());
+        let mut expected = font_inputs(ui);
+        // A direct browser save normalizes the selected role only.
+        ui.set_page(0);
+        ui.invoke_font_browser_show(role);
+        ui.invoke_font_browser_use(format!(" {family} ").into());
+        expected[role as usize] = family.into();
+        assert_eq!(font_inputs(ui), expected);
+        assert!(ui.get_appearance_fonts_dirty());
+        let accepted = store.load().unwrap();
+        let accepted_names = [
+            accepted.appearance.font_family.as_str(),
+            accepted
+                .typography
+                .message_font_family
+                .as_deref()
+                .unwrap_or(""),
+            accepted
+                .typography
+                .composer_font_family
+                .as_deref()
+                .unwrap_or(""),
+            accepted.typography.monospace_font_family.as_str(),
+        ];
+        assert_eq!(accepted_names[role as usize], family);
+        ui.invoke_font_browser_close();
+        assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+        settle(ui).await;
+        tab_to_control(ui, "Apply fonts");
+        key(ui, Key::Space);
+        settle(ui).await;
+        assert!(!ui.get_appearance_fonts_dirty());
+        assert_eq!(font_inputs(ui), expected);
+        // Settings stages the form; its Apply commits the exact combined look.
+        ui.invoke_studio_apply();
+        let applied_fonts = store.load().unwrap();
+        assert_eq!(applied_fonts.appearance.font_family, expected[0].as_str());
+        assert_eq!(
+            applied_fonts.typography.message_font_family.as_deref(),
+            Some(expected[1].as_str())
+        );
+        assert_eq!(
+            applied_fonts.typography.composer_font_family.as_deref(),
+            Some(expected[2].as_str())
+        );
+        assert_eq!(
+            applied_fonts.typography.monospace_font_family,
+            expected[3].as_str()
+        );
+    }
+    // A Settings browser choice is staged: synchronize its returned value,
+    // including inheritance, while preserving other drafts and the disk file.
+    ui.set_appearance_fonts_dirty(true);
+    ui.set_appearance_ui_font_input("Staged interface draft".into());
+    ui.set_appearance_message_font_input("Staged message draft".into());
+    ui.set_appearance_composer_font_input("Staged composer draft".into());
+    ui.set_appearance_mono_font_input("Staged monospace draft".into());
+    let mut inherited_inputs = font_inputs(ui);
+    inherited_inputs[1] = "".into();
+    let before_staged = std::fs::read(store.path()).unwrap();
+    ui.invoke_font_browser_show(1);
+    ui.invoke_font_browser_inherit();
+    assert_eq!(font_inputs(ui), inherited_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert!(ui.get_studio_pending() > 0);
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_staged);
+    ui.invoke_font_browser_close();
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    settle(ui).await;
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(font_inputs(ui), inherited_inputs);
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_staged);
+    ui.invoke_studio_apply();
+    let inherited = store.load().unwrap();
+    assert_eq!(inherited.appearance.font_family, inherited_inputs[0].as_str());
+    assert_eq!(inherited.typography.message_font_family, None);
+    assert_eq!(
+        inherited.typography.composer_font_family.as_deref(),
+        Some(inherited_inputs[2].as_str())
+    );
+    assert_eq!(
+        inherited.typography.monospace_font_family,
+        inherited_inputs[3].as_str()
+    );
+
+    // Use remains enabled for the current family, as does already-inherited
+    // selection. Both are valid choices even when no file write is needed.
+    ui.set_appearance_fonts_dirty(true);
+    ui.set_appearance_ui_font_input("Unapplied interface".into());
+    ui.set_appearance_message_font_input("Unapplied messages".into());
+    ui.set_appearance_composer_font_input("Unapplied composer".into());
+    ui.set_appearance_mono_font_input("Unapplied monospace".into());
+    let mut no_op_inputs = font_inputs(ui);
+    let before_no_op = std::fs::read(store.path()).unwrap();
+    ui.set_page(0);
+    ui.invoke_font_browser_show(0);
+    ui.invoke_font_browser_use(inherited.appearance.font_family.as_str().into());
+    no_op_inputs[0] = inherited.appearance.font_family.as_str().into();
+    assert_eq!(font_inputs(ui), no_op_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_no_op);
+    ui.invoke_font_browser_show(1);
+    ui.invoke_font_browser_inherit();
+    no_op_inputs[1] = "".into();
+    assert_eq!(font_inputs(ui), no_op_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_no_op);
+    ui.invoke_font_browser_close();
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    settle(ui).await;
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(font_inputs(ui), no_op_inputs);
+    ui.invoke_studio_apply();
+    let no_op_applied = store.load().unwrap();
+    assert_eq!(
+        no_op_applied.appearance.font_family,
+        inherited.appearance.font_family
+    );
+    assert_eq!(no_op_applied.typography.message_font_family, None);
+    assert_eq!(
+        no_op_applied.typography.composer_font_family.as_deref(),
+        Some(no_op_inputs[2].as_str())
+    );
+    assert_eq!(
+        no_op_applied.typography.monospace_font_family,
+        no_op_inputs[3].as_str()
+    );
+
+    // Failed reads never synchronize a choice or overwrite the dirty form/file.
+    ui.set_appearance_fonts_dirty(true);
+    ui.set_appearance_message_font_input("Unapplied messages".into());
+    let refused_inputs = font_inputs(ui);
+    ui.set_page(0);
+    ui.invoke_font_browser_show(1);
+    let broken = "[appearance\nfont_family = \"broken\"\n";
+    std::fs::write(store.path(), broken).unwrap();
+    ui.invoke_font_browser_use("Literata".into());
+    assert_eq!(font_inputs(ui), refused_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), broken);
+    ui.invoke_font_browser_close();
+    ui.set_appearance_fonts_dirty(false);
+    store.save(&initial).unwrap();
+    ui.set_config_error("".into());
+    apply_config(ui, &initial, None);
 
     // A family typed by hand that is not installed is kept as typed and
     // shown as not found.

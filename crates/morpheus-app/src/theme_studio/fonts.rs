@@ -589,11 +589,36 @@ fn choose(ui: &AppWindow, family: Option<&str>) {
     let Some(store) = with(|browser| browser.store.clone()) else {
         return;
     };
+    let mut unchanged_role = None;
     let saved = crate::save_config_edit(ui, &store, |config| {
         let before = config.clone();
         role.set(config, family);
-        *config != before
+        let changed = *config != before;
+        if !changed {
+            // The save helper deliberately returns None for a valid no-op.
+            // Capture only the accepted role from its already-read config;
+            // failed reads and refused changes never reach this branch.
+            unchanged_role = Some(role.own(config).unwrap_or("").to_owned());
+        }
+        changed
     });
+    // The four-field form may contain unrelated edits. Only a successful
+    // browser choice replaces this role, using the accepted/staged value.
+    // A valid no-op also accepts this role; failed/refused saves do not.
+    // Inheritance is an empty input, not the resolved parent family.
+    let chosen_role = saved
+        .as_ref()
+        .map(|config| role.own(config).unwrap_or("").to_owned())
+        .or(unchanged_role);
+    if let Some(value) = chosen_role {
+        let value = value.into();
+        match role {
+            Role::Interface => ui.set_appearance_ui_font_input(value),
+            Role::Message => ui.set_appearance_message_font_input(value),
+            Role::Composer => ui.set_appearance_composer_font_input(value),
+            Role::Monospace => ui.set_appearance_mono_font_input(value),
+        }
+    }
     let drafted = super::drafting();
     let name = family.unwrap_or("the inherited font");
     let text = match (saved, drafted) {
