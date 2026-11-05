@@ -7,8 +7,8 @@ concurrency:
   group: linux-seal-provider-${{ github.sha }}
   cancel-in-progress: false
 env:
-  REVIEWED_SEAL_SOURCE: ffbe9731c81fe571ba0ac87884e1aea73f3287f3
-  REVIEWED_SEAL_TREE: 8a81d5057b24166870857998189bd41a2f789130
+  REVIEWED_SEAL_SOURCE: 433d5d2bbc1543311b0692725f04275e5312d13b
+  REVIEWED_SEAL_TREE: ffd3bf4b5a8ac8e9e8d10a4ab041f785f7458484
 jobs:
   provider:
     name: Real Linux sealed package provider feasibility
