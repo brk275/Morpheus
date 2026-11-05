@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import struct
+import stat
 import tarfile
 import os
 import re
@@ -1163,11 +1164,13 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
             with mock.patch.object(acquisition, "_NOTICE_FAILURE_PHASE", "git_export"), \
                     mock.patch.object(acquisition.sys, "stderr", output):
                 acquisition._notice_report_failure(error)
+            site = acquisition._notice_failure_site(error)
         lines = output.getvalue().splitlines()
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 1)
         failure = json.loads(lines[0].removeprefix("MORPHEUS_NATIVE_NOTICE_FAILURE "))
-        self.assertEqual(failure, {"phase":"git_export", "exception":"value_error", "errno":None, "winerror":None})
-        site = json.loads(lines[1].removeprefix("MORPHEUS_NATIVE_NOTICE_SITE "))
+        self.assertEqual(failure, {"phase":"source", "exception":"value_error", "errno":None, "winerror":None})
+        # Main keeps its coarse closed publisher; the Windows driver uses
+        # this separate owned-code locator only behind its full privacy gates.
         self.assertEqual(set(site), {"module", "line"})
         self.assertEqual(site["module"], "notice_source")
         self.assertIs(type(site["line"]), int)
@@ -1179,6 +1182,8 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
         self.assertNotIn("native_notice_source.py", output.getvalue())
         self.assertNotIn("checked", output.getvalue())
 
+        self.assertNotIn(marker, json.dumps(site))
+        self.assertNotIn("relative-source-site", json.dumps(site))
 
     def test_notice_failure_site_omits_unknown_inner_code_and_excess_trace_depth(self):
         from scripts import native_notice_source as acquisition

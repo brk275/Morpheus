@@ -603,29 +603,46 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
     def test_windows_build_passes_selected_msvc_linker_and_nonce_to_actual_cargo_command(self):
         class StopAfterCargo(Exception):pass
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary).resolve();source=root/"source";source.mkdir()
-            original={"PATH":"original", "GIT_CONFIG_GLOBAL":"nul"}
+            root=Path(temporary).resolve();source=root/"old-source";source.mkdir()
+            rustup=root/"rustup"
+            cargo=rustup/"toolchains/1.99.0-x86_64-pc-windows-msvc/bin/cargo.exe"
+            cargo.parent.mkdir(parents=True);cargo.write_bytes(b"synthetic pinned Cargo")
+            original={"PATH":"original", "GIT_CONFIG_GLOBAL":"nul", "RUSTUP_HOME":str(rustup)}
             selected={"PATH":"protected-msvc-first", "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER":"protected-link.exe"}
-            commands=types.SimpleNamespace(root=root,environment=original,
-                run=Mock(side_effect=StopAfterCargo()),build_substage="unavailable")
+            commands=update.Commands(root,original)
+            job=Mock()
+            log=commands.logs/"0001.log";log.write_bytes(b"synthetic compiler output")
             def private_directory(path,**options):Path(path).mkdir(**options);return Path(path)
             security=types.SimpleNamespace(private_directory=private_directory)
+            # Exercise build -> real compile_app -> start/wait. Only the owned
+            # process boundary is mocked; no compiler is launched by this case.
             with patch.object(update,"export_source",return_value=(source,{"proof":"unchanged"})), \
                     patch.object(update.notice_source.S,"windows_security",return_value=security), \
                     patch.object(update.notices,"prepare",return_value={}), \
-                    patch.object(update,"msvc_build_environment",return_value=selected) as select:
+                    patch.object(update,"msvc_build_environment",return_value=selected) as select, \
+                    patch.object(update,"checked",side_effect=lambda path,**options:Path(path)), \
+                    patch.object(update.capture,"WindowsJob",return_value=job), \
+                    patch.object(commands,"start",return_value=(10,log)) as start, \
+                    patch.object(commands,"wait",side_effect=StopAfterCargo()) as waited:
                 with self.assertRaises(StopAfterCargo):
                     update.build(commands,source,b"archive","0.1.0-updateqa.1","a"*32,"old",
-                                 "cargo.exe",root/"bundle",root/"receipt","b"*40)
+                                 cargo,root/"bundle",root/"receipt","b"*40)
             select.assert_called_once_with(original)
-            invocation=commands.run.call_args
-            self.assertEqual(invocation.args[0][:7],["cargo.exe","build","--release","--locked","-p","morpheus-app","--features"])
-            self.assertEqual(invocation.args[0][7],"native-calls")
-            self.assertEqual(invocation.kwargs["environment"]["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"],"protected-link.exe")
-            self.assertEqual(invocation.kwargs["environment"]["PATH"],"protected-msvc-first")
-            self.assertEqual(invocation.kwargs["environment"]["MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD"],"a"*32)
-            self.assertEqual(invocation.kwargs["seconds"],3600)
-            self.assertEqual(original,{"PATH":"original", "GIT_CONFIG_GLOBAL":"nul"})
+            start.assert_called_once()
+            invocation=start.call_args
+            self.assertIs(invocation.args[0],job)
+            self.assertEqual(invocation.args[1][:7],[cargo,"build","--release","--locked","-p","morpheus-app","--features"])
+            self.assertEqual(invocation.args[1][7],"native-calls")
+            self.assertEqual(invocation.args[1][8:],["--target-dir",root/"native-target"])
+            self.assertEqual(invocation.args[2]["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"],"protected-link.exe")
+            self.assertEqual(invocation.args[2]["PATH"],"protected-msvc-first")
+            self.assertEqual(invocation.args[2]["MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD"],"a"*32)
+            self.assertEqual(invocation.args[2]["MORPHEUS_PACKAGE_FORMAT"],"nsis-payload-v2")
+            self.assertEqual(invocation.args[3],source)
+            waited.assert_called_once_with(job,10,3600)
+            job.close.assert_called_once_with()
+            self.assertFalse(commands.cleanup_failed)
+            self.assertEqual(original,{"PATH":"original", "GIT_CONFIG_GLOBAL":"nul", "RUSTUP_HOME":str(rustup)})
 
     def test_msvc_build_environment_refuses_unsafe_tools_version_aliases_and_excessive_sdk_entries(self):
         with tempfile.TemporaryDirectory() as temporary:
