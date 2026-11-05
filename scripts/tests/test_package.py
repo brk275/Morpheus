@@ -803,6 +803,60 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
 
 
 class NativeSourceAcquisitionTests(unittest.TestCase):
+    def test_temporary_sealed_fetch_payload_uses_only_exact_complete_owned_streams_and_bounded_slices(self):
+        from scripts import native_notice_source as acquisition
+        root = Path("synthetic-private-root")
+        error = root/"logs/00003.err"
+        bodies = {error: b"private-error"*2000, error.with_suffix(".out"): b"private-output"*2000}
+        commands = SimpleNamespace(root=root, logs=root/"logs", logs_complete=True, cleanup_failed=False,
+                                   retained=[], cargo_fetch_failure=(error,101,len(bodies[error])),
+                                   cargo_fetch_stdout=(error.with_suffix(".out"),len(bodies[error.with_suffix(".out")])))
+        with mock.patch.object(acquisition,"checked",side_effect=lambda path,**kw:path), \
+                mock.patch.object(acquisition.N,"read_regular",side_effect=lambda path,*a,**kw:bodies[path]):
+            payload = acquisition._sealed_fetch_payload(commands,"a"*40)
+            self.assertLessEqual(len(payload),65536)
+            facts = json.loads(payload)
+            self.assertEqual(facts["status"],101)
+            self.assertEqual(set(facts["streams"]),{"stdout","stderr"})
+            for stream in facts["streams"].values():
+                self.assertTrue(stream["truncated"])
+                self.assertEqual(len(acquisition.base64.b64decode(stream["head_base64"])),8192)
+                self.assertEqual(len(acquisition.base64.b64decode(stream["tail_base64"])),8192)
+            self.assertNotIn(b"synthetic-private-root",payload)
+            commands.cargo_fetch_stdout=(root/"foreign.out",1)
+            with self.assertRaises(ValueError):acquisition._sealed_fetch_payload(commands,"a"*40)
+
+    def test_temporary_sealed_fetch_never_prints_child_output_without_fresh_full_scan(self):
+        from scripts import native_notice_source as acquisition
+        for scan_fails, malformed in ((False,False),(True,False),(False,True)):
+            output=io.StringIO(); events=[]
+            def run(*args,**options):
+                events.append("encrypt")
+                self.assertEqual(options["stdin_bytes"],b"synthetic-private-input")
+                self.assertEqual(options["env"],{"POWERSHELL_TELEMETRY_OPTOUT":"1",
+                    "DOTNET_CLI_TELEMETRY_OPTOUT":"1","POWERSHELL_UPDATECHECK":"Off"})
+                self.assertEqual(commands.environment,{})
+                self.assertNotIn("synthetic-private-input",str(args))
+                return b"private-raw-refusal" if malformed else b"0:1:"+b"A"*768+b"\n"
+            def scan(scanner):
+                events.append("scan")
+                self.assertEqual(output.getvalue(),"")
+                if scan_fails:raise ValueError("private-scan-refusal")
+            commands=SimpleNamespace(root=Path("owned"),environment={},logs_complete=True,
+                                     cleanup_failed=False,retained=[],run=run,scan=scan)
+            with self.subTest(scan_fails=scan_fails,malformed=malformed), \
+                    mock.patch.object(acquisition,"os",SimpleNamespace(name="nt",environ={"PROGRAMFILES":"protected"})), \
+                    mock.patch.object(acquisition.sys,"platform","win32"), \
+                    mock.patch.object(acquisition.sys,"stderr",output), \
+                    mock.patch.object(acquisition,"checked",side_effect=lambda path,**kw:path), \
+                    mock.patch.object(acquisition,"_sealed_fetch_payload",return_value=b"synthetic-private-input"):
+                scanned=acquisition._seal_failed_fetch(commands,"scanner","a"*40,True)
+            self.assertEqual(events,["encrypt","scan"])
+            self.assertEqual(scanned,not scan_fails)
+            self.assertNotIn("private-",output.getvalue())
+            self.assertNotIn("ciphertext_hex",output.getvalue() if scan_fails or malformed else "")
+            if not scan_fails and not malformed:self.assertIn('"ciphertext_hex"',output.getvalue())
+
     def test_cargo_stderr_classification_is_bounded_fixed_and_does_not_reflect_private_bytes(self):
         from scripts import native_notice_source as acquisition
         samples = {"manifest":b"failed to parse manifest", "lockfile":b"needs to be updated but --locked was passed",

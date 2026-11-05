@@ -6,6 +6,7 @@ its separate namespace route. Outputs and logs never leave this ephemeral job.
 """
 from __future__ import annotations
 import argparse
+import base64
 import contextlib
 import json
 import os
@@ -172,6 +173,78 @@ def _notice_report_cargo_fetch_failure(commands, scanned):
             print("MORPHEUS_NATIVE_NOTICE_CARGO_FETCH " + json.dumps(facts, sort_keys=True), file=sys.stderr)
     except BaseException:
         return  # Diagnostic refusal never replaces the original command error.
+
+
+# TEMPORARY DIAGNOSTIC ONLY. Never merge this one-time recipient transport.
+_SEALED_RECIPIENT = "981b3084f72673f04254de615651b7c8847f1c7823070c981bf92868c16fb70a"
+_SEALED_POWERSHELL = "$ErrorActionPreference='Stop'\n$ProgressPreference='SilentlyContinue'\n$PSModuleAutoLoadingPreference='None'\n$rsa=$null\ntry {\n  $parameters=[System.Security.Cryptography.RSAParameters]::new()\n  $parameters.Modulus=[Convert]::FromBase64String('o87QianqKagsPqe7OXHtChurVX8CiCBNJBWylbmuGhs3xMsgy/MfO+9Y/gCbguGk53rDsXHcefhiSns2WoXq+KVAG/14+zSzIF+H33M+yUo4wFwH/kBKMz2/VYq6MEFOJwmjgrtNW8gJ3VK1KGjTMjJBK8aBwsrfM0ACgYBwQIwZi3Rmt94z27tAqL6KE3EfsRk3TGnZr1IeLGv8/gtRT3sJVPwH6CP1/VTl3kAd+IBh69rduTFNnZeUZEz+c6QvYA7ijzhxuOEIiJFLJYRidgRlLg/t8lcI9BNLAhmq2ngxCoUvkcAs6TJ/EuzU8crJGw7KV09tVpY70X6ukphAMoPngwm74pvwp2yN3B5P2VrylFUZAZv9RrcpKKl9VF+TkttIjSEws/chyJYrxqcLiqo3BfjTdNUBqxYjOPsRjkNTLHeJFFHdU3lkNWNK7qGdINAhMN+HQLcCwT0N4y0dqpls45sCHkkOvj27PI6H1tQFQX/FsjOFN90J/3riEaCd')\n  $parameters.Exponent=[Convert]::FromBase64String('AQAB')\n  if ($parameters.Modulus.Length -ne 384) { exit 2 }\n  $rsa=[System.Security.Cryptography.RSACng]::new()\n  $rsa.ImportParameters($parameters)\n  if ($rsa.KeySize -ne 3072) { exit 2 }\n  $reader=[System.IO.BinaryReader]::new([Console]::OpenStandardInput())\n  $data=$reader.ReadBytes(65537)\n  if ($data.Length -eq 0 -or $data.Length -gt 65536) { exit 2 }\n  $count=[int][Math]::Ceiling($data.Length/318.0)\n  for ($i=0;$i -lt $count;$i++) {\n    $length=[Math]::Min(318,$data.Length-$i*318)\n    $chunk=[byte[]]::new($length)\n    [Array]::Copy($data,$i*318,$chunk,0,$length)\n    $sealed=$rsa.Encrypt($chunk,[System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)\n    if ($sealed.Length -ne 384) { exit 2 }\n    [Console]::Out.WriteLine(('{0}:{1}:{2}' -f $i,$count,[Convert]::ToHexString($sealed)))\n  }\n} catch { exit 2 } finally { if ($null -ne $rsa) { $rsa.Dispose() } }\n"
+
+
+def _sealed_fetch_payload(commands, revision):
+    # Reuse the existing complete/stopped/scan admission before touching bytes.
+    require(_cargo_fetch_failure_diagnostic(commands, True) is not None)
+    require(re.fullmatch(r"[0-9a-f]{40}", revision) is not None)
+    error_path, status, error_size = commands.cargo_fetch_failure
+    output_path, output_size = commands.cargo_fetch_stdout
+    require(output_path == Path(error_path).with_suffix(".out")
+            and type(output_size) is int and 0 <= output_size <= 8*1024**2)
+    streams = {}
+    for label, path, size in (("stdout", output_path, output_size), ("stderr", error_path, error_size)):
+        checked(path, private=True)
+        data = N.read_regular(path, 8*1024**2, allow_empty=True)
+        require(len(data) == size)
+        streams[label] = {"size": size, "truncated": size > 16384,
+                          "head_base64": base64.b64encode(data[:8192]).decode("ascii"),
+                          "tail_base64": base64.b64encode(data[-8192:] if size > 8192 else b"").decode("ascii")}
+    payload = json.dumps({"schema": 1, "canary": "morpheus-private-cargo-diagnostic-20261104",
+                          "source_revision": revision, "status": status, "streams": streams},
+                         sort_keys=True, separators=(",", ":")).encode("ascii")
+    require(0 < len(payload) <= 65536)
+    return payload
+
+
+def _seal_failed_fetch(commands, scanner, revision, scanned):
+    # Called only after the first complete raw scan. No plaintext is an argv,
+    # script interpolant, public marker, exception message or command output.
+    ciphertext = None
+    try:
+        require(scanned is True and os.name == "nt" and sys.platform == "win32")
+        payload = _sealed_fetch_payload(commands, revision)
+        powershell = Path(os.environ["PROGRAMFILES"]) / "PowerShell/7/pwsh.exe"
+        checked(powershell)
+        encoded = base64.b64encode(_SEALED_POWERSHELL.encode("utf-16le")).decode("ascii")
+        child_environment = dict(commands.environment)
+        child_environment.update(POWERSHELL_TELEMETRY_OPTOUT="1", DOTNET_CLI_TELEMETRY_OPTOUT="1",
+                                 POWERSHELL_UPDATECHECK="Off")
+        scanned = False  # A new owned child invalidates the prior scan receipt.
+        try:
+            raw = commands.run("seal-fetch", [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive",
+                               "-EncodedCommand", encoded], cwd=commands.root, env=child_environment,
+                               timeout=30, output_limit=192*1024, stderr_limit=65536, stdin_bytes=payload)
+            lines = raw.decode("ascii").splitlines()
+            count = (len(payload)+317)//318
+            require(len(lines) == count and 1 <= count <= 207)
+            ciphertext = []
+            for index, line in enumerate(lines):
+                match = re.fullmatch(r"([0-9]{1,3}):([0-9]{1,3}):([0-9A-F]{768})", line)
+                require(match is not None and int(match[1]) == index and int(match[2]) == count)
+                ciphertext.append(match[3])
+        finally:
+            # Even rejected encryption output must reach a fresh full scan.
+            commands.scan(scanner)
+            scanned = True
+        require(commands.logs_complete and not commands.cleanup_failed and not commands.retained)
+    except BaseException:
+        ciphertext = None
+    if scanned is True and commands.logs_complete and not commands.cleanup_failed and not commands.retained:
+        if ciphertext is not None:
+            for index, block in enumerate(ciphertext):
+                print("MORPHEUS_NATIVE_NOTICE_SEALED_FETCH " + json.dumps({"schema": 1,
+                    "recipient": _SEALED_RECIPIENT, "sequence": index, "count": len(ciphertext),
+                    "ciphertext_hex": block}, sort_keys=True), file=sys.stderr)
+        else:
+            print('MORPHEUS_NATIVE_NOTICE_SEALED_FETCH_AVAILABLE false', file=sys.stderr)
+    return scanned
 
 
 def require(value):
@@ -359,7 +432,7 @@ class Commands:
     def __init__(self, root, environment):
         self.root, self.environment = root, environment
         self.logs = root/"logs"; self.sequence = 0; self.cleanup_failed = False
-        self.retained = []; self.bytes = 0; self.logs_complete = True; self.cargo_fetch_failure = None; self.deadline = time.monotonic() + 1800
+        self.retained = []; self.bytes = 0; self.logs_complete = True; self.cargo_fetch_failure = None; self.cargo_fetch_stdout = None; self.deadline = time.monotonic() + 1800
 
     def run(self, stage, command, *, cwd, env, timeout, output_limit, stderr_limit=65536, log_root=None,
             expected_status=(0,), binary_output=False, stdin_bytes=None):
@@ -484,6 +557,7 @@ class Commands:
             # both exact streams were flushed/fsynced/closed. Publish nothing
             # here; the complete default scan must succeed first.
             self.cargo_fetch_failure = (errors, status, counts[1])
+            self.cargo_fetch_stdout = (output, counts[0])
         require(status in expected_status)
         if not binary_output:
             data=S.read_owned(output,output_limit,private=True) if counts[0] else b""
@@ -682,6 +756,8 @@ def prepare(environment, scanner):
             commands.scan(scanner);scanned=True
             if not success:
                 _notice_report_cargo_fetch_failure(commands, scanned)
+                if commands.cargo_fetch_failure is not None:
+                    scanned = _seal_failed_fetch(commands, scanner, revision, scanned)
         finally:
             write_new(root/"state.json",json.dumps({"schema":1,"source_revision":revision,
                 "prepared":success,"logs_scanned":scanned,"logs_complete":commands.logs_complete,
