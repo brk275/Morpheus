@@ -24,6 +24,125 @@ PID = 4242
 
 
 class InstalledUpdateTransactionBoundaryTests(unittest.TestCase):
+    def test_finish_deadline_observation_uses_existing_calls_and_retains_original_cleanup_failure(self):
+        commands=object.__new__(update_qa.Commands)
+        process,log=Mock(returncode=None),Mock()
+        commands.pending,commands.cleanup_failed=[process],False
+        log.lstat.return_value.st_size=0
+        cleanup=PermissionError(1,"private cleanup path and arguments")
+        with patch.object(update_qa.smoke,"process_status",return_value=None) as status, \
+                patch.object(update_qa.time,"monotonic",side_effect=[0,500]) as clock, \
+                patch.object(update_qa.owned,"stop_group",side_effect=cleanup) as stop:
+            with self.assertRaises(update_qa.Refused):
+                commands.finish(process,log,seconds=1,allow_stop=True)
+        stop.assert_called_once_with(process)
+        self.assertEqual(clock.call_count,2);self.assertEqual(status.call_count,1)
+        process.poll.assert_not_called();process.wait.assert_not_called()
+        self.assertEqual(commands.pending,[process]);self.assertTrue(commands.cleanup_failed)
+        observed=update_qa.command_settlement_diagnostic(commands.command_settlement_state)
+        self.assertEqual(observed,{"finish_phase":"work_deadline","observed_terminal_status":None,
+            "work_deadline_reached":True,"cleanup_phase":"group_stop",
+            "cleanup_exception":"permission","cleanup_errno":1,"cleanup_refusal_code":None})
+        self.assertNotIn("private",json.dumps(observed))
+
+    def test_finish_terminal_observation_keeps_drain_order_and_actual_exception_precedence(self):
+        for code,cleanup in ((101,None),(0,update_qa.subprocess.TimeoutExpired(["private command"],5))):
+            with self.subTest(code=code):
+                commands=object.__new__(update_qa.Commands)
+                process,log=Mock(returncode=None),Mock()
+                commands.pending,commands.cleanup_failed=[process],False
+                log.lstat.return_value.st_size=0
+                def stop(target):
+                    self.assertIs(target,process);self.assertEqual(commands.pending,[process])
+                    self.assertEqual(commands.command_settlement_state["cleanup_phase"],"group_stop")
+                    if cleanup is not None:raise cleanup
+                with patch.object(update_qa.smoke,"process_status",return_value=code) as status, \
+                        patch.object(update_qa.time,"monotonic",return_value=0) as clock, \
+                        patch.object(update_qa.owned,"stop_group",side_effect=stop):
+                    with self.assertRaises(update_qa.Refused if cleanup is None else update_qa.subprocess.TimeoutExpired) as caught:
+                        commands.finish(process,log,seconds=3300,allow_stop=True)
+                if cleanup is not None:self.assertIs(caught.exception,cleanup)
+                self.assertEqual(status.call_count,1);self.assertEqual(clock.call_count,1)
+                process.poll.assert_not_called();process.wait.assert_not_called()
+                observed=update_qa.command_settlement_diagnostic(commands.command_settlement_state)
+                self.assertEqual(observed["observed_terminal_status"],code)
+                self.assertEqual(observed["finish_phase"],"exit_guard" if code else "complete")
+                self.assertFalse(observed["work_deadline_reached"])
+                self.assertEqual(observed["cleanup_phase"],"complete" if cleanup is None else "group_stop")
+                self.assertEqual(observed["cleanup_exception"],"none" if cleanup is None else "wait_timeout")
+                self.assertEqual(commands.pending,[] if cleanup is None else [process])
+                self.assertEqual(commands.cleanup_failed,cleanup is not None)
+                self.assertNotIn("private",json.dumps(observed))
+
+    def test_finish_cleanup_refusal_code_is_exact_fixed_token_without_subclass_reflection(self):
+        class Foreign(update_qa.owned.DiagnosticFailure):
+            def __getattribute__(self,name):
+                if name == "code":raise AssertionError("foreign code must not be read")
+                return super().__getattribute__(name)
+        for error,expected,category in ((update_qa.owned.DiagnosticFailure("process_remaining"),"process_remaining","owned_refusal"),
+                (update_qa.owned.DiagnosticFailure("private path or arbitrary token"),None,"owned_refusal"),
+                (update_qa.owned.DiagnosticFailure(object()),None,"owned_refusal"),
+                (Foreign("process_remaining"),None,"other")):
+            with self.subTest(expected=expected,category=category):
+                commands=object.__new__(update_qa.Commands)
+                process,log=Mock(returncode=None),Mock()
+                commands.pending,commands.cleanup_failed=[process],False
+                log.lstat.return_value.st_size=0
+                with patch.object(update_qa.smoke,"process_status",return_value=0) as status, \
+                        patch.object(update_qa.time,"monotonic",return_value=0) as clock, \
+                        patch.object(update_qa.owned,"stop_group",side_effect=error):
+                    with self.assertRaises(type(error)) as caught:
+                        commands.finish(process,log,seconds=3300,allow_stop=True)
+                self.assertIs(caught.exception,error)
+                self.assertEqual(status.call_count,1);self.assertEqual(clock.call_count,1)
+                observed=update_qa.command_settlement_diagnostic(commands.command_settlement_state)
+                self.assertEqual(observed["cleanup_refusal_code"],expected)
+                self.assertEqual(observed["cleanup_exception"],category)
+                self.assertEqual(commands.pending,[process]);self.assertTrue(commands.cleanup_failed)
+                self.assertNotIn("private",json.dumps(observed))
+                process.poll.assert_not_called();process.wait.assert_not_called()
+        invalid=dict(observed,cleanup_refusal_code="process_remaining")
+        self.assertIsNone(update_qa.command_settlement_diagnostic(invalid))
+
+    def test_closed_settlement_metadata_cannot_reflect_objects_or_waive_scan_and_ownership(self):
+        state={"finish_phase":"work_deadline","observed_terminal_status":None,
+               "work_deadline_reached":True,"cleanup_phase":"group_stop",
+               "cleanup_exception":"owned_refusal","cleanup_errno":None,"cleanup_refusal_code":None}
+        counters={"phase":"complete","scanner_identity_verified":True,"log_enumeration_completed":True,
+            "logs_seen":5,"logs_read_complete":5,"log_read_refused":0,"scanner_attempts":5,
+            "scanner_exit_zero":5,"scanner_exit_one":0,"scanner_exit_other":0,
+            "scanner_timeouts":0,"scanner_launch_errors":0}
+        commands=types.SimpleNamespace(command_settlement_state=state,log_scan_state=counters,
+            final_log_scan_clean=True,pending=[object()],helper_observers=[],cleanup_failed=True)
+        report={"status":"failed","stage":"build_old","checks":{
+            "bounded_log_scan_attempted":True,"default_log_scan":False}}
+        with patch.object(update_qa.smoke,"process_status",side_effect=AssertionError("no extra process query")), \
+                patch.object(update_qa,"bounded",side_effect=AssertionError("no log body read")):
+            diagnostic=update_qa.log_gate_failure_diagnostic(commands,report)
+            self.assertEqual(diagnostic["command_settlement"],state)
+            self.assertTrue(diagnostic["cleanup_failed"]);self.assertEqual(diagnostic["pending_commands"],1)
+            self.assertIsNone(update_qa.build_failure_diagnostic(commands,report))
+            class Unknown(dict):
+                def __getitem__(self,key):raise AssertionError("must not inspect foreign mappings")
+            invalid=[Unknown(state),state|{"pid":"private-process"},
+                     {key:value for key,value in state.items() if key!="cleanup_errno"}]
+            for field,value in (("finish_phase","private path"),("cleanup_phase","private command"),
+                    ("cleanup_exception","private-token"),("cleanup_errno",True),("cleanup_errno",65536),
+                    ("cleanup_errno",-1),("cleanup_refusal_code","private-refusal"),("cleanup_refusal_code",True),("observed_terminal_status",True),("observed_terminal_status",256),
+                    ("observed_terminal_status",-256),("work_deadline_reached",1),("work_deadline_reached",False)):
+                invalid.append(state|{field:value})
+            for malformed in invalid:
+                commands.command_settlement_state=malformed
+                self.assertIsNone(update_qa.command_settlement_diagnostic(malformed))
+                diagnostic=update_qa.log_gate_failure_diagnostic(commands,report)
+                self.assertNotIn("command_settlement",diagnostic)
+                self.assertTrue(diagnostic["cleanup_failed"])
+                self.assertEqual(diagnostic["pending_commands"],1)
+                self.assertNotIn("private",json.dumps(diagnostic))
+            self.assertEqual(report["checks"],{"bounded_log_scan_attempted":True,"default_log_scan":False})
+            report["status"]="passed"
+            self.assertIsNone(update_qa.log_gate_failure_diagnostic(commands,report))
+
     @unittest.skipUnless(os.name == "posix", "POSIX private scanner log contract")
     def test_log_gate_diagnostic_separates_all_scanner_outcomes_without_child_text(self):
         with tempfile.TemporaryDirectory() as temporary:

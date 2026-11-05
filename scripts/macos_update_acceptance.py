@@ -178,6 +178,7 @@ class Commands:
         self.cleanup_failed = False
 
     def start(self, argv, *, cwd=None, extra=None):
+        self.command_settlement_state = None  # Never attribute an older command to this owner.
         self.sequence += 1
         path = self.logs / f"{self.sequence:03d}.log"
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -190,31 +191,75 @@ class Commands:
 
     def finish(self, process, path, *, seconds, allow_stop=False):
         failure, terminal = None, False
+        state, observed_time, deadline, log_size = None, None, None, None
         try:
+            # Optional closed observations of existing locals only. A diagnostic
+            # allocation/refusal cannot skip the original owned-group cleanup.
+            try:
+                state = {"finish_phase":"poll", "observed_terminal_status":None,
+                         "work_deadline_reached":False, "cleanup_phase":"not_started",
+                         "cleanup_exception":"none", "cleanup_errno":None, "cleanup_refusal_code":None}
+                self.command_settlement_state = state
+            except BaseException:
+                state = None
+                self.command_settlement_state = None
             deadline = time.monotonic() + seconds
             # Do not reap until owned-group cleanup proves empty. A poll or
             # log-bound failure is just as terminal for a build/signer command
             # as a deadline; every such failure must stop its retained group.
             while True:
+                if state is not None:state["finish_phase"] = "poll"
                 status = smoke.process_status(process)
+                if state is not None:state["observed_terminal_status"] = status
                 if status is not None:
                     terminal = True
                     break
-                require(path.lstat().st_size <= MAX_LOG and time.monotonic() < deadline)
+                if state is not None:state["finish_phase"] = "work_guard"
+                require((log_size := path.lstat().st_size) <= MAX_LOG
+                        and (observed_time := time.monotonic()) < deadline)
+                if state is not None:state["finish_phase"] = "sleep"
                 time.sleep(0.05)
-            require(path.lstat().st_size <= MAX_LOG and status == 0)
+            if state is not None:state["finish_phase"] = "exit_guard"
+            require((log_size := path.lstat().st_size) <= MAX_LOG and status == 0)
+            if state is not None:state["finish_phase"] = "complete"
         except BaseException as error:
             failure = error
+            if state is not None:
+                if state["finish_phase"] in {"work_guard", "exit_guard"} and log_size is not None and log_size > MAX_LOG:
+                    state["finish_phase"] = "log_bound"
+                if (state["finish_phase"] == "work_guard" and observed_time is not None
+                        and deadline is not None and observed_time >= deadline):
+                    state["finish_phase"] = "work_deadline"
+                    state["work_deadline_reached"] = True
         finally:
             # Nonactor tools may always be stopped through their still-owned
             # group. A live synthetic actor may own helpers in other groups:
             # preserve its monitor on failure, never substitute orphan PID kills.
             if allow_stop or terminal:
                 try:
+                    if state is not None:state["cleanup_phase"] = "group_stop"
                     owned.stop_group(process)
+                    if state is not None:state["cleanup_phase"] = "pending_release"
                     self.pending.remove(process)
+                    if state is not None:state["cleanup_phase"] = "complete"
                 except BaseException as error:
                     self.cleanup_failed = True
+                    try:
+                        if state is not None:
+                            state["cleanup_exception"] = {
+                                owned.DiagnosticFailure:"owned_refusal", subprocess.TimeoutExpired:"wait_timeout",
+                                subprocess.CalledProcessError:"command_error", PermissionError:"permission",
+                                ProcessLookupError:"process_missing", ChildProcessError:"child_process",
+                                OSError:"os_error", RuntimeError:"runtime_error", ValueError:"value_error",
+                                KeyboardInterrupt:"interrupted", SystemExit:"system_exit",
+                            }.get(type(error), "other")
+                            value = error.errno if type(error) in {OSError, PermissionError, ProcessLookupError, ChildProcessError} else None
+                            state["cleanup_errno"] = value if type(value) is int and 0 <= value <= 65535 else None
+                            # Only the exact reviewed class and its fixed stop_group refusal.
+                            code = error.code if type(error) is owned.DiagnosticFailure else None
+                            state["cleanup_refusal_code"] = code if type(code) is str and code == "process_remaining" else None
+                    except BaseException:
+                        self.command_settlement_state = None
                     if failure is None:
                         failure = error
         if failure is not None:
@@ -232,6 +277,7 @@ class Commands:
         return path
 
     def finish_actor(self, process, path, *, seconds=180, expected=0):
+        self.command_settlement_state = None  # This separate actor path has no finish() observation.
         # These fixed synthetic actors never create same-group descendants.
         # Observe/reap only this actual Popen; helper exit has its separate
         # retained kernel registration. This is not a group-drain assertion.
@@ -890,6 +936,33 @@ def scan_final_logs(commands, scanner, report):
     return final
 
 
+
+def command_settlement_diagnostic(state):
+    """Validate optional scalar observations; never consult a process or log."""
+    if (type(state) is not dict or set(state) != {"finish_phase", "observed_terminal_status",
+            "work_deadline_reached", "cleanup_phase", "cleanup_exception", "cleanup_errno", "cleanup_refusal_code"}):
+        return None
+    if (type(state["finish_phase"]) is not str or state["finish_phase"] not in
+            {"poll", "work_guard", "sleep", "exit_guard", "log_bound", "work_deadline", "complete"}
+            or type(state["work_deadline_reached"]) is not bool
+            or state["work_deadline_reached"] != (state["finish_phase"] == "work_deadline")
+            or type(state["cleanup_phase"]) is not str or state["cleanup_phase"] not in
+            {"not_started", "group_stop", "pending_release", "complete"}
+            or type(state["cleanup_exception"]) is not str or state["cleanup_exception"] not in
+            {"none", "owned_refusal", "wait_timeout", "command_error", "permission", "process_missing",
+             "child_process", "os_error", "runtime_error", "value_error", "interrupted", "system_exit", "other"}):
+        return None
+    status, number = state["observed_terminal_status"], state["cleanup_errno"]
+    if (status is not None and (type(status) is not int or not -255 <= status <= 255)
+            or number is not None and (type(number) is not int or not 0 <= number <= 65535)):
+        return None
+    code = state["cleanup_refusal_code"]
+    if code is not None and (type(code) is not str or code != "process_remaining"
+                             or state["cleanup_exception"] != "owned_refusal"):
+        return None
+    return dict(state)
+
+
 def log_gate_failure_diagnostic(commands, report):
     """Separate closed scanner execution facts from owned-process acceptance.
 
@@ -914,10 +987,14 @@ def log_gate_failure_diagnostic(commands, report):
     require(type(clean) is bool and type(commands.cleanup_failed) is bool
             and type(commands.pending) is list and type(commands.helper_observers) is list
             and len(commands.pending) <= 2**20 and len(commands.helper_observers) <= 2**20)
-    return {"schema": 1, "check": "macos_update_log_gate_diagnostic", "stage": report["stage"],
-            "scan_completed_clean": clean, "pending_commands": len(commands.pending),
-            "pending_helpers": len(commands.helper_observers), "cleanup_failed": commands.cleanup_failed,
-            **state}
+    result = {"schema": 1, "check": "macos_update_log_gate_diagnostic", "stage": report["stage"],
+              "scan_completed_clean": clean, "pending_commands": len(commands.pending),
+              "pending_helpers": len(commands.helper_observers), "cleanup_failed": commands.cleanup_failed,
+              **state}
+    observed = command_settlement_diagnostic(getattr(commands, "command_settlement_state", None))
+    if observed is not None:
+        result["command_settlement"] = observed
+    return result
 
 
 
