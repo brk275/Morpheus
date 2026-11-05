@@ -300,7 +300,7 @@ class ProcessTests(unittest.TestCase):
                 original_open = F.os.open
                 original_read = F.os.read
                 source_identity = ((root / "a.log").lstat().st_dev, (root / "a.log").lstat().st_ino)
-                replaced = {"source":False, "report_nonblocking":False, "partial_reads":0,
+                replaced = {"source":False, "report_opened":False, "partial_reads":0,
                             "unknown_snapshot":False}
                 def raced_read(descriptor, maximum):
                     info = F.os.fstat(descriptor)
@@ -318,8 +318,8 @@ class ProcessTests(unittest.TestCase):
                     return original_read(descriptor, maximum)
                 def raced_open(path, flags, *args, **options):
                     if action == "report_fifo" and path == "report.json":
-                        replaced["report_nonblocking"] = bool(flags & F.os.O_NONBLOCK)
-                        self.assertTrue(replaced["report_nonblocking"])
+                        replaced["report_opened"] = True
+                        self.fail("Unexpected snapshot FIFO must never be opened")
                     if action == "source_fifo_race" and path == "a.log" and not replaced["source"]:
                         self.assertTrue(flags & F.os.O_NONBLOCK)
                         (root / "a.log").unlink()
@@ -350,15 +350,13 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual(arguments[arguments.index("--max-decode-depth") + 1], "5")
                     self.assertEqual(arguments[arguments.index("--max-archive-depth") + 1], "0")
                     self.assertIn("--ignore-gitleaks-allow", arguments)
-                    report = Path(arguments[arguments.index("--report-path") + 1])
+                    self.assertEqual(arguments[arguments.index("--report-path") + 1], "-")
                     if action == "process_cleanup":
                         raise F.PrivateLogScanError(process_stopped=False)
                     if action == "report_fifo":
-                        report.unlink()
-                        F.os.mkfifo(report, 0o600)
-                    if action not in {"missing", "report_fifo"}:
-                        report.write_bytes(b"{bad" if action == "malformed" else
-                                           b'[{"RuleID":"synthetic"}]' if action == "finding" else b"[]\n")
+                        F.os.mkfifo(Path(cwd) / "report.json", 0o600)
+                    report_body = (b"" if action == "missing" else b"{bad" if action == "malformed" else
+                                   b'[{"RuleID":"synthetic"}]' if action == "finding" else b"[]\n")
                     if action == "source_changed": (root / "a.log").write_bytes(b"changed source")
                     if action == "source_added": P.client.write_new(root / "c.log", b"new unscanned original")
                     if action == "snapshot_changed": (data / "00000000.log").write_bytes(b"changed copy")
@@ -374,7 +372,7 @@ class ProcessTests(unittest.TestCase):
                     if action == "coverage_duplicate": footer += footer
                     if action == "coverage_malformed": footer = footer.replace(b"scanned ~", b"scanned ?")
                     return (1 if action == "finding" else 0,
-                            b"unexpected output" if action == "stdout" else b"",
+                            b"[]" + b" " * 4096 if action == "stdout" else report_body,
                             footer + b"partial scan warning" if action == "warning" else footer)
                 with mock.patch.object(F.tempfile, "mkdtemp", side_effect=allocate), \
                         mock.patch.object(F.os, "open", side_effect=raced_open), \
@@ -398,7 +396,7 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual((snapshots[0] / "data/00000000.log").read_bytes(),
                                      b"keep unknown replacement")
                 if action == "report_fifo":
-                    self.assertTrue(replaced["report_nonblocking"])
+                    self.assertFalse(replaced["report_opened"])
                 self.assertEqual(foreign.read_bytes(), b"preserve this unrelated fixture")
                 if action in {"snapshot_changed", "snapshot_extra", "process_cleanup", "report_fifo", "partial_copy_unknown_inode"}:
                     self.assertTrue(snapshots[0].exists())
@@ -428,9 +426,9 @@ class ProcessTests(unittest.TestCase):
             clock = {"value":10}
             def scanned(arguments, *, cwd, deadline):
                 self.assertIn(deadline, (11, 40))
-                Path(arguments[arguments.index("--report-path") + 1]).write_bytes(b"[]\n")
+                self.assertEqual(arguments[arguments.index("--report-path") + 1], "-")
                 if deadline == 11: clock["value"] = 12
-                return 0, b"", b"3:04PM INF scanned ~26 bytes (26 bytes) in 1ms\n3:04PM INF no leaks found\n"
+                return 0, b"[]\n", b"3:04PM INF scanned ~26 bytes (26 bytes) in 1ms\n3:04PM INF no leaks found\n"
             with mock.patch.object(P.time, "monotonic", side_effect=lambda: clock["value"]), \
                     mock.patch.object(F, "_run_log_scanner", side_effect=scanned) as scanner:
                 with self.assertRaises(P.PackageFailure):
