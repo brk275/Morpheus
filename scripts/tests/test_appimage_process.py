@@ -50,6 +50,112 @@ class FakeSelector:
 
 
 class ProcessTests(unittest.TestCase):
+    @unittest.skipUnless(P.os.name == "posix", "Linux full-log scan deadline")
+    def test_temporary_scan_deadline_only_tightens_default_and_never_accepts_partial_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = P.client.private_directory(Path(directory).resolve())
+            for name in ("a.log", "b.log"):
+                P.client.write_new(root / name, b"synthetic log")
+            with mock.patch.object(P.time, "monotonic", return_value=10), \
+                    mock.patch.object(P.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as scanner:
+                with self.assertRaises(P.PackageFailure):
+                    P.scan_private_logs(root, "/scanner", deadline=10)
+                scanner.assert_not_called()
+                P.scan_private_logs(root, "/scanner")
+                self.assertEqual(scanner.call_count, 2)
+                self.assertTrue(all(call.kwargs["timeout"] == 30 for call in scanner.call_args_list))
+            with mock.patch.object(P.time, "monotonic", side_effect=[10, 12]), \
+                    mock.patch.object(P.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as scanner:
+                with self.assertRaises(P.PackageFailure):
+                    P.scan_private_logs(root, "/scanner", deadline=11)
+                scanner.assert_called_once()
+                self.assertEqual(scanner.call_args.kwargs["timeout"], 1)
+
+
+    @unittest.skipUnless(P.os.name == "posix", "Linux private package log capture")
+    def test_temporary_inner_package_seal_owns_one_child_scans_all_output_and_refuses_failed_gates(self):
+        for action in ("valid", "scan_refusal", "aux_cleanup", "malformed", "child_exit"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
+                root = P.client.private_directory(Path(directory).resolve())
+                logs = P.client.private_directory(root / "command-logs")
+                stdout = b"synthetic-private-stdout" * 1000
+                stderr = b"synthetic-private-stderr" * 1000
+                for kind, body in (("stdout", stdout), ("stderr", stderr)):
+                    P.client.write_new(logs / ("0007-package." + kind + ".log"), body)
+                plan = {"revision": "b" * 40}
+                plan_path = root / "update-plan.json"
+                P.client.write_new(plan_path, json.dumps(plan).encode())
+                progress = P.diagnostics.Progress(root)
+                progress.wrapper("build"); progress.command("package")
+                refusal = M.CommandFailure("exit")
+                progress.failed(refusal)
+                original_failure = dict(progress.value["failure"])
+                runner = SimpleNamespace(last_stage="package", sequence=7, log_root=logs)
+                events = []
+                test = self
+                class Provider:
+                    def resolve(self, strict=False): return self
+                    def __str__(self): return "/opt/microsoft/powershell/7/pwsh"
+                provider = Provider()
+                def paths(value):
+                    return provider if str(value) == str(provider) else Path(value)
+                class Encoder:
+                    def __init__(self, log_root, progress):
+                        self.log_root = P.client.private_directory(log_root)
+                        self.progress = progress
+                    def run(self, stage, argv, **options):
+                        events.append("child")
+                        test.assertEqual(stage, "package")
+                        test.assertEqual(argv[:4], [str(provider), "-NoLogo", "-NoProfile", "-NonInteractive"])
+                        test.assertEqual(base64.b64decode(argv[-1]).decode("utf-16-le"), P._TEMP_SEALED_POWERSHELL)
+                        test.assertEqual(options["timeout"], 30)
+                        test.assertEqual(options["output_limit"], 192 * 1024)
+                        test.assertEqual(options["stderr_limit"], 65536)
+                        test.assertFalse(options.get("binary_output", False))
+                        test.assertEqual(options["env"]["DOTNET_CLI_TELEMETRY_OPTOUT"], "1")
+                        payload = json.loads(options["stdin_bytes"])
+                        test.assertLessEqual(len(options["stdin_bytes"]), 65536)
+                        for kind, body in (("stdout", stdout), ("stderr", stderr)):
+                            stream = payload["streams"][kind]
+                            test.assertEqual(base64.b64decode(stream["head_base64"]), body[:8192])
+                            test.assertEqual(base64.b64decode(stream["tail_base64"]), body[-8192:])
+                            test.assertEqual(stream["size"], len(body)); test.assertTrue(stream["truncated"])
+                        test.assertEqual(payload["source_revision"], "b" * 40)
+                        test.assertEqual(payload["run_id"], 41956870809)
+                        count = (len(options["stdin_bytes"]) + 317) // 318
+                        raw = ("".join(f"{i}:{count}:" + "A" * 768 + "\n" for i in range(count))).encode()
+                        if action == "malformed": raw = b"private-malformed-output"
+                        P.client.write_new(self.log_root / "0001-package.stdout.log", raw)
+                        P.client.write_new(self.log_root / "0001-package.stderr.log", b"")
+                        if action == "aux_cleanup":
+                            self.progress.cleanup(False)
+                            raise M.CommandFailure("cleanup")
+                        if action == "child_exit": raise M.CommandFailure("exit")
+                        return raw
+                def scan(selected_root, scanner, *, deadline):
+                    events.append("scan")
+                    self.assertEqual(selected_root, root); self.assertEqual(deadline, 130)
+                    self.assertTrue((root / "sealed-package/command-logs/0001-package.stdout.log").is_file())
+                    self.assertFalse((root / "sealed-package.json").exists())
+                    if action == "scan_refusal": raise P.PackageFailure("scan")
+                def owned_tool(value, **options):
+                    if value is provider:
+                        self.assertIs(options.get("root_owned"), True)
+                    return str(value)
+                with mock.patch.object(P, "Path", side_effect=paths), \
+                        mock.patch.object(P, "owned_tool", side_effect=owned_tool), \
+                        mock.patch.object(P, "expected_revision", return_value="b" * 40), \
+                        mock.patch.dict(P.os.environ, {"GITHUB_RUN_ID": "41956870809"}), \
+                        mock.patch.object(P.time, "monotonic", return_value=10), \
+                        mock.patch.object(P, "OwnedRunner", Encoder), \
+                        mock.patch.object(P, "scan_private_logs", side_effect=scan):
+                    scanned = P._temporary_seal_package(root, plan_path, plan, runner, progress, refusal, True, "/scanner")
+                self.assertEqual(events, ["child", "scan"])
+                self.assertEqual(scanned, action not in {"scan_refusal", "aux_cleanup"})
+                self.assertEqual((root / "sealed-package.json").exists(), action == "valid")
+                self.assertEqual(progress.value["failure"], original_failure)
+
+
     def invoke(self, root, *, stdout=b"okay", stderr=b"private", limit=4096, binary=False,
                timeout=10, status=0, cleanup_error=None, interrupt=False, progress=None,
                stdin_bytes=None, stderr_limit=8 * 1024 * 1024, expected_status=(0,), archive_revision=None):

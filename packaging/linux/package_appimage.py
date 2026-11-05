@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / "scripts"))
 import appimage_client as client
 import appimage_runtime_build as runtime_builder
-from appimage_process import OwnedRunner, download_package_input as download
+from appimage_process import CommandFailure, OwnedRunner, download_package_input as download
 import appimage_diagnostics as diagnostics
 import element_process_namespace as containment
 from package import package_config
@@ -251,7 +251,7 @@ def bounded_file_log(path, maximum=8 * 1024 * 1024):
     return client.read_regular(path, maximum)
 
 
-def scan_private_logs(root, scanner):
+def scan_private_logs(root, scanner, *, deadline=None):
     # Child logs are private even after a clean scan. A scan does not prove an
     # arbitrary server error is safe to print; publish only our fixed receipt.
     # An independently specified default configuration and empty ignore file
@@ -264,11 +264,14 @@ def scan_private_logs(root, scanner):
         for path in sorted(root.rglob("*.log")):
             try:
                 value = bounded_file_log(path)
+                seconds = 30 if deadline is None else min(30, deadline - time.monotonic())
+                if seconds <= 0:
+                    raise PackageFailure("scan")
                 result = subprocess.run([scanner, "stdin", "--config", str(scan / "gitleaks.toml"),
                                         "--gitleaks-ignore-path", str(scan / "empty.ignore"),
                                         "--redact=100", "--ignore-gitleaks-allow", "--no-banner"],
                                         input=value, cwd=scan, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL, timeout=30, check=False)
+                                        stderr=subprocess.DEVNULL, timeout=seconds, check=False)
                 if result.returncode:
                     failed = True
             except (PackageFailure, OSError, subprocess.SubprocessError):
@@ -586,6 +589,110 @@ def validate_update_parameters(update):
         raise PackageFailure("identity")
 
 
+# TEMPORARY ONE-SHOT PRIVATE DIAGNOSTIC: NEVER MERGE INTO PRODUCT.
+_TEMP_SEALED_BASE = "a31f0120a394b43e08e6b5cad7b7680896618d12"
+_TEMP_SEALED_RECIPIENT = "981b3084f72673f04254de615651b7c8847f1c7823070c981bf92868c16fb70a"
+_TEMP_SEALED_POWERSHELL = "$ErrorActionPreference='Stop'\n$ProgressPreference='SilentlyContinue'\n$PSModuleAutoLoadingPreference='None'\n$rsa=$null\ntry {\n  $parameters=[System.Security.Cryptography.RSAParameters]::new()\n  $parameters.Modulus=[Convert]::FromBase64String('o87QianqKagsPqe7OXHtChurVX8CiCBNJBWylbmuGhs3xMsgy/MfO+9Y/gCbguGk53rDsXHcefhiSns2WoXq+KVAG/14+zSzIF+H33M+yUo4wFwH/kBKMz2/VYq6MEFOJwmjgrtNW8gJ3VK1KGjTMjJBK8aBwsrfM0ACgYBwQIwZi3Rmt94z27tAqL6KE3EfsRk3TGnZr1IeLGv8/gtRT3sJVPwH6CP1/VTl3kAd+IBh69rduTFNnZeUZEz+c6QvYA7ijzhxuOEIiJFLJYRidgRlLg/t8lcI9BNLAhmq2ngxCoUvkcAs6TJ/EuzU8crJGw7KV09tVpY70X6ukphAMoPngwm74pvwp2yN3B5P2VrylFUZAZv9RrcpKKl9VF+TkttIjSEws/chyJYrxqcLiqo3BfjTdNUBqxYjOPsRjkNTLHeJFFHdU3lkNWNK7qGdINAhMN+HQLcCwT0N4y0dqpls45sCHkkOvj27PI6H1tQFQX/FsjOFN90J/3riEaCd')\n  $parameters.Exponent=[Convert]::FromBase64String('AQAB')\n  if ($parameters.Modulus.Length -ne 384) { exit 2 }\n  $rsa=[System.Security.Cryptography.RSA]::Create()\n  $rsa.ImportParameters($parameters)\n  if ($rsa.KeySize -ne 3072) { exit 2 }\n  $reader=[System.IO.BinaryReader]::new([Console]::OpenStandardInput())\n  $data=$reader.ReadBytes(65537)\n  if ($data.Length -eq 0 -or $data.Length -gt 65536) { exit 2 }\n  $count=[int][Math]::Ceiling($data.Length/318.0)\n  for ($i=0;$i -lt $count;$i++) {\n    $length=[Math]::Min(318,$data.Length-$i*318)\n    $chunk=[byte[]]::new($length)\n    [Array]::Copy($data,$i*318,$chunk,0,$length)\n    $sealed=$rsa.Encrypt($chunk,[System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)\n    if ($sealed.Length -ne 384) { exit 2 }\n    [Console]::Out.WriteLine(('{0}:{1}:{2}' -f $i,$count,[Convert]::ToHexString($sealed)))\n  }\n} catch { exit 2 } finally { if ($null -ne $rsa) { $rsa.Dispose() } }\n"
+
+
+def _temporary_seal_package(root, plan_path, plan, runner, progress, failed, scan_passed, scanner):
+    """Seal only the failed inner packager streams; never emit private bytes."""
+    if (scan_passed is not True or type(failed) is not CommandFailure or failed.reason != "exit"
+            or runner.last_stage != "package" or not diagnostics.valid_record(progress.value)
+            or progress.value["inner_cleanup"] == "failed"
+            or progress.value["failure"] is None
+            or progress.value["failure"]["command_stage"] != "package"
+            or progress.value["failure"]["reason"] != "command_exit"):
+        return scan_passed
+    try:
+        revision = expected_revision(os.environ)
+        run = os.environ.get("GITHUB_RUN_ID")
+        if (revision != plan["revision"] or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+                or type(run) is not str or re.fullmatch(r"[1-9][0-9]{0,18}", run) is None
+                or not 0 < int(run) < 2**63):
+            return scan_passed
+        # Resolve exactly the preinstalled provider executable, not PATH/tool installs.
+        program = Path("/opt/microsoft/powershell/7/pwsh")
+        if program.resolve(strict=True) != program:
+            return scan_passed
+        pwsh = owned_tool(program, root_owned=True)
+        if Path(plan_path).parent != root or Path(plan_path).name != "update-plan.json":
+            return scan_passed
+        plan_digest = hashlib.sha256(client.read_regular(plan_path, 32768)).hexdigest()
+        streams = {}
+        for kind in ("stdout", "stderr"):
+            path = runner.log_root / f"{runner.sequence:04d}-package.{kind}.log"
+            if path.parent != root / "command-logs" or path.resolve(strict=True) != path:
+                return scan_passed
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+                return scan_passed
+            data = bounded_file_log(path)
+            streams[kind] = {"size": len(data), "truncated": len(data) > 16384,
+                             "head_base64": base64.b64encode(data[:8192]).decode("ascii"),
+                             "tail_base64": base64.b64encode(data[-8192:] if len(data) > 8192 else b"").decode("ascii")}
+        payload = json.dumps({"schema": 1, "canary": "morpheus-private-linux-package-diagnostic-20261104",
+                              "base_revision": _TEMP_SEALED_BASE, "source_revision": revision,
+                              "run_id": int(run), "plan_sha256": plan_digest,
+                              "streams": streams}, separators=(",", ":")).encode("ascii")
+        if not 0 < len(payload) <= 65536:
+            return scan_passed
+        auxiliary = client.private_directory(root / "sealed-package")
+        home = client.private_directory(auxiliary / "home")
+        temporary = client.private_directory(auxiliary / "tmp")
+        observed = diagnostics.Progress(auxiliary)
+        encoder = OwnedRunner(auxiliary / "command-logs", progress=observed)
+        environment = {"PATH": "/usr/bin:/bin", "HOME": str(home), "TMPDIR": str(temporary),
+                       "POWERSHELL_TELEMETRY_OPTOUT": "1", "POWERSHELL_UPDATECHECK": "Off",
+                       "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+                       "POWERSHELL_DISTRIBUTION_CHANNEL": "GitHub-Actions-ubuntu24"}
+        deadline = time.monotonic() + 120
+        # Original 3300s namespace and 6900s outer limits still enclose this work.
+        # From here all new child output must join a fresh complete default scan.
+        scan_passed = False
+        encoded = base64.b64encode(_TEMP_SEALED_POWERSHELL.encode("utf-16-le")).decode("ascii")
+        raw = None
+        try:
+            raw = encoder.run("package", [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                              cwd=auxiliary, env=environment, timeout=min(30, deadline - time.monotonic()),
+                              output_limit=192 * 1024, stderr_limit=65536, stdin_bytes=payload)
+        except BaseException:
+            pass
+        finally:
+            # Include stdout even on malformed/failed encoder output. No bytes
+            # are interpreted until all original and auxiliary logs scan clean.
+            try:
+                scan_private_logs(root, owned_tool(scanner), deadline=deadline)
+                scan_passed = observed.value["inner_cleanup"] != "failed"
+            except BaseException:
+                scan_passed = False
+        if raw is None or scan_passed is not True:
+            return scan_passed
+        count = (len(payload) + 317) // 318
+        lines = raw.decode("ascii").splitlines()
+        if (not 1 <= count <= 207 or len(lines) != count
+                or observed.value["inner_cleanup"] == "failed"):
+            return scan_passed
+        blocks = []
+        for index, line in enumerate(lines):
+            match = re.fullmatch(r"([0-9]{1,3}):([0-9]{1,3}):([0-9A-F]{768})", line)
+            if match is None or int(match[1]) != index or int(match[2]) != count:
+                return scan_passed
+            blocks.append(match[3])
+        if (observed.value["inner_cleanup"] == "failed" or time.monotonic() > deadline):
+            return scan_passed
+        # Ciphertext only. The parent authenticates this exact plan/root and emits
+        # it only after namespace, full outer scan, certificate/key and root cleanup.
+        handoff = {"schema": 1, "recipient": _TEMP_SEALED_RECIPIENT,
+                   "base_revision": _TEMP_SEALED_BASE, "source_revision": revision,
+                   "run_id": int(run), "plan_sha256": plan_digest,
+                   "stopped_and_rescanned": True, "blocks": blocks}
+        client.write_new(root / "sealed-package.json", json.dumps(handoff, separators=(",", ":")).encode("ascii"))
+    except BaseException:
+        pass  # The original package refusal is never replaced by diagnostic failure.
+    return scan_passed
+
+
 def update_build(plan_path, scanner):
     """Private build-only capability for the unchanged installed update gate.
 
@@ -626,6 +733,7 @@ def update_build(plan_path, scanner):
     progress = diagnostics.Progress(root)
     failed = None
     scan_passed = False
+    runner = None
     try:
         if plan_path.name != "update-plan.json":
             raise PackageFailure("configuration")
@@ -683,6 +791,11 @@ def update_build(plan_path, scanner):
             if failed is None:
                 failed = error
     if failed is not None:
+        if runner is not None:
+            try:
+                scan_passed = _temporary_seal_package(root, plan_path, plan, runner, progress, failed, scan_passed, scanner)
+            except BaseException:
+                scan_passed = False  # Diagnostic setup cannot replace the original package refusal.
         facts = diagnostics.public_failure(root, scan_passed=scan_passed,
                     outer_cleanup="not_started", outer_reason=diagnostics.reason(failed))
         print("MORPHEUS_APPIMAGE_RESULT " + json.dumps(facts, sort_keys=True), file=sys.stderr)

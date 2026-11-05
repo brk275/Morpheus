@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -28,6 +29,55 @@ def image(path, version="0.1.0-updateqa.2"):
 
 
 class AppImageAcceptanceTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "Linux ciphertext handoff identity")
+    def test_temporary_sealed_package_handoff_binds_plan_and_emits_only_after_stopped_scanned_removed_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = target.private_directory(Path(directory).resolve())
+            commands = target.Commands(root, {"GITHUB_RUN_ID": "41956870809"})
+            commands.reviewed_revision = "b" * 40
+            commands._temporary_package_stopped = True
+            target.private_directory(root / "artifacts")
+            build_root = target.private_directory(root / "artifacts/0.1.0-updateqa.1")
+            plan_path = build_root / "update-plan.json"
+            plan = json.dumps({"revision": commands.reviewed_revision})
+            target.write_private(plan_path, plan, create=True)
+            good = {"schema": 1, "recipient": target._TEMP_SEALED_RECIPIENT,
+                    "base_revision": target._TEMP_SEALED_BASE, "source_revision": "b" * 40,
+                    "run_id": 41956870809, "plan_sha256": hashlib.sha256(plan.encode()).hexdigest(),
+                    "stopped_and_rescanned": True, "blocks": ["A" * 768]}
+            path = build_root / "sealed-package.json"
+            for change in ({"source_revision": "c" * 40}, {"run_id": True}, {"plan_sha256": "0" * 64},
+                           {"blocks": ["private-body"]}, {"blocks": ["A" * 768] * 208},
+                           {"stopped_and_rescanned": False}, {"schema": True}, {"private_path": "body"}):
+                target.write_private(path, json.dumps(good | change))
+                with self.assertRaises(target.QAError):
+                    target._temporary_read_sealed_package(commands, build_root, plan_path)
+            target.write_private(path, json.dumps(good))
+            commands._temporary_package_handoff = target._temporary_read_sealed_package(commands, build_root, plan_path)
+            error = target.QAError("command_failed", operation="package_build", stage="build_old", exit_status=1)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                target._temporary_emit_sealed_package(commands, error, True)
+            self.assertEqual(output.getvalue(), "", "existing private root forbids publication")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            target._temporary_emit_sealed_package(commands, error, False)
+            commands._temporary_package_stopped = False
+            target._temporary_emit_sealed_package(commands, error, True)
+            commands._temporary_package_stopped = True
+            commands._temporary_package_handoff = good | {"blocks": ["private-body"]}
+            target._temporary_emit_sealed_package(commands, error, True)
+        self.assertEqual(output.getvalue(), "")
+        commands._temporary_package_handoff = good
+        with contextlib.redirect_stdout(output):
+            target._temporary_emit_sealed_package(commands, error, True)
+        line, = output.getvalue().splitlines()
+        frame = json.loads(line.removeprefix("MORPHEUS_APPIMAGE_SEALED_PACKAGE "))
+        self.assertEqual(frame["ciphertext_hex"], "A" * 768)
+        self.assertEqual((frame["sequence"], frame["count"], frame["run_id"]), (0, 1, 41956870809))
+        self.assertNotIn(str(root), output.getvalue()); self.assertNotIn("private-body", output.getvalue())
+
+
     def test_published_identity_is_bounded_exact_and_distinguishes_negative_payload(self):
         artifacts = [{"version": f"0.1.0-updateqa.{i}", "sha256": str(i) * 64, "persistence": "a" * 64} for i in (1, 2)]
         record = target.identity_record("b" * 40, artifacts, "c" * 64, "d" * 64)

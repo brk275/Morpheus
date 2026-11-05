@@ -19,6 +19,7 @@ import runpy
 import shutil
 import signal
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -262,6 +263,8 @@ class Commands:
         self.deadline = time.monotonic() + 6900
         self.sequence = 0
         self.stage = "preflight"
+        self._temporary_package_stopped = False
+        self._temporary_package_handoff = None
 
     def mark(self, stage):
         require(stage in STAGES)
@@ -271,6 +274,9 @@ class Commands:
     def run(self, args, *, env=None, cwd=None, seconds=180, operation=None):
         require(operation is None or operation in OPERATIONS)
         operation = operation or operation_code(args)
+        if operation == "package_build":
+            self._temporary_package_stopped = False
+            self._temporary_package_handoff = None
         self.sequence += 1
         timeout = min(seconds, self.deadline - time.monotonic())
         require(timeout > 0)
@@ -286,6 +292,8 @@ class Commands:
                 raise QAError("command_deadline", operation=operation) from None
         finally:
             stop_owned(process)
+            if operation == "package_build":
+                self._temporary_package_stopped = True
         if result != 0:
             # Only an allowlisted child's fixed diagnostics may cross this
             # boundary; raw compiler/server/app messages remain private.
@@ -472,7 +480,107 @@ def package_build_environment(environment):
                "GITHUB_REF", "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH", "GITHUB_SHA", "GITHUB_ACTOR",
                "GITHUB_ACTOR_ID", "GITHUB_TRIGGERING_ACTOR", "MORPHEUS_PACKAGE_SOURCE_REVISION",
                "MORPHEUS_FREE_HOSTED_UPDATE_QA"}
-    return {name: value for name, value in environment.items() if name in allowed}
+    result = {name: value for name, value in environment.items() if name in allowed}
+    # TEMP: this one public provider ID enters only with its strict positive type.
+    run = environment.get("GITHUB_RUN_ID")
+    if run is not None:
+        require(type(run) is str and re.fullmatch(r"[1-9][0-9]{0,18}", run) is not None
+                and 0 < int(run) < 2**63, "artifact_identity")
+        result["GITHUB_RUN_ID"] = run
+    return result
+
+
+# TEMPORARY ONE-SHOT PRIVATE DIAGNOSTIC: NEVER MERGE INTO PRODUCT.
+_TEMP_SEALED_BASE = "a31f0120a394b43e08e6b5cad7b7680896618d12"
+_TEMP_SEALED_RECIPIENT = "981b3084f72673f04254de615651b7c8847f1c7823070c981bf92868c16fb70a"
+
+
+def _temporary_read_sealed_package(commands, build_root, plan_path):
+    """Read ciphertext only, after the exact original namespace command stopped."""
+    require(commands._temporary_package_stopped is True, "artifact_identity")
+    root = commands.root
+    require(build_root.parent == root / "artifacts" and plan_path == build_root / "update-plan.json", "artifact_identity")
+    for directory in (root, root / "artifacts", build_root):
+        info = directory.lstat()
+        require(directory.resolve(strict=True) == directory and stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid() and info.st_mode & 0o077 == 0, "artifact_identity")
+    path = build_root / "sealed-package.json"
+    def read_private_file(selected, maximum):
+        descriptor = os.open(selected, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            before = os.fstat(descriptor)
+            require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
+                    and before.st_mode & 0o077 == 0 and before.st_nlink == 1
+                    and 0 < before.st_size <= maximum, "artifact_identity")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                data = stream.read(maximum + 1)
+            def identity(info):
+                return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                        info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            require(len(data) == before.st_size and identity(before) == identity(os.fstat(descriptor))
+                    and identity(before) == identity(selected.lstat()), "artifact_identity")
+            return data
+        finally:
+            os.close(descriptor)
+    data = read_private_file(path, 192 * 1024)
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, "artifact_identity")
+            value[key] = item
+        return value
+    value = json.loads(data, object_pairs_hook=unique)
+    keys = {"schema", "recipient", "base_revision", "source_revision", "run_id", "plan_sha256",
+            "stopped_and_rescanned", "blocks"}
+    run = commands.env.get("GITHUB_RUN_ID")
+    require(type(run) is str and re.fullmatch(r"[1-9][0-9]{0,18}", run) is not None
+            and 0 < int(run) < 2**63, "artifact_identity")
+    require(type(value) is dict and set(value) == keys and type(value["schema"]) is int and value["schema"] == 1
+            and value["recipient"] == _TEMP_SEALED_RECIPIENT and value["base_revision"] == _TEMP_SEALED_BASE
+            and value["source_revision"] == commands.reviewed_revision
+            and re.fullmatch(r"[0-9a-f]{40}", value["source_revision"]) is not None
+            and type(value["run_id"]) is int and value["run_id"] == int(run)
+            and value["stopped_and_rescanned"] is True, "artifact_identity")
+    require(plan_path.resolve(strict=True) == plan_path, "artifact_identity")
+    plan_data = read_private_file(plan_path, 32768)
+    require(type(value["plan_sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", value["plan_sha256"]) is not None
+            and value["plan_sha256"] == hashlib.sha256(plan_data).hexdigest(), "artifact_identity")
+    blocks = value["blocks"]
+    require(type(blocks) is list and 1 <= len(blocks) <= 207
+            and all(type(block) is str and re.fullmatch(r"[0-9A-F]{768}", block) is not None for block in blocks),
+            "artifact_identity")
+    return value
+
+
+def _temporary_emit_sealed_package(commands, error, scanned):
+    """Publish ciphertext only after the original complete outer cleanup."""
+    if (scanned is not True or type(error) is not QAError or error.reason != "command_failed"
+            or error.operation != "package_build" or error.stage not in {"build_old", "build_new"}
+            or type(error.exit_status) is not int or not -64 <= error.exit_status <= 255 or error.exit_status == 0
+            or commands._temporary_package_stopped is not True or commands.root.exists()):
+        return
+    value = commands._temporary_package_handoff
+    run = commands.env.get("GITHUB_RUN_ID")
+    if (type(value) is not dict or set(value) != {"schema", "recipient", "base_revision", "source_revision",
+            "run_id", "plan_sha256", "stopped_and_rescanned", "blocks"}
+            or type(value["schema"]) is not int or value["schema"] != 1
+            or value["recipient"] != _TEMP_SEALED_RECIPIENT or value["base_revision"] != _TEMP_SEALED_BASE
+            or type(value["source_revision"]) is not str or value["source_revision"] != commands.reviewed_revision
+            or re.fullmatch(r"[0-9a-f]{40}", value["source_revision"]) is None
+            or type(run) is not str or re.fullmatch(r"[1-9][0-9]{0,18}", run) is None
+            or type(value["run_id"]) is not int or value["run_id"] != int(run) or not 0 < int(run) < 2**63
+            or type(value["plan_sha256"]) is not str or re.fullmatch(r"[0-9a-f]{64}", value["plan_sha256"]) is None
+            or value["stopped_and_rescanned"] is not True or type(value["blocks"]) is not list
+            or not 1 <= len(value["blocks"]) <= 207
+            or any(type(block) is not str or re.fullmatch(r"[0-9A-F]{768}", block) is None for block in value["blocks"])):
+        return
+    count = len(value["blocks"])
+    for sequence, block in enumerate(value["blocks"]):
+        print("MORPHEUS_APPIMAGE_SEALED_PACKAGE " + json.dumps({
+            "schema": 1, "recipient": value["recipient"], "base_revision": value["base_revision"],
+            "source_revision": value["source_revision"], "run_id": value["run_id"],
+            "plan_sha256": value["plan_sha256"], "sequence": sequence, "count": count,
+            "ciphertext_hex": block}, separators=(",", ":")), flush=True)
 
 
 def build_image(commands, source, target, version, feed, public_key):
@@ -491,7 +599,14 @@ def build_image(commands, source, target, version, feed, public_key):
                   str(source / "packaging/linux/package_appimage.py"),
                   "--update-build-plan", str(plan_path), "--gitleaks", commands.gitleaks],
                   build_root / "namespace", environment)
-    commands.run(invocation, cwd=source, seconds=3300, env=environment, operation="package_build")
+    try:
+        commands.run(invocation, cwd=source, seconds=3300, env=environment, operation="package_build")
+    except BaseException:
+        try:
+            commands._temporary_package_handoff = _temporary_read_sealed_package(commands, build_root, plan_path)
+        except BaseException:
+            pass  # Malformed/missing ciphertext cannot replace the original refusal.
+        raise
     destination = build_root / "packages"
     helper = runpy.run_path(str(source / "scripts/prepare_appimage_update.py"))
     # Inspect the just-built local binary before any signing/download, using its
@@ -677,75 +792,86 @@ def execute(args):
     target = Path(args.target_dir).resolve()
     target.mkdir(parents=True, exist_ok=True)
     checks = set()
-    with tempfile.TemporaryDirectory(prefix="morpheus-installed-update-") as temporary:
-        commands = Commands(Path(temporary))
-        commands.gitleaks = args.gitleaks
-        certificate, feed = Certificate(commands), None
-        try:
-            commands.mark("preflight")
-            require("0.11.8" in commands.run(["cargo", "packager", "--version"]).split())
-            source, revision = export_source(commands, Path(args.source).resolve())
-            versions = app_versions(source)
-            commands.mark("key_generation")
-            key, wrong_key = generate_key(commands, "signing.key"), generate_key(commands, "wrong.key")
-            public_key = key.with_name(key.name + ".pub").read_text().strip()
-            commands.mark("certificate")
-            certificate.create()
-            feed = Feed(certificate)
-            # Ordinary system-root validation, without custom client CA options.
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(feed.url + "/feed.json", timeout=10) as response:
-                require(response.status == 204)
-            checks.add("https_system_trust")
-            commands.mark("build_old")
-            old, old_meta = build_image(commands, source, target, versions[0], feed.url + "/feed.json", public_key)
-            commands.mark("build_new")
-            new, new_meta = build_image(commands, source, target, versions[1], feed.url + "/feed.json", public_key)
-            require({k: v for k, v in old_meta.items() if k != "version"} == {k: v for k, v in new_meta.items() if k != "version"}, "cohort_mismatch")
-            artifact_evidence = [{"version": metadata["version"], "sha256": sha256(image),
-                                  "persistence": metadata["persistence"]}
-                                 for image, metadata in ((old, old_meta), (new, new_meta))]
-            checks.add("cohort_equal")
-            commands.mark("signing")
-            sign(commands, old, key)
-            valid_signature = sign(commands, new, key)
-            wrong = commands.root / "wrong-key.AppImage"
-            shutil.copyfile(new, wrong)
-            wrong_signature = sign(commands, wrong, wrong_key)
-            invalid = commands.root / "signed-invalid-elf.AppImage"
-            invalid_elf_copy(new, invalid)
-            invalid_signature = sign(commands, invalid, key)
-            identity = identity_record(revision, artifact_evidence, sha256(invalid),
-                                       hashlib.sha256(public_key.encode()).hexdigest())
-            checks.add("official_signer")
-            commands.mark("containment")
-            commands.run(["/usr/bin/python3", str(ROOT / "scripts/element_process_namespace.py"), "--check",
-                          str(commands.root / "containment")], seconds=60)
-            for case in CASES:
-                image = invalid if case == "signed_invalid_elf_rollback" else new
-                signature = wrong_signature if case == "invalid_signature" else invalid_signature if case == "signed_invalid_elf_rollback" else valid_signature
-                run_case(commands, case, old, image, signature, feed, versions[1])
-                checks.add(case)
-        except BaseException as error:
-            safe = error if isinstance(error, QAError) else QAError()
-            safe.stage = commands.stage
-            raise safe from None
-        finally:
-            commands.mark("cleanup")
-            # Teardown retains its own finite budget even if the run deadline
-            # was exhausted. Never leave the runner's temporary CA installed
-            # merely because a build or UI operation consumed its allowance.
-            commands.deadline = max(commands.deadline, time.monotonic() + 300)
+    commands = None
+    outer_scan_passed = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="morpheus-installed-update-") as temporary:
+            commands = Commands(Path(temporary))
+            commands.gitleaks = args.gitleaks
+            certificate, feed = Certificate(commands), None
             try:
-                if feed is not None:
-                    feed.close()
+                commands.mark("preflight")
+                require("0.11.8" in commands.run(["cargo", "packager", "--version"]).split())
+                source, revision = export_source(commands, Path(args.source).resolve())
+                versions = app_versions(source)
+                commands.mark("key_generation")
+                key, wrong_key = generate_key(commands, "signing.key"), generate_key(commands, "wrong.key")
+                public_key = key.with_name(key.name + ".pub").read_text().strip()
+                commands.mark("certificate")
+                certificate.create()
+                feed = Feed(certificate)
+                # Ordinary system-root validation, without custom client CA options.
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(feed.url + "/feed.json", timeout=10) as response:
+                    require(response.status == 204)
+                checks.add("https_system_trust")
+                commands.mark("build_old")
+                old, old_meta = build_image(commands, source, target, versions[0], feed.url + "/feed.json", public_key)
+                commands.mark("build_new")
+                new, new_meta = build_image(commands, source, target, versions[1], feed.url + "/feed.json", public_key)
+                require({k: v for k, v in old_meta.items() if k != "version"} == {k: v for k, v in new_meta.items() if k != "version"}, "cohort_mismatch")
+                artifact_evidence = [{"version": metadata["version"], "sha256": sha256(image),
+                                      "persistence": metadata["persistence"]}
+                                     for image, metadata in ((old, old_meta), (new, new_meta))]
+                checks.add("cohort_equal")
+                commands.mark("signing")
+                sign(commands, old, key)
+                valid_signature = sign(commands, new, key)
+                wrong = commands.root / "wrong-key.AppImage"
+                shutil.copyfile(new, wrong)
+                wrong_signature = sign(commands, wrong, wrong_key)
+                invalid = commands.root / "signed-invalid-elf.AppImage"
+                invalid_elf_copy(new, invalid)
+                invalid_signature = sign(commands, invalid, key)
+                identity = identity_record(revision, artifact_evidence, sha256(invalid),
+                                           hashlib.sha256(public_key.encode()).hexdigest())
+                checks.add("official_signer")
+                commands.mark("containment")
+                commands.run(["/usr/bin/python3", str(ROOT / "scripts/element_process_namespace.py"), "--check",
+                              str(commands.root / "containment")], seconds=60)
+                for case in CASES:
+                    image = invalid if case == "signed_invalid_elf_rollback" else new
+                    signature = wrong_signature if case == "invalid_signature" else invalid_signature if case == "signed_invalid_elf_rollback" else valid_signature
+                    run_case(commands, case, old, image, signature, feed, versions[1])
+                    checks.add(case)
+            except BaseException as error:
+                safe = error if isinstance(error, QAError) else QAError()
+                safe.stage = commands.stage
+                raise safe from None
             finally:
+                commands.mark("cleanup")
+                # Teardown retains its own finite budget even if the run deadline
+                # was exhausted. Never leave the runner's temporary CA installed
+                # merely because a build or UI operation consumed its allowance.
+                commands.deadline = max(commands.deadline, time.monotonic() + 300)
                 try:
-                    certificate.close()
+                    if feed is not None:
+                        feed.close()
                 finally:
-                    commands.mark("log_scan")
-                    commands.scan(args.gitleaks)
-        checks.add("private_cleanup")
+                    try:
+                        certificate.close()
+                    finally:
+                        commands.mark("log_scan")
+                        commands.scan(args.gitleaks)
+                        outer_scan_passed = True
+            checks.add("private_cleanup")
+    except BaseException as error:
+        try:
+            if commands is not None:
+                _temporary_emit_sealed_package(commands, error, outer_scan_passed)
+        except BaseException:
+            pass  # Best-effort observation never replaces original failure/cleanup.
+        raise
     require(checks == CHECKS)
     print("MORPHEUS_APPIMAGE_QA_IDENTITY " + json.dumps(identity, separators=(",", ":")), flush=True)
     for check in sorted(checks):
