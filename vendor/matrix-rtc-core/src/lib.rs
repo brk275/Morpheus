@@ -1094,7 +1094,9 @@ mod tests {
                         assert_eq!(unsupported.transport_type, "unknown_transport");
                         assert!(unsupported.extra_fields.contains_key("custom_field"));
                     }
-                    RtcTransport::LiveKit(_) => panic!("Expected Unsupported transport"),
+                    RtcTransport::LiveKit(_) | RtcTransport::LiveKitCsApi(_) => {
+                        panic!("Expected Unsupported transport")
+                    }
                 }
             }
             RtcMembershipEvent::Left(_) => panic!("Expected Joined membership"),
