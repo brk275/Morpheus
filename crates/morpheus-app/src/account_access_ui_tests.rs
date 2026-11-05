@@ -14395,8 +14395,11 @@ async fn assert_font_browser(ui: &AppWindow, directory: &std::path::Path) {
         ui.set_appearance_mono_font_input("Draft monospace".into());
         assert!(ui.get_appearance_fonts_dirty());
         let mut expected = font_inputs(ui);
+        // Use the production navigation boundary even when leaving and
+        // returning in one event: it retires the mounted Settings handoff.
+        ui.invoke_navigate_page(0);
+        assert!(!ui.get_settings_controls_mounted());
         // A direct browser save normalizes the selected role only.
-        ui.set_page(0);
         ui.invoke_font_browser_show(role);
         ui.invoke_font_browser_use(format!(" {family} ").into());
         expected[role as usize] = family.into();
@@ -14491,7 +14494,8 @@ async fn assert_font_browser(ui: &AppWindow, directory: &std::path::Path) {
     ui.set_appearance_mono_font_input("Unapplied monospace".into());
     let mut no_op_inputs = font_inputs(ui);
     let before_no_op = std::fs::read(store.path()).unwrap();
-    ui.set_page(0);
+    ui.invoke_navigate_page(0);
+    assert!(!ui.get_settings_controls_mounted());
     ui.invoke_font_browser_show(0);
     ui.invoke_font_browser_use(inherited.appearance.font_family.as_str().into());
     no_op_inputs[0] = inherited.appearance.font_family.as_str().into();
