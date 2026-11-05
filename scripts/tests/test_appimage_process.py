@@ -1,4 +1,4 @@
-"""Pure/mocked command ownership checks; no child process or service is run."""
+"""Mocked command checks; explicit hosted opt-in also checks the real sealed-log provider."""
 
 import importlib.util
 import base64
@@ -15,6 +15,165 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "packaging/linux"))
 import appimage_process as M
 import package_appimage as P
+
+
+def _temporary_real_seal_provider(test):
+    """Opt-in hosted micro: the real namespace, owner, scanner and public encoder."""
+    import hashlib
+    import os
+    import re
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import appimage_update_acceptance as A
+
+    env = dict(os.environ)
+    expected = {"GITHUB_ACTIONS":"true", "RUNNER_ENVIRONMENT":"github-hosted",
+                "RUNNER_OS":"Linux", "RUNNER_ARCH":"X64", "GITHUB_REPOSITORY":"brk275/Morpheus",
+                "GITHUB_EVENT_NAME":"workflow_dispatch", "GITHUB_ACTOR":"brk275",
+                "GITHUB_TRIGGERING_ACTOR":"brk275",
+                "GITHUB_REF":"refs/heads/codex/temp-linux-seal-provider-regression-20261105"}
+    test.assertTrue(sys.platform == "linux" and all(env.get(k) == v for k, v in expected.items()))
+    event = json.loads(P.client.read_regular(Path(env["GITHUB_EVENT_PATH"]), 1024 * 1024))
+    test.assertIs(event["repository"]["private"], False)
+    owner, sender = event["repository"]["owner"], event["sender"]
+    test.assertTrue(owner["login"] == sender["login"] == "brk275"
+                    and type(owner["id"]) is int and 0 < owner["id"] < 2**63
+                    and type(sender["id"]) is int and owner["id"] == sender["id"]
+                    and env["GITHUB_ACTOR_ID"] == str(owner["id"]))
+    revision = env["MORPHEUS_PACKAGE_SOURCE_REVISION"]
+    test.assertEqual(P.verify_checkout(ROOT, P.expected_revision(env)), revision)
+    run = env["GITHUB_RUN_ID"]
+    test.assertTrue(re.fullmatch(r"[1-9][0-9]{0,18}", run) is not None and 0 < int(run) < 2**63)
+    scanner = Path(env["MORPHEUS_SEAL_PROVIDER_SCANNER"])
+    test.assertEqual(scanner.resolve(strict=True), scanner)
+    test.assertEqual(hashlib.sha256(P.client.read_regular(scanner, 32 * 1024 * 1024)).hexdigest(),
+                     "88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509")
+    P.owned_tool(scanner)
+    phases = {"provider_admitted":False, "encoder_entered":False, "encoder_returned":False,
+              "fresh_scan_entered":False, "fresh_scan_passed":False, "handoff_created":False}
+    if env.get("MORPHEUS_SEAL_PROVIDER_INNER") == "1":
+        P.containment.assert_contained()
+        owner_root = P.client.private_directory(Path(env["MORPHEUS_SEAL_PROVIDER_OWNER_ROOT"]))
+        root = P.client.private_directory(Path(env["MORPHEUS_SEAL_PROVIDER_BUILD_ROOT"]))
+        test.assertEqual(root, owner_root / "artifacts" / "0.1.0-updateqa.1")
+        test.assertTrue(owner_root.parent == Path(env["RUNNER_TEMP"]).resolve(strict=True)
+                        and owner_root.name.startswith("morpheus-seal-provider-"))
+        plan_path = root / "update-plan.json"
+        plan = json.loads(P.client.read_regular(plan_path, 32768))
+        test.assertEqual(plan["revision"], revision)
+        progress = P.diagnostics.Progress(root)
+        progress.wrapper("build")
+        runner = M.OwnedRunner(root / "command-logs", progress=progress)
+        refused = None
+        try:
+            runner.run("package", ["/usr/bin/python3", "-I", "-c",
+                       "import sys;sys.stderr.write('synthetic package failure\\n');sys.exit(1)"],
+                       cwd=root, env={"PATH":"/usr/bin:/bin"}, timeout=10, output_limit=4096)
+        except M.CommandFailure as error:
+            test.assertEqual(error.reason, "exit")
+            refused = error
+            progress.failed(error)
+        test.assertIs(type(refused), M.CommandFailure)
+        test.assertEqual(runner.last_stage, "package")
+        test.assertNotEqual(progress.value["inner_cleanup"], "failed")
+        P.scan_private_logs(root, str(scanner))
+        actual_tool, actual_run, actual_scan = P.owned_tool, M.OwnedRunner.run, P.scan_private_logs
+        def tool(value, **options):
+            result = actual_tool(value, **options)
+            if str(value) == "/opt/microsoft/powershell/7/pwsh":
+                phases["provider_admitted"] = True
+            return result
+        def child(owner, *args, **options):
+            phases["encoder_entered"] = True
+            result = actual_run(owner, *args, **options)
+            phases["encoder_returned"] = True
+            return result
+        def scan(*args, **options):
+            phases["fresh_scan_entered"] = True
+            result = actual_scan(*args, **options)
+            phases["fresh_scan_passed"] = True
+            return result
+        scanned = False
+        try:
+            with mock.patch.object(P, "owned_tool", side_effect=tool), \
+                    mock.patch.object(M.OwnedRunner, "run", child), \
+                    mock.patch.object(P, "scan_private_logs", side_effect=scan):
+                scanned = P._temporary_seal_package(root, plan_path, plan, runner, progress,
+                                                    refused, True, str(scanner))
+            phases["handoff_created"] = (root / "sealed-package.json").is_file()
+        finally:
+            # Even failed observation leaves no new unscanned child output.
+            P.scan_private_logs(root, str(scanner))
+            P.client.write_new(root / "provider-observation.json", json.dumps(phases).encode("ascii"))
+        test.assertTrue(scanned and all(phases.values()), "real_provider_boundary_failed")
+        return
+
+    # The parent observes the REAL stopped namespace owner before using the
+    # unchanged production handoff reader. No flag is assigned by the fixture.
+    test.assertNotEqual(P.os.getpid(), 1)
+    observations = None
+    namespace_passed = False
+    handoff_passed = False
+    with tempfile.TemporaryDirectory(prefix="morpheus-seal-provider-", dir=env["RUNNER_TEMP"]) as directory:
+        root = Path(directory).resolve(strict=True)
+        commands = A.Commands(root)
+        commands.reviewed_revision = revision
+        build_root = A.private_directory(root / "artifacts" / "0.1.0-updateqa.1")
+        plan_path = build_root / "update-plan.json"
+        A.write_private(plan_path, json.dumps({"schema":1, "reviewed_checkout":str(ROOT),
+                        "revision":revision, "target":str(root / "target"), "version":"0.1.0-updateqa.1",
+                        "feed":"https://127.0.0.1:1/feed.json", "public_key":"synthetic public fixture"}), create=True)
+        inner = A.package_build_environment(env)
+        inner.update({"MORPHEUS_LINUX_SEAL_REAL_PROVIDER":"1", "MORPHEUS_SEAL_PROVIDER_INNER":"1",
+                      "MORPHEUS_SEAL_PROVIDER_BUILD_ROOT":str(build_root),
+                      "MORPHEUS_SEAL_PROVIDER_OWNER_ROOT":str(root),
+                      "MORPHEUS_SEAL_PROVIDER_SCANNER":str(scanner)})
+        invocation = A.namespace_command(["/usr/bin/python3", "-I", "-B", str(Path(__file__).resolve()),
+                     "ProcessTests.test_temporary_inner_package_seal_owns_one_child_scans_all_output_and_refuses_failed_gates"],
+                     build_root / "namespace", inner)
+        try:
+            commands.run(invocation, cwd=ROOT, seconds=180, env=inner, operation="package_build")
+            namespace_passed = True
+        except A.QAError:
+            pass  # Only the fixed post-scan status may leave this private log.
+        finally:
+            commands.scan(str(scanner))
+        test.assertIs(commands._temporary_package_stopped, True)
+        status = build_root / "provider-observation.json"
+        if status.exists():
+            observations = json.loads(P.client.read_regular(status, 2048))
+            test.assertTrue(type(observations) is dict and set(observations) == set(phases)
+                            and all(type(v) is bool for v in observations.values()))
+        if namespace_passed:
+            try:
+                value = A._temporary_read_sealed_package(commands, build_root, plan_path)
+                handoff_passed = type(value) is dict and value["source_revision"] == revision
+                del value  # Never publish or decrypt synthetic cipher frames.
+            except (A.QAError, ValueError, OSError):
+                pass  # Failure stays false; only the fixed parent_handoff reason leaves.
+    test.assertFalse(root.exists())
+    reason = "passed"
+    if observations is None:
+        reason = "inner_preflight"
+    elif not observations["provider_admitted"]:
+        reason = "provider_canonical_or_admission"
+    elif not observations["encoder_entered"]:
+        reason = "private_log_or_auxiliary_setup"
+    elif not observations["encoder_returned"]:
+        reason = "encoder_exit_or_cleanup"
+    elif not observations["fresh_scan_passed"]:
+        reason = "fresh_scan"
+    elif not observations["handoff_created"]:
+        reason = "cipher_protocol_or_handoff"
+    elif not namespace_passed:
+        reason = "namespace_owner"
+    elif not handoff_passed:
+        reason = "parent_handoff"
+    facts = {"reason":reason, "schema":1, "check":"real_linux_seal_provider", "namespace_passed":namespace_passed,
+             "parent_handoff_passed":handoff_passed, "cleanup_passed":True,
+             "observations":observations}
+    print("MORPHEUS_LINUX_SEAL_PROVIDER " + json.dumps(facts, sort_keys=True), flush=True)
+    test.assertTrue(namespace_passed and handoff_passed and observations is not None
+                    and all(observations.values()), "real_provider_micro_failed")
 
 
 class FakePipe:
@@ -74,6 +233,8 @@ class ProcessTests(unittest.TestCase):
 
     @unittest.skipUnless(P.os.name == "posix", "Linux private package log capture")
     def test_temporary_inner_package_seal_owns_one_child_scans_all_output_and_refuses_failed_gates(self):
+        if P.os.environ.get("MORPHEUS_LINUX_SEAL_REAL_PROVIDER") == "1":
+            return _temporary_real_seal_provider(self)
         for action in ("valid", "scan_refusal", "aux_cleanup", "malformed", "child_exit",
                        "preexisting_aux", "linked_aux"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
