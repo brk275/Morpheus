@@ -107,7 +107,12 @@ def _temporary_tiny_msvc_workspace(test):
             commands.deadline = original_deadline  # Restore the unchanged absolute 90s overall cap.
         build_passed = True
         phase = "binary"
-        binary = update.checked(target / "release/morpheus-app.exe")
+        # Mirror production build(): Cargo's final output can be a hardlink.
+        # Validate and run only a fresh private copy, retaining checked()'s link1 rule.
+        binary = fixture / "target/release/morpheus-app.exe"
+        security.private_directory(binary.parent, parents=True)
+        update.shutil.copyfile(target / "release/morpheus-app.exe", binary)
+        binary = update.checked(binary)
         test.assertEqual(commands.run([binary], cwd=fixture,
                                      environment=compiled_environment, seconds=10), b"")
         binary_passed = True
