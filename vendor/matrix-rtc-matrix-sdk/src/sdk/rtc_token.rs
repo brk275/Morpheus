@@ -415,39 +415,42 @@ mod tests {
             .unwrap();
         // The pinned SDK's restore_session spawns E2EE recovery setup, which
         // reads this account-data event even with automatic backups disabled.
-        // Finish exactly that authenticated bootstrap before observing RTC
+        // Its independent backup-state watcher also emits the initial Unknown
+        // state and makes the same request. Complete exactly these two known
         // requests; never ignore extra connections during the actual check.
         let bootstrap = async {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let bytes = request_bytes(&mut stream).await;
-            let request = std::str::from_utf8(&bytes).expect("Invalid SDK bootstrap HTTP");
-            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
-            let headers = headers.to_ascii_lowercase();
-            let expected_request = concat!(
-                "get /_matrix/client/v3/user/@alice:own.example.org/",
-                "account_data/m.secret_storage.default_key http/1.1"
-            );
-            assert!(headers.lines().next() == Some(expected_request));
-            assert!(
-                headers
-                    .lines()
-                    .filter(|line| line.starts_with("authorization:"))
-                    .eq(["authorization: bearer synthetic-old-token"])
-            );
-            let expected_host = format!("host: {origin}");
-            assert!(
-                headers
-                    .lines()
-                    .filter(|line| line.starts_with("host:"))
-                    .eq([expected_host.as_str()])
-            );
-            assert!(body.is_empty() && !headers.contains("transfer-encoding:"));
-            answer(
-                &mut stream,
-                404,
-                r#"{"errcode":"M_NOT_FOUND","error":"No synthetic account data"}"#,
-            )
-            .await;
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let bytes = request_bytes(&mut stream).await;
+                let request = std::str::from_utf8(&bytes).expect("Invalid SDK bootstrap HTTP");
+                let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+                let headers = headers.to_ascii_lowercase();
+                let expected_request = concat!(
+                    "get /_matrix/client/v3/user/@alice:own.example.org/",
+                    "account_data/m.secret_storage.default_key http/1.1"
+                );
+                assert!(headers.lines().next() == Some(expected_request));
+                assert!(
+                    headers
+                        .lines()
+                        .filter(|line| line.starts_with("authorization:"))
+                        .eq(["authorization: bearer synthetic-old-token"])
+                );
+                let expected_host = format!("host: {origin}");
+                assert!(
+                    headers
+                        .lines()
+                        .filter(|line| line.starts_with("host:"))
+                        .eq([expected_host.as_str()])
+                );
+                assert!(body.is_empty() && !headers.contains("transfer-encoding:"));
+                answer(
+                    &mut stream,
+                    404,
+                    r#"{"errcode":"M_NOT_FOUND","error":"No synthetic account data"}"#,
+                )
+                .await;
+            }
         };
         let initialized = async {
             client
