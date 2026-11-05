@@ -592,7 +592,75 @@ def validate_update_parameters(update):
 # TEMPORARY ONE-SHOT PRIVATE DIAGNOSTIC: NEVER MERGE INTO PRODUCT.
 _TEMP_SEALED_BASE = "a31f0120a394b43e08e6b5cad7b7680896618d12"
 _TEMP_SEALED_RECIPIENT = "981b3084f72673f04254de615651b7c8847f1c7823070c981bf92868c16fb70a"
-_TEMP_SEALED_POWERSHELL = "$ErrorActionPreference='Stop'\n$ProgressPreference='SilentlyContinue'\n$PSModuleAutoLoadingPreference='None'\n$rsa=$null\ntry {\n  $parameters=[System.Security.Cryptography.RSAParameters]::new()\n  $parameters.Modulus=[Convert]::FromBase64String('o87QianqKagsPqe7OXHtChurVX8CiCBNJBWylbmuGhs3xMsgy/MfO+9Y/gCbguGk53rDsXHcefhiSns2WoXq+KVAG/14+zSzIF+H33M+yUo4wFwH/kBKMz2/VYq6MEFOJwmjgrtNW8gJ3VK1KGjTMjJBK8aBwsrfM0ACgYBwQIwZi3Rmt94z27tAqL6KE3EfsRk3TGnZr1IeLGv8/gtRT3sJVPwH6CP1/VTl3kAd+IBh69rduTFNnZeUZEz+c6QvYA7ijzhxuOEIiJFLJYRidgRlLg/t8lcI9BNLAhmq2ngxCoUvkcAs6TJ/EuzU8crJGw7KV09tVpY70X6ukphAMoPngwm74pvwp2yN3B5P2VrylFUZAZv9RrcpKKl9VF+TkttIjSEws/chyJYrxqcLiqo3BfjTdNUBqxYjOPsRjkNTLHeJFFHdU3lkNWNK7qGdINAhMN+HQLcCwT0N4y0dqpls45sCHkkOvj27PI6H1tQFQX/FsjOFN90J/3riEaCd')\n  $parameters.Exponent=[Convert]::FromBase64String('AQAB')\n  if ($parameters.Modulus.Length -ne 384) { exit 2 }\n  $rsa=[System.Security.Cryptography.RSA]::Create()\n  $rsa.ImportParameters($parameters)\n  if ($rsa.KeySize -ne 3072) { exit 2 }\n  $reader=[System.IO.BinaryReader]::new([Console]::OpenStandardInput())\n  $data=$reader.ReadBytes(65537)\n  if ($data.Length -eq 0 -or $data.Length -gt 65536) { exit 2 }\n  $count=[int][Math]::Ceiling($data.Length/318.0)\n  for ($i=0;$i -lt $count;$i++) {\n    $length=[Math]::Min(318,$data.Length-$i*318)\n    $chunk=[byte[]]::new($length)\n    [Array]::Copy($data,$i*318,$chunk,0,$length)\n    $sealed=$rsa.Encrypt($chunk,[System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)\n    if ($sealed.Length -ne 384) { exit 2 }\n    [Console]::Out.WriteLine(('{0}:{1}:{2}' -f $i,$count,[Convert]::ToHexString($sealed)))\n  }\n} catch { exit 2 } finally { if ($null -ne $rsa) { $rsa.Dispose() } }\n"
+_TEMP_SEALED_PUBLIC_PEM = b'-----BEGIN PUBLIC KEY-----\nMIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAo87QianqKagsPqe7OXHt\nChurVX8CiCBNJBWylbmuGhs3xMsgy/MfO+9Y/gCbguGk53rDsXHcefhiSns2WoXq\n+KVAG/14+zSzIF+H33M+yUo4wFwH/kBKMz2/VYq6MEFOJwmjgrtNW8gJ3VK1KGjT\nMjJBK8aBwsrfM0ACgYBwQIwZi3Rmt94z27tAqL6KE3EfsRk3TGnZr1IeLGv8/gtR\nT3sJVPwH6CP1/VTl3kAd+IBh69rduTFNnZeUZEz+c6QvYA7ijzhxuOEIiJFLJYRi\ndgRlLg/t8lcI9BNLAhmq2ngxCoUvkcAs6TJ/EuzU8crJGw7KV09tVpY70X6ukphA\nMoPngwm74pvwp2yN3B5P2VrylFUZAZv9RrcpKKl9VF+TkttIjSEws/chyJYrxqcL\niqo3BfjTdNUBqxYjOPsRjkNTLHeJFFHdU3lkNWNK7qGdINAhMN+HQLcCwT0N4y0d\nqpls45sCHkkOvj27PI6H1tQFQX/FsjOFN90J/3riEaCdAgMBAAE=\n-----END PUBLIC KEY-----\n'
+
+
+def _temporary_openssl_blocks(root, payload, scanner, deadline):
+    """Same public RSA frames, owned per chunk within shared original budgets."""
+    scan_passed = True
+    blocks = None
+    try:
+        if (type(payload) is not bytes or not 0 < len(payload) <= 65536
+                or time.monotonic() >= deadline):
+            return scan_passed, blocks
+        program = Path("/usr/bin/openssl")
+        if program.resolve(strict=True) != program:
+            return scan_passed, blocks
+        openssl = owned_tool(program, root_owned=True)
+        auxiliary = root / "sealed-package"
+        auxiliary.mkdir(mode=0o700)
+        client.private_directory(auxiliary)
+        home = auxiliary / "home"
+        home.mkdir(mode=0o700)
+        client.private_directory(home)
+        temporary = auxiliary / "tmp"
+        temporary.mkdir(mode=0o700)
+        client.private_directory(temporary)
+        public_key = auxiliary / "recipient-public.pem"
+        client.write_new(public_key, _TEMP_SEALED_PUBLIC_PEM)
+        observed = diagnostics.Progress(auxiliary)
+        encoder = OwnedRunner(auxiliary / "command-logs", progress=observed)
+        environment = {"PATH":"/usr/bin:/bin", "HOME":str(home), "TMPDIR":str(temporary),
+                       "OPENSSL_CONF":"/dev/null"}
+        encoding_deadline = min(deadline, time.monotonic() + 30)
+        remaining_stderr = 65536
+        raw_blocks = []
+        scan_passed = False
+        try:
+            for offset in range(0, len(payload), 318):
+                seconds = min(30, encoding_deadline - time.monotonic(), deadline - time.monotonic())
+                if seconds <= 0:
+                    break
+                raw = encoder.run("package", [openssl, "pkeyutl", "-encrypt", "-pubin",
+                                  "-inkey", str(public_key), "-pkeyopt", "rsa_padding_mode:oaep",
+                                  "-pkeyopt", "rsa_oaep_md:sha256", "-pkeyopt", "rsa_mgf1_md:sha256"],
+                                  cwd=auxiliary, env=environment, timeout=seconds, output_limit=384,
+                                  stderr_limit=remaining_stderr, stdin_bytes=payload[offset:offset + 318])
+                # Every ordinary stdout/stderr log remains in the full scan.
+                # Keep aggregate stderr at the original single-child ceiling.
+                stderr = bounded_file_log(encoder.log_root / f"{encoder.sequence:04d}-package.stderr.log", 65536)
+                remaining_stderr -= len(stderr)
+                if (len(raw) != 384 or remaining_stderr < 0
+                        or observed.value["inner_cleanup"] == "failed"
+                        or time.monotonic() >= encoding_deadline):
+                    break
+                raw_blocks.append(raw)
+        except BaseException:
+            pass  # Original failure remains authoritative; no partial frames.
+        finally:
+            try:
+                scan_private_logs(root, owned_tool(scanner), deadline=deadline)
+                scan_passed = observed.value["inner_cleanup"] != "failed"
+            except BaseException:
+                scan_passed = False
+        count = (len(payload) + 317) // 318
+        if (scan_passed is True and len(raw_blocks) == count and 1 <= count <= 207
+                and observed.value["inner_cleanup"] != "failed" and time.monotonic() < deadline):
+            # Interpret/serialize only complete, stopped, default-scanned output.
+            blocks = [raw.hex().upper() for raw in raw_blocks]
+    except BaseException:
+        pass
+    return scan_passed, blocks
 
 
 def _temporary_seal_package(root, plan_path, plan, runner, progress, failed, scan_passed, scanner):
@@ -604,6 +672,7 @@ def _temporary_seal_package(root, plan_path, plan, runner, progress, failed, sca
             or progress.value["failure"]["command_stage"] != "package"
             or progress.value["failure"]["reason"] != "command_exit"):
         return scan_passed
+    deadline = time.monotonic() + 120
     try:
         revision = expected_revision(os.environ)
         run = os.environ.get("GITHUB_RUN_ID")
@@ -611,11 +680,6 @@ def _temporary_seal_package(root, plan_path, plan, runner, progress, failed, sca
                 or type(run) is not str or re.fullmatch(r"[1-9][0-9]{0,18}", run) is None
                 or not 0 < int(run) < 2**63):
             return scan_passed
-        # Resolve exactly the preinstalled provider executable, not PATH/tool installs.
-        program = Path("/opt/microsoft/powershell/7/pwsh")
-        if program.resolve(strict=True) != program:
-            return scan_passed
-        pwsh = owned_tool(program, root_owned=True)
         if Path(plan_path).parent != root or Path(plan_path).name != "update-plan.json":
             return scan_passed
         plan_digest = hashlib.sha256(client.read_regular(plan_path, 32768)).hexdigest()
@@ -637,56 +701,8 @@ def _temporary_seal_package(root, plan_path, plan, runner, progress, failed, sca
                               "streams": streams}, separators=(",", ":")).encode("ascii")
         if not 0 < len(payload) <= 65536:
             return scan_passed
-        # These are new exclusive directories; private_directory validates only.
-        auxiliary = root / "sealed-package"
-        auxiliary.mkdir(mode=0o700)
-        client.private_directory(auxiliary)
-        home = auxiliary / "home"
-        home.mkdir(mode=0o700)
-        client.private_directory(home)
-        temporary = auxiliary / "tmp"
-        temporary.mkdir(mode=0o700)
-        client.private_directory(temporary)
-        observed = diagnostics.Progress(auxiliary)
-        encoder = OwnedRunner(auxiliary / "command-logs", progress=observed)
-        environment = {"PATH": "/usr/bin:/bin", "HOME": str(home), "TMPDIR": str(temporary),
-                       "POWERSHELL_TELEMETRY_OPTOUT": "1", "POWERSHELL_UPDATECHECK": "Off",
-                       "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
-                       "POWERSHELL_DISTRIBUTION_CHANNEL": "GitHub-Actions-ubuntu24"}
-        deadline = time.monotonic() + 120
-        # Original 3300s namespace and 6900s outer limits still enclose this work.
-        # From here all new child output must join a fresh complete default scan.
-        scan_passed = False
-        encoded = base64.b64encode(_TEMP_SEALED_POWERSHELL.encode("utf-16-le")).decode("ascii")
-        raw = None
-        try:
-            raw = encoder.run("package", [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-                              cwd=auxiliary, env=environment, timeout=min(30, deadline - time.monotonic()),
-                              output_limit=192 * 1024, stderr_limit=65536, stdin_bytes=payload)
-        except BaseException:
-            pass
-        finally:
-            # Include stdout even on malformed/failed encoder output. No bytes
-            # are interpreted until all original and auxiliary logs scan clean.
-            try:
-                scan_private_logs(root, owned_tool(scanner), deadline=deadline)
-                scan_passed = observed.value["inner_cleanup"] != "failed"
-            except BaseException:
-                scan_passed = False
-        if raw is None or scan_passed is not True:
-            return scan_passed
-        count = (len(payload) + 317) // 318
-        lines = raw.decode("ascii").splitlines()
-        if (not 1 <= count <= 207 or len(lines) != count
-                or observed.value["inner_cleanup"] == "failed"):
-            return scan_passed
-        blocks = []
-        for index, line in enumerate(lines):
-            match = re.fullmatch(r"([0-9]{1,3}):([0-9]{1,3}):([0-9A-F]{768})", line)
-            if match is None or int(match[1]) != index or int(match[2]) != count:
-                return scan_passed
-            blocks.append(match[3])
-        if (observed.value["inner_cleanup"] == "failed" or time.monotonic() > deadline):
+        scan_passed, blocks = _temporary_openssl_blocks(root, payload, scanner, deadline)
+        if blocks is None or scan_passed is not True or time.monotonic() >= deadline:
             return scan_passed
         # Ciphertext only. The parent authenticates this exact plan/root and emits
         # it only after namespace, full outer scan, certificate/key and root cleanup.

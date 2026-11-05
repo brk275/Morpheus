@@ -30,7 +30,7 @@ def _temporary_real_seal_provider(test):
                 "RUNNER_OS":"Linux", "RUNNER_ARCH":"X64", "GITHUB_REPOSITORY":"brk275/Morpheus",
                 "GITHUB_EVENT_NAME":"workflow_dispatch", "GITHUB_ACTOR":"brk275",
                 "GITHUB_TRIGGERING_ACTOR":"brk275",
-                "GITHUB_REF":"refs/heads/codex/temp-linux-seal-provider-regression-20261105"}
+                "GITHUB_REF":"refs/heads/codex/temp-linux-openssl-provider-regression-20261105"}
     test.assertTrue(sys.platform == "linux" and all(env.get(k) == v for k, v in expected.items()))
     event = json.loads(P.client.read_regular(Path(env["GITHUB_EVENT_PATH"]), 1024 * 1024))
     test.assertIs(event["repository"]["private"], False)
@@ -50,6 +50,9 @@ def _temporary_real_seal_provider(test):
     P.owned_tool(scanner)
     phases = {"provider_admitted":False, "encoder_entered":False, "encoder_returned":False,
               "fresh_scan_entered":False, "fresh_scan_passed":False, "handoff_created":False}
+    maximum = {"calls":0, "chunks":0, "passed":False}
+    admission = None
+    calls = {"count":0}
     if env.get("MORPHEUS_SEAL_PROVIDER_INNER") == "1":
         P.containment.assert_contained()
         owner_root = P.client.private_directory(Path(env["MORPHEUS_SEAL_PROVIDER_OWNER_ROOT"]))
@@ -76,19 +79,29 @@ def _temporary_real_seal_provider(test):
         test.assertEqual(runner.last_stage, "package")
         test.assertNotEqual(progress.value["inner_cleanup"], "failed")
         P.scan_private_logs(root, str(scanner))
+        program = Path("/usr/bin/openssl")
+        opt = Path("/opt").lstat()
+        chain = [item.lstat() for item in (program, *program.parents)]
+        admission = {"openssl_canonical":program.resolve(strict=True) == program,
+                     "openssl_root_owned":all(info.st_uid == 0 for info in chain),
+                     "openssl_nonwritable":all(info.st_mode & 0o022 == 0 for info in chain),
+                     "opt_root_owned":opt.st_uid == 0, "opt_nonwritable":opt.st_mode & 0o022 == 0}
         actual_tool, actual_run, actual_scan = P.owned_tool, M.OwnedRunner.run, P.scan_private_logs
         def tool(value, **options):
+            if str(value) == "/usr/bin/openssl": phases["provider_admitted"] = False
             result = actual_tool(value, **options)
-            if str(value) == "/opt/microsoft/powershell/7/pwsh":
-                phases["provider_admitted"] = True
+            if str(value) == "/usr/bin/openssl": phases["provider_admitted"] = True
             return result
         def child(owner, *args, **options):
             phases["encoder_entered"] = True
+            phases["encoder_returned"] = False
+            calls["count"] += 1
             result = actual_run(owner, *args, **options)
             phases["encoder_returned"] = True
             return result
         def scan(*args, **options):
             phases["fresh_scan_entered"] = True
+            phases["fresh_scan_passed"] = False
             result = actual_scan(*args, **options)
             phases["fresh_scan_passed"] = True
             return result
@@ -97,14 +110,25 @@ def _temporary_real_seal_provider(test):
             with mock.patch.object(P, "owned_tool", side_effect=tool), \
                     mock.patch.object(M.OwnedRunner, "run", child), \
                     mock.patch.object(P, "scan_private_logs", side_effect=scan):
-                scanned = P._temporary_seal_package(root, plan_path, plan, runner, progress,
-                                                    refused, True, str(scanner))
+                max_root = root / "maximum-payload"
+                max_root.mkdir(mode=0o700)
+                P.client.private_directory(max_root)
+                max_scanned, max_blocks = P._temporary_openssl_blocks(
+                    max_root, b"X" * 65536, str(scanner), P.time.monotonic() + 120)
+                maximum["calls"] = calls["count"]
+                maximum["chunks"] = len(max_blocks) if type(max_blocks) is list else 0
+                maximum["passed"] = max_scanned is True and maximum["calls"] == maximum["chunks"] == 207
+                del max_blocks
+                if maximum["passed"]:
+                    scanned = P._temporary_seal_package(root, plan_path, plan, runner, progress,
+                                                        refused, True, str(scanner))
             phases["handoff_created"] = (root / "sealed-package.json").is_file()
         finally:
             # Even failed observation leaves no new unscanned child output.
             P.scan_private_logs(root, str(scanner))
-            P.client.write_new(root / "provider-observation.json", json.dumps(phases).encode("ascii"))
-        test.assertTrue(scanned and all(phases.values()), "real_provider_boundary_failed")
+            P.client.write_new(root / "provider-observation.json", json.dumps(
+                {"observations":phases, "maximum":maximum, "admission":admission}).encode("ascii"))
+        test.assertTrue(scanned and all(phases.values()) and maximum["passed"], "real_provider_boundary_failed")
         return
 
     # The parent observes the REAL stopped namespace owner before using the
@@ -140,9 +164,17 @@ def _temporary_real_seal_provider(test):
         test.assertIs(commands._temporary_package_stopped, True)
         status = build_root / "provider-observation.json"
         if status.exists():
-            observations = json.loads(P.client.read_regular(status, 2048))
+            value = json.loads(P.client.read_regular(status, 2048))
+            test.assertTrue(type(value) is dict and set(value) == {"observations", "maximum", "admission"})
+            observations, maximum, admission = value["observations"], value["maximum"], value["admission"]
             test.assertTrue(type(observations) is dict and set(observations) == set(phases)
                             and all(type(v) is bool for v in observations.values()))
+            test.assertTrue(type(maximum) is dict and set(maximum) == {"calls", "chunks", "passed"}
+                            and type(maximum["passed"]) is bool
+                            and all(type(maximum[k]) is int and 0 <= maximum[k] <= 207 for k in ("calls", "chunks")))
+            test.assertTrue(type(admission) is dict and set(admission) == {"openssl_canonical",
+                            "openssl_root_owned", "openssl_nonwritable", "opt_root_owned", "opt_nonwritable"}
+                            and all(type(v) is bool for v in admission.values()))
         if namespace_passed:
             try:
                 value = A._temporary_read_sealed_package(commands, build_root, plan_path)
@@ -170,10 +202,12 @@ def _temporary_real_seal_provider(test):
         reason = "parent_handoff"
     facts = {"reason":reason, "schema":1, "check":"real_linux_seal_provider", "namespace_passed":namespace_passed,
              "parent_handoff_passed":handoff_passed, "cleanup_passed":True,
-             "observations":observations}
+             "observations":observations, "maximum":maximum, "admission":admission}
     print("MORPHEUS_LINUX_SEAL_PROVIDER " + json.dumps(facts, sort_keys=True), flush=True)
     test.assertTrue(namespace_passed and handoff_passed and observations is not None
-                    and all(observations.values()), "real_provider_micro_failed")
+                    and all(observations.values()) and maximum["passed"]
+                    and all(admission[k] for k in ("openssl_canonical", "openssl_root_owned", "openssl_nonwritable")),
+                    "real_provider_micro_failed")
 
 
 class FakePipe:
@@ -235,8 +269,10 @@ class ProcessTests(unittest.TestCase):
     def test_temporary_inner_package_seal_owns_one_child_scans_all_output_and_refuses_failed_gates(self):
         if P.os.environ.get("MORPHEUS_LINUX_SEAL_REAL_PROVIDER") == "1":
             return _temporary_real_seal_provider(self)
+        import hashlib
+        self.assertEqual(hashlib.sha256(P._TEMP_SEALED_PUBLIC_PEM).hexdigest(), P._TEMP_SEALED_RECIPIENT)
         for action in ("valid", "scan_refusal", "aux_cleanup", "malformed", "child_exit",
-                       "preexisting_aux", "linked_aux"):
+                       "preexisting_aux", "linked_aux", "stderr_budget", "encode_deadline"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
                 root = P.client.private_directory(Path(directory).resolve())
                 logs = root / "command-logs"
@@ -265,48 +301,48 @@ class ProcessTests(unittest.TestCase):
                 progress.failed(refusal)
                 original_failure = dict(progress.value["failure"])
                 runner = SimpleNamespace(last_stage="package", sequence=7, log_root=logs)
-                events = []
+                events, inputs, stderr_limits = [], [], []
+                clock = {"value":10}
                 test = self
                 class Provider:
                     def resolve(self, strict=False): return self
-                    def __str__(self): return "/opt/microsoft/powershell/7/pwsh"
+                    def __str__(self): return "/usr/bin/openssl"
                 provider = Provider()
                 def paths(value):
                     return provider if str(value) == str(provider) else Path(value)
                 class Encoder:
                     def __init__(self, log_root, progress):
                         self.log_root = Path(log_root)
-                        self.log_root.mkdir(mode=0o700)  # Same exclusive allocation as OwnedRunner.
+                        self.log_root.mkdir(mode=0o700)
                         P.client.private_directory(self.log_root)
-                        self.progress = progress
+                        self.progress, self.sequence = progress, 0
                     def run(self, stage, argv, **options):
-                        events.append("child")
+                        events.append("child"); self.sequence += 1
                         test.assertEqual(stage, "package")
-                        test.assertEqual(argv[:4], [str(provider), "-NoLogo", "-NoProfile", "-NonInteractive"])
-                        test.assertEqual(base64.b64decode(argv[-1]).decode("utf-16-le"), P._TEMP_SEALED_POWERSHELL)
+                        key = auxiliary / "recipient-public.pem"
+                        test.assertEqual(key.read_bytes(), P._TEMP_SEALED_PUBLIC_PEM)
+                        test.assertEqual(argv, [str(provider), "pkeyutl", "-encrypt", "-pubin", "-inkey", str(key),
+                                         "-pkeyopt", "rsa_padding_mode:oaep", "-pkeyopt", "rsa_oaep_md:sha256",
+                                         "-pkeyopt", "rsa_mgf1_md:sha256"])
                         test.assertEqual(options["timeout"], 30)
-                        test.assertEqual(options["output_limit"], 192 * 1024)
-                        test.assertEqual(options["stderr_limit"], 65536)
+                        test.assertEqual(options["output_limit"], 384)
                         test.assertFalse(options.get("binary_output", False))
-                        test.assertEqual(options["env"]["DOTNET_CLI_TELEMETRY_OPTOUT"], "1")
-                        payload = json.loads(options["stdin_bytes"])
-                        test.assertLessEqual(len(options["stdin_bytes"]), 65536)
-                        for kind, body in (("stdout", stdout), ("stderr", stderr)):
-                            stream = payload["streams"][kind]
-                            test.assertEqual(base64.b64decode(stream["head_base64"]), body[:8192])
-                            test.assertEqual(base64.b64decode(stream["tail_base64"]), body[-8192:])
-                            test.assertEqual(stream["size"], len(body)); test.assertTrue(stream["truncated"])
-                        test.assertEqual(payload["source_revision"], "b" * 40)
-                        test.assertEqual(payload["run_id"], 41956870809)
-                        count = (len(options["stdin_bytes"]) + 317) // 318
-                        raw = ("".join(f"{i}:{count}:" + "A" * 768 + "\n" for i in range(count))).encode()
-                        if action == "malformed": raw = b"private-malformed-output"
-                        P.client.write_new(self.log_root / "0001-package.stdout.log", raw)
-                        P.client.write_new(self.log_root / "0001-package.stderr.log", b"")
+                        test.assertEqual(options["env"]["OPENSSL_CONF"], "/dev/null")
+                        test.assertTrue(0 < len(options["stdin_bytes"]) <= 318)
+                        inputs.append(options["stdin_bytes"])
+                        stderr_limits.append(options["stderr_limit"])
+                        raw = b"A" * 384 if action != "malformed" else b"malformed"
+                        error_log = b"S" * 65536 if action == "stderr_budget" and self.sequence == 1 else b""
+                        P.client.write_new(self.log_root / f"{self.sequence:04d}-package.stdout.log", raw)
+                        P.client.write_new(self.log_root / f"{self.sequence:04d}-package.stderr.log", error_log)
                         if action == "aux_cleanup":
                             self.progress.cleanup(False)
                             raise M.CommandFailure("cleanup")
                         if action == "child_exit": raise M.CommandFailure("exit")
+                        if action == "stderr_budget" and self.sequence == 2:
+                            test.assertEqual(options["stderr_limit"], 0)
+                            raise M.CommandFailure("output")
+                        if action == "encode_deadline": clock["value"] = 40
                         return raw
                 def scan(selected_root, scanner, *, deadline):
                     events.append("scan")
@@ -315,21 +351,34 @@ class ProcessTests(unittest.TestCase):
                     self.assertFalse((root / "sealed-package.json").exists())
                     if action == "scan_refusal": raise P.PackageFailure("scan")
                 def owned_tool(value, **options):
-                    if value is provider:
-                        self.assertIs(options.get("root_owned"), True)
+                    if value is provider: self.assertIs(options.get("root_owned"), True)
                     return str(value)
                 with mock.patch.object(P, "Path", side_effect=paths), \
                         mock.patch.object(P, "owned_tool", side_effect=owned_tool), \
                         mock.patch.object(P, "expected_revision", return_value="b" * 40), \
-                        mock.patch.dict(P.os.environ, {"GITHUB_RUN_ID": "41956870809"}), \
-                        mock.patch.object(P.time, "monotonic", return_value=10), \
+                        mock.patch.dict(P.os.environ, {"GITHUB_RUN_ID":"41956870809"}), \
+                        mock.patch.object(P.time, "monotonic", side_effect=lambda: clock["value"]), \
                         mock.patch.object(P, "OwnedRunner", Encoder), \
                         mock.patch.object(P, "scan_private_logs", side_effect=scan):
                     scanned = P._temporary_seal_package(root, plan_path, plan, runner, progress, refusal, True, "/scanner")
-                self.assertEqual(events, [] if sentinel is not None else ["child", "scan"])
+                self.assertEqual(events, [] if sentinel is not None else ["child"] * len(inputs) + ["scan"])
                 self.assertEqual(scanned, action not in {"scan_refusal", "aux_cleanup"})
                 self.assertEqual((root / "sealed-package.json").exists(), action == "valid")
                 self.assertEqual(progress.value["failure"], original_failure)
+                if action in {"valid", "scan_refusal"}:
+                    payload = b"".join(inputs)
+                    self.assertLessEqual(len(payload), 65536)
+                    self.assertEqual(len(inputs), (len(payload) + 317) // 318)
+                    value = json.loads(payload)
+                    for kind, body in (("stdout", stdout), ("stderr", stderr)):
+                        stream = value["streams"][kind]
+                        self.assertEqual(base64.b64decode(stream["head_base64"]), body[:8192])
+                        self.assertEqual(base64.b64decode(stream["tail_base64"]), body[-8192:])
+                        self.assertEqual(stream["size"], len(body)); self.assertTrue(stream["truncated"])
+                    self.assertEqual(value["source_revision"], "b" * 40)
+                    self.assertEqual(value["run_id"], 41956870809)
+                if action == "stderr_budget": self.assertEqual(stderr_limits, [65536, 0])
+                if action == "encode_deadline": self.assertEqual(len(inputs), 1)
                 if sentinel is not None:
                     self.assertEqual(sentinel.read_bytes(), b"preserve this existing directory")
                     self.assertEqual(foreign.lstat().st_mode, foreign_mode)
