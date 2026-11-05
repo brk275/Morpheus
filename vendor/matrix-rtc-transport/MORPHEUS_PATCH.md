@@ -112,9 +112,16 @@ and low-bandwidth constraints. These source tests still require hosted execution
 identity contract, or the explicit direct-draft `/get_token` route with its
 user/device/member identity contract. Legacy service admission accepts only
 the standard upper-case room slot; direct draft retains custom-slot support.
-The sticky compatibility profile keeps its draft default even for that room
-slot. Callers can explicitly select a verified service dialect before the
-request; no URL-field inference or endpoint fallback is added.
+The standard native call path now resolves its contract from the typed
+advertised transport before joining, independently of the membership profile.
+A standard service publisher uses the legacy identity; a service subscriber
+uses the direct token endpoint with its separate subscriber identity. An SFU
+`url` locator uses the account's own homeserver CS API and the current two-part
+user/member identity. An optional standard `server_name` is retained as request
+data and a connection grouping key, never an account-token HTTP destination.
+The older direct-draft publisher remains an explicit separately scoped
+compatibility operation and does not claim current stock-peer compatibility.
+No endpoint failure selects a different contract or identity.
 
 Member-attributed imports carry the authoritative participation lease through
 ring application, delayed activation and sender registration. Retired leases
@@ -129,5 +136,22 @@ Existing constraint ordering and receiver-generation rules remain. Focused
 source cases cover contract selection, held-import handover, delayed-key and
 pending-notification retirement, and late connection ownership. Hosted native
 and integration acceptance remain separate requirements; no stock-peer,
-package or release result is claimed. Dependency selectors, retained upstream
-preimages, license declarations and provenance inventories remain unchanged.
+package or release result is claimed. Retained upstream preimages and license
+declarations remain unchanged.
+
+## Transport-bound publisher ownership
+
+Remote tracks, mute state, speakers and encryption reports are attributed only
+on the member's selected advertised transport. Buffered receivers obey the same
+rule; a publication change retires old receivers immediately and removes old
+identity mappings. Participation leases also bind the publication endpoints and
+issuer metadata. Historical direct scope refuses modern CS API publications;
+standard scope derives each peer's publisher identity from its own descriptor.
+An ambiguous multi-contract publication fails closed instead of accepting aliases.
+
+Bounded JWT consistency checks preserve authorized opaque room names and
+LiveKit permission defaults. The SFU handshake remains responsible for signature
+verification; the actual participant and room must then match the exact checked
+claims. Subscriber handles cannot publish local tracks or activate sender keys,
+even when the service grants them permission to publish. No token payload is
+retained in diagnostics. These source regressions have not been executed locally.

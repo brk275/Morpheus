@@ -62,6 +62,11 @@ pub async fn attach_livekit<B: MatrixBackend + 'static>(
     let (own_user_id, own_device_id) = (backend.own_user_id(), backend.own_device_id());
     let guard = AuthGuard::new(
         options.auth_dialect,
+        match call.transport() {
+            matrix_rtc_core::TransportIntent::Publish(transport) => Some(transport.clone()),
+            matrix_rtc_core::TransportIntent::ReceiveOnly { .. } => None,
+        },
+        options.format,
         OwnMemberClaims {
             member_id: call.member_id().to_owned(),
             user_id: own_user_id.clone(),

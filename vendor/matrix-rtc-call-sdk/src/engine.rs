@@ -1153,6 +1153,12 @@ impl Actor {
                 PoolEvent::OwnConnectionLost { message } => {
                     self.end(EndedReason::ConnectionClosed { message });
                 }
+                PoolEvent::AuthenticationRequired => {
+                    self.end(EndedReason::AuthenticationRequired);
+                }
+                PoolEvent::AuthenticationExpired => {
+                    self.end(EndedReason::AuthenticationExpired);
+                }
             }
         }
     }
@@ -1557,6 +1563,15 @@ impl Actor {
         if matches!(&reason, EndedReason::IdentityRejected) {
             self.identity_rejected = true;
         }
+        if matches!(&reason, EndedReason::AuthenticationRequired | EndedReason::AuthenticationExpired) {
+            // Revoke the same publication/key/capture authority immediately.
+            // The actor's normal retirement closes adopted and late-successful
+            // connections without replacing this typed terminal notification.
+            self.identity_rejected = true;
+            if let Some(guard) = &self.admission {
+                guard.active.store(false, Ordering::Release);
+            }
+        }
         self.emit(CallEvent::Ended { reason });
         self.pool.close();
     }
@@ -1819,7 +1834,7 @@ mod tests {
         fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
             match transport {
                 RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
-                RtcTransport::Unsupported(_) => None,
+                RtcTransport::LiveKitCsApi(_) | RtcTransport::Unsupported(_) => None,
             }
         }
 

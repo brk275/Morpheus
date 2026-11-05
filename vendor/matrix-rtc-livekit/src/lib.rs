@@ -57,6 +57,7 @@ pub use token::{MemberClaims, SfuToken};
 // should not need a second dependency to do it.
 pub use matrix_rtc_core::{MatrixBackend, OpenIdToken};
 pub use transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
+pub use transport_impl::livekit_connection_key;
 
 /// Android initialisation, re-exported so consumers (e.g. the FFI crate)
 /// don't need a direct `livekit`/`libwebrtc` dependency for it.
@@ -89,6 +90,7 @@ async fn acquire_token(
     let dialect = match config.token_endpoint {
         TokenEndpoint::Msc4195 => LiveKitAuthDialect::DirectDraft,
         TokenEndpoint::LegacyElementCall => LiveKitAuthDialect::LegacyService,
+        TokenEndpoint::CsApi => return Err(Error::UnsupportedAuthDialect),
     };
     dialect
         .validate_slot(&config.slot_id)
@@ -129,6 +131,7 @@ async fn acquire_token(
             )
             .await
         }
+        TokenEndpoint::CsApi => Err(Error::UnsupportedAuthDialect),
     }
 }
 
@@ -175,11 +178,19 @@ async fn connect_e2ee_guarded(
     auto_subscribe: bool,
     admission: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<LiveKitConnection, Error> {
+    let sfu_token = acquire_token(http, config, backend, admission).await?;
+    connect_token_e2ee_guarded(&sfu_token, key_provider, auto_subscribe, admission).await
+}
+
+async fn connect_token_e2ee_guarded(
+    sfu_token: &SfuToken,
+    key_provider: livekit::e2ee::key_provider::KeyProvider,
+    auto_subscribe: bool,
+    admission: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<LiveKitConnection, Error> {
     use livekit::RoomOptions;
     use livekit::e2ee::{E2eeOptions, EncryptionType};
     use std::sync::atomic::Ordering;
-
-    let sfu_token = acquire_token(http, config, backend, admission).await?;
     if admission.is_some_and(|active| !active.load(Ordering::Acquire)) {
         return Err(Error::IdentityRejected);
     }
@@ -194,7 +205,7 @@ async fn connect_e2ee_guarded(
     // are actually subscribed and unneeded ones stop being encoded.
     options.dynacast = true;
     options.auto_subscribe = auto_subscribe;
-    LiveKitSession::connect_with_options(&sfu_token, options).await
+    LiveKitSession::connect_with_options(sfu_token, options).await
 }
 
 /// Errors produced by the LiveKit transport.

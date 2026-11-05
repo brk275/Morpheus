@@ -183,3 +183,15 @@ The companion `matrix-rtc-livekit` facade and transport handlers carry this
 admission through native imports; these are source changes awaiting affected
 hosted checks, not a real-call or cryptographic-readiness result. Upstream pin,
 dependencies, original license texts and provenance records are unchanged.
+
+## Standard typed LiveKit descriptors
+
+Standard LiveKit service descriptors remain separate from homeserver-mediated
+SFU URL locators. Optional standard server_name metadata is retained; malformed
+present fields never become an absent-field fallback. Publication serializes only
+standard wire fields. A backend method delegates CS API authorization to the
+fixed owning account adapter; the compatibility wrapper preserves that delegation.
+Redundant member user/device fields cannot contradict authenticated event origin.
+Historical Current publication and slot codecs remain unchanged; normal stock
+interop uses the explicitly selected existing Sticky2025 codec in the application.
+No trust, key-origin, encryption, expiry or compatibility fallback is added.

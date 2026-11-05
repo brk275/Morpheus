@@ -69,6 +69,13 @@ pub fn pseudonymous_identity(user_id: &str, device_id: &str, member_id: &str) ->
     hash_string_array(&[user_id, device_id, member_id])
 }
 
+/// Current MSC4195 CSAPI publisher identity. The authenticated membership
+/// binds the device separately; current services hash exactly user and member.
+/// The historical direct draft's three-input derivation remains separate.
+pub fn csapi_identity(user_id: &str, member_id: &str) -> String {
+    hash_string_array(&[user_id, member_id])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +108,14 @@ mod tests {
             id,
             pseudonymous_identity("@user:matrix.example.com", "DEVICEID", "xyzABCDEF10123")
         );
+    }
+
+    #[test]
+    fn current_and_historical_identity_contracts_do_not_alias() {
+        let current = csapi_identity("@user:example.org", "member");
+        assert_eq!(current.len(), 43);
+        assert_ne!(current, pseudonymous_identity("@user:example.org", "DEVICE", "member"));
+        assert_ne!(current, csapi_identity("@other:example.org", "member"));
+        assert_ne!(current, csapi_identity("@user:example.org", "other"));
     }
 }

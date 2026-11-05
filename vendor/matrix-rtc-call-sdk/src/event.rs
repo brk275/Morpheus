@@ -59,6 +59,10 @@ pub struct SpeakingMember {
 /// Why the call ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EndedReason {
+    /// The owning account must sign in again; never automatically rejoin.
+    AuthenticationRequired,
+    /// The account's normal SDK session must reconnect before calling again.
+    AuthenticationExpired,
     /// We left the call deliberately.
     Left,
     /// The slot was closed, which ended our participation without us asking.

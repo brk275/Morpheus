@@ -10,7 +10,9 @@ pub use matrix_rtc_call_sdk::livekit::MediaFailureSnapshot;
 use matrix_rtc_call_sdk::{
     LiveKitCall, LiveKitCallOptions, Participant, close_slot, open_slot, open_slot_with_admission,
 };
-use matrix_rtc_core::{LiveKitTransport, SlotEncryption, compat::MembershipFormat};
+use matrix_rtc_core::{
+    LiveKitCsApiTransport, LiveKitTransport, RtcTransport, SlotEncryption, compat::MembershipFormat,
+};
 use matrix_rtc_transport::{MediaStreamKind, livekit::LiveKitAuthDialect};
 use matrix_sdk::{
     Client,
@@ -23,7 +25,8 @@ use matrix_sdk::{
 use serde_json::Value;
 
 use crate::{
-    RtcError, TransportSupport, VOICE_SPACE_EVENT_TYPE, VOICE_SPACE_STATE_KEY, VoiceSpaceMarker,
+    LiveKitDescriptor, RtcError, TransportSupport, VOICE_SPACE_EVENT_TYPE, VOICE_SPACE_STATE_KEY,
+    VoiceSpaceMarker,
     classify_transports,
 };
 
@@ -52,9 +55,12 @@ impl From<InteropMode> for MembershipFormat {
 pub struct CallOptions {
     pub slot_id: String,
     pub interop_mode: InteropMode,
-    /// Explicit verified service contract, independent of membership carrier.
-    /// None keeps the selected interop profile's default. Set LegacyService
-    /// for newer service-based sticky peers; no endpoint fallback is attempted.
+    /// Explicit service contract, independent of the membership carrier.
+    /// None follows the account's advertised transport: OpenID for a legacy
+    /// service, or the authenticated homeserver CS API for an SFU locator.
+    /// DirectDraft is a deprecated, explicit historical/custom service scope;
+    /// it is not compatible with current stock Element Call. No auth fallback
+    /// is attempted, and explicit auth must match the advertised authority.
     pub auth_dialect: Option<LiveKitAuthDialect>,
 }
 
@@ -79,6 +85,49 @@ impl CallOptions {
             slot_id: "m.call#room".to_owned(),
             interop_mode: InteropMode::Sticky2025,
             auth_dialect: None,
+        }
+    }
+
+    /// Explicit stock-compatible room-wide intent. Literal/custom callers use
+    /// the existing join APIs and retain their exact slot. The sticky and old
+    /// room-state codecs already address the canonical wire room, m.call#ROOM.
+    fn room_wide(self) -> Result<Self, RtcError> {
+        if self.slot_id != "m.call#room" || self.interop_mode == InteropMode::Current {
+            return Err(RtcError::Discovery(
+                "room-wide calls require a supported room profile; use a literal join for explicit draft or custom slots"
+                    .to_owned(),
+            ));
+        }
+        Ok(self)
+    }
+
+    /// Preserve the advertised credential authority before the call SDK can
+    /// publish membership or obtain a token. Membership mode never selects auth.
+    fn transport(&self, descriptor: LiveKitDescriptor) -> Result<RtcTransport, RtcError> {
+        match (descriptor, self.auth_dialect) {
+            (
+                LiveKitDescriptor::LegacyService { service_url },
+                None | Some(LiveKitAuthDialect::LegacyService | LiveKitAuthDialect::DirectDraft),
+            ) => {
+                let room_slot = self.slot_id == "m.call#ROOM"
+                    || (self.slot_id == "m.call#room"
+                        && matches!(self.interop_mode, InteropMode::Sticky2025 | InteropMode::RoomState));
+                if self.auth_dialect != Some(LiveKitAuthDialect::DirectDraft) && !room_slot {
+                    return Err(RtcError::Discovery(
+                        "the advertised legacy service cannot authorize this literal slot".to_owned(),
+                    ));
+                }
+                Ok(RtcTransport::LiveKit(LiveKitTransport {
+                    livekit_service_url: service_url,
+                }))
+            }
+            (LiveKitDescriptor::CsApi { url, server_name }, None | Some(LiveKitAuthDialect::CsApi)) => {
+                Ok(RtcTransport::LiveKitCsApi(LiveKitCsApiTransport { url, server_name }))
+            }
+            _ => Err(RtcError::Discovery(
+                "the explicit auth dialect conflicts with the advertised LiveKit transport"
+                    .to_owned(),
+            )),
         }
     }
 
@@ -258,6 +307,14 @@ impl RtcService {
         Ok(classify_transports(&value))
     }
 
+    async fn room_transport(&self) -> Result<TransportSupport, RtcError> {
+        let transport = tokio::time::timeout(std::time::Duration::from_secs(15), self.discover_transport())
+            .await
+            .map_err(|_| RtcError::Discovery("room transport discovery timed out".to_owned()))??;
+        if !transport.is_supported() { return Err(RtcError::NoLiveKitTransport); }
+        Ok(transport)
+    }
+
     async fn ensure_sticky_support(&self) -> Result<(), RtcError> {
         if !self
             .client
@@ -279,7 +336,7 @@ impl RtcService {
         slot_id: &str,
         encrypted: bool,
     ) -> Result<(), RtcError> {
-        self.open_slot_inner(room_id, slot_id, encrypted, None)
+        self.open_slot_inner(room_id, slot_id, encrypted, None, None)
             .await
     }
 
@@ -293,8 +350,22 @@ impl RtcService {
         mode: InteropMode,
         admit: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<(), RtcError> {
-        self.open_slot_inner(room_id, slot_id, encrypted, Some((mode, admit)))
+        self.open_slot_inner(room_id, slot_id, encrypted, Some((mode, admit)), None)
             .await
+    }
+
+    /// Open the stock-compatible room-wide slot using one explicit profile.
+    /// Discovery and admission run once in the existing slot-writing path.
+    pub async fn open_outgoing_room(
+        &self,
+        room_id: &str,
+        encrypted: bool,
+        mode: InteropMode,
+        admit: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), RtcError> {
+        let options = CallOptions { interop_mode: mode, ..CallOptions::default() }.room_wide()?;
+        let transport = self.room_transport().await?;
+        self.open_slot_inner(room_id, &options.slot_id, encrypted, Some((mode, admit)), Some(transport)).await
     }
 
     async fn open_slot_inner(
@@ -303,6 +374,7 @@ impl RtcService {
         slot_id: &str,
         encrypted: bool,
         outgoing: Option<(InteropMode, Arc<dyn Fn() -> bool + Send + Sync>)>,
+        selected: Option<TransportSupport>,
     ) -> Result<(), RtcError> {
         let room = self.ensure_loaded_room(room_id)?;
         let encryption_state = room
@@ -322,10 +394,11 @@ impl RtcService {
         // Reject unsupported homeservers before writing a slot that nobody
         // using Morpheus can join. Joining performs the same discovery again
         // because the advertised service may change between these actions.
-        if matches!(
-            self.discover_transport().await?,
-            TransportSupport::NoLiveKitTransport
-        ) {
+        let transport = match selected {
+            Some(transport) => transport,
+            None => self.discover_transport().await?,
+        };
+        if matches!(transport, TransportSupport::NoLiveKitTransport) {
             return Err(RtcError::NoLiveKitTransport);
         }
         self.ensure_sticky_support().await?;
@@ -385,7 +458,7 @@ impl RtcService {
         room_id: &str,
         options: CallOptions,
     ) -> Result<CallInfo, RtcError> {
-        self.join_inner(room_id, options, None).await
+        self.join_inner(room_id, options, None, None).await
     }
 
     /// Ordinary outgoing admission only. Incoming Answer and reconnect keep
@@ -396,7 +469,32 @@ impl RtcService {
         options: CallOptions,
         admit: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<CallInfo, RtcError> {
-        self.join_inner(room_id, options, Some(admit)).await
+        self.join_inner(room_id, options, Some(admit), None).await
+    }
+
+    /// Join the explicitly chosen stock-compatible room-wide profile. Generic
+    /// join remains literal; no transport discovery or auth fallback is added.
+    pub async fn join_room(
+        &mut self,
+        room_id: &str,
+        options: CallOptions,
+    ) -> Result<CallInfo, RtcError> {
+        let options = options.room_wide()?;
+        let transport = self.room_transport().await?;
+        self.join_inner(room_id, options, None, Some(transport)).await
+    }
+
+    /// Outgoing room-wide intent with the same admission fence as a literal
+    /// outgoing join. The returned concrete slot is retained by the caller.
+    pub async fn join_outgoing_room(
+        &mut self,
+        room_id: &str,
+        options: CallOptions,
+        admit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<CallInfo, RtcError> {
+        let options = options.room_wide()?;
+        let transport = self.room_transport().await?;
+        self.join_inner(room_id, options, Some(admit), Some(transport)).await
     }
 
     async fn join_inner(
@@ -404,6 +502,7 @@ impl RtcService {
         room_id: &str,
         options: CallOptions,
         outgoing: Option<&(dyn Fn() -> bool + Send + Sync)>,
+        selected: Option<TransportSupport>,
     ) -> Result<CallInfo, RtcError> {
         let room = self.ensure_loaded_room(room_id)?;
         if self.calls.contains_key(room_id) {
@@ -417,8 +516,12 @@ impl RtcService {
             return Err(RtcError::UnknownEncryptionState);
         }
         options.validate_encryption(encryption_state.is_encrypted())?;
-        let service_url = match self.discover_transport().await? {
-            TransportSupport::LiveKit { service_url } => service_url,
+        let selected = match selected {
+            Some(transport) => transport,
+            None => self.discover_transport().await?,
+        };
+        let transport = match selected {
+            TransportSupport::LiveKit { transport } => options.transport(transport)?,
             TransportSupport::NoLiveKitTransport => return Err(RtcError::NoLiveKitTransport),
         };
         if options.interop_mode != InteropMode::RoomState {
@@ -443,9 +546,7 @@ impl RtcService {
             slot_id: options.slot_id.clone(),
             format: options.interop_mode.into(),
             auth_dialect: options.auth_dialect,
-            livekit_transport: Some(LiveKitTransport {
-                livekit_service_url: service_url,
-            }),
+            rtc_transport: Some(transport),
             ..LiveKitCallOptions::default()
         };
         let call = if let Some(admit) = outgoing {
@@ -672,6 +773,120 @@ mod tests {
             MembershipFormat::Current.token_slot_id(&options.slot_id),
             "m.call#room"
         );
+    }
+
+    #[test]
+    fn membership_modes_keep_advertised_auth_authority() {
+        for options in [
+            CallOptions::element_call_matrix_2_0(),
+            CallOptions::room_state_compatibility(),
+        ] {
+            let options = options.room_wide().unwrap();
+            assert_eq!(options.auth_dialect, None);
+            assert_eq!(
+                options
+                    .transport(LiveKitDescriptor::LegacyService {
+                        service_url: "https://auth.example.test".into(),
+                    })
+                    .unwrap(),
+                RtcTransport::LiveKit(LiveKitTransport {
+                    livekit_service_url: "https://auth.example.test".into(),
+                })
+            );
+            assert_eq!(
+                options
+                    .transport(LiveKitDescriptor::CsApi {
+                        url: "wss://sfu.example.test".into(),
+                        server_name: None,
+                    })
+                    .unwrap(),
+                RtcTransport::LiveKitCsApi(LiveKitCsApiTransport {
+                    url: "wss://sfu.example.test".into(),
+                    server_name: None,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn room_intent_never_renames_a_literal_or_experimental_profile() {
+        assert!(CallOptions::default().room_wide().is_err());
+        let custom = CallOptions {
+            slot_id: "m.call#standup".into(),
+            ..CallOptions::element_call_matrix_2_0()
+        };
+        assert!(custom.clone().room_wide().is_err());
+        let literal = CallOptions {
+            auth_dialect: Some(LiveKitAuthDialect::DirectDraft),
+            ..custom
+        };
+        assert!(literal.transport(LiveKitDescriptor::LegacyService {
+            service_url: "https://auth.example.test".into(),
+        }).is_ok());
+        assert_eq!(literal.slot_id, "m.call#standup");
+        assert!(CallOptions::default().transport(LiveKitDescriptor::LegacyService {
+            service_url: "https://auth.example.test".into(),
+        }).is_err());
+    }
+
+    #[test]
+    fn a_csapi_server_name_is_preserved_as_descriptor_data() {
+        assert_eq!(
+            CallOptions::default()
+                .transport(LiveKitDescriptor::CsApi {
+                    url: "wss://sfu.example.test".into(),
+                    server_name: Some("operator.example.test:8448".into()),
+                })
+                .unwrap(),
+            RtcTransport::LiveKitCsApi(LiveKitCsApiTransport {
+                url: "wss://sfu.example.test".into(),
+                server_name: Some("operator.example.test:8448".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_auth_cannot_change_credential_authority() {
+        for dialect in [
+            LiveKitAuthDialect::LegacyService,
+            LiveKitAuthDialect::DirectDraft,
+        ] {
+            let options = CallOptions {
+                auth_dialect: Some(dialect),
+                ..CallOptions::element_call_matrix_2_0()
+            };
+            assert!(matches!(
+                options.transport(LiveKitDescriptor::CsApi {
+                    url: "wss://sfu.example.test".into(),
+                    server_name: None,
+                }),
+                Err(RtcError::Discovery(_))
+            ));
+            assert!(matches!(
+                options.transport(LiveKitDescriptor::LegacyService {
+                    service_url: "https://auth.example.test".into(),
+                }),
+                Ok(RtcTransport::LiveKit(_))
+            ));
+            assert_eq!(options.auth_dialect, Some(dialect));
+        }
+        let options = CallOptions {
+            auth_dialect: Some(LiveKitAuthDialect::CsApi),
+            ..CallOptions::default()
+        };
+        assert!(matches!(
+            options.transport(LiveKitDescriptor::LegacyService {
+                service_url: "https://auth.example.test".into(),
+            }),
+            Err(RtcError::Discovery(_))
+        ));
+        assert!(matches!(
+            options.transport(LiveKitDescriptor::CsApi {
+                url: "wss://sfu.example.test".into(),
+                server_name: None,
+            }),
+            Ok(RtcTransport::LiveKitCsApi(_))
+        ));
     }
 
     fn wire_slot(key: &str, event_type: &str, content: Value) -> matrix_rtc_core::EventIn {

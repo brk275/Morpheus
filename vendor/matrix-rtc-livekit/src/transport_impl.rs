@@ -62,6 +62,72 @@ use crate::session::LiveKitSession;
 use crate::token::MemberClaims;
 use crate::{LiveKitTransportConfig, TokenEndpoint};
 
+enum Locator {
+    Service(String),
+    CsApi { url: String, server_name: String },
+}
+
+#[cfg(test)]
+mod transport_contract_tests {
+    use super::*;
+
+    #[test]
+    fn csapi_connections_are_scoped_to_the_authenticated_publishing_server() {
+        let transport = RtcTransport::LiveKitCsApi(matrix_rtc_core::LiveKitCsApiTransport {
+            url: "wss://media.example.org/rtc".into(), server_name: None });
+        let first = livekit_connection_key(&transport, "@alice:first.example.org").unwrap();
+        let other = livekit_connection_key(&transport, "@bob:other.example.org").unwrap();
+        assert_ne!(first, other);
+        assert_eq!(first, livekit_connection_key(&transport, "@carol:first.example.org").unwrap());
+        assert!(matches!(locator(&first), Some(Locator::CsApi { server_name, .. }) if server_name == "first.example.org"));
+        assert!(livekit_connection_key(&transport, "@alice:https://foreign.example.org").is_none());
+        let operated = RtcTransport::LiveKitCsApi(matrix_rtc_core::LiveKitCsApiTransport {
+            url: "wss://media.example.org/rtc".into(), server_name: Some("operator.example.org:8448".into()),
+        });
+        let explicit = livekit_connection_key(&operated, "@alice:first.example.org").unwrap();
+        assert!(matches!(locator(&explicit), Some(Locator::CsApi { server_name, .. }) if server_name == "operator.example.org:8448"));
+    }
+
+    #[test]
+    fn unsafe_locators_never_become_openid_or_account_token_destinations() {
+        for url in ["https://auth.example.org", "ws://foreign.example.org", "wss://user:secret@media.example.org", "wss://media.example.org?token=secret"] {
+            let transport = RtcTransport::LiveKitCsApi(matrix_rtc_core::LiveKitCsApiTransport { url: url.into(), server_name: None });
+            assert!(livekit_connection_key(&transport, "@alice:example.org").is_none());
+        }
+        assert!(locator("csapi:[\"wss://media.example.org\",\"https://foreign.example.org\"]").is_none());
+    }
+}
+
+/// Group by the authenticated publisher's Matrix server as well as SFU URL.
+/// The server name is never an HTTP credential destination.
+pub fn livekit_connection_key(transport: &RtcTransport, publisher: &str) -> Option<String> {
+    match transport {
+        RtcTransport::LiveKit(t) => livekit_api::connection_policy::authorization_url(&t.livekit_service_url)
+            .ok().map(|_| t.livekit_service_url.clone()),
+        RtcTransport::LiveKitCsApi(t) => {
+            livekit_api::connection_policy::sfu_url(&t.url).ok()?;
+            let server = t.server_name.as_deref().or_else(|| matrix_rtc_transport::livekit::publisher_server_name(publisher))?;
+            matrix_rtc_transport::livekit::publisher_server_name(&format!("@publisher:{server}"))?;
+            Some(format!("csapi:{}", serde_json::to_string(&[t.url.as_str(), server]).ok()?))
+        }
+        _ => None,
+    }
+}
+
+fn locator(key: &str) -> Option<Locator> {
+    if key.len() > 4096 { return None; }
+    if let Some(json) = key.strip_prefix("csapi:") {
+        let fields: Vec<String> = serde_json::from_str(json).ok()?;
+        if fields.len() != 2 { return None; }
+        livekit_api::connection_policy::sfu_url(&fields[0]).ok()?;
+        matrix_rtc_transport::livekit::publisher_server_name(&format!("@publisher:{}", fields[1]))?;
+        Some(Locator::CsApi { url: fields[0].clone(), server_name: fields[1].clone() })
+    } else {
+        livekit_api::connection_policy::authorization_url(key).ok()?;
+        Some(Locator::Service(key.to_owned()))
+    }
+}
+
 /// Sample rate remote audio is resampled to before crossing the transport
 /// boundary, matching what the recording helpers in [`crate::media`] use.
 const AUDIO_SAMPLE_RATE: i32 = 48_000;
@@ -157,14 +223,12 @@ impl LiveKitMediaTransport {
 
 /// The typed connect, for callers that need the underlying [`LiveKitSession`]
 /// (the `LiveKitCall` facade's deprecated raw accessors).
-#[async_trait]
-impl OwnFocusTransport for LiveKitMediaTransport {
-    type Connection = LiveKitTransportConnection;
-
-    async fn connect_own(
+impl LiveKitMediaTransport {
+    async fn connect_context(
         &self,
-        livekit_service_url: &str,
+        connection_key: &str,
         ctx: &ConnectionContext,
+        publisher: bool,
     ) -> Result<
         (
             LiveKitTransportConnection,
@@ -181,15 +245,28 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                 "call identity contract refused".into(),
             ));
         }
-        let own_identity = (self.identity_mapper)(
+        let location = locator(connection_key).ok_or_else(|| TransportError::Unsupported("invalid LiveKit transport authority".into()))?;
+        if self.token_endpoint == TokenEndpoint::Msc4195 && matches!(location, Locator::CsApi { .. }) {
+            return Err(TransportError::Unsupported("historical direct draft cannot join a standard CSAPI transport".into()));
+        }
+        let own_identity = if publisher { (self.identity_mapper)(
             &ctx.member.user_id,
             &ctx.member.device_id,
             &ctx.member.member_id,
             None,
         )
-        .ok_or_else(|| TransportError::Closed("call identity contract refused".into()))?;
-        let config = LiveKitTransportConfig {
-            livekit_service_url: livekit_service_url.to_owned(),
+        .ok_or_else(|| TransportError::Closed("call identity contract refused".into()))? } else {
+            // Subscriber token identity is independent of the remote publisher
+            // identity used by the member/key mapper and cannot publish media.
+            match &location {
+                Locator::CsApi { .. } => crate::identity::csapi_identity(&ctx.member.user_id, &ctx.member.member_id),
+                Locator::Service(_) => pseudonymous_identity(&ctx.member.user_id, &ctx.member.device_id, &ctx.member.member_id),
+            }
+        };
+        let token = match location {
+            Locator::Service(service_url) => {
+                let config = LiveKitTransportConfig {
+            livekit_service_url: service_url,
             room_id: ctx.room_id.clone(),
             slot_id: ctx.slot_id.clone(),
             member: MemberClaims {
@@ -197,21 +274,40 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                 claimed_user_id: ctx.member.user_id.clone(),
                 claimed_device_id: ctx.member.device_id.clone(),
             },
-            token_endpoint: self.token_endpoint,
+            token_endpoint: if publisher { self.token_endpoint } else { TokenEndpoint::Msc4195 },
         };
-        let connection = crate::connect_e2ee_guarded(
+        crate::acquire_token(
             &self.http,
             &config,
             self.backend.as_ref(),
-            self.key_provider.clone(),
-            self.auto_subscribe,
             self.admission.as_ref(),
         )
         .await
-        .map_err(|error| TransportError::Connect(error.to_string()))?;
+        .map_err(|error| TransportError::Connect(error.to_string()))?
+            }
+            Locator::CsApi { url, server_name } => {
+                let jwt = self.backend.livekit_token(matrix_rtc_core::LiveKitTokenRequest {
+                    url: url.clone(), server_name, room_id: ctx.room_id.clone(), slot_id: ctx.slot_id.clone(),
+                    member_id: ctx.member.member_id.clone(), own_user_id: ctx.member.user_id.clone(),
+                    own_device_id: ctx.member.device_id.clone(),
+                }).await.map_err(|error| {
+                    match error.errcode.as_deref() {
+                        Some("RTC_AUTH_SOFT_LOGOUT" | "RTC_AUTH_SIGN_IN_REQUIRED") => TransportError::SignInRequired,
+                        Some("M_UNKNOWN_TOKEN") => TransportError::AuthExpired,
+                        _ => TransportError::Connect("RTC homeserver authorization failed".into()),
+                    }
+                })?;
+                crate::SfuToken { url, jwt }
+            }
+        };
+        let authorization = matrix_rtc_transport::livekit::token::authorization(&token.jwt, &own_identity, publisher)
+            .map_err(|_| TransportError::AuthorizationMismatch)?;
+        let connection = crate::connect_token_e2ee_guarded(&token, self.key_provider.clone(), self.auto_subscribe, self.admission.as_ref())
+            .await.map_err(|_| TransportError::Connect("RTC media authorization failed".into()))?;
 
-        // The SFU authenticated this participant; do not decode an unverified
-        // JWT or try another identity to make the media/key mapping fit.
+        // Only the SFU handshake authenticates the signed token. The earlier
+        // local claim read was a consistency check, never signature evidence.
+        // No alternate identity or room can make a mismatch fit.
         if connection
             .session
             .room()
@@ -219,6 +315,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
             .identity()
             .as_str()
             != own_identity
+            || connection.session.room().name() != authorization.room
             || self
                 .admission
                 .as_ref()
@@ -228,9 +325,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                 active.store(false, Ordering::Release);
             }
             let _ = connection.session.room().close().await;
-            return Err(TransportError::Closed(
-                "call identity contract refused".into(),
-            ));
+            return Err(TransportError::AuthorizationMismatch);
         }
 
         // The receiver returned by the room connect carries events from the
@@ -240,14 +335,25 @@ impl OwnFocusTransport for LiveKitMediaTransport {
 
         Ok((
             LiveKitTransportConnection {
-                connection_key: livekit_service_url.to_owned(),
+                connection_key: connection_key.to_owned(),
                 session: Arc::new(connection.session),
                 own_identity,
                 local_key_index: Arc::new(Mutex::new(None)),
                 admission: self.admission.clone(),
+                publisher,
+                authorization,
             },
             events_rx,
         ))
+    }
+}
+
+#[async_trait]
+impl OwnFocusTransport for LiveKitMediaTransport {
+    type Connection = LiveKitTransportConnection;
+
+    async fn connect_own(&self, key: &str, ctx: &ConnectionContext) -> Result<(LiveKitTransportConnection, UnboundedReceiver<ConnectionEvent>), TransportError> {
+        self.connect_context(key, ctx, true).await
     }
 }
 
@@ -258,16 +364,11 @@ impl MediaTransport for LiveKitMediaTransport {
     }
 
     fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
-        match transport {
-            // Reject unsafe peer foci before the pool stores/logs its key.
-            // The connection boundary validates again before requesting OpenID.
-            RtcTransport::LiveKit(livekit) => {
-                livekit_api::connection_policy::authorization_url(&livekit.livekit_service_url)
-                    .ok()
-                    .map(|_| livekit.livekit_service_url.clone())
-            }
-            RtcTransport::Unsupported(_) => None,
-        }
+        livekit_connection_key(transport, &self.backend.own_user_id())
+    }
+
+    fn connection_key_for_member(&self, member: &JoinedMembership, transport: &RtcTransport) -> Option<String> {
+        livekit_connection_key(transport, &member.sender)
     }
 
     fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
@@ -281,7 +382,7 @@ impl MediaTransport for LiveKitMediaTransport {
         // Through the mapper rather than `pseudonymous_identity` directly, so a
         // legacy call derives peer identities exactly as it derives its own.
         let device_id = member.origin.sender_device_id()?;
-        (self.identity_mapper)(&member.sender, device_id, &member.member_id, None)
+        (self.identity_mapper)(&member.sender, device_id, &member.member_id, Some(std::slice::from_ref(member)))
     }
 
     async fn connect(
@@ -295,7 +396,7 @@ impl MediaTransport for LiveKitMediaTransport {
         ),
         TransportError,
     > {
-        let (connection, events) = self.connect_own(connection_key, ctx).await?;
+        let (connection, events) = self.connect_context(connection_key, ctx, false).await?;
         Ok((Box::new(connection), events))
     }
 }
@@ -317,6 +418,8 @@ pub struct LiveKitTransportConnection {
     /// with an index no peer holds a key for.
     local_key_index: Arc<Mutex<Option<u8>>>,
     admission: Option<Arc<AtomicBool>>,
+    publisher: bool,
+    authorization: matrix_rtc_transport::livekit::token::SfuAuthorization,
 }
 
 // Select/update the cached index and apply it in one synchronous critical
@@ -397,6 +500,7 @@ impl TransportConnection for LiveKitTransportConnection {
     /// `set_key` only fills the key *ring*; the index a sender stamps lives on
     /// its frame cryptor and changes only here.
     fn set_local_key_index(&self, key_index: u8) {
+        if !self.publisher { return; }
         apply_selected_local_key_index(
             &self.local_key_index,
             Some(key_index),
@@ -409,6 +513,19 @@ impl TransportConnection for LiveKitTransportConnection {
         &self,
         options: PublishOptions,
     ) -> Result<Arc<dyn LocalTrackHandle>, TransportError> {
+        if !self.publisher {
+            return Err(TransportError::Unsupported("subscriber connections cannot publish media".into()));
+        }
+        let source = match options.kind {
+            MediaStreamKind::Microphone => "microphone",
+            MediaStreamKind::Camera => "camera",
+            MediaStreamKind::ScreenShare => "screen_share",
+            MediaStreamKind::ScreenShareAudio => "screen_share_audio",
+            MediaStreamKind::Data => return Err(TransportError::Unsupported("data publication is not a media source".into())),
+        };
+        if !self.authorization.permits_source(source) {
+            return Err(TransportError::AuthorizationMismatch);
+        }
         if self
             .admission
             .as_ref()

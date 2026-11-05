@@ -18,6 +18,16 @@
 pub mod identity;
 pub mod token;
 
+/// Matrix server identity from an authenticated Matrix sender. It is not a
+/// URL and must never be used as an account-token HTTP destination.
+pub fn publisher_server_name(user: &str) -> Option<&str> {
+    if !user.starts_with('@') { return None; }
+    let (_, server) = user.split_once(':')?;
+    (!server.is_empty() && server.len() <= 1024
+        && !server.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '#' | '@')))
+        .then_some(server)
+}
+
 pub use token::{MemberClaims, SfuToken, TokenServiceError};
 
 use matrix_rtc_core::compat::{MembershipFormat, room_state};
@@ -72,14 +82,14 @@ pub enum LiveKitAuthDialect {
     /// Explicit deprecated direct `/get_token` draft: room+slot and triple hash.
     /// Retained for existing custom-slot and draft peers; never auto-tried.
     DirectDraft,
+    /// Standard homeserver-mediated token exchange for an SFU `url` locator.
+    CsApi,
 }
 
 impl LiveKitAuthDialect {
-    /// Default the explicit 2025 sticky compatibility profile to its draft
-    /// token endpoint and triple-hashed identities, even for the upper room
-    /// slot. Membership carrier and slot spelling alone do not authorize a
-    /// switch to legacy identities. Callers can still explicitly select a
-    /// different verified service contract before any token request.
+    /// Historical API retained for callers that deliberately select an older
+    /// custom/draft contract. Production defaults must instead use the typed
+    /// advertised transport, independently of membership carrier or slot case.
     pub fn for_membership_profile(format: MembershipFormat, slot_id: &str) -> Self {
         match format {
             MembershipFormat::Sticky2025 => Self::DirectDraft,
@@ -110,6 +120,9 @@ impl LiveKitAuthDialect {
         match self {
             Self::LegacyService => TokenEndpoint::LegacyElementCall,
             Self::DirectDraft => TokenEndpoint::Msc4195,
+            // CSAPI does not use an OpenID token endpoint. Callers must branch
+            // on the typed contract before consulting this compatibility API.
+            Self::CsApi => TokenEndpoint::CsApi,
         }
     }
 
@@ -120,7 +133,23 @@ impl LiveKitAuthDialect {
         Some(match self {
             Self::LegacyService => room_state::participant_identity(user, device),
             Self::DirectDraft => identity::pseudonymous_identity(user, device, member),
+            Self::CsApi => identity::csapi_identity(user, member),
         })
+    }
+
+    /// Exact publisher contract for a checked advertised transport. Historical
+    /// direct draft is a separately selected call scope, never inferred from
+    /// membership format, slot spelling, failed auth, or a second identity.
+    pub fn for_transport(transport: &matrix_rtc_core::RtcTransport, historical_direct: bool) -> Option<Self> {
+        match transport {
+            matrix_rtc_core::RtcTransport::LiveKit(_) => Some(if historical_direct {
+                Self::DirectDraft
+            } else {
+                Self::LegacyService
+            }),
+            matrix_rtc_core::RtcTransport::LiveKitCsApi(_) if !historical_direct => Some(Self::CsApi),
+            _ => None,
+        }
     }
 }
 
@@ -133,6 +162,8 @@ pub enum TokenEndpoint {
     /// Pre-MSC4195 `POST /sfu/get`, for Element Call builds older than MSC4354.
     /// Temporary; see `matrix_rtc_core::compat`.
     LegacyElementCall,
+    /// No OpenID request is valid; use the account backend's CSAPI mediation.
+    CsApi,
 }
 
 impl TokenEndpoint {

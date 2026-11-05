@@ -23,6 +23,18 @@ struct CachedMarker {
     retry_after: Duration,
 }
 
+/// A local configuration snapshot, never protocol evidence from a remote peer.
+#[cfg(feature = "native-calls")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RoomCallProfile {
+    epoch: u64,
+    mode: RoomCallMode,
+}
+#[cfg(feature = "native-calls")]
+impl RoomCallProfile {
+    pub(crate) fn mode(self) -> RoomCallMode { self.mode }
+}
+
 pub struct VoiceSpaces {
     store: ConfigStore,
     config: RwLock<Config>,
@@ -189,6 +201,30 @@ impl VoiceSpaces {
             .read()
             .expect("voice config lock poisoned")
             .room_call_mode(account_id, room_id)
+    }
+
+    #[cfg(feature = "native-calls")]
+    pub(crate) fn room_call_profile(&self, account_id: &str, room_id: &str) -> Option<RoomCallProfile> {
+        let config = self.config.read().expect("voice config lock poisoned");
+        let epoch = self.ring_policy_epoch.load(std::sync::atomic::Ordering::Acquire);
+        (epoch != u64::MAX).then(|| RoomCallProfile {
+            epoch,
+            mode: config.room_call_mode(account_id, room_id),
+        })
+    }
+
+    /// Immutable authority for one original UI request; never adopts a newer profile.
+    #[cfg(feature = "native-calls")]
+    pub(crate) fn room_call_admission(
+        self: &std::sync::Arc<Self>,
+        account_id: String,
+        room_id: String,
+        profile: RoomCallProfile,
+    ) -> std::sync::Arc<dyn Fn() -> bool + Send + Sync> {
+        let spaces = self.clone();
+        std::sync::Arc::new(move || {
+            spaces.room_call_profile(&account_id, &room_id) == Some(profile)
+        })
     }
 
     pub fn set_room_call_mode(
@@ -508,6 +544,10 @@ fn incoming_policy_changed(before: &Config, after: &Config) -> bool {
                     != new
                         .map(|value| value.local_voice_rooms.as_slice())
                         .unwrap_or_default()
+                || old.map(|value| value.legacy_element_call_rooms.as_slice()).unwrap_or_default()
+                    != new.map(|value| value.legacy_element_call_rooms.as_slice()).unwrap_or_default()
+                || old.map(|value| value.element_call_matrix_2_0_rooms.as_slice()).unwrap_or_default()
+                    != new.map(|value| value.element_call_matrix_2_0_rooms.as_slice()).unwrap_or_default()
         })
 }
 
@@ -515,8 +555,56 @@ fn incoming_policy_changed(before: &Config, after: &Config) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "native-calls")]
     #[test]
-    fn incoming_policy_wakes_for_quiet_or_notification_changes_only() {
+    fn room_profile_changes_revoke_the_epoch_even_when_the_choice_is_restored() {
+        let directory = tempfile::tempdir().unwrap();
+        let spaces = VoiceSpaces::new(ConfigStore::at(directory.path().join("config.toml")));
+        let mut changes = spaces.subscribe_incoming_policy();
+        let original = spaces.room_call_profile("account-a", "!call:example.org").unwrap();
+        let mut config = Config::default();
+        config.set_room_call_mode("account-a", "!call:example.org", RoomCallMode::ElementCallMatrix2).unwrap();
+        spaces.apply_config(&config);
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        assert_ne!(spaces.room_call_profile("account-a", "!call:example.org"), Some(original));
+        config.set_room_call_mode("account-a", "!call:example.org", RoomCallMode::Standard).unwrap();
+        spaces.apply_config(&config);
+        assert!(changes.has_changed().unwrap());
+        let restored = spaces.room_call_profile("account-a", "!call:example.org").unwrap();
+        assert_eq!(restored.mode(), original.mode());
+        assert_ne!(restored, original);
+    }
+
+    #[cfg(feature = "native-calls")]
+    #[test]
+    fn a_captured_room_admission_is_revoked_before_a_late_state_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let spaces = std::sync::Arc::new(VoiceSpaces::new(ConfigStore::at(
+            directory.path().join("config.toml"),
+        )));
+        let account = "account-a";
+        let room = "!call:example.org";
+        let original = spaces.room_call_profile(account, room).unwrap();
+        let admit = spaces.room_call_admission(account.into(), room.into(), original);
+        assert!(admit());
+        let mut config = Config::default();
+        config
+            .set_room_call_mode(account, room, RoomCallMode::ElementCallMatrix2)
+            .unwrap();
+        spaces.apply_config(&config);
+        assert!(!admit(), "the pending state write must retain its original profile");
+        config
+            .set_room_call_mode(account, room, RoomCallMode::Standard)
+            .unwrap();
+        spaces.apply_config(&config);
+        assert!(!admit(), "restoring the mode must not authorize the old request");
+        let fresh = spaces.room_call_profile(account, room).unwrap();
+        assert!(spaces.room_call_admission(account.into(), room.into(), fresh)());
+    }
+
+    #[test]
+    fn incoming_policy_wakes_for_call_policy_changes_only() {
         let directory = tempfile::tempdir().unwrap();
         let spaces = VoiceSpaces::new(ConfigStore::at(directory.path().join("config.toml")));
         let mut updates = spaces.subscribe_incoming_policy();

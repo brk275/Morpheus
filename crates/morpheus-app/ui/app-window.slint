@@ -11507,7 +11507,7 @@ export component AppWindow inherits Window {
                                     ? "Match Element Call's Matrix 2.0 setting. Encrypted rooms only; Open room call requires room permission."
                                     : root.room-call-mode == 2
                                         ? "Older Element Call room-state calls; room permission may be required."
-                                        : "Standard MatrixRTC. Saved for this account and room; no automatic compatibility fallback.";
+                                        : "Standard encrypted calls. Saved for this account and room; no automatic compatibility fallback.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                         }
                         if !root.call-connected && !root.native-call-request-pending && root.active-room-id != "" && root.room-call-mode != 2 && !root.active-voice-local && !root.active-voice-shared : HorizontalLayout {

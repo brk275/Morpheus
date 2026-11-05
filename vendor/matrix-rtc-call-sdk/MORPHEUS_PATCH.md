@@ -146,14 +146,18 @@ any real media or call acceptance gate passed. No candidate was executed locally
 
 The native call facade now selects a complete `LiveKitAuthDialect`: token
 endpoint and participant-identity derivation stay paired. Membership carrier
-and room-slot spelling do not independently switch that contract. The sticky
-compatibility profile retains its direct-draft default; a caller can explicitly
-select the verified legacy service contract. There is no endpoint fallback.
+and room-slot spelling do not independently switch that contract. Standard
+defaults follow the typed service or CS API descriptor before publication.
+The older direct-draft publisher is an explicit historical scope only. There
+is no endpoint fallback or current-stock claim for that historical scope.
 
 The private attachment guard bounds identity ownership and binds each inbound
 key import to the authoritative member and exact `membership_ts` participation.
 An unchanged-timestamp refresh preserves that lease; departure or a changed
 timestamp retires it, including when no feed observed an intervening leave.
+Publication endpoints and optional issuer metadata also belong to the lease;
+changing them retires the old lease. Standard peers derive identity from their
+own attested descriptor, independently of this call's publisher contract.
 Mapper observations cannot advance authoritative generations. Imports for an
 old lease cannot become imports for its successor; same-alias ring operations
 remain serialized across the handover. Ambiguous ownership permanently refuses
@@ -166,7 +170,14 @@ key adoption and retained-event ownership remain in force. Source regressions
 cover dialect selection, ownership collisions, timestamp transitions, delayed
 and replayed imports, and retirement. They require affected hosted execution;
 this patch does not establish stock-peer interoperability or native media
-acceptance. No dependency, upstream revision or license term changes.
+acceptance. This batch adds a normal edge to the already locked serde_json
+dependency for typed discovery. No dependency version, upstream revision or
+license term changes.
+
+The native transport separately authenticates publisher and subscriber roles.
+An account-homeserver CS API request never sends a Bearer token to a peer SFU.
+Standard typed publication uses the locked call crate's added carrier without
+changing its actor admission, delayed leave, notification or cancellation code.
 
 ## Standalone Windows SDK test SQLite linkage
 

@@ -185,6 +185,10 @@ pub enum RtcCallEnd {
     ConnectionLost,
     /// Identity/auth ambiguity permanently refused this call; never rejoin it.
     IdentityRejected,
+    /// The account must sign in again; never recover by joining automatically.
+    AuthenticationRequired,
+    /// A rejected account token awaits SDK-managed refresh; never rejoin blindly.
+    AuthenticationExpired,
     /// The SFU deliberately removed this participant: an administrator
     /// removed it, deleted the room, or the same identity joined elsewhere.
     /// Rejoining automatically would undo that decision.
@@ -216,6 +220,8 @@ impl RtcConnectionSignal {
                     EndedReason::Left => RtcCallEnd::Left,
                     EndedReason::SlotClosed => RtcCallEnd::SlotClosed,
                     EndedReason::IdentityRejected => RtcCallEnd::IdentityRejected,
+                    EndedReason::AuthenticationRequired => RtcCallEnd::AuthenticationRequired,
+                    EndedReason::AuthenticationExpired => RtcCallEnd::AuthenticationExpired,
                     EndedReason::ConnectionClosed { message } if removed_by_server(message) => {
                         RtcCallEnd::Removed
                     }
@@ -298,6 +304,28 @@ mod tests {
                 reason: matrix_rtc_call_sdk::EndedReason::IdentityRejected,
             }),
             Some(RtcConnectionSignal::Ended(RtcCallEnd::IdentityRejected)),
+        );
+    }
+
+    #[cfg(feature = "native-rtc")]
+    #[test]
+    fn sign_in_required_preserves_its_terminal_reason() {
+        assert_eq!(
+            RtcConnectionSignal::from_event(&matrix_rtc_call_sdk::CallEvent::Ended {
+                reason: matrix_rtc_call_sdk::EndedReason::AuthenticationRequired,
+            }),
+            Some(RtcConnectionSignal::Ended(RtcCallEnd::AuthenticationRequired)),
+        );
+    }
+
+    #[cfg(feature = "native-rtc")]
+    #[test]
+    fn expired_auth_preserves_its_terminal_reason() {
+        assert_eq!(
+            RtcConnectionSignal::from_event(&matrix_rtc_call_sdk::CallEvent::Ended {
+                reason: matrix_rtc_call_sdk::EndedReason::AuthenticationExpired,
+            }),
+            Some(RtcConnectionSignal::Ended(RtcCallEnd::AuthenticationExpired)),
         );
     }
 

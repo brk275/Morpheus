@@ -26,6 +26,7 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 async-trait = "0.1"
 log = "0.4"
 thiserror = "2.0"
+serde_json = "1.0"
 
 # --- `livekit` feature: native LiveKit media (pulls libwebrtc) ---------------
 matrix-rtc-livekit = { git = "https://github.com/element-hq/matrix-rust-rtc", tag = "v0.5.0-rc.2", optional = true }

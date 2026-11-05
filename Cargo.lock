@@ -5659,7 +5659,6 @@ dependencies = [
 [[package]]
 name = "matrix-rtc-call"
 version = "0.5.0-rc.2"
-source = "git+https://github.com/element-hq/matrix-rust-rtc?tag=v0.5.0-rc.2#53880ef1ef66b62df555ce71ccd1d6c85b813596"
 dependencies = [
  "async-trait",
  "log",
@@ -5751,8 +5750,11 @@ dependencies = [
  "matrix-rtc-core",
  "matrix-sdk",
  "matrix-sdk-base",
+ "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
 ]
 

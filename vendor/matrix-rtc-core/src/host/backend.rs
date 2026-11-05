@@ -85,6 +85,20 @@ pub struct BackendError {
     pub message: String,
 }
 
+/// Homeserver-mediated RTC token request. The SFU locator and publishing server
+/// are request data only; the backend must use its own fixed account authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveKitTokenRequest {
+    pub url: String,
+    pub server_name: String,
+    pub room_id: String,
+    pub slot_id: String,
+    pub member_id: String,
+    /// Expected account/device, checked before reading the account token.
+    pub own_user_id: String,
+    pub own_device_id: String,
+}
+
 impl BackendError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
@@ -470,6 +484,12 @@ pub trait MatrixBackend: MaybeSend {
     /// A fresh OpenID token for the account.
     async fn openid_token(&self) -> Result<OpenIdToken, BackendError> {
         Err(BackendError::not_implemented("openid_token"))
+    }
+
+    /// Obtain a JWT through this account's authenticated homeserver. Never
+    /// forward an account Bearer token to the request's SFU or server name.
+    async fn livekit_token(&self, _request: LiveKitTokenRequest) -> Result<String, BackendError> {
+        Err(BackendError::not_implemented("livekit_token"))
     }
 
     /// The homeserver's `rtc_transports` array, raw, from

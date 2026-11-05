@@ -89,7 +89,7 @@ impl MediaTransport for FakeTransport {
     fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
         match transport {
             RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
-            RtcTransport::Unsupported(_) => None,
+            RtcTransport::LiveKitCsApi(_) | RtcTransport::Unsupported(_) => None,
         }
     }
 

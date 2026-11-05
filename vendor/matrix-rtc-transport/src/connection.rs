@@ -76,6 +76,14 @@ pub type FrameStream<'a, T> = futures_core::stream::LocalBoxStream<'a, T>;
 /// Errors produced by media transports.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
+    #[error("the account session requires sign in before calling")]
+    SignInRequired,
+    #[error("LiveKit authorization does not match the requested participant, room or purpose")]
+    AuthorizationMismatch,
+    /// This account's SDK must refresh or reauthenticate before another token
+    /// request can be attempted. No peer URL or response text is retained.
+    #[error("RTC authorization awaits account session refresh or sign in")]
+    AuthExpired,
     /// The transport cannot serve the requested connection.
     #[error("unsupported transport: {0}")]
     Unsupported(String),
@@ -258,6 +266,13 @@ pub trait MediaTransport: MaybeSend {
     /// The connection grouping key for a published transport, if this backend
     /// can serve it. Members with equal keys share one connection.
     fn connection_key(&self, transport: &RtcTransport) -> Option<String>;
+
+    /// Publisher-aware grouping. A homeserver-mediated SFU locator belongs to
+    /// the authenticated publishing user's Matrix server, which need not be
+    /// this account's homeserver or the delegated HTTPS base URL.
+    fn connection_key_for_member(&self, _member: &JoinedMembership, transport: &RtcTransport) -> Option<String> {
+        self.connection_key(transport)
+    }
 
     /// The identity this member will have on the media plane, used to
     /// reverse-map transport participants to memberships. `None` when the

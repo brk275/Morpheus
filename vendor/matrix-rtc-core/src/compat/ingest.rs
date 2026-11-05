@@ -155,6 +155,19 @@ pub fn to_core_member_event(room_id: &str, event: RawMemberEventIn) -> Option<Ra
 
     let claimed_device = sticky_2025::claimed_device_id(&value);
 
+    // Redundant body identities never replace event/decryption attribution.
+    // Preserve the explicit historical Claimed origin when no authenticated
+    // device exists; encrypted-room admission still rejects that origin.
+    if let Some(user) = value.pointer("/member/user_id") {
+        if user.as_str() != Some(event.sender.as_str()) { return None; }
+    }
+    if let Some(device) = value.pointer("/member/device_id") {
+        let Some(device) = device.as_str().filter(|device| !device.is_empty()) else { return None; };
+        if event.sender_device_id.as_deref().is_some_and(|authenticated| authenticated != device) {
+            return None;
+        }
+    }
+
     let content: RawStickyEventContent = match serde_json::from_value(value) {
         Ok(content) => content,
         Err(error) => {
@@ -455,6 +468,27 @@ mod tests {
             origin_server_ts: None,
             event_type: "org.matrix.msc4143.rtc.member".to_owned(),
             content,
+        }
+    }
+
+    #[test]
+    fn redundant_body_identities_cannot_override_authenticated_member_origin() {
+        let content = serde_json::json!({
+            "slot_id":"m.call#ROOM", "msc4354_sticky_key":"MEMBER",
+            "application":{"type":"m.call"},
+            "member":{"id":"MEMBER","membership":"join","user_id":"@alice:example.org","device_id":"ALICEDEVICE"},
+            "transports":{"published":[],"can_subscribe":[]}
+        });
+        let valid = to_core_member_event("!room:example.org", raw(content.clone())).unwrap();
+        assert_eq!(valid.origin.sender_device_id(), Some("ALICEDEVICE"));
+        for (field, value) in [
+            ("user_id", serde_json::json!("@mallory:example.org")),
+            ("device_id", serde_json::json!("MALLORY")),
+            ("device_id", serde_json::Value::Null),
+        ] {
+            let mut conflict = content.clone();
+            conflict["member"][field] = value;
+            assert!(to_core_member_event("!room:example.org", raw(conflict)).is_none());
         }
     }
 

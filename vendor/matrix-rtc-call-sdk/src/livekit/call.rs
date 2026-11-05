@@ -53,7 +53,7 @@ use matrix_rtc_call::{
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{self, MembershipFormat};
 use matrix_rtc_core::{
-    BaseRtcRoom, EncryptionConfig, LeaveError, LiveKitTransport, SlotEncryption,
+    BaseRtcRoom, EncryptionConfig, LeaveError, LiveKitTransport, MatrixBackend, RtcTransport, SlotEncryption,
 };
 use matrix_rtc_matrix_sdk::SdkMatrixBackend;
 use matrix_rtc_transport::{
@@ -149,10 +149,12 @@ pub struct LiveKitCallOptions {
     /// advertised transports (MSC4143 `GET /rtc/transports`). `None` takes the
     /// first LiveKit one advertised; joining fails if there is none.
     pub livekit_transport: Option<LiveKitTransport>,
-    /// Explicit auth contract. None keeps Sticky2025's direct draft profile;
-    /// other formats select legacy for canonical `m.call#ROOM` service flows
-    /// and direct for custom slots. No HTTP failure or unverified JWT changes
-    /// this selection. An explicit contract remains authoritative.
+    /// Standard typed publication. Cannot be combined with livekit_transport.
+    pub rtc_transport: Option<RtcTransport>,
+    /// Explicit contract, validated against the publication before joining.
+    /// None follows its standard descriptor, independently of membership mode.
+    /// DirectDraft is deprecated historical/custom compatibility only; it is
+    /// never inferred, mixed with CSAPI, or advertised as stock 0.28-compatible.
     pub auth_dialect: Option<matrix_rtc_transport::livekit::LiveKitAuthDialect>,
     /// Override for the core's media-key policy. `None` keeps the core's
     /// default, which requires key senders to be cross-signed (MSC4153) —
@@ -246,6 +248,7 @@ impl Default for LiveKitCallOptions {
             slot_id: "m.call#room".to_owned(),
             application: "m.call".to_owned(),
             livekit_transport: None,
+            rtc_transport: None,
             auth_dialect: None,
             encryption_config: None,
             keep_alive_interval_ms: None,
@@ -344,6 +347,31 @@ impl LiveKitCall {
             .await?;
         room.seeded().await;
 
+        if options.rtc_transport.is_some() && options.livekit_transport.is_some() {
+            return Err(signalling_error("conflicting LiveKit publication options"));
+        }
+        let published = match options.rtc_transport.clone()
+            .or_else(|| options.livekit_transport.clone().map(RtcTransport::LiveKit)) {
+            Some(transport) => transport,
+            None => {
+                let advertised = room.backend().rtc_transports().await.map_err(signalling_error)?;
+                advertised.as_array().into_iter().flatten().find_map(|entry| {
+                    let raw: matrix_rtc_core::RawRtcTransport = serde_json::from_value(entry.clone()).ok()?;
+                    let typed = raw.into_typed();
+                    typed.is_livekit().then_some(typed)
+                }).ok_or_else(|| signalling_error("the homeserver advertises no supported LiveKit transport"))?
+            }
+        };
+        let dialect = matrix_rtc_transport::livekit::LiveKitAuthDialect::for_transport(
+            &published, options.auth_dialect == Some(matrix_rtc_transport::livekit::LiveKitAuthDialect::DirectDraft),
+        ).ok_or_else(|| signalling_error("unsupported LiveKit publication contract"))?;
+        if options.auth_dialect.is_some_and(|explicit| explicit != dialect)
+            || matrix_rtc_livekit::livekit_connection_key(&published, &user_id).is_none() {
+            return Err(signalling_error("LiveKit authorization conflicts with its publication"));
+        }
+        dialect.validate_slot(&crate::attach::token_slot_id(options.format, &options.slot_id))
+            .map_err(signalling_error)?;
+
         // The join picks the `member.id` this mode joins with (a fresh one per
         // join, except in the pre-sticky generation; see
         // `compat::ingest::member_id`) and renders our sends in the room's
@@ -354,10 +382,7 @@ impl LiveKitCall {
         };
         // The join's own choice, else the first LiveKit focus the homeserver
         // advertises; media reads it back from the call.
-        join.transport = options
-            .livekit_transport
-            .clone()
-            .map_or(JoinTransport::Advertised, JoinTransport::Publish);
+        join.transport = JoinTransport::PublishTransport(published);
         join.encryption_config = options.encryption_config.clone();
         join.sticky_duration_ms = options.sticky_duration_ms;
         join.degraded_lifetime_ms = options.degraded_lifetime_ms;
@@ -384,12 +409,7 @@ impl LiveKitCall {
             room.backend().clone(),
             LiveKitAttachOptions {
                 format: options.format,
-                auth_dialect: options.auth_dialect.unwrap_or_else(|| {
-                    matrix_rtc_transport::livekit::LiveKitAuthDialect::for_membership_profile(
-                        options.format,
-                        &crate::attach::token_slot_id(options.format, &options.slot_id),
-                    )
-                }),
+                auth_dialect: dialect,
                 http: options.http.clone(),
                 auto_subscribe: options.auto_subscribe,
                 stability: options.stability.clone(),

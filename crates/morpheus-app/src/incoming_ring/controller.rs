@@ -15,7 +15,7 @@ use super::{
     ledger::{OfferKey, OfferLedger},
     policy,
 };
-use crate::voice_spaces::VoiceSpaces;
+use crate::voice_spaces::{RoomCallProfile, VoiceSpaces};
 use futures_util::FutureExt;
 use matrix_sdk::{
     deserialized_responses::{AlgorithmInfo, EncryptionInfo, VerificationState},
@@ -1258,6 +1258,7 @@ impl DeclineClaim {
 pub(crate) struct JoinTarget {
     room_id: String,
     options: CallOptions,
+    profile: RoomCallProfile,
     selection: AccountSelection,
 }
 impl JoinTarget {
@@ -1267,6 +1268,7 @@ impl JoinTarget {
     pub(crate) fn options(&self) -> &CallOptions {
         &self.options
     }
+    pub(crate) fn profile(&self) -> RoomCallProfile { self.profile }
     pub(crate) fn selection(&self) -> &AccountSelection {
         &self.selection
     }
@@ -1392,14 +1394,16 @@ impl AcceptedOffer {
         {
             return Err(ControllerFailure::Revoked);
         }
-        let options = match self.offer.mode() {
+        let mut options = match self.offer.mode() {
             InteropMode::Current => CallOptions::default(),
             InteropMode::Sticky2025 => CallOptions::element_call_matrix_2_0(),
             InteropMode::RoomState => return Err(ControllerFailure::WrongCall),
         };
+        options.slot_id = self.offer.slot_id().to_owned();
         Ok(JoinTarget {
             room_id: self.offer.room.room_id().to_string(),
             options,
+            profile: self.offer.profile,
             selection: self.offer.selection.clone(),
         })
     }
@@ -1646,7 +1650,7 @@ fn require_call_identity(
     info: &CallInfo,
 ) -> Result<(), ControllerFailure> {
     if info.room_id != offer.room.room_id().as_str()
-        || info.slot_id != "m.call#room"
+        || info.slot_id != offer.slot_id()
         || rtc.client().user_id().map(|id| id.as_str()) != Some(offer.own_user.as_str())
         || rtc.client().device_id().map(|id| id.as_str()) != Some(offer.own_device.as_str())
     {
