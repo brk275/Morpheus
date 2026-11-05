@@ -230,11 +230,7 @@ impl ActorAcceptance {
         // Match the explicit local profile before actor registration. The
         // offer must retain this choice and epoch through Answer.
         preferences
-            .set_room_call_mode(
-                &account.id,
-                case.room_id.as_str(),
-                case.room_mode,
-            )
+            .set_room_call_mode(&account.id, case.room_id.as_str(), case.room_mode)
             .map_err(|_| error("unavailable"))?;
         let worker = IncomingWorker::start(
             &tokio::runtime::Handle::current(),
@@ -630,9 +626,7 @@ impl ActorAcceptance {
         drop(transition);
         check(self.calls.status() == CallStatus::Idle)?;
         let video = self.calls.subscribe_local_video().borrow().clone();
-        check(
-            video.camera.phase == CapturePhase::Off && video.screen.phase == CapturePhase::Off,
-        )?;
+        check(video.camera.phase == CapturePhase::Off && video.screen.phase == CapturePhase::Off)?;
         check(rtc.participants(&info.room_id).is_ok_and(|roster| {
             roster.len() == 1
                 && roster[0].is_local

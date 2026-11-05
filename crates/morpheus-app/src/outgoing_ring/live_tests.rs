@@ -490,20 +490,12 @@ impl Session {
                 if message == "room-wide calls require a supported room profile; use a literal join for explicit draft or custom slots"
         ))?;
         fact("experimental_current_room_entry_rejected");
-        rtc.open_outgoing_room(
-            case.room_id.as_str(),
-            true,
-            case.mode,
-            Arc::clone(&admit),
-        )
-        .await
-        .map_err(|_| ())?;
-        original_sticky_slot_without_lower(&alice_client, &case.room_id, admit.as_ref())
-            .await?;
+        rtc.open_outgoing_room(case.room_id.as_str(), true, case.mode, Arc::clone(&admit))
+            .await
+            .map_err(|_| ())?;
+        original_sticky_slot_without_lower(&alice_client, &case.room_id, admit.as_ref()).await?;
         let options = CallJoinMode::from(case.room_mode).options();
-        require(
-            options.interop_mode == InteropMode::Sticky2025 && options.auth_dialect.is_none(),
-        )?;
+        require(options.interop_mode == InteropMode::Sticky2025 && options.auth_dialect.is_none())?;
         fact("shipping_sticky_profile");
         let info = time::timeout(
             PHASE_LIMIT,

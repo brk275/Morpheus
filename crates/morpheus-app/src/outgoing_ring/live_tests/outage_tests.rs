@@ -661,9 +661,7 @@ impl OutageSession {
         // This loopback fixture advertises only the standard legacy OpenID
         // service. Its publisher identity is stable per authenticated device;
         // a new membership and imported key ownership must still be fresh.
-        require(
-            original.local_identity == format!("{}:{}", account.user_id, account.device_id),
-        )?;
+        require(original.local_identity == format!("{}:{}", account.user_id, account.device_id))?;
         let stable_call = self.calls.call_token();
         let before_generation = self.calls.video_token();
         require(stable_call != 0 && before_generation != 0 && selection.is_current())?;
