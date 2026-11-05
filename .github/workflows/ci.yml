@@ -4,12 +4,12 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: windows-tiny-msvc-94d3b916b6a3c119db14d83e4a43b290d6bedabc
+  group: windows-tiny-msvc-7e7f27a5794ee89257a5c8f2549c32ebdb710b40
   cancel-in-progress: false
 env:
-  REVIEWED_TINY_SOURCE: 94d3b916b6a3c119db14d83e4a43b290d6bedabc
-  REVIEWED_TINY_TREE: 6a08471fde73289f7670134522bad7f02f0db6c4
-  MORPHEUS_PACKAGE_SOURCE_REVISION: 94d3b916b6a3c119db14d83e4a43b290d6bedabc
+  REVIEWED_TINY_SOURCE: 7e7f27a5794ee89257a5c8f2549c32ebdb710b40
+  REVIEWED_TINY_TREE: cc04b77111c9ed06d267ff021564b15ab3a1b17f
+  MORPHEUS_PACKAGE_SOURCE_REVISION: 7e7f27a5794ee89257a5c8f2549c32ebdb710b40
 jobs:
   tiny:
     name: Synthetic protected Windows compiler and cleanup probe
@@ -97,7 +97,7 @@ jobs:
               lines=observed.getvalue().splitlines()
               assert len(lines)==1 and lines[0].startswith('MORPHEUS_WINDOWS_TINY_MSVC ')
               observation=json.loads(lines[0].split(' ',1)[1])
-              assert type(observation) is dict and set(observation)=={'schema','check','source_revision','source_tree','phase','build_passed','binary_passed','private_scan_passed','cleanup_passed','cleanup_refusal','job_closed','job_cleanup_failed','readonly_retries','compiler_hint','native_failure_cause_proven','installed_update_qualified'}
+              assert type(observation) is dict and set(observation)=={'schema','check','source_revision','source_tree','phase','build_passed','binary_passed','private_scan_passed','cleanup_passed','cleanup_refusal','job_closed','job_cleanup_failed','readonly_retries','compiler_hint','command_lifecycle','last_exit_status','native_failure_cause_proven','installed_update_qualified'}
               assert observation['schema']==1 and observation['check']=='tiny_owned_windows_msvc' and observation['source_revision']==source and observation['source_tree']==tree
               assert observation['phase'] in {'private_environment','toolchain','fixture','cargo_build','binary'}
               booleans=('build_passed','binary_passed','private_scan_passed','cleanup_passed','job_closed','job_cleanup_failed','native_failure_cause_proven','installed_update_qualified')
@@ -112,14 +112,35 @@ jobs:
                   if 'predicate' in refusal: assert refusal['category']=='guard' and refusal['predicate'] in {'root_identity','inventory_limit','inventory_symlink','inventory_reparse','callback_scope','callback_root_identity','inner_removed','workspace_scope','workspace_identity','workspace_empty','workspace_removed'}
                   if 'reparse' in refusal:
                       fixed=refusal['reparse']
-                      assert refusal.get('predicate')=='inventory_reparse' and type(fixed) is dict and set(fixed)=={'role','kind','attributes','tag','subcomponent','compatibility_name','depth'}
+                      assert refusal.get('predicate')=='inventory_reparse' and type(fixed) is dict and set(fixed)=={'role','kind','attributes','tag','subcomponent','compatibility_name','depth','components'}
                       assert type(fixed['role']) is str and fixed['role'] in {'native-target','tools-home','tiny-source','synthetic-git','logs','other'}
                       assert type(fixed['kind']) is str and fixed['kind'] in {'directory','regular','other'}
                       assert all(fixed[k] is None or type(fixed[k]) is int and 0<=fixed[k]<=0xffffffff for k in ('attributes','tag'))
                       assert type(fixed['subcomponent']) is str and fixed['subcomponent'] in {'not-tools-home','home','roaming','local','temp','other','none'}
                       assert type(fixed['compatibility_name']) is str and fixed['compatibility_name'] in {'not-tools-home','application-data','local-settings','history','cookies','temporary-internet-files','my-documents','nethood','printhood','recent','sendto','templates','start-menu','other'}
                       assert fixed['depth'] is None or type(fixed['depth']) is int and 1<=fixed['depth']<=64
+                      assert (fixed['depth'] is None and fixed['components'] is None) or (type(fixed['components']) is list and len(fixed['components'])==fixed['depth'] and all(type(v) is str and v in {'tools-home','home','appdata','local','roaming','temp','microsoft','windows','visualstudio','.cargo','.rustup','toolchains','registry','cache','native-target','tiny-source','synthetic-git','logs','opaque'} for v in fixed['components']))
                       assert (fixed['role']=='tools-home' and fixed['subcomponent']!='not-tools-home' and fixed['compatibility_name']!='not-tools-home') or (fixed['role']!='tools-home' and fixed['subcomponent']==fixed['compatibility_name']=='not-tools-home')
+              retained_status=observation['last_exit_status']
+              assert retained_status is None or type(retained_status) is int and 0<=retained_status<=0xffffffff
+              lifecycle=observation['command_lifecycle']
+              if lifecycle is not None:
+                  assert type(lifecycle) is dict and set(lifecycle)=={'schema','check','stage','command_phase','job_close','job_close_refusal','scan_phase','scan_counts','cleanup_phase','cleanup_refusal','job_cleanup_failed','private_log_scan_passed','cleanup_passed','passed','distribution_ready'}
+                  assert type(lifecycle['schema']) is int and lifecycle['schema']==1 and lifecycle['check']=='windows_update_gate_diagnostic' and lifecycle['stage']=='build-old' and lifecycle['cleanup_phase']=='workspace'
+                  assert lifecycle['command_phase'] in {'unavailable','job_create','start','wait_log_bounds','process_wait','exit_status','job_query','drain_log_bounds','drain_deadline','drained_log_bounds','result_log_bounds','result_log_read','complete'}
+                  assert lifecycle['job_close'] in {'unattempted','attempted','complete','failed'}
+                  assert lifecycle['scan_phase'] in {'unattempted','configuration','enumeration','owned_log_read','scanner','result','complete'}
+                  assert type(lifecycle['scan_counts']) is dict and set(lifecycle['scan_counts'])=={'success','exit_one','other_exit','timeout','refusal'}
+                  assert all(type(v) is int and 0<=v<=128 for v in lifecycle['scan_counts'].values()) and sum(lifecycle['scan_counts'].values())<=128
+                  assert all(type(lifecycle[k]) is bool for k in ('job_cleanup_failed','private_log_scan_passed','cleanup_passed','passed','distribution_ready'))
+                  assert lifecycle['passed'] is False and lifecycle['distribution_ready'] is False
+                  assert lifecycle['job_cleanup_failed']==observation['job_cleanup_failed'] and lifecycle['private_log_scan_passed']==observation['private_scan_passed'] and lifecycle['cleanup_passed']==observation['cleanup_passed']
+                  assert (lifecycle['job_close']=='complete')==observation['job_closed'] and lifecycle['cleanup_refusal']==observation['cleanup_refusal']
+                  close_refusal=lifecycle['job_close_refusal']
+                  if close_refusal is not None:
+                      assert type(close_refusal) is dict and set(close_refusal)=={'code','operation'}
+                      assert close_refusal['code'] in {'guard','job_setup','job_assignment','process_start','process_wait','deadline','cleanup','containment','build','discovery','capture','internal'}
+                      assert close_refusal['operation'] in {'job_create','job_configure','handle_duplicate','process_create','job_assign','thread_resume','process_observe','process_terminate','process_completion','process_wait','process_exit_code','job_query','job_terminate','job_drain'}
               hint=observation['compiler_hint']
               if hint is not None:
                   assert observation['private_scan_passed'] is True and observation['job_closed'] is True and observation['job_cleanup_failed'] is False
