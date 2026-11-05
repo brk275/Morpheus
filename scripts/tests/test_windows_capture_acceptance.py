@@ -520,6 +520,133 @@ class WindowsCaptureTests(unittest.TestCase):
 
 class InstalledWindowsUpdateTests(unittest.TestCase):
     @staticmethod
+    def _provider_msvc_fixture(root, generation="18"):
+        program = root / "Program Files"
+        program86 = root / "Program Files (x86)"
+        installation = program / "Microsoft Visual Studio" / generation / "Enterprise"
+        tool_root = installation / "VC/Tools/MSVC/14.51.36231"
+        metadata = installation / "VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_bytes(b"14.51.36231\r\n")
+        for name in ("link.exe", "cl.exe", "lib.exe"):
+            path = tool_root / "bin/Hostx64/x64" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"synthetic non-executed tool")
+        for name in ("include", "lib/x64"):
+            (tool_root / name).mkdir(parents=True, exist_ok=True)
+        sdk = program86 / "Windows Kits/10"
+        for version in ("10.0.22621.0", "10.0.26100.0"):
+            for part, name in (("um", "kernel32.lib"), ("ucrt", "ucrt.lib")):
+                path = sdk / "Lib" / version / part / "x64" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"synthetic non-executed library")
+            for part in ("ucrt", "shared", "um", "winrt", "cppwinrt"):
+                (sdk / "Include" / version / part).mkdir(parents=True, exist_ok=True)
+        environment = {"PROGRAMFILES":str(program), "PROGRAMFILES(X86)":str(program86),
+            "PATH":"untrusted-first-GNU-tool-directory", "LIB":"ambient-wrong-libraries",
+            "INCLUDE":"ambient-wrong-headers", "VCINSTALLDIR":"ambient-partial-vcvars",
+            "GIT_CONFIG_GLOBAL":"nul", "RUSTUP_TOOLCHAIN":"1.99.0"}
+        return environment, installation, tool_root, sdk, metadata
+
+    def test_msvc_build_environment_selects_protected_x64_tools_before_gnu_and_exact_sdk(self):
+        for generation in ("18", "2022"):
+            with self.subTest(generation=generation), tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve()
+                environment,installation,tools,sdk,metadata=self._provider_msvc_fixture(root,generation)
+                original=dict(environment);admissions=[]
+                def checked(path,**options):
+                    path=Path(path);self.assertTrue(path.exists());admissions.append((path,options));return path
+                with patch.object(update.notice_source,"checked",side_effect=checked), \
+                        patch.object(update.notices,"read_regular",side_effect=lambda path,bound:Path(path).read_bytes()):
+                    selected=update.msvc_build_environment(environment)
+                linker=tools/"bin/Hostx64/x64/link.exe"
+                self.assertEqual(selected["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"],str(linker))
+                self.assertEqual(selected["PATH"].split(update.os.pathsep)[0],str(linker.parent))
+                self.assertEqual(selected["LIB"].split(update.os.pathsep),[str(tools/"lib/x64"),
+                    str(sdk/"Lib/10.0.26100.0/um/x64"),str(sdk/"Lib/10.0.26100.0/ucrt/x64")])
+                self.assertNotIn("ambient",selected["LIB"]+selected["INCLUDE"]+selected["VCINSTALLDIR"])
+                self.assertIn(str(sdk/"Include/10.0.26100.0/cppwinrt"),selected["INCLUDE"].split(update.os.pathsep))
+                self.assertEqual(selected["VSCMD_ARG_TGT_ARCH"],"x64")
+                self.assertEqual(selected["WINDOWSSDKVERSION"],"10.0.26100.0"+update.os.sep)
+                self.assertEqual(selected["GIT_CONFIG_GLOBAL"],"nul")
+                self.assertEqual(selected["RUSTUP_TOOLCHAIN"],"1.99.0")
+                self.assertIn((installation,{"directory":True}),admissions)
+                for name in ("link.exe", "cl.exe", "lib.exe"):
+                    self.assertIn((linker.parent/name,{}),admissions)
+                self.assertEqual(environment,original)
+
+    def test_msvc_sdk_admits_parent_before_leaf_and_skips_only_missing_partial_versions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve()
+            environment,installation,tools,sdk,metadata=self._provider_msvc_fixture(root)
+            latest=sdk/"Lib/10.0.26100.0"
+            (latest/"um/x64/kernel32.lib").unlink()
+            def checked(path,**options):
+                path=Path(path)
+                if not path.exists():raise FileNotFoundError()
+                return path
+            with patch.object(update.notice_source,"checked",side_effect=checked), \
+                    patch.object(update.notices,"read_regular",side_effect=lambda path,bound:Path(path).read_bytes()):
+                selected=update.msvc_build_environment(environment)
+                self.assertEqual(selected["WINDOWSSDKVERSION"],"10.0.22621.0"+update.os.sep)
+            admissions=[]
+            def unsafe(path,**options):
+                path=Path(path);admissions.append((path,options))
+                if path==latest/"um/x64":raise ValueError("unsafe SDK parent")
+                return checked(path,**options)
+            with patch.object(update.notice_source,"checked",side_effect=unsafe), \
+                    patch.object(update.notices,"read_regular",side_effect=lambda path,bound:Path(path).read_bytes()):
+                with self.assertRaises(ValueError):update.msvc_build_environment(environment)
+            self.assertIn((latest/"um/x64",{"directory":True}),admissions)
+            self.assertNotIn((latest/"um/x64/kernel32.lib",{}),admissions)
+
+    def test_windows_build_passes_selected_msvc_linker_and_nonce_to_actual_cargo_command(self):
+        class StopAfterCargo(Exception):pass
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();source=root/"source";source.mkdir()
+            original={"PATH":"original", "GIT_CONFIG_GLOBAL":"nul"}
+            selected={"PATH":"protected-msvc-first", "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER":"protected-link.exe"}
+            commands=types.SimpleNamespace(root=root,environment=original,
+                run=Mock(side_effect=StopAfterCargo()),build_substage="unavailable")
+            def private_directory(path,**options):Path(path).mkdir(**options);return Path(path)
+            security=types.SimpleNamespace(private_directory=private_directory)
+            with patch.object(update,"export_source",return_value=(source,{"proof":"unchanged"})), \
+                    patch.object(update.notice_source.S,"windows_security",return_value=security), \
+                    patch.object(update.notices,"prepare",return_value={}), \
+                    patch.object(update,"msvc_build_environment",return_value=selected) as select:
+                with self.assertRaises(StopAfterCargo):
+                    update.build(commands,source,b"archive","0.1.0-updateqa.1","a"*32,"old",
+                                 "cargo.exe",root/"bundle",root/"receipt","b"*40)
+            select.assert_called_once_with(original)
+            invocation=commands.run.call_args
+            self.assertEqual(invocation.args[0][:7],["cargo.exe","build","--release","--locked","-p","morpheus-app","--features"])
+            self.assertEqual(invocation.args[0][7],"native-calls")
+            self.assertEqual(invocation.kwargs["environment"]["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"],"protected-link.exe")
+            self.assertEqual(invocation.kwargs["environment"]["PATH"],"protected-msvc-first")
+            self.assertEqual(invocation.kwargs["environment"]["MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD"],"a"*32)
+            self.assertEqual(invocation.kwargs["seconds"],3600)
+            self.assertEqual(original,{"PATH":"original", "GIT_CONFIG_GLOBAL":"nul"})
+
+    def test_msvc_build_environment_refuses_unsafe_tools_version_aliases_and_excessive_sdk_entries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve()
+            environment,installation,tools,sdk,metadata=self._provider_msvc_fixture(root)
+            with patch.object(update.notice_source,"checked",side_effect=lambda path,**options:Path(path)), \
+                    patch.object(update.notices,"read_regular",side_effect=lambda path,bound:Path(path).read_bytes()):
+                metadata.write_bytes(b"../untrusted")
+                with self.assertRaises(update.Failure):update.msvc_build_environment(environment)
+                metadata.write_bytes(b"14.51.36231\n")
+                (tools/"bin/Hostx64/x64/link.exe").unlink()
+                with self.assertRaises(FileNotFoundError):update.msvc_build_environment(environment)
+                (tools/"bin/Hostx64/x64/link.exe").write_bytes(b"synthetic non-executed linker")
+                for index in range(65):(sdk/"Lib"/("irrelevant-"+str(index))).mkdir()
+                with self.assertRaises(update.Failure):update.msvc_build_environment(environment)
+            with patch.object(update.notice_source,"checked",side_effect=ValueError("unsafe provider path")), \
+                    patch.object(update.notices,"read_regular") as read:
+                with self.assertRaises(ValueError):update.msvc_build_environment(environment)
+                read.assert_not_called()
+
+    @staticmethod
     def _workspace_security_fixture(parent, calls):
         def check(path, **options):
             path=Path(path);calls.append(("check",path,options));return path

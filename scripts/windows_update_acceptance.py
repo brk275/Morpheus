@@ -144,6 +144,73 @@ def private_environment(environment, home):
         RUSTUP_TOOLCHAIN="1.99.0", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
     return result
 
+
+def msvc_build_environment(environment):
+    """Select protected provider x64 tools; never resolve GNU link from PATH.
+
+    Rust's vcvars shortcut can accept the first link.exe when its architecture
+    probe is unavailable. Derive the complete fixed native toolchain instead
+    of forwarding more ambient vcvars/compiler overrides or running setup hooks.
+    """
+    result = dict(environment)
+    program_files = Path(environment["PROGRAMFILES"])
+    installations = [program_files / "Microsoft Visual Studio" / name / "Enterprise"
+                     for name in ("18", "2022")]
+    installation = next((path for path in installations if path.exists()), None)
+    require(installation is not None)
+    notice_source.checked(installation, directory=True)
+    metadata = installation / "VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt"
+    notice_source.checked(metadata)
+    version = notices.read_regular(metadata, 64).decode("ascii").strip()
+    require(re.fullmatch(r"14\.[0-9]{1,2}\.[0-9]{3,6}", version) is not None)
+    tool_root = installation / "VC/Tools/MSVC" / version
+    binaries = tool_root / "bin/Hostx64/x64"
+    notice_source.checked(binaries, directory=True)
+    for name in ("link.exe", "cl.exe", "lib.exe"):
+        tool = notice_source.checked(binaries / name)
+        require(tool.stat().st_size > 0)
+    libraries = [tool_root / "lib/x64"]
+    includes = [tool_root / "include"]
+    atl = tool_root / "atlmfc"
+    if atl.exists():
+        notice_source.checked(atl, directory=True)
+        libraries.append(atl / "lib/x64")
+        includes.append(atl / "include")
+    sdk = Path(environment["PROGRAMFILES(X86)"]) / "Windows Kits/10"
+    notice_source.checked(sdk / "Lib", directory=True)
+    versions = []
+    for index, path in enumerate((sdk / "Lib").iterdir(), 1):
+        require(index <= 64)
+        if re.fullmatch(r"10\.0\.[0-9]{4,6}\.[0-9]{1,5}", path.name):
+            notice_source.checked(path, directory=True)
+            try:
+                for part, library in (("um", "kernel32.lib"), ("ucrt", "ucrt.lib")):
+                    parent = notice_source.checked(path / part / "x64", directory=True)
+                    notice_source.checked(parent / library)
+            except FileNotFoundError:
+                continue  # A partial installed SDK is not a complete candidate.
+            versions.append(path.name)
+    require(versions)
+    sdk_version = max(versions, key=lambda value: tuple(map(int, value.split("."))))
+    for part, library in (("um", "kernel32.lib"), ("ucrt", "ucrt.lib")):
+        path = sdk / "Lib" / sdk_version / part / "x64"
+        notice_source.checked(path / library)
+        libraries.append(path)
+    includes.extend(sdk / "Include" / sdk_version / name for name in ("ucrt", "shared", "um", "winrt", "cppwinrt"))
+    for path in libraries + includes:
+        notice_source.checked(path, directory=True)
+    result.update(CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=str(binaries / "link.exe"),
+        PATH=str(binaries) + os.pathsep + environment["PATH"],
+        LIB=os.pathsep.join(map(str, libraries)), INCLUDE=os.pathsep.join(map(str, includes)),
+        LIBPATH=os.pathsep.join(map(str, libraries)),
+        VSINSTALLDIR=str(installation) + os.sep, VCINSTALLDIR=str(installation / "VC") + os.sep,
+        VCTOOLSINSTALLDIR=str(tool_root) + os.sep, VCTOOLSVERSION=version,
+        VSCMD_ARG_TGT_ARCH="x64", WINDOWSSDKDIR=str(sdk) + os.sep,
+        WINDOWSSDKVERSION=sdk_version + os.sep, UNIVERSALCRTSDKDIR=str(sdk) + os.sep,
+        UCRTVERSION=sdk_version)
+    return result
+
+
 class Commands:
     def __init__(self, root, environment):
         self.root, self.environment = root, environment
@@ -367,7 +434,9 @@ def build(commands, source, archive, version, nonce, label, cargo, notice_bundle
     notice_contents=notices.prepare(notice_bundle,notice_receipt,notice_dir,revision=reviewed,
                                     platform="win32",version=version,working=exported)
     target = commands.root/"native-target"
-    environment = {"MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD":nonce,"MORPHEUS_PACKAGE_FORMAT":"nsis-payload-v2"}
+    commands.build_substage = "config"
+    environment = msvc_build_environment(commands.environment)
+    environment.update(MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD=nonce, MORPHEUS_PACKAGE_FORMAT="nsis-payload-v2")
     commands.build_substage = "cargo_build"
     commands.run([cargo,"build","--release","--locked","-p","morpheus-app","--features","native-calls",
         "--target-dir",target],environment=environment,cwd=exported,seconds=3600)
