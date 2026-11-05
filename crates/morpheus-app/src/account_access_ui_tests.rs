@@ -873,7 +873,10 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
     assert_eq!(std::fs::read_to_string(config_path).unwrap(), broken_fonts);
     assert!(ui.get_appearance_fonts_dirty());
     assert_eq!(ui.get_appearance_ui_font_input(), font_draft);
-    tab_to_control(ui, "Use the default interface, message and monospaced fonts");
+    tab_to_control(
+        ui,
+        "Use the default interface, message and monospaced fonts",
+    );
     key(ui, Key::Space);
     assert_eq!(std::fs::read_to_string(config_path).unwrap(), broken_fonts);
     assert!(ui.get_appearance_fonts_dirty());
@@ -894,15 +897,24 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
     key(ui, Key::End);
     type_text(ui, " draft");
     assert!(ui.get_appearance_fonts_dirty());
-    tab_to_control(ui, "Use the default interface, message and monospaced fonts");
+    tab_to_control(
+        ui,
+        "Use the default interface, message and monospaced fonts",
+    );
     key(ui, Key::Space);
     assert!(!ui.get_appearance_fonts_dirty());
-    assert_eq!(ui.get_appearance_ui_font_input(), defaults.appearance.font_family);
+    assert_eq!(
+        ui.get_appearance_ui_font_input(),
+        defaults.appearance.font_family
+    );
     assert_eq!(ui.get_appearance_message_font_input(), "");
     assert_eq!(ui.get_appearance_composer_font_input(), "");
     assert_eq!(ui.get_appearance_mono_font_input(), "monospace");
     let reset_draft = store.load().unwrap();
-    assert_eq!(reset_draft.appearance.font_family, defaults.appearance.font_family);
+    assert_eq!(
+        reset_draft.appearance.font_family,
+        defaults.appearance.font_family
+    );
     assert_eq!(reset_draft.typography.message_font_family, None);
     assert_eq!(reset_draft.typography.composer_font_family, None);
     assert_eq!(reset_draft.typography.monospace_font_family, "monospace");
@@ -5874,7 +5886,10 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     assert!(!ui.get_style_profile_items().row_data(0).unwrap().current);
     ui.invoke_style_profile_chosen(item.key.clone());
     // A typed four-field form remains local while a profile changes the look.
-    assert!(!ui.get_appearance_fonts_dirty(), "projection is not a user edit");
+    assert!(
+        !ui.get_appearance_fonts_dirty(),
+        "projection is not a user edit"
+    );
     assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
     settle(ui).await;
     assert!(focused_control_has_label(ui, "Interface font family"));
@@ -6017,7 +6032,10 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     assert_eq!(ui.get_message_font_size(), 15);
     assert!(ui.get_style_profile_items().row_data(0).unwrap().current);
     assert_font_drafts(ui);
-    assert_eq!(applied.appearance.font_family, config.appearance.font_family);
+    assert_eq!(
+        applied.appearance.font_family,
+        config.appearance.font_family
+    );
     assert_ne!(applied.appearance.font_family, font_drafts.0.as_str());
 
     // An invalid settings file is never overwritten by Apply.
