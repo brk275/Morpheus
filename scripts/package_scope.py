@@ -13,7 +13,7 @@ else:
 def package_matrix(platform, linux_formats, appimage_updates=False, appimage_capture=False, source_bundle=False, native_updates=False):
     if type(native_updates) is not bool:
         raise ValueError("Native update selection must be an explicit boolean")
-    if native_updates and (platform not in {"macos", "windows"} or linux_formats != "appimage"
+    if native_updates and (platform not in {"macos", "macos-arm64", "macos-x64", "windows"} or linux_formats != "appimage"
                            or appimage_updates or appimage_capture or source_bundle):
         raise ValueError("Native update QA requires explicit Mac or Windows alone and excludes AppImage/capture/source modes")
     if source_bundle and (platform != "linux" or linux_formats != "appimage" or appimage_updates or appimage_capture):
@@ -34,6 +34,8 @@ def package_matrix(platform, linux_formats, appimage_updates=False, appimage_cap
             {"os": "macos-15-intel", "label": "macos-x64", "formats": "dmg"},
         ],
     }
+    options["macos-arm64"] = options["macos"][:1]
+    options["macos-x64"] = options["macos"][1:]
     options["all"] = options["macos"] + options["windows"] + options["linux"]
     try:
         return {"include": options[platform]}

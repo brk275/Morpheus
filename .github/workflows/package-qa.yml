@@ -13,7 +13,7 @@ on:
         type: choice
         required: true
         default: linux
-        options: [linux, windows, macos, all]
+        options: [linux, windows, macos, macos-arm64, macos-x64, all]
       linux_formats:
         description: Linux package formats (Debian deferred until a project email is configured)
         type: choice
@@ -21,7 +21,7 @@ on:
         default: appimage
         options: [both, appimage, deb]
       native_updates:
-        description: Synthetic installed update transactions (explicit macos or windows only; two version-only packages)
+        description: Synthetic installed update transactions (explicit Mac architecture, macos or windows; two packages per architecture)
         type: boolean
         required: true
         default: false
