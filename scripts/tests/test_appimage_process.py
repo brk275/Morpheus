@@ -349,7 +349,7 @@ class ProcessTests(unittest.TestCase):
                                "GITHUB_EVENT_PATH":str(event),"GITHUB_ACTOR":"brk275",
                                "GITHUB_TRIGGERING_ACTOR":"brk275","GITHUB_ACTOR_ID":"42"}
                 archive, proof = b"synthetic selected archive bytes", {"fixture":"complete source proof"}
-                runner = SimpleNamespace(run=mock.Mock(side_effect=[head, clean]),
+                runner = SimpleNamespace(last_stage="none", run=mock.Mock(side_effect=[head, clean]),
                                          source_archive=mock.Mock(return_value=archive))
                 with mock.patch.dict(P.os.environ, environment, clear=True), \
                         mock.patch.object(P, "ROOT", exported), \
