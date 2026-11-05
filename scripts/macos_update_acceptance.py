@@ -153,7 +153,11 @@ def execution_environment(environment):
                "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "RUNNER_TEMP", "GITHUB_ACTIONS", "RUNNER_ENVIRONMENT",
                "RUNNER_OS", "RUNNER_ARCH", "ImageOS", "GITHUB_REPOSITORY", "GITHUB_EVENT_NAME",
                "GITHUB_EVENT_PATH", "GITHUB_SHA", "GITHUB_ACTOR", "GITHUB_ACTOR_ID", "GITHUB_TRIGGERING_ACTOR"}
-    return {name: value for name, value in environment.items() if name in allowed}
+    selected = {name: value for name, value in environment.items() if name in allowed}
+    # Preserve the canonical hosted Cargo resource bounds through sanitization.
+    # Fixed policy values cannot be changed by ambient or fixture environment.
+    selected.update(CARGO_BUILD_JOBS="2", CARGO_INCREMENTAL="0")
+    return selected
 
 
 class Commands:
