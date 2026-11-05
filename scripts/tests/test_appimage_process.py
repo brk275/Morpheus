@@ -30,7 +30,7 @@ def _temporary_real_seal_provider(test):
                 "RUNNER_OS":"Linux", "RUNNER_ARCH":"X64", "GITHUB_REPOSITORY":"brk275/Morpheus",
                 "GITHUB_EVENT_NAME":"workflow_dispatch", "GITHUB_ACTOR":"brk275",
                 "GITHUB_TRIGGERING_ACTOR":"brk275",
-                "GITHUB_REF":"refs/heads/codex/temp-linux-private-handoff-regression-20261105"}
+                "GITHUB_REF":"refs/heads/codex/temp-linux-byte-coverage-regression-20261105"}
     test.assertTrue(sys.platform == "linux" and all(env.get(k) == v for k, v in expected.items()))
     event = json.loads(P.client.read_regular(Path(env["GITHUB_EVENT_PATH"]), 1024 * 1024))
     test.assertIs(event["repository"]["private"], False)
@@ -78,6 +78,31 @@ def _temporary_real_seal_provider(test):
         test.assertIs(type(refused), M.CommandFailure)
         test.assertEqual(runner.last_stage, "package")
         test.assertNotEqual(progress.value["inner_cleanup"], "failed")
+        # Real pinned scanner: NUL and a line larger than its fragment boundary
+        # must still contribute every exact byte to the accepted raw counter.
+        P.client.write_new(root / "command-logs" / "coverage-boundary.log",
+                           b"first\x00" + b"A" * 200_000 + b"tail\n")
+        # A known application signature is silently skipped by the default
+        # fragment source; exact-byte coverage must refuse its clean report.
+        negative = root / "coverage-refusal"
+        negative.mkdir(mode=0o700)
+        P.client.private_directory(negative)
+        binary = negative / "binary.log"
+        payload = b"\x00asm\x01\x00\x00\x00synthetic private fixture"
+        P.client.write_new(binary, payload)
+        info = binary.lstat()
+        identity = (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                    info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        try:
+            with test.assertRaises(P.PackageFailure):
+                P.scan_private_logs(negative, str(scanner))
+        finally:
+            info = binary.lstat()
+            test.assertEqual((info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                              info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns), identity)
+            test.assertEqual(P.client.read_regular(binary, 4096), payload)
+            binary.unlink()
+            negative.rmdir()
         P.scan_private_logs(root, str(scanner))
         program = Path("/usr/bin/openssl")
         opt = Path("/opt").lstat()
@@ -249,14 +274,18 @@ class ProcessTests(unittest.TestCase):
         import fixture_paths as F
         import appimage_update_acceptance as A
         original_mkdtemp = tempfile.mkdtemp
-        for action in ("valid", "finding", "warning", "stdout", "malformed", "missing",
+        for action in ("valid", "valid_large", "finding", "warning", "stdout", "malformed", "missing",
                        "source_changed", "source_added", "snapshot_changed", "snapshot_extra",
-                       "symlink", "oversize", "process_cleanup", "source_fifo_race", "report_fifo"):
+                       "symlink", "oversize", "process_cleanup", "source_fifo_race", "report_fifo",
+                       "coverage_short", "coverage_extra", "coverage_missing", "coverage_duplicate",
+                       "coverage_malformed", "source_partial_copy", "partial_copy_unknown_inode"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
                 fixture = Path(temporary).resolve()
                 root = fixture / "source"
                 root.mkdir(mode=0o700)
                 bodies = {"a.log":b"first\x00raw\nbody", "b.log":b"second separate body\n"}
+                if action == "valid_large":
+                    bodies["a.log"] = b"first\x00" + b"A" * 200_000 + b"tail\n"
                 for name, value in bodies.items():
                     P.client.write_new(root / name, value)
                 foreign = fixture / "foreign"
@@ -269,7 +298,24 @@ class ProcessTests(unittest.TestCase):
                         stream.truncate(8 * 1024 * 1024 + 1)
                 snapshots = []
                 original_open = F.os.open
-                replaced = {"source":False, "report_nonblocking":False}
+                original_read = F.os.read
+                source_identity = ((root / "a.log").lstat().st_dev, (root / "a.log").lstat().st_ino)
+                replaced = {"source":False, "report_nonblocking":False, "partial_reads":0,
+                            "unknown_snapshot":False}
+                def raced_read(descriptor, maximum):
+                    info = F.os.fstat(descriptor)
+                    if (action in {"source_partial_copy", "partial_copy_unknown_inode"}
+                            and (info.st_dev, info.st_ino) == source_identity):
+                        replaced["partial_reads"] += 1
+                        if replaced["partial_reads"] == 1:
+                            return original_read(descriptor, min(5, maximum))
+                        if action == "partial_copy_unknown_inode":
+                            path = snapshots[0] / "data/00000000.log"
+                            path.unlink()
+                            P.client.write_new(path, b"keep unknown replacement")
+                            replaced["unknown_snapshot"] = True
+                        raise OSError("synthetic owned-copy read refusal")
+                    return original_read(descriptor, maximum)
                 def raced_open(path, flags, *args, **options):
                     if action == "report_fifo" and path == "report.json":
                         replaced["report_nonblocking"] = bool(flags & F.os.O_NONBLOCK)
@@ -289,13 +335,20 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual(arguments[0:2], ["/scanner", "dir"])
                     self.assertEqual(deadline, 40)
                     data = Path(arguments[2])
-                    self.assertEqual(sorted(p.name for p in data.iterdir()), ["00000000.log", "00000001.log"])
-                    self.assertEqual([p.read_bytes() for p in sorted(data.iterdir())], list(bodies.values()))
+                    safe_bodies = ([bodies["b.log"]] if action in {"symlink", "oversize", "source_fifo_race", "source_partial_copy"}
+                                   else list(bodies.values()))
+                    expected_names = (["00000001.log"] if action in {"source_fifo_race", "source_partial_copy"} else
+                                      [str(index).zfill(8) + ".log" for index in range(len(safe_bodies))])
+                    self.assertEqual(sorted(p.name for p in data.iterdir()), expected_names)
+                    self.assertEqual([p.read_bytes() for p in sorted(data.iterdir())], safe_bodies)
                     self.assertEqual(Path(arguments[arguments.index("--config") + 1]).read_bytes(),
                                      b"[extend]\nuseDefault = true\n")
                     self.assertEqual(Path(arguments[arguments.index("--gitleaks-ignore-path") + 1]).read_bytes(), b"")
                     self.assertEqual(arguments[arguments.index("--max-target-megabytes") + 1], "0")
-                    self.assertEqual(arguments[arguments.index("--log-level") + 1], "warn")
+                    self.assertEqual(arguments[arguments.index("--log-level") + 1], "info")
+                    self.assertIn("--no-color", arguments)
+                    self.assertEqual(arguments[arguments.index("--max-decode-depth") + 1], "5")
+                    self.assertEqual(arguments[arguments.index("--max-archive-depth") + 1], "0")
                     self.assertIn("--ignore-gitleaks-allow", arguments)
                     report = Path(arguments[arguments.index("--report-path") + 1])
                     if action == "process_cleanup":
@@ -309,14 +362,25 @@ class ProcessTests(unittest.TestCase):
                     if action == "source_added": P.client.write_new(root / "c.log", b"new unscanned original")
                     if action == "snapshot_changed": (data / "00000000.log").write_bytes(b"changed copy")
                     if action == "snapshot_extra": P.client.write_new(data / "extra.log", b"unknown copy")
+                    count = sum(len(value) for value in safe_bodies)
+                    if action == "coverage_short": count -= 1
+                    if action == "coverage_extra": count += 1
+                    display = "200.03 KB" if action == "valid_large" else f"{count} bytes"
+                    duration = "1µs" if action == "valid" else "1ms"
+                    footer = (f"3:04PM INF scanned ~{count} bytes ({display}) in {duration}\n"
+                              "3:04PM INF no leaks found\n").encode()
+                    if action == "coverage_missing": footer = b""
+                    if action == "coverage_duplicate": footer += footer
+                    if action == "coverage_malformed": footer = footer.replace(b"scanned ~", b"scanned ?")
                     return (1 if action == "finding" else 0,
                             b"unexpected output" if action == "stdout" else b"",
-                            b"partial scan warning" if action == "warning" else b"")
+                            footer + b"partial scan warning" if action == "warning" else footer)
                 with mock.patch.object(F.tempfile, "mkdtemp", side_effect=allocate), \
                         mock.patch.object(F.os, "open", side_effect=raced_open), \
+                        mock.patch.object(F.os, "read", side_effect=raced_read), \
                         mock.patch.object(P.time, "monotonic", return_value=10), \
                         mock.patch.object(F, "_run_log_scanner", side_effect=scanner) as invoked:
-                    if action == "valid":
+                    if action in {"valid", "valid_large"}:
                         P.scan_private_logs(root, "/scanner")
                         self.assertEqual(invoked.call_count, 1)
                         # The outer owner also uses explicit independent defaults.
@@ -325,11 +389,17 @@ class ProcessTests(unittest.TestCase):
                     else:
                         with self.assertRaises(P.PackageFailure):
                             P.scan_private_logs(root, "/scanner")
-                        self.assertEqual(invoked.call_count, 0 if action in {"symlink", "oversize", "source_fifo_race"} else 1)
+                        self.assertEqual(invoked.call_count, 0 if action == "partial_copy_unknown_inode" else 1)
+                if action in {"source_partial_copy", "partial_copy_unknown_inode"}:
+                    self.assertEqual(replaced["partial_reads"], 2)
+                if action == "partial_copy_unknown_inode":
+                    self.assertTrue(replaced["unknown_snapshot"])
+                    self.assertEqual((snapshots[0] / "data/00000000.log").read_bytes(),
+                                     b"keep unknown replacement")
                 if action == "report_fifo":
                     self.assertTrue(replaced["report_nonblocking"])
                 self.assertEqual(foreign.read_bytes(), b"preserve this unrelated fixture")
-                if action in {"snapshot_changed", "snapshot_extra", "process_cleanup", "report_fifo"}:
+                if action in {"snapshot_changed", "snapshot_extra", "process_cleanup", "report_fifo", "partial_copy_unknown_inode"}:
                     self.assertTrue(snapshots[0].exists())
                 elif snapshots:
                     self.assertTrue(all(not path.exists() for path in snapshots))
@@ -359,7 +429,7 @@ class ProcessTests(unittest.TestCase):
                 self.assertIn(deadline, (11, 40))
                 P.client.write_new(Path(arguments[arguments.index("--report-path") + 1]), b"[]\n")
                 if deadline == 11: clock["value"] = 12
-                return 0, b"", b""
+                return 0, b"", b"3:04PM INF scanned ~26 bytes (26 bytes) in 1ms\n3:04PM INF no leaks found\n"
             with mock.patch.object(P.time, "monotonic", side_effect=lambda: clock["value"]), \
                     mock.patch.object(F, "_run_log_scanner", side_effect=scanned) as scanner:
                 with self.assertRaises(P.PackageFailure):
