@@ -49,7 +49,10 @@ default secret rules on a bare mirror, excepting only reviewed public fixtures b
 exact fingerprint and file content. Reports stay on the runner; the log shows
 only a closed summary of counts and hashes. Candidates must include the current
 package QA tools, including
-`scripts/package_revision.py`. Package receipts and update-source exports identify
+`scripts/package_revision.py` and `scripts/package_scope.py`. Architecture-specific
+requests must also be supported by the selected candidate’s package scope helper;
+the notice guard revalidates the original selector against the actual host.
+Package receipts and update-source exports identify
 the selected source; `GITHUB_SHA` continues to identify the workflow itself.
 
 Candidate revisions restore caches without writing shared entries. Only the
@@ -63,7 +66,9 @@ runner; signing, licensing and installed-package release gates still apply.
 
 After source/dependency review and stable affected native checks, the existing
 **Package validation** workflow can explicitly select `native_updates=true`
-with `platform=macos` or `platform=windows`. Keep `linux_formats=appimage` (its
+with `platform=macos`, `platform=macos-arm64`, `platform=macos-x64` or
+`platform=windows`. `macos` retains both native Mac architectures; an architecture
+selector runs only its matching existing standard worker. Keep `linux_formats=appimage` (its
 neutral default), `appimage_updates=false`, `appimage_capture=false` and
 `source_bundle=false`. Linux, all-platform, Debian/both-format and mixed mode
 selections are rejected before emitting runner/cache outputs. The new option is
@@ -87,8 +92,8 @@ fixture root and receives the exact reviewed scanner hash. Each driver exports
 the selected tree twice and changes only app/lockfile versions to
 `-updateqa.1` and `-updateqa.2`, using one fresh compiled nonce/cohort and the
 existing generated disposable signing route. There are exactly two necessary
-version-only package builds per architecture: four for the explicit Mac request
-(Apple Silicon and Intel), or two for Windows. The ordinary package build,
+version-only package builds per architecture: four for `macos` (Apple Silicon
+and Intel), or two for a single Mac architecture or Windows. The ordinary package build,
 keyboard preflight and package smoke are omitted in this mode, so no third
 package or normal UI launch is added. Driver failure, missing observation,
 private log scan failure or cleanup failure remains a failed job; this route
@@ -240,9 +245,12 @@ acceptance.
 
 The manual [`package-qa.yml`](../.github/workflows/package-qa.yml) workflow runs
 only on public `main` using standard hosted runners. It requires an explicit
-platform choice (`linux`, `windows`, `macos`, or `all`), defaulting to Linux.
+platform choice (`linux`, `windows`, `macos`, `macos-arm64`, `macos-x64`, or
+`all`), defaulting to Linux.
 For a shared candidate, select `all` and `linux_formats=appimage` to validate
-both Mac architectures, Windows and the current Linux AppImage. A Linux-only
+both Mac architectures, Windows and the current Linux AppImage. For an affected
+Mac architecture, select `macos-arm64` or `macos-x64`; `macos` still selects both.
+A Linux-only
 packaging edit selects only Linux. Although the input lists `both` and `deb`,
 the workflow currently rejects them while Debian packaging is deferred.
 Results name the formats actually tested; AppImage QA does not satisfy the
