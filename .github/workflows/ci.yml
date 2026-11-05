@@ -4,12 +4,12 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: windows-tiny-msvc-5637ae20f41e1d4f30284c41a1b909d7b6c90eda
+  group: windows-tiny-msvc-ea5bbf7f4fa9dd1e0dc3e6e60cf4ee2a3652c250
   cancel-in-progress: false
 env:
-  REVIEWED_TINY_SOURCE: 5637ae20f41e1d4f30284c41a1b909d7b6c90eda
-  REVIEWED_TINY_TREE: ca3f34452d71b5d1a56588b53d7c8713772d19ad
-  MORPHEUS_PACKAGE_SOURCE_REVISION: 5637ae20f41e1d4f30284c41a1b909d7b6c90eda
+  REVIEWED_TINY_SOURCE: ea5bbf7f4fa9dd1e0dc3e6e60cf4ee2a3652c250
+  REVIEWED_TINY_TREE: e01e849e85cc986dfb7d6e41778d0f515b25449d
+  MORPHEUS_PACKAGE_SOURCE_REVISION: ea5bbf7f4fa9dd1e0dc3e6e60cf4ee2a3652c250
 jobs:
   tiny:
     name: Synthetic protected Windows compiler and cleanup probe
@@ -96,10 +96,16 @@ jobs:
               assert type(observation['readonly_retries']) is int and 0<=observation['readonly_retries']<=300000
               refusal=observation['cleanup_refusal']
               if refusal is not None:
-                  assert type(refusal) is dict and set(refusal) in ({'category','errno','winerror'},{'category','errno','winerror','predicate'})
+                  assert type(refusal) is dict and set(refusal) in ({'category','errno','winerror'},{'category','errno','winerror','predicate'},{'category','errno','winerror','predicate','reparse'})
                   assert refusal['category'] in {'os_error','guard','value_error','other'}
                   assert all(refusal[k] is None or type(refusal[k]) is int and 0<=refusal[k]<=65535 for k in ('errno','winerror'))
                   if 'predicate' in refusal: assert refusal['category']=='guard' and refusal['predicate'] in {'root_identity','inventory_limit','inventory_symlink','inventory_reparse','callback_scope','callback_root_identity','inner_removed','workspace_scope','workspace_identity','workspace_empty','workspace_removed'}
+                  if 'reparse' in refusal:
+                      fixed=refusal['reparse']
+                      assert refusal.get('predicate')=='inventory_reparse' and type(fixed) is dict and set(fixed)=={'role','kind','attributes','tag'}
+                      assert type(fixed['role']) is str and fixed['role'] in {'native-target','tools-home','tiny-source','synthetic-git','logs','other'}
+                      assert type(fixed['kind']) is str and fixed['kind'] in {'directory','regular','other'}
+                      assert all(fixed[k] is None or type(fixed[k]) is int and 0<=fixed[k]<=0xffffffff for k in ('attributes','tag'))
               hint=observation['compiler_hint']
               if hint is not None:
                   assert observation['cleanup_passed'] is True and observation['private_scan_passed'] is True
