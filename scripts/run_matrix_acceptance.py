@@ -264,8 +264,8 @@ OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_accep
                            "browser_callback_url", "browser_callback_match"))
 OAUTH_STAGE = re.compile(r"^MORPHEUS_OAUTH_STAGE ([a-z_]+)$", re.MULTILINE)
 OAUTH_FAILURE = re.compile(r"^MORPHEUS_OAUTH_FAILURE ([a-z_]+)$", re.MULTILINE)
-OUTAGE_TEST = "outgoing_ring::live_tests::outage_tests::current_call_recovers_from_owned_sfu_restart"
-OUTAGE_LABELS = ("rtc-recovery-current-dm", "rtc-recovery-current-room")
+OUTAGE_TEST = "outgoing_ring::live_tests::outage_tests::standard_call_recovers_from_owned_sfu_restart"
+OUTAGE_LABELS = ("rtc-recovery-standard-dm", "rtc-recovery-standard-room")
 OUTAGE_HELPER_TESTS = (
     ("rtc-recovery-stage-readiness", "video_render::tests::hidden_stage_pauses_every_remote_stream_and_drops_pictures"),
     ("rtc-recovery-audio-spectrum", "outgoing_ring::live_tests::alsa_playback::tests::group_oracle_requires_both_distinct_new_tones_and_refuses_old_or_silent_audio"),
@@ -276,8 +276,9 @@ OUTAGE_HELPER_TESTS = (
 )
 OUTAGE_CHECKS = frozenset(("initial_notification", "sfu_stopped", "app_ended_into_rejoin",
     "sfu_restarted", "automatic_new_join", "fresh_key_identities", "new_epoch_media_all_peers",
+    "legacy_publisher_identity_stable",
     "no_extra_notification", "native_audio_before", "native_audio_after", "cleanup"))
-OUTAGE_TARGET = {"dm": "current_dm", "room": "current_three_participant_room"}
+OUTAGE_TARGET = {"dm": "standard_dm", "room": "standard_three_participant_room"}
 OUTAGE_STAGES = frozenset(("fixture", "login", "join", "initial_media", "outage", "app_rejoining",
     "restart", "peer_rejoin", "recovered_media", "initial_audio", "recovered_audio", "sync_barrier", "history", "cleanup",
     "peer_join", "initial_checkpoint", "initial_audio_source", "recovered_checkpoint", "recovered_audio_source"))
@@ -439,6 +440,7 @@ def outage_diagnostics(output: str) -> dict:
 RING_TEST = "outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction"
 RING_CHECKS = frozenset((
     "sticky_sync", "own_crypto", "peer_trust", "joined_without_media", "encrypted_membership",
+    "experimental_current_room_entry_rejected", "shipping_sticky_profile",
     "invitation_receipt", "unsolicited_encrypted_notification", "fetched_decrypted_notification",
     "targeted_reference", "redaction_receipt", "redaction_observed", "unsolicited_redaction_observed", "cleanup",
 ))
@@ -463,12 +465,13 @@ RING_ADMISSION_RESULTS = frozenset((
     "quiet", "transport", "unavailable", "timed_out", "revoked",
 ))
 RING_ADMISSION = re.compile(r"^MORPHEUS_RING_ADMISSION result=([a-z_]+)$", re.MULTILINE)
-RING_CASES = tuple((mode, target) for mode in ("current", "sticky-2025") for target in ("dm", "room"))
+RING_CASES = tuple((mode, target) for mode in ("standard", "sticky-2025") for target in ("dm", "room"))
 # Actor facts remain separate from the existing sender/receipt contract.
 INCOMING_CHECKS = frozenset((
     "actor_discovered", "exact_key_once", "actor_withdrew", "admitted_target_preserved",
     "accepted_join_identity", "slot_unchanged", "quiet_receive_only",
     "established_after_withdrawal", "accepted_leave_observed", "actor_cleanup",
+    "profile_change_revokes_pending",
 ))
 INCOMING_REPLAY_CHECK = "account_replay_rejected"
 INCOMING_STAGES = frozenset((
@@ -483,7 +486,7 @@ INCOMING_ERRORS = frozenset((
     "admission_sync", "admission_receipt", "admission_replay", "admission_expired",
     "admission_membership", "admission_trust", "admission_policy", "admission_quiet",
     "admission_transport", "admission_unavailable", "admission_timed_out", "admission_revoked",
-    "wrong_call", "cancelled", "account_changed", "incoming_offer_unavailable", "room_not_loaded",
+    "wrong_call", "cancelled", "account_changed", "call_profile_changed", "incoming_offer_unavailable", "room_not_loaded",
     "encryption_state", "room_state", "matrix", "rtc", "media", "worker_stopped", "timed_out",
     "cleanup", "update", "connection_lost", "assertion",
     "invitation_account_mismatch",
@@ -962,11 +965,11 @@ def ring_passed_tests(output: str, ring_case: tuple[str, str]) -> int:
     named = re.findall(rf"^test {re.escape(RING_TEST)} \.\.\. ok$", output, re.MULTILINE)
     checks = ring_evidence(output)
     incoming = incoming_diagnostics(output)
-    required = INCOMING_CHECKS | ({INCOMING_REPLAY_CHECK} if ring_case == ("current", "dm") else set())
+    required = INCOMING_CHECKS | ({INCOMING_REPLAY_CHECK} if ring_case == ("standard", "dm") else set())
     if (ring_case not in RING_CASES
             or any(incoming["checks"].get(name) is not True for name in required)
             or any(value is False for value in incoming["checks"].values())
-            or (ring_case != ("current", "dm") and INCOMING_REPLAY_CHECK in incoming["checks"])
+            or (ring_case != ("standard", "dm") and INCOMING_REPLAY_CHECK in incoming["checks"])
             or any(name in incoming for name in ("failure", "error", "malformed"))):
         raise RuntimeError("Incoming actor acceptance evidence is incomplete")
     if (passed_tests(output) != 1 or len(RESULT.findall(output)) != 1 or len(named) != 1
@@ -1322,11 +1325,11 @@ class Acceptance:
             ring_case=None, outage_target=None, stdin=None, seconds=900, pid_namespace=False, cleanup=False,
             cwd=None, native_binary=False) -> str:
         if ring_case is not None and ring_case not in (
-                ("current", "dm"), ("current", "room"), ("sticky-2025", "dm"), ("sticky-2025", "room")):
+                ("standard", "dm"), ("standard", "room"), ("sticky-2025", "dm"), ("sticky-2025", "room")):
             raise RuntimeError("Invalid outgoing ring acceptance case")
         if ((label in OUTAGE_LABELS and outage_target is None)
                 or (outage_target is not None and (self.suite != "rtc-recovery" or outage_target not in OUTAGE_TARGET
-                    or label != f"rtc-recovery-current-{outage_target}" or not pid_namespace))):
+                    or label != f"rtc-recovery-standard-{outage_target}" or not pid_namespace))):
             raise RuntimeError("Invalid owned SFU outage command")
         if native_binary and not pid_namespace:
             raise RuntimeError("Native recovery binaries require owned process containment")
@@ -1507,12 +1510,16 @@ class Acceptance:
     def validated_record(self, label, output, *, test, ring_case, oauth_checks, element_checks, outage_target=None):
         record = {"check": label}
         if label in OUTAGE_LABELS and (self.suite != "rtc-recovery" or outage_target not in OUTAGE_TARGET
-                                      or label != f"rtc-recovery-current-{outage_target}"):
+                                      or label != f"rtc-recovery-standard-{outage_target}"):
             raise RuntimeError("Owned SFU outage record requires its exact target")
         if outage_target is not None:
             record["outage_checks"] = outage_evidence(output, outage_target)
             record["passed"] = 1
-            record["call_mode"] = "current"
+            record["call_mode"] = "standard"
+            record["interop_mode"] = "sticky-2025"
+            record["identity_contract"] = "legacy_openid_publisher_user_device"
+            record["backend_identity_rotated"] = False
+            record["key_evidence"] = "native_key_import_for_fresh_membership_identity_tuple"
             record["participants"] = 2 if outage_target == "dm" else 3
             record["media_scope"] = "synthetic_remote_camera_and_native_alsa_mixed_playback"
             record["notification_scope"] = "complete_bounded_decrypted_history_after_sync_barrier"
@@ -1524,11 +1531,12 @@ class Acceptance:
                 raise
             record["ring_checks"] = ring_evidence(output)
             record["incoming_checks"] = incoming_evidence(output)
-            record["account_replay_exercised"] = ring_case == ("current", "dm")
+            record["account_replay_exercised"] = ring_case == ("standard", "dm")
             record["quiet_evidence"] = "sampled_cache_and_media_state"
             record["withdrawal_evidence"] = "joined_after_sdk_cache_removal"
             record["actor_withdrawal_processing_confirmed"] = False
             record["ring_mode"], record["ring_target"] = ring_case
+            record["interop_mode"] = "sticky-2025"
         elif test:
             record["passed"] = passed_tests(output)
         if label in ("local_rtc-late-join", "local_rtc-sticky-2025-late-join"):
@@ -1753,14 +1761,14 @@ class Acceptance:
                 def case():
                     fixture = fixture_from_output(self.script("local_matrix_rtc",
                         "rtc-fixture" if target == "dm" else "rtc-group-fixture"), self.root)
-                    self.run(f"rtc-recovery-current-{target}",
+                    self.run(f"rtc-recovery-standard-{target}",
                         binary.command(OUTAGE_TEST, "--ignored", "--exact", "--nocapture", "--test-threads=2"),
                         extra=binary.extra | {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture),
                                "MORPHEUS_RTC_OUTAGE_TARGET": target, "SLINT_EMIT_DEBUG_INFO": "1",
                                "MORPHEUS_CALL_AUDIO_ROOT": str(self.root / f"rtc-playback-{target}"),
                                "ALSA_CONFIG_PATH": str(self.root / f"rtc-playback-{target}" / "alsa.conf")},
                         outage_target=target, seconds=540, pid_namespace=True, cwd=binary.cwd, native_binary=True)
-                if not self.group((f"rtc-recovery-current-{target}",), case):
+                if not self.group((f"rtc-recovery-standard-{target}",), case):
                     # The outage may still own a stopped SFU. Do not turn the next
                     # room case into a retry of failed shared infrastructure.
                     for label in OUTAGE_LABELS[index + 1:]:
@@ -1878,11 +1886,11 @@ class Acceptance:
                     output.write("Full suite: real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
                                  "synthetic call media and OAuth browser-form protocol automation.\n\n")
                 elif self.suite == "rtc-recovery":
-                    output.write("Explicit Current-only owned SFU kill/restart checks: actual app automatic bounded rejoin, "
-                                 "two DM participants and three room participants, fresh key-event identities, "
+                    output.write("Standard Sticky2025 owned SFU kill/restart checks: actual app automatic bounded rejoin, "
+                                 "two DM participants and three room participants, fresh membership/key-import ownership with stable legacy publisher identities, "
                                  "new post-restart synthetic camera epochs, both group tones through actual native ALSA mixed playback, "
                                  "and complete bounded notification history "
-                                 "after a real sync barrier. This is not Sticky/Element, incoming-app automatic rejoin, "
+                                 "after a real sync barrier. This does not exercise a stock Element peer, incoming-app automatic rejoin, "
                                  "physical audio/video, installed-package or whole-beta acceptance.\n\n")
                 elif self.suite == "element-interop":
                     output.write("Focused stock Element interoperability: only the existing Element peer case ran "
@@ -1910,14 +1918,14 @@ class Acceptance:
                 elif self.suite == "native-call":
                     output.write("Focused generated-window timeline and encrypted invitation/incoming actor checks: "
                                  "one disposable Synapse, OS Secret Service and LiveKit lifecycle. "
-                                 "Includes app-live-timeline followed by fresh Current/Sticky2025 DM/room cases. "
+                                 "Includes app-live-timeline followed by fresh Standard and saved Matrix2 alias (both Sticky2025) DM/room cases. "
                                  "No OAuth, broader call interoperability, physical-device or installed-package "
                                  "checks; this is not full acceptance. "
                                  "The invitation cases do not exercise live cross-device Decline.\n\n")
                 elif self.suite == "outgoing-ring":
                     output.write("Focused encrypted invitation and incoming actor checks: real Synapse, "
                                  "an ephemeral OS Secret Service and LiveKit, with fresh users and rooms "
-                                 "for Current/Sticky2025 and DM/room cases. "
+                                 "for Standard and saved Matrix2 alias (both Sticky2025) and DM/room cases. "
                                  "This is not full call, Element interoperability, UI, physical-device "
                                  "or installed-package acceptance.\n\n")
                 elif self.suite == "media-only":
@@ -1949,7 +1957,7 @@ class Acceptance:
                     output.write(f"\nElement peer passed: `{ELEMENT_VERSION}`, `{ELEMENT_IMAGE_DIGEST}`. "
                                  "Only its pre-synced Sticky2025 mode was tested, with two-way synthetic video, "
                                  "two-way synthetic audio, roster and departure. This does not verify stable "
-                                 "v0.26.1 Matrix 2.0, Morpheus's Current default, fresh-device late join, "
+                                 "v0.26.1 Matrix 2.0, historical Current/custom API calls, the full app call lifecycle, fresh-device late join, "
                                  "physical microphone/speaker devices, or full call release acceptance.\n")
                 if any("ring_checks" in item for item in self.results):
                     output.write("\nInvitation rows verify the actual app sender, unsolicited encrypted sync "
@@ -1959,7 +1967,7 @@ class Acceptance:
                                  "receive-only joining and owned cleanup. Quiet checks sample cache/media state; "
                                  "withdrawal checks Joined after SDK cache removal, without confirming the actor "
                                  "processed that removal. "
-                                 "Only Current/DM exercises account-switch replay rejection. "
+                                 "Only Standard/DM exercises account-switch replay rejection; all four cases require pending-offer profile-change rejection. "
                                  "They do not verify incoming call UI, audible ringing, offline/restart replay, "
                                  "or Element receipt.\n")
                 output.write("\nNo fixture credentials or installers were uploaded. Physical-device, UI, "

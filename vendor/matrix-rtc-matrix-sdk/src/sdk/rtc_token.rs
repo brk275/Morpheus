@@ -71,12 +71,12 @@ fn requires_sign_in(error: &matrix_sdk::RefreshTokenError) -> bool {
     use matrix_sdk::authentication::oauth::error::{
         BasicErrorResponseType, OAuthError, RequestTokenError,
     };
-    use matrix_sdk::ruma::api::client::error::ErrorKind;
+    use matrix_sdk::ruma::api::error::ErrorKind;
     match error {
         RefreshTokenError::RefreshTokenRequired => true,
         RefreshTokenError::MatrixAuth(error) => matches!(
             error.client_api_error_kind(),
-            Some(ErrorKind::UnknownToken { .. } | ErrorKind::Forbidden)
+            Some(ErrorKind::UnknownToken(_) | ErrorKind::Forbidden)
         ),
         RefreshTokenError::OAuth(error) => match error.as_ref() {
             OAuthError::NotAuthenticated
@@ -575,6 +575,45 @@ mod tests {
         assert_eq!(first.errcode.as_deref(), Some("RTC_AUTH_SIGN_IN_REQUIRED"));
         let second = second.unwrap_err();
         assert_eq!(second.errcode.as_deref(), Some("RTC_AUTH_SIGN_IN_REQUIRED"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_sdk_refresh_requires_sign_in_without_replaying_the_account_token() {
+        use matrix_rtc_core::MatrixBackend;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let client = client(&origin, true).await;
+        let backend = crate::SdkMatrixBackend::new(client);
+        let other = backend.clone();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let bytes = request_bytes(&mut stream).await;
+                let received = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                let expected = if index == 0 {
+                    format!("post {TOKEN_PATH} ")
+                } else {
+                    "post /_matrix/client/v3/refresh ".to_owned()
+                };
+                assert!(received.starts_with(&expected));
+                answer(
+                    &mut stream,
+                    401,
+                    r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":false}"#,
+                )
+                .await;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        for client in [&backend, &other] {
+            let error = client.livekit_token(token_request()).await.unwrap_err();
+            assert_eq!(error.errcode.as_deref(), Some("RTC_AUTH_SIGN_IN_REQUIRED"));
+        }
         server.await.unwrap();
     }
 
