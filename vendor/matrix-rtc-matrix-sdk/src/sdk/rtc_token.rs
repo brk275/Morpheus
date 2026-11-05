@@ -385,10 +385,12 @@ mod tests {
         }
     }
 
-    async fn client(endpoint: &str, refresh: bool) -> Client {
+    async fn client(listener: &TcpListener, refresh: bool) -> Client {
         crypto();
+        let origin = listener.local_addr().unwrap();
+        let endpoint = format!("http://{origin}");
         let client = Client::builder()
-            .homeserver_url(endpoint)
+            .homeserver_url(&endpoint)
             .server_versions([matrix_sdk::ruma::api::MatrixVersion::V1_11])
             .request_config(
                 matrix_sdk::config::RequestConfig::new()
@@ -411,6 +413,49 @@ mod tests {
             })
             .await
             .unwrap();
+        // The pinned SDK's restore_session spawns E2EE recovery setup, which
+        // reads this account-data event even with automatic backups disabled.
+        // Finish exactly that authenticated bootstrap before observing RTC
+        // requests; never ignore extra connections during the actual check.
+        let bootstrap = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let bytes = request_bytes(&mut stream).await;
+            let request = std::str::from_utf8(&bytes).expect("Invalid SDK bootstrap HTTP");
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            let headers = headers.to_ascii_lowercase();
+            let expected_request = concat!(
+                "get /_matrix/client/v3/user/@alice:own.example.org/",
+                "account_data/m.secret_storage.default_key http/1.1"
+            );
+            assert!(headers.lines().next() == Some(expected_request));
+            assert!(
+                headers
+                    .lines()
+                    .filter(|line| line.starts_with("authorization:"))
+                    .eq(["authorization: bearer synthetic-old-token"])
+            );
+            let expected_host = format!("host: {origin}");
+            assert!(
+                headers
+                    .lines()
+                    .filter(|line| line.starts_with("host:"))
+                    .eq([expected_host.as_str()])
+            );
+            assert!(body.is_empty() && !headers.contains("transfer-encoding:"));
+            answer(
+                &mut stream,
+                404,
+                r#"{"errcode":"M_NOT_FOUND","error":"No synthetic account data"}"#,
+            )
+            .await;
+        };
+        let initialized = async { client.encryption().wait_for_e2ee_initialization_tasks().await };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(bootstrap, initialized)
+        })
+        .await
+        .expect("SDK bootstrap did not finish within its existing request deadline");
+        assert!(client.access_token().as_deref() == Some("synthetic-old-token"));
         client
     }
 
@@ -454,8 +499,7 @@ mod tests {
     #[tokio::test]
     async fn actual_account_client_refreshes_once_and_only_retries_with_the_fresh_snapshot() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let client = client(&origin, true).await;
+        let client = client(&listener, true).await;
         let server = tokio::spawn(async move {
             for index in 0..3 {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -509,7 +553,7 @@ mod tests {
             r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":"false"}"#,
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let client = client(&format!("http://{}", listener.local_addr().unwrap()), true).await;
+            let client = client(&listener, true).await;
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 request_bytes(&mut stream).await;
@@ -533,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn mismatched_account_is_refused_before_any_authorized_request() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = client(&format!("http://{}", listener.local_addr().unwrap()), true).await;
+        let client = client(&listener, true).await;
         let mut request = token_request();
         request.own_device_id = "OTHER-ACCOUNT-DEVICE".into();
         assert!(get(&client, request).await.is_err());
@@ -548,7 +592,7 @@ mod tests {
     async fn a_rejected_snapshot_is_not_replayed_by_another_backend_clone() {
         use matrix_rtc_core::MatrixBackend;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = client(&format!("http://{}", listener.local_addr().unwrap()), false).await;
+        let client = client(&listener, false).await;
         let backend = crate::SdkMatrixBackend::new(client);
         let other = backend.clone();
         let server = tokio::spawn(async move {
@@ -582,8 +626,7 @@ mod tests {
     async fn rejected_sdk_refresh_requires_sign_in_without_replaying_the_account_token() {
         use matrix_rtc_core::MatrixBackend;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let client = client(&origin, true).await;
+        let client = client(&listener, true).await;
         let backend = crate::SdkMatrixBackend::new(client);
         let other = backend.clone();
         let server = tokio::spawn(async move {
@@ -620,7 +663,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_authorization_does_not_return_a_late_token_or_start_a_retry() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = client(&format!("http://{}", listener.local_addr().unwrap()), true).await;
+        let client = client(&listener, true).await;
         let (entered, waiting) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {

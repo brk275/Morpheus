@@ -163,17 +163,12 @@ pub fn to_core_member_event(room_id: &str, event: RawMemberEventIn) -> Option<Ra
             return None;
         }
     }
-    if let Some(device) = value.pointer("/member/device_id") {
-        let Some(device) = device.as_str().filter(|device| !device.is_empty()) else {
-            return None;
-        };
-        if event
-            .sender_device_id
-            .as_deref()
-            .is_some_and(|authenticated| authenticated != device)
-        {
-            return None;
-        }
+    // This legacy field remains an unauthenticated claim when modern fields
+    // ride alongside it. A different claim must not displace a decrypted origin.
+    if let Some(device) = value.pointer("/member/device_id")
+        && device.as_str().is_none_or(str::is_empty)
+    {
+        return None;
     }
 
     let content: RawStickyEventContent = match serde_json::from_value(value) {
@@ -489,9 +484,13 @@ mod tests {
         });
         let valid = to_core_member_event("!room:example.org", raw(content.clone())).unwrap();
         assert_eq!(valid.origin.sender_device_id(), Some("ALICEDEVICE"));
+        let mut claimed = content.clone();
+        claimed["member"]["device_id"] = serde_json::json!("MALLORY");
+        let attributed = to_core_member_event("!room:example.org", raw(claimed)).unwrap();
+        assert_eq!(attributed.origin.sender_device_id(), Some("ALICEDEVICE"));
+        assert_ne!(attributed.origin.sender_device_id(), Some("MALLORY"));
         for (field, value) in [
             ("user_id", serde_json::json!("@mallory:example.org")),
-            ("device_id", serde_json::json!("MALLORY")),
             ("device_id", serde_json::Value::Null),
         ] {
             let mut conflict = content.clone();
@@ -551,16 +550,32 @@ mod tests {
 
     #[test]
     fn prefers_the_decrypted_device_over_the_claimed_one() {
-        let event = raw(serde_json::json!({
+        let legacy = serde_json::json!({
             "slot_id": "m.call#room",
             "msc4354_sticky_key": "MEMBER",
             "application": { "type": "m.call" },
             "member": { "id": "MEMBER", "device_id": "CLAIMED" },
-        }));
+        });
+        let mut additive = legacy.clone();
+        additive["member"]["membership"] = serde_json::json!("join");
+        additive["member"]["user_id"] = serde_json::json!("@alice:example.org");
 
-        let converted = to_core_member_event("!room:example.org", event).expect("a membership");
-        assert_eq!(converted.origin.sender_device_id(), Some("ALICEDEVICE"));
-        assert_eq!(converted.origin.was_encrypted(), Some(true));
+        for content in [legacy, additive] {
+            let event = raw(content);
+            let converted = to_core_member_event("!room:example.org", event).expect("a membership");
+            assert_eq!(converted.origin.sender_device_id(), Some("ALICEDEVICE"));
+            assert_eq!(converted.origin.was_encrypted(), Some(true));
+            let membership = converted.try_into_membership_event().expect("converts");
+            let crate::RtcMembershipEvent::Joined(joined) = membership else {
+                panic!("a join");
+            };
+            assert_eq!(joined.sender, "@alice:example.org");
+            assert_eq!(joined.member_id, "MEMBER");
+            assert_eq!(joined.sticky_key, "MEMBER");
+            assert_eq!(joined.origin.sender_device_id(), Some("ALICEDEVICE"));
+            assert_ne!(joined.origin.sender_device_id(), Some("CLAIMED"));
+            assert_eq!(joined.origin.was_encrypted(), Some(true));
+        }
     }
 
     #[test]
