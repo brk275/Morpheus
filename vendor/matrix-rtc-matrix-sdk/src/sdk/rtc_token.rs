@@ -449,7 +449,12 @@ mod tests {
             )
             .await;
         };
-        let initialized = async { client.encryption().wait_for_e2ee_initialization_tasks().await };
+        let initialized = async {
+            client
+                .encryption()
+                .wait_for_e2ee_initialization_tasks()
+                .await
+        };
         tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(bootstrap, initialized)
         })
