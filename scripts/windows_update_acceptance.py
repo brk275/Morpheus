@@ -352,7 +352,23 @@ _BUILD_SUBSTAGES = frozenset(("unavailable", "source_export", "notices_prepare",
 
 
 
-def gate_failure_diagnostic(commands, stage, cleanup_phase, scanned, cleaned):
+def _cleanup_refusal_diagnostic(error):
+    os_errors = {OSError, PermissionError, FileNotFoundError, FileExistsError,
+                 NotADirectoryError, IsADirectoryError, InterruptedError, TimeoutError,
+                 BlockingIOError, ChildProcessError, ConnectionError, BrokenPipeError,
+                 ConnectionAbortedError, ConnectionRefusedError, ConnectionResetError,
+                 ProcessLookupError}
+    category = "os_error" if type(error) in os_errors else (
+        "guard" if type(error) is Failure else "value_error" if type(error) is ValueError else "other")
+    values = {"errno": None, "winerror": None}
+    if category == "os_error":
+        for name in values:
+            value = getattr(error, name, None)
+            values[name] = value if type(value) is int and 0 <= value <= 65535 else None
+    return {"category": category, **values}
+
+
+def gate_failure_diagnostic(commands, stage, cleanup_phase, scanned, cleaned, cleanup_refusal=None):
     """Own fixed observations only; not a log scan or transaction verdict."""
     if scanned is True and cleaned is True:
         return None
@@ -363,7 +379,7 @@ def gate_failure_diagnostic(commands, stage, cleanup_phase, scanned, cleaned):
     refusal = getattr(commands, "close_refusal", None)
     if (type(stage) is not str or stage not in _FAILURE_STAGES | {"complete"}
             or type(cleanup_phase) is not str or cleanup_phase not in {
-                "scan", "credentials", "job_gate", "registry", "workspace", "complete"}
+                "scan", "credentials", "job_gate", "registry", "scan_gate", "workspace", "complete"}
             or type(command) is not str or command not in {
                 "unavailable", "job_create", "start", "wait_log_bounds", "process_wait",
                 "exit_status", "job_query", "drain_log_bounds", "drain_deadline",
@@ -374,6 +390,12 @@ def gate_failure_diagnostic(commands, stage, cleanup_phase, scanned, cleaned):
             or (refusal is not None and (type(refusal) is not dict or set(refusal) != {"code", "operation"}
                 or type(refusal["code"]) is not str or refusal["code"] not in capture.FAILURES
                 or type(refusal["operation"]) is not str or refusal["operation"] not in capture.OPERATIONS))
+            or (cleanup_refusal is not None and (type(cleanup_refusal) is not dict
+                or set(cleanup_refusal) != {"category", "errno", "winerror"}
+                or type(cleanup_refusal["category"]) is not str
+                or cleanup_refusal["category"] not in {"os_error", "guard", "value_error", "other"}
+                or any(v is not None and (type(v) is not int or not 0 <= v <= 65535)
+                       for v in (cleanup_refusal["errno"], cleanup_refusal["winerror"]))))
             or type(counts) is not dict or set(counts) != {"success", "exit_one", "other_exit", "timeout", "refusal"}
             or any(type(value) is not int or not 0 <= value <= 128 for value in counts.values())
             or sum(counts.values()) > 128 or type(scanned) is not bool or type(cleaned) is not bool
@@ -383,6 +405,7 @@ def gate_failure_diagnostic(commands, stage, cleanup_phase, scanned, cleaned):
             "command_phase": command, "job_close": close, "job_close_refusal": None if refusal is None else dict(refusal),
             "scan_phase": scan,
             "scan_counts": dict(counts), "cleanup_phase": cleanup_phase,
+            "cleanup_refusal": None if cleanup_refusal is None else dict(cleanup_refusal),
             "job_cleanup_failed": commands.cleanup_failed,
             "private_log_scan_passed": scanned, "cleanup_passed": cleaned,
             "passed": False, "distribution_ready": False}
@@ -821,7 +844,7 @@ def run_case(commands, case_name, old, new, nonce, signatures):
             require(environment is not None and uninstall_hash is not None)
             cleanup_case(commands,case,old,new,uninstall_hash,environment)
 
-def remove_owned_root(root, identity):
+def remove_owned_root(root, identity, workspace, workspace_identity):
     info=root.lstat(); require((info.st_dev,info.st_ino)==identity)
     count=0
     for directory, dirs, files in os.walk(root,followlinks=False):
@@ -829,7 +852,28 @@ def remove_owned_root(root, identity):
             path=Path(directory)/name; info=path.lstat(); count+=1
             require(count<=300000 and not stat.S_ISLNK(info.st_mode)
                     and not getattr(info,"st_file_attributes",0)&0x400)
-    shutil.rmtree(root)
+    if os.name == "nt":
+        def readonly(function, path, error):
+            # Only the known readonly-unlink failure can authorize a retry.
+            if ((function is not os.unlink and function is not os.remove)
+                    or not isinstance(error, PermissionError) or error.errno != 13
+                    or getattr(error, "winerror", None) != 5):
+                raise error
+            require(root.parent == workspace
+                    and re.fullmatch(r"morpheus-windows-updateqa-[0-9a-f]{32}", root.name)
+                    and Path(path).is_absolute() and Path(path) != root
+                    and Path(path).is_relative_to(root))
+            notice_source.S.windows_security().path(root, directory=True, private=True)
+            current = root.lstat()
+            require((current.st_dev, current.st_ino) == identity)
+            # Reuse the exact protected-leaf handle/ACL/link/identity checks.
+            # The outer native-source root retains its original inode authority
+            # even after rmtree has consumed files in the inner nonce tree.
+            notice_source._remove_readonly_owned_leaf(
+                workspace, workspace_identity, function, path, error)
+        shutil.rmtree(root, onexc=readonly)
+    else:
+        shutil.rmtree(root)
     require(not root.exists())
 
 def remove_unused_workspace(workspace, identity):
@@ -875,7 +919,7 @@ def remove_owned_workspace(workspace, workspace_identity, root, identity):
     security.path(workspace,directory=True,private=True)
     info=workspace.lstat();require((info.st_dev,info.st_ino)==workspace_identity)
     security.path(root,directory=True,private=True)
-    remove_owned_root(root,identity)
+    remove_owned_root(root,identity,workspace,workspace_identity)
     security.path(workspace,directory=True,private=True)
     info=workspace.lstat();require((info.st_dev,info.st_ino)==workspace_identity and not any(workspace.iterdir()))
     workspace.rmdir();require(not workspace.exists())
@@ -904,6 +948,7 @@ def execute(args):
     stage,results,scan,clean="source-export",[],False,False
     failed, failure_site = False, None
     cargo_failure = None
+    cleanup_refusal = None
     keys = {}
     try:
         # Use the already provisioned exact toolchain binary, not a rustup
@@ -971,9 +1016,21 @@ def execute(args):
                 require(not commands.cleanup_failed)
                 cleanup_phase = "registry"
                 absent_registry()
-                cleanup_phase = "workspace"
-                remove_owned_workspace(workspace,workspace_identity,root,identity); clean=True
-                cleanup_phase = "complete"
+                cleanup_phase = "scan_gate"
+                # The reused readonly primitive requires a fresh complete scan.
+                # Keep the original scanner exception and the owned tree when
+                # that prerequisite failed; key/job/registry teardown ran above.
+                if scan is True:
+                    cleanup_phase = "workspace"
+                    try:
+                        remove_owned_workspace(workspace,workspace_identity,root,identity); clean=True
+                    except BaseException as error:
+                        try:
+                            cleanup_refusal = _cleanup_refusal_diagnostic(error)
+                        except BaseException:
+                            pass  # Closed observation failure never replaces cleanup refusal.
+                        raise
+                    cleanup_phase = "complete"
             if failed:
                 diagnostic = failure_diagnostic(commands, stage, failure_site, scan, clean)
                 if diagnostic is not None:
@@ -986,7 +1043,7 @@ def execute(args):
             # This channel contains no private content and never substitutes
             # for the original full-scan/cleanup gates on source/compiler hints.
             try:
-                gate = gate_failure_diagnostic(commands, stage, cleanup_phase, scan, clean)
+                gate = gate_failure_diagnostic(commands, stage, cleanup_phase, scan, clean, cleanup_refusal)
                 if gate is not None:
                     print("MORPHEUS_WINDOWS_UPDATE_GATE_DIAGNOSTIC " + json.dumps(gate, sort_keys=True),
                           file=sys.stderr, flush=True)

@@ -727,6 +727,80 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                     with self.assertRaises(ValueError):update.export_source(commands,parent,data.getvalue(),"0.1.0-updateqa.1","new")
                     self.assertFalse((root/"new-source").exists())
 
+    def test_update_owned_readonly_cleanup_wires_outer_authority_and_refuses_foreign_or_changed_inner_root(self):
+        real_rmtree=update.shutil.rmtree
+        class WindowsOS:
+            name="nt"
+            def __getattr__(self,name):return getattr(update_os,name)
+        update_os=update.os
+        for refusal in (None,"foreign","changed_root","other_error"):
+            with self.subTest(refusal=refusal),tempfile.TemporaryDirectory() as temporary:
+                parent=Path(temporary).resolve();calls=[];security=self._workspace_security_fixture(parent,calls)
+                workspace=parent/("morpheus-native-source-"+"b"*32);workspace.mkdir()
+                root=workspace/("morpheus-windows-updateqa-"+"a"*32);root.mkdir()
+                target=root/"synthetic-git/objects/pack/fixture.pack";target.parent.mkdir(parents=True)
+                target.write_bytes(b"owned readonly fixture");target.chmod(update.stat.S_IREAD)
+                outer=workspace.lstat();inner=root.lstat();outer_id=(outer.st_dev,outer.st_ino);inner_id=(inner.st_dev,inner.st_ino)
+                error=PermissionError(13,"private-cleanup-error");error.winerror=5 if refusal!="other_error" else 32
+                def delegate(authority,identity,function,path,caught):
+                    self.assertEqual((authority,identity),(workspace,outer_id))
+                    self.assertIs(caught,error);self.assertIs(function,update_os.unlink)
+                    self.assertEqual(Path(path),target)
+                    # Test double for the reviewed helper; Windows unlink also
+                    # needs the known synthetic readonly attribute cleared.
+                    Path(path).chmod(update.stat.S_IWRITE)
+                    function(path)
+                def remove(path,*,onexc):
+                    self.assertEqual(path,root)
+                    if refusal=="changed_root":inner_id_bad=(inner_id[0],inner_id[1]+1)
+                    else:inner_id_bad=inner_id
+                    callback_path=workspace/"foreign-leaf" if refusal=="foreign" else target
+                    if refusal=="changed_root":
+                        original=root.lstat()
+                        with patch.object(Path,"lstat",autospec=True,side_effect=lambda p:
+                                types.SimpleNamespace(st_dev=inner_id_bad[0],st_ino=inner_id_bad[1]) if p==root else original):
+                            onexc(update_os.unlink,callback_path,error)
+                    else:onexc(update_os.unlink,callback_path,error)
+                    real_rmtree(path)
+                with patch.object(Path,"home",return_value=parent),patch.object(update,"os",WindowsOS()), \
+                        patch.object(update.notice_source.S,"windows_security",return_value=security), \
+                        patch.object(update.notice_source,"_remove_readonly_owned_leaf",side_effect=delegate) as retry, \
+                        patch.object(update.shutil,"rmtree",side_effect=remove):
+                    if refusal is None:
+                        update.remove_owned_workspace(workspace,outer_id,root,inner_id)
+                        retry.assert_called_once();self.assertFalse(workspace.exists())
+                    elif refusal=="other_error":
+                        with self.assertRaises(PermissionError) as caught:update.remove_owned_workspace(workspace,outer_id,root,inner_id)
+                        self.assertIs(caught.exception,error);retry.assert_not_called()
+                    else:
+                        with self.assertRaises(update.Failure):update.remove_owned_workspace(workspace,outer_id,root,inner_id)
+                        retry.assert_not_called()
+                if refusal is not None:
+                    self.assertTrue(target.exists())
+                    target.chmod(update.stat.S_IWRITE)
+
+    def test_update_cleanup_refusal_diagnostic_keeps_only_builtin_category_and_bounded_numeric_codes(self):
+        for code in (5,32,206):
+            error=PermissionError(13,"private-path-and-error-body");error.winerror=code
+            facts=update._cleanup_refusal_diagnostic(error)
+            self.assertEqual(facts,{"category":"os_error","errno":13,"winerror":code})
+            self.assertNotIn("private-",json.dumps(facts))
+        class Foreign(Exception):
+            @property
+            def errno(self):raise AssertionError("foreign attribute must not be inspected")
+            @property
+            def winerror(self):raise AssertionError("foreign attribute must not be inspected")
+        self.assertEqual(update._cleanup_refusal_diagnostic(Foreign()),{"category":"other","errno":None,"winerror":None})
+        self.assertEqual(update._cleanup_refusal_diagnostic(update.Failure()),{"category":"guard","errno":None,"winerror":None})
+        with tempfile.TemporaryDirectory() as temporary:
+            commands=update.Commands(Path(temporary).resolve(),{})
+            facts={"category":"os_error","errno":13,"winerror":5}
+            value=update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,facts)
+            self.assertEqual(value["cleanup_refusal"],facts)
+            self.assertFalse(value["passed"])
+            for bad in (facts|{"winerror":True},facts|{"winerror":65536},facts|{"message":"private"},facts|{"category":"private"}):
+                self.assertIsNone(update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,bad))
+
     @unittest.skipUnless(sys.platform=="win32","actual Windows protected update workspace and source ACL reads")
     def test_update_workspace_actual_windows_acl_source_reads_and_cleanup_preserve_actor_parent(self):
         workspace,workspace_identity,root,identity=update.reserve_workspace("a"*32)
@@ -738,7 +812,21 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
             expected=update.revision.versioned_source_bytes(name,body,"0.1.0-updateqa.1")
             self.assertEqual(update.notices.read_regular(exported/name,1024,allow_empty=True),expected)
         self.assertEqual(root,workspace/("morpheus-windows-updateqa-"+"a"*32))
-        update.remove_owned_workspace(workspace,workspace_identity,root,identity)
+        # Real readonly loose/pack leaves must be removed through the original
+        # strict Windows handle/ACL primitive, not a mocked permission bypass.
+        security.private_directory(root/"synthetic-git/objects/aa",parents=True)
+        security.private_directory(root/"synthetic-git/objects/pack")
+        readonly=[root/"synthetic-git/objects/aa/fixture",root/"synthetic-git/objects/pack/fixture.pack"]
+        for target in readonly:
+            target.write_bytes(b"owned synthetic Git object")
+            update.os.chmod(target,update.stat.S_IREAD)
+            security.path(target,private=True)
+            self.assertTrue(target.lstat().st_file_attributes & 1)
+        with patch.object(update.notice_source,"_remove_readonly_owned_leaf",
+                          wraps=update.notice_source._remove_readonly_owned_leaf) as retried:
+            update.remove_owned_workspace(workspace,workspace_identity,root,identity)
+        self.assertCountEqual([Path(call.args[3]) for call in retried.call_args_list],readonly)
+        self.assertTrue(all(call.args[:2]==(workspace,workspace_identity) for call in retried.call_args_list))
         self.assertFalse(workspace.exists())
 
     def test_installed_update_gate_observations_preserve_wait_drain_close_refusals(self):
@@ -804,6 +892,8 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
             with self.subTest(scan_fails=scan_fails),tempfile.TemporaryDirectory() as temporary:
                 root=Path(temporary).resolve();output=io.StringIO();events=[]
                 commands=update.Commands(root,{"RUSTUP_HOME":str(root)})
+                retained_log=commands.logs/"0001.log"
+                retained_log.write_bytes(b"synthetic-private-evidence")
                 error=OSError("private-refusal-body")
                 commands.run=Mock(side_effect=[b"cargo-packager 0.11.8",update.Failure()])
                 def scan(scanner):
@@ -831,12 +921,13 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                         patch.object(update.notice_source,"system_git",return_value=root/"git.exe"), \
                         patch.object(update,"absent_registry"),patch.object(update,"remove_owned_workspace",side_effect=cleanup):
                     with self.assertRaises(OSError) as caught:update.execute(args)
-                self.assertIs(caught.exception,error);self.assertEqual(events,["scan","cleanup"])
+                self.assertIs(caught.exception,error);self.assertEqual(events,["scan"] if scan_fails else ["scan","cleanup"])
+                self.assertTrue(retained_log.exists(),"failed scan or cleanup retains this owned fixture")
                 line,=output.getvalue().splitlines()
                 facts=json.loads(line.removeprefix("MORPHEUS_WINDOWS_UPDATE_GATE_DIAGNOSTIC "))
-                self.assertEqual(facts["cleanup_phase"],"complete" if scan_fails else "workspace")
+                self.assertEqual(facts["cleanup_phase"],"scan_gate" if scan_fails else "workspace")
                 self.assertEqual(facts["private_log_scan_passed"],not scan_fails)
-                self.assertEqual(facts["cleanup_passed"],not cleanup_fails)
+                self.assertFalse(facts["cleanup_passed"])
                 self.assertFalse(facts["passed"])
                 self.assertNotIn("private-",output.getvalue())
                 self.assertNotIn("CARGO_DIAGNOSTIC",output.getvalue())
@@ -896,7 +987,7 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                         patch.object(update.notice_source,"_notice_failure_site",return_value={"module":"native_notices","line":171}), \
                         patch.object(update,"absent_registry"),patch.object(update,"remove_owned_workspace",side_effect=lambda workspace,workspace_identity,run,identity:cleanup(run,identity)):
                     with self.assertRaises(PrivateFailure) as caught:update.execute(args)
-                self.assertEqual(events,["scan","cleanup"])
+                self.assertEqual(events,["scan"] if scan_fails else ["scan","cleanup"])
                 self.assertNotIn("private-",output.getvalue())
                 if scan_fails or cleanup_fails:self.assertEqual(output.getvalue(),"")
                 else:
@@ -1156,7 +1247,7 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                         patch.object(update,"cargo_failure_diagnostic",side_effect=diagnostic) as metadata, \
                         patch.object(update,"absent_registry"),patch.object(update,"remove_owned_workspace",side_effect=cleanup):
                     with self.assertRaises(PrivateFailure) as caught:update.execute(args)
-                self.assertEqual(events,["build","scan"]+([] if scan_fails else ["metadata"])+["cleanup"])
+                self.assertEqual(events,["build","scan"]+([] if scan_fails else ["metadata","cleanup"]))
                 self.assertNotIn("private-original-error",output.getvalue())
                 if scan_fails or cleanup_fails:self.assertEqual(output.getvalue(),"")
                 else:
