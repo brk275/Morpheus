@@ -803,7 +803,7 @@ class NativeLifecycleTests(unittest.TestCase):
             root = Path(directory).resolve()
             root.chmod(0o700)
             (root / "capture-receipt.json").write_text('{"installed_capture_passed":true}')
-            events, scanned = [], []
+            events, scanned, scan_completed = [], [], []
             source = root / "native-source-inputs/cargo/registry/src/fixture/sample_session.log"
             def spawn(*_args, **_kwargs):
                 source.parent.mkdir(parents=True)
@@ -829,15 +829,17 @@ class NativeLifecycleTests(unittest.TestCase):
                 data = Path(argv[2])
                 values = [path.read_bytes() for path in sorted(data.iterdir())]
                 scanned.extend(values)
-                self.assertEqual(sorted(values), [b"assembly diagnostic", b"fetch diagnostic"])
+                self.assertEqual(sorted(values), [b"", b"assembly diagnostic", b"fetch diagnostic"])
                 self.assertEqual(Path(argv[argv.index("--config") + 1]).read_bytes(),
                                  b"[extend]\nuseDefault = true\n")
                 self.assertEqual(Path(argv[argv.index("--gitleaks-ignore-path") + 1]).read_bytes(), b"")
                 self.assertIn("--ignore-gitleaks-allow", argv)
                 M.client.write_new(Path(argv[argv.index("--report-path") + 1]), b"[]\n")
                 count = sum(map(len, values))
-                return 0, b"", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
-                                 "3:04PM INF no leaks found\n").encode()
+                result = 0, b"", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
+                                   "3:04PM INF no leaks found\n").encode()
+                scan_completed.append(True)
+                return result
             with mock.patch.object(M.containment, "namespace_command", return_value=["/inert"]), \
                     mock.patch.object(M.containment, "status", return_value=0), \
                     mock.patch.object(M.containment, "stop_owned", side_effect=stop), \
@@ -849,6 +851,7 @@ class NativeLifecycleTests(unittest.TestCase):
                 receipt = M.contained(root, "/reviewed-scanner", {"cargo": "/cargo"}, {})
             self.assertTrue(receipt["installed_capture_passed"])
             self.assertEqual(invoked.call_count, 1)
+            self.assertEqual(scan_completed, [True])
             self.assertIn(b"fetch diagnostic", scanned)
             self.assertIn(b"assembly diagnostic", scanned)
             self.assertNotIn(b"synthetic crate source-data fixture", scanned)
@@ -859,7 +862,7 @@ class NativeLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             root.chmod(0o700)
-            child, scanned = SimpleNamespace(pid=42), []
+            child, scanned, scan_completed = SimpleNamespace(pid=42), [], []
             def spawn(*_args, **_kwargs):
                 work = root / "native-source-inputs"
                 source = work / "cargo/registry/src/fixture/source.log"
@@ -877,12 +880,14 @@ class NativeLifecycleTests(unittest.TestCase):
                 self.assertEqual(argv[:2], ["/reviewed-scanner", "dir"])
                 values = [path.read_bytes() for path in sorted(Path(argv[2]).iterdir())]
                 scanned.extend(values)
-                self.assertEqual(sorted(values), [b"acquisition output", b"assembly output"])
+                self.assertEqual(sorted(values), [b"", b"acquisition output", b"assembly output"])
                 self.assertNotIn(b"source fixture is not a private command log", values)
                 M.client.write_new(Path(argv[argv.index("--report-path") + 1]), b"[]\n")
                 count = sum(map(len, values))
-                return 0, b"", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
-                                 "3:04PM INF no leaks found\n").encode()
+                result = 0, b"", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
+                                   "3:04PM INF no leaks found\n").encode()
+                scan_completed.append(True)
+                return result
             with mock.patch.object(M.containment, "namespace_command", return_value=["/inert"]), \
                     mock.patch.object(M.containment, "status", return_value=0), \
                     mock.patch.object(M.containment, "stop_owned", side_effect=RuntimeError("private stop failure")), \
@@ -897,6 +902,7 @@ class NativeLifecycleTests(unittest.TestCase):
             self.assertIn(b"acquisition output", scanned)
             self.assertIn(b"assembly output", scanned)
             self.assertEqual(invoked.call_count, 1)
+            self.assertEqual(scan_completed, [True])
             self.assertNotIn(b"source fixture is not a private command log", scanned)
             verified.assert_not_called()
 
