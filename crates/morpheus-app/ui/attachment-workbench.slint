@@ -140,9 +140,9 @@ export component AttachmentQueue inherits Rectangle {
     // may also budget fewer visible rows, while retaining the complete model.
     in property <length> viewport-cap: 0px;
     out property <length> natural-height: root.items.length == 0 ? 0px : root.header-height + min(3, root.items.length) * root.row-height;
-    out property <length> minimum-height: root.items.length == 0 ? 0px : root.header-height + root.row-height;
+    out property <length> minimum-queue-height: root.items.length == 0 ? 0px : root.header-height + root.row-height;
     out property <length> needed-height: root.viewport-cap > 0px
-        ? min(root.natural-height, max(root.minimum-height, root.viewport-cap))
+        ? min(root.natural-height, max(root.minimum-queue-height, root.viewport-cap))
         : root.natural-height;
 
     height: root.needed-height;

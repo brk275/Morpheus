@@ -7336,7 +7336,7 @@ export component AppWindow inherits Window {
                 if root.page == 0 : room-canvas := Rectangle {
                     min-height: 0px;
                     vertical-stretch: 1;
-                    preferred-height: self.composer-base-height + attachment-queue.minimum-height + 50px
+                    preferred-height: self.composer-base-height + attachment-queue.minimum-queue-height + 50px
                         + self.header-minimum + self.footer-minimum + self.status-minimum;
                     property <length> composer-base-height: root.composer-box-height
                         + (root.composer-mode == 0 ? 20px : 51px);
@@ -8174,7 +8174,7 @@ export component AppWindow inherits Window {
                         }
                         // The queue sits first; the saved-send strip follows it.
                         attachment-queue := AttachmentQueue {
-                            viewport-cap: max(self.minimum-height,
+                            viewport-cap: max(self.minimum-queue-height,
                                 room-canvas.height - room-canvas.composer-base-height - 50px
                                     - room-canvas.header-minimum - room-canvas.footer-minimum - room-canvas.status-minimum);
                             x: 22px; y: root.composer-mode == 0 ? 2px : 33px;
