@@ -80,7 +80,7 @@ class ProcessTests(unittest.TestCase):
                 original_open = F.os.open
                 original_read = F.os.read
                 source_identity = ((root / "a.log").lstat().st_dev, (root / "a.log").lstat().st_ino)
-                replaced = {"source":False, "report_nonblocking":False, "partial_reads":0,
+                replaced = {"source":False, "report_opened":False, "partial_reads":0,
                             "unknown_snapshot":False}
                 def raced_read(descriptor, maximum):
                     info = F.os.fstat(descriptor)
@@ -98,8 +98,8 @@ class ProcessTests(unittest.TestCase):
                     return original_read(descriptor, maximum)
                 def raced_open(path, flags, *args, **options):
                     if action == "report_fifo" and path == "report.json":
-                        replaced["report_nonblocking"] = bool(flags & F.os.O_NONBLOCK)
-                        self.assertTrue(replaced["report_nonblocking"])
+                        replaced["report_opened"] = True
+                        self.fail("Unexpected snapshot FIFO must never be opened")
                     if action == "source_fifo_race" and path == "a.log" and not replaced["source"]:
                         self.assertTrue(flags & F.os.O_NONBLOCK)
                         (root / "a.log").unlink()
@@ -130,15 +130,13 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual(arguments[arguments.index("--max-decode-depth") + 1], "5")
                     self.assertEqual(arguments[arguments.index("--max-archive-depth") + 1], "0")
                     self.assertIn("--ignore-gitleaks-allow", arguments)
-                    report = Path(arguments[arguments.index("--report-path") + 1])
+                    self.assertEqual(arguments[arguments.index("--report-path") + 1], "-")
                     if action == "process_cleanup":
                         raise F.PrivateLogScanError(process_stopped=False)
                     if action == "report_fifo":
-                        report.unlink()
-                        F.os.mkfifo(report, 0o600)
-                    if action not in {"missing", "report_fifo"}:
-                        report.write_bytes(b"{bad" if action == "malformed" else
-                                           b'[{"RuleID":"synthetic"}]' if action == "finding" else b"[]\n")
+                        F.os.mkfifo(Path(cwd) / "report.json", 0o600)
+                    report_body = (b"" if action == "missing" else b"{bad" if action == "malformed" else
+                                   b'[{"RuleID":"synthetic"}]' if action == "finding" else b"[]\n")
                     if action == "source_changed": (root / "a.log").write_bytes(b"changed source")
                     if action == "source_added": P.client.write_new(root / "c.log", b"new unscanned original")
                     if action == "snapshot_changed": (data / "00000000.log").write_bytes(b"changed copy")
@@ -154,7 +152,7 @@ class ProcessTests(unittest.TestCase):
                     if action == "coverage_duplicate": footer += footer
                     if action == "coverage_malformed": footer = footer.replace(b"scanned ~", b"scanned ?")
                     return (1 if action == "finding" else 0,
-                            b"unexpected output" if action == "stdout" else b"",
+                            b"[]" + b" " * 4096 if action == "stdout" else report_body,
                             footer + b"partial scan warning" if action == "warning" else footer)
                 with mock.patch.object(F.tempfile, "mkdtemp", side_effect=allocate), \
                         mock.patch.object(F.os, "open", side_effect=raced_open), \
@@ -178,7 +176,7 @@ class ProcessTests(unittest.TestCase):
                     self.assertEqual((snapshots[0] / "data/00000000.log").read_bytes(),
                                      b"keep unknown replacement")
                 if action == "report_fifo":
-                    self.assertTrue(replaced["report_nonblocking"])
+                    self.assertFalse(replaced["report_opened"])
                 self.assertEqual(foreign.read_bytes(), b"preserve this unrelated fixture")
                 if action in {"snapshot_changed", "snapshot_extra", "process_cleanup", "report_fifo", "partial_copy_unknown_inode"}:
                     self.assertTrue(snapshots[0].exists())
@@ -222,20 +220,17 @@ class ProcessTests(unittest.TestCase):
                     self.assertTrue(process.stdout.closed and process.stderr.closed)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux private snapshot cleanup")
-    def test_interrupted_snapshot_cleanup_requires_stopped_scanner_and_exact_report_anchor(self):
+    def test_interrupted_snapshot_cleanup_requires_stopped_scanner_and_exact_inventory(self):
         import fixture_paths as F
         allocate_real = tempfile.mkdtemp
         for kind in (KeyboardInterrupt, SystemExit):
-            for mode in ("empty", "partial", "complete", "unknown_stop", "unknown_interrupt",
-                         "replaced", "symlink", "oversize"):
+            for mode in ("known_stop", "unknown_stop", "unknown_interrupt", "snapshot_extra", "snapshot_fifo"):
                 with self.subTest(kind=kind.__name__, mode=mode), tempfile.TemporaryDirectory() as temporary:
                     fixture = Path(temporary).resolve()
                     root = fixture / "source"
                     root.mkdir(mode=0o700)
                     log = root / "private.log"
                     P.client.write_new(log, b"synthetic private log")
-                    foreign = fixture / "foreign"
-                    P.client.write_new(foreign, b"preserve unrelated bytes")
                     snapshots = []
                     interruption = kind()
                     def allocate(*args, **options):
@@ -243,20 +238,13 @@ class ProcessTests(unittest.TestCase):
                         snapshots.append(path)
                         return str(path)
                     def scanner(arguments, *, cwd, deadline):
-                        report = Path(arguments[arguments.index("--report-path") + 1])
-                        before = report.lstat()
-                        self.assertEqual(before.st_size, 0)
-                        self.assertEqual(before.st_nlink, 1)
-                        if mode in {"partial", "complete"}:
-                            report.write_bytes(b"[" if mode == "partial" else b"[]\n")
-                        if mode in {"replaced", "symlink"}:
-                            report.unlink()
-                            if mode == "symlink":
-                                report.symlink_to(foreign)
-                            else:
-                                P.client.write_new(report, b"preserve unknown replacement")
-                        if mode == "oversize":
-                            report.write_bytes(b"x" * 4097)
+                        self.assertEqual(arguments[arguments.index("--report-path") + 1], "-")
+                        self.assertEqual(set(Path(cwd).iterdir()),
+                                         {Path(cwd) / name for name in ("data", "gitleaks.toml", "empty.ignore")})
+                        if mode == "snapshot_extra":
+                            P.client.write_new(Path(cwd) / "unknown", b"preserve unknown bytes")
+                        if mode == "snapshot_fifo":
+                            F.os.mkfifo(Path(cwd) / "unknown", 0o600)
                         if mode == "unknown_interrupt":
                             raise interruption
                         raise F.PrivateLogScanError(process_stopped=mode != "unknown_stop",
@@ -267,18 +255,16 @@ class ProcessTests(unittest.TestCase):
                         F.scan_owned_logs(root, Path("/scanner"))
                     self.assertIs(caught.exception, interruption)
                     self.assertEqual(len(snapshots), 1)
-                    retained = mode not in {"empty", "partial", "complete"}
+                    retained = mode != "known_stop"
                     self.assertEqual(snapshots[0].exists(), retained)
                     self.assertEqual(log.read_bytes(), b"synthetic private log")
-                    self.assertEqual(foreign.read_bytes(), b"preserve unrelated bytes")
                     if retained:
                         self.assertEqual((snapshots[0] / "data/00000000.log").read_bytes(),
                                          b"synthetic private log")
-                    if mode == "replaced":
-                        self.assertEqual((snapshots[0] / "report.json").read_bytes(),
-                                         b"preserve unknown replacement")
-                    if mode == "symlink":
-                        self.assertTrue((snapshots[0] / "report.json").is_symlink())
+                    if mode == "snapshot_extra":
+                        self.assertEqual((snapshots[0] / "unknown").read_bytes(), b"preserve unknown bytes")
+                    if mode == "snapshot_fifo":
+                        self.assertTrue(P.stat.S_ISFIFO((snapshots[0] / "unknown").lstat().st_mode))
 
     def invoke(self, root, *, stdout=b"okay", stderr=b"private", limit=4096, binary=False,
                timeout=10, status=0, cleanup_error=None, interrupt=False, progress=None,

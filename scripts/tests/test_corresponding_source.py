@@ -834,9 +834,9 @@ class NativeLifecycleTests(unittest.TestCase):
                                  b"[extend]\nuseDefault = true\n")
                 self.assertEqual(Path(argv[argv.index("--gitleaks-ignore-path") + 1]).read_bytes(), b"")
                 self.assertIn("--ignore-gitleaks-allow", argv)
-                Path(argv[argv.index("--report-path") + 1]).write_bytes(b"[]\n")
+                self.assertEqual(argv[argv.index("--report-path") + 1], "-")
                 count = sum(map(len, values))
-                result = 0, b"", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
+                result = 0, b"[]\n", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
                                    "3:04PM INF no leaks found\n").encode()
                 scan_completed.append(True)
                 return result
@@ -882,9 +882,9 @@ class NativeLifecycleTests(unittest.TestCase):
                 scanned.extend(values)
                 self.assertEqual(sorted(values), [b"", b"acquisition output", b"assembly output"])
                 self.assertNotIn(b"source fixture is not a private command log", values)
-                Path(argv[argv.index("--report-path") + 1]).write_bytes(b"[]\n")
+                self.assertEqual(argv[argv.index("--report-path") + 1], "-")
                 count = sum(map(len, values))
-                result = 0, b"", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
+                result = 0, b"[]\n", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
                                    "3:04PM INF no leaks found\n").encode()
                 scan_completed.append(True)
                 return result
@@ -931,9 +931,9 @@ class NativeLifecycleTests(unittest.TestCase):
                     self.assertEqual(argv[argv.index("--max-target-megabytes") + 1], "0")
                     self.assertEqual(argv[argv.index("--log-level") + 1], "info")
                     scans.append(config.parent)
-                    Path(argv[argv.index("--report-path") + 1]).write_bytes(b"[]\n")
+                    self.assertEqual(argv[argv.index("--report-path") + 1], "-")
                     count = len(b"synthetic private diagnostic")
-                    return status, b"", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
+                    return status, b"[]\n", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
                                          "3:04PM INF no leaks found\n").encode()
                 with mock.patch.object(F, "_run_log_scanner", side_effect=scanner) as invoked:
                     if status:
