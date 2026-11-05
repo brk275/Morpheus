@@ -31,7 +31,7 @@ import tomllib
 import urllib.request
 import uuid
 
-from fixture_paths import external_path, private_directory, write_private
+from fixture_paths import external_path, private_directory, write_private, scan_owned_logs, PrivateLogScanError
 from package_revision import expected_revision, SourceRevisionError
 from element_process_namespace import namespace_command, stop_owned, wait_owned
 
@@ -306,12 +306,10 @@ class Commands:
         return log.read_text(errors="replace")
 
     def scan(self, scanner):
-        for path in sorted(self.root.rglob("*.log")):
-            with path.open("rb") as source:
-                result = subprocess.run([scanner, "stdin", "--redact=100", "--ignore-gitleaks-allow", "--no-banner"],
-                                        stdin=source, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                        timeout=30, cwd=self.root)
-            require(result.returncode == 0, "log_scan")
+        try:
+            scan_owned_logs(self.root, scanner, deadline=self.deadline)
+        except PrivateLogScanError:
+            raise QAError("log_scan") from None
 
 
 def export_source(commands, source):
