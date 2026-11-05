@@ -1314,6 +1314,8 @@ impl Scenario {
         );
         let selection = self.manager.account_selection(&self.account).unwrap();
         let row = |ui: &AppWindow| has_event_id(&ui.get_messages(), root);
+        self.joined_follow_up_releases_transition(&selection, root)
+            .await;
 
         // An ordinary same-room navigation (a room-list click) lands between
         // the absent row and its retry, and the reopened room delivers the
@@ -1475,6 +1477,42 @@ impl Scenario {
         self.select_room().await;
         let live_rows = |ui: &AppWindow| !ui.get_conversation_focused() && row(ui);
         wait_for_ui(ui, "The live conversation did not return", live_rows).await;
+    }
+
+    /// A confirmed join's snapshot has been admitted, with its feed follow-up
+    /// held at the existing production pause. Account controls can claim their
+    /// transition before that follow-up is released, and the same join still
+    /// finishes with its own receipt and live rows.
+    async fn joined_follow_up_releases_transition(&self, selection: &AccountSelection, root: &str) {
+        let held = self.live.pauses.install("snapshot.before_feed_key");
+        let asked = self.live.join_asked();
+        let joining = asked.clone();
+        let (live, weak) = (self.live.clone(), self.ui.as_weak());
+        let (selection, room) = (selection.clone(), self.room.clone());
+        let mut opened = OwnedTask::spawn(&self.runtime, async move {
+            live.open_joined(selection, room, JoinedNavigation::Room, joining, weak)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(60), held.entered())
+            .await
+            .expect("The admitted join must reach its feed follow-up");
+        let live = self.live.clone();
+        let released = on_runtime(&self.runtime, async move {
+            let released =
+                tokio::time::timeout(Duration::from_secs(2), live.account_transition.lock())
+                    .await
+                    .is_ok();
+            released
+        })
+        .await;
+        assert!(released, "A joined follow-up blocked account controls");
+        held.proceed();
+        assert!(matches!(opened.join().await, Ok(true)));
+        assert!(asked.owned_open(&self.live).is_some());
+        wait_for_ui(&self.ui, "The joined follow-up lost its live row", |ui| {
+            has_event_id(&ui.get_messages(), root)
+        })
+        .await;
     }
 
     /// The join's own open of this (already joined) room, as join_target_for

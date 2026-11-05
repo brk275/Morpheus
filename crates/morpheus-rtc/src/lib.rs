@@ -153,6 +153,7 @@ pub fn classify_transports(transports: &Value) -> TransportSupport {
     entries
         .iter()
         .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("livekit"))
+        .filter(|entry| entry.get("url").is_none())
         .filter_map(|entry| entry.get("livekit_service_url").and_then(Value::as_str))
         .find_map(valid_service_url)
         .map(|service_url| TransportSupport::LiveKit { service_url })
@@ -213,6 +214,8 @@ pub enum RtcError {
     AlreadyJoined,
     #[error("there is no active call in this room")]
     NotJoined,
+    #[error("the call stopped because participant identities could not be uniquely verified")]
+    IdentityRejected,
     #[error("the homeserver advertises no usable LiveKit MatrixRTC transport")]
     NoLiveKitTransport,
     #[error("the homeserver does not advertise sticky events required by this call mode")]
@@ -238,7 +241,19 @@ pub enum RtcError {
     OutgoingPreflight(#[from] OutgoingCallError),
     #[cfg(feature = "native-rtc")]
     #[error("MatrixRTC call failed: {0}")]
-    Call(#[from] matrix_rtc_call_sdk::LiveKitCallError),
+    Call(matrix_rtc_call_sdk::LiveKitCallError),
+}
+
+#[cfg(feature = "native-rtc")]
+impl From<matrix_rtc_call_sdk::LiveKitCallError> for RtcError {
+    fn from(error: matrix_rtc_call_sdk::LiveKitCallError) -> Self {
+        match error {
+            matrix_rtc_call_sdk::LiveKitCallError::Attach(
+                matrix_rtc_call_sdk::AttachError::IdentityRejected,
+            ) => Self::IdentityRejected,
+            other => Self::Call(other),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +261,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[cfg(feature = "native-rtc")]
+    #[test]
+    fn identity_refusal_is_not_the_retryable_generic_call_error() {
+        let error = matrix_rtc_call_sdk::LiveKitCallError::Attach(
+            matrix_rtc_call_sdk::AttachError::IdentityRejected,
+        );
+        assert!(matches!(RtcError::from(error), RtcError::IdentityRejected));
+    }
 
     #[test]
     fn picks_first_valid_livekit_transport_in_server_order() {
@@ -269,6 +293,8 @@ mod tests {
             json!([]),
             json!({"rtc_transports": []}),
             json!([{"type": "org.example.p2p", "url": "https://p2p.example"}]),
+            json!([{"type": "livekit", "url": "https://sfu.example.org"}]),
+            json!([{"type": "livekit", "url": "https://sfu.example.org", "livekit_service_url": "https://auth.example.org"}]),
             json!([{"type": "livekit", "livekit_service_url": "file:///tmp/token"}]),
             json!([{"type": "livekit", "livekit_service_url": "https://"}]),
             json!([{"type": "livekit", "livekit_service_url": "http://rtc.example.org"}]),

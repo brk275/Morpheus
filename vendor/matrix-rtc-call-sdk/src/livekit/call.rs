@@ -149,6 +149,10 @@ pub struct LiveKitCallOptions {
     /// advertised transports (MSC4143 `GET /rtc/transports`). `None` takes the
     /// first LiveKit one advertised; joining fails if there is none.
     pub livekit_transport: Option<LiveKitTransport>,
+    /// Explicit auth contract. None selects legacy only for the standard
+    /// canonical `m.call#ROOM` service flow; custom slots retain the direct
+    /// draft route. No HTTP failure or unverified JWT changes this selection.
+    pub auth_dialect: Option<matrix_rtc_transport::livekit::LiveKitAuthDialect>,
     /// Override for the core's media-key policy. `None` keeps the core's
     /// default, which requires key senders to be cross-signed (MSC4153) —
     /// only relax this for test setups whose users have no cross-signing.
@@ -205,8 +209,8 @@ pub struct LiveKitCallOptions {
     ///
     /// [`MembershipFormat::RoomState`] goes further and is not additive at
     /// all: the membership moves to `org.matrix.msc3401.call.member` room state,
-    /// the SFU participant identity becomes the plain `{user}:{device}` string,
-    /// and the token comes from the pre-MSC4195 `/sfu/get` endpoint. Nothing
+    /// while auth and SFU identity are selected separately by `auth_dialect`.
+    /// Nothing
     /// about such a call is visible to a spec-current peer.
     ///
     /// Reading the 2025 sticky dialect needs no flag and is always on. See
@@ -241,6 +245,7 @@ impl Default for LiveKitCallOptions {
             slot_id: "m.call#room".to_owned(),
             application: "m.call".to_owned(),
             livekit_transport: None,
+            auth_dialect: None,
             encryption_config: None,
             keep_alive_interval_ms: None,
             sticky_duration_ms: None,
@@ -317,9 +322,8 @@ impl LiveKitCall {
             ),
             MembershipFormat::RoomState => log::warn!(
                 "[{room_id}/{}] joining in pre-sticky Element Call compatibility mode: our \
-                 membership goes out as {} room state, our SFU identity is the plain \
-                 {{user}}:{{device}} string, and the token comes from /sfu/get. Nothing about \
-                 this call is visible to a spec-current peer.",
+                 membership goes out as {} room state. Auth is selected separately; nothing about \
+                 this membership is visible to a spec-current peer.",
                 options.slot_id,
                 compat::STATE_MEMBER_EVENT_TYPE,
             ),
@@ -379,6 +383,11 @@ impl LiveKitCall {
             room.backend().clone(),
             LiveKitAttachOptions {
                 format: options.format,
+                auth_dialect: options.auth_dialect.unwrap_or_else(|| {
+                    matrix_rtc_transport::livekit::LiveKitAuthDialect::for_service_slot(
+                        &crate::attach::token_slot_id(options.format, &options.slot_id),
+                    )
+                }),
                 http: options.http.clone(),
                 auto_subscribe: options.auto_subscribe,
                 stability: options.stability.clone(),

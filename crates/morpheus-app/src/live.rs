@@ -3057,9 +3057,12 @@ impl LiveUi {
                     .await
             }
         };
+        // The reveal has admitted its snapshot or completed its give-back.
+        // Follow-ups carry that snapshot's selection and navigation; their
+        // SDK/feed/recovery waits must not hold up newer account controls.
+        drop(_transition);
         match opened {
-            // Its follow-ups still run under this open's transition lock, as
-            // before; each is scoped to its own snapshot (after_snapshot).
+            // Every follow-up still belongs to this exact admitted snapshot.
             Ok(Some(after)) => {
                 self.after_snapshot(after, ui).await;
                 // Its receipt: the navigation this open took and the exact
@@ -4057,8 +4060,8 @@ impl LiveUi {
     /// lock keeps its own feed, key, draft, presentation and selection. A
     /// search result's or a created room's reveal runs this with no
     /// transition lock and no barrier held, so none of these waits holds up
-    /// navigation; a join's open runs it under its own transition lock, as
-    /// before.
+    /// navigation. A join's admitted snapshot uses the same scoped follow-ups
+    /// after releasing its transition lock.
     async fn after_snapshot(self: &Arc<Self>, after: AfterSnapshot, ui: Weak<AppWindow>) {
         let AfterSnapshot {
             account_id,
