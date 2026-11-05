@@ -49,6 +49,223 @@ class FakeSelector:
 
 
 class ProcessTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "Linux complete private log snapshot")
+    def test_owned_log_snapshot_is_complete_independent_and_scans_once(self):
+        import fixture_paths as F
+        import appimage_update_acceptance as A
+        original_mkdtemp = tempfile.mkdtemp
+        for action in ("valid", "valid_large", "finding", "warning", "stdout", "malformed", "missing",
+                       "source_changed", "source_added", "snapshot_changed", "snapshot_extra",
+                       "symlink", "oversize", "process_cleanup", "source_fifo_race", "report_fifo",
+                       "coverage_short", "coverage_extra", "coverage_missing", "coverage_duplicate",
+                       "coverage_malformed", "source_partial_copy", "partial_copy_unknown_inode"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
+                fixture = Path(temporary).resolve()
+                root = fixture / "source"
+                root.mkdir(mode=0o700)
+                bodies = {"a.log":b"first\x00raw\nbody", "b.log":b"second separate body\n"}
+                if action == "valid_large":
+                    bodies["a.log"] = b"first\x00" + b"A" * 200_000 + b"tail\n"
+                for name, value in bodies.items():
+                    P.client.write_new(root / name, value)
+                foreign = fixture / "foreign"
+                P.client.write_new(foreign, b"preserve this unrelated fixture")
+                if action == "symlink":
+                    (root / "a.log").unlink()
+                    (root / "a.log").symlink_to(foreign)
+                if action == "oversize":
+                    with (root / "a.log").open("wb") as stream:
+                        stream.truncate(8 * 1024 * 1024 + 1)
+                snapshots = []
+                original_open = F.os.open
+                original_read = F.os.read
+                source_identity = ((root / "a.log").lstat().st_dev, (root / "a.log").lstat().st_ino)
+                replaced = {"source":False, "report_opened":False, "partial_reads":0,
+                            "unknown_snapshot":False}
+                def raced_read(descriptor, maximum):
+                    info = F.os.fstat(descriptor)
+                    if (action in {"source_partial_copy", "partial_copy_unknown_inode"}
+                            and (info.st_dev, info.st_ino) == source_identity):
+                        replaced["partial_reads"] += 1
+                        if replaced["partial_reads"] == 1:
+                            return original_read(descriptor, min(5, maximum))
+                        if action == "partial_copy_unknown_inode":
+                            path = snapshots[0] / "data/00000000.log"
+                            path.unlink()
+                            P.client.write_new(path, b"keep unknown replacement")
+                            replaced["unknown_snapshot"] = True
+                        raise OSError("synthetic owned-copy read refusal")
+                    return original_read(descriptor, maximum)
+                def raced_open(path, flags, *args, **options):
+                    if action == "report_fifo" and path == "report.json":
+                        replaced["report_opened"] = True
+                        self.fail("Unexpected snapshot FIFO must never be opened")
+                    if action == "source_fifo_race" and path == "a.log" and not replaced["source"]:
+                        self.assertTrue(flags & F.os.O_NONBLOCK)
+                        (root / "a.log").unlink()
+                        F.os.mkfifo(root / "a.log", 0o600)
+                        replaced["source"] = True
+                    return original_open(path, flags, *args, **options)
+                def allocate(*args, **options):
+                    self.assertEqual(options["dir"], Path("/tmp"))
+                    path = original_mkdtemp(prefix=options["prefix"], dir=fixture)
+                    snapshots.append(Path(path))
+                    return path
+                def scanner(arguments, *, cwd, deadline):
+                    self.assertEqual(arguments[0:2], ["/scanner", "dir"])
+                    self.assertEqual(deadline, 40)
+                    data = Path(arguments[2])
+                    safe_bodies = ([bodies["b.log"]] if action in {"symlink", "oversize", "source_fifo_race", "source_partial_copy"}
+                                   else list(bodies.values()))
+                    expected_names = (["00000001.log"] if action in {"source_fifo_race", "source_partial_copy"} else
+                                      [str(index).zfill(8) + ".log" for index in range(len(safe_bodies))])
+                    self.assertEqual(sorted(p.name for p in data.iterdir()), expected_names)
+                    self.assertEqual([p.read_bytes() for p in sorted(data.iterdir())], safe_bodies)
+                    self.assertEqual(Path(arguments[arguments.index("--config") + 1]).read_bytes(),
+                                     b"[extend]\nuseDefault = true\n")
+                    self.assertEqual(Path(arguments[arguments.index("--gitleaks-ignore-path") + 1]).read_bytes(), b"")
+                    self.assertEqual(arguments[arguments.index("--max-target-megabytes") + 1], "0")
+                    self.assertEqual(arguments[arguments.index("--log-level") + 1], "info")
+                    self.assertIn("--no-color", arguments)
+                    self.assertEqual(arguments[arguments.index("--max-decode-depth") + 1], "5")
+                    self.assertEqual(arguments[arguments.index("--max-archive-depth") + 1], "0")
+                    self.assertIn("--ignore-gitleaks-allow", arguments)
+                    self.assertEqual(arguments[arguments.index("--report-path") + 1], "-")
+                    if action == "process_cleanup":
+                        raise F.PrivateLogScanError(process_stopped=False)
+                    if action == "report_fifo":
+                        F.os.mkfifo(Path(cwd) / "report.json", 0o600)
+                    report_body = (b"" if action == "missing" else b"{bad" if action == "malformed" else
+                                   b'[{"RuleID":"synthetic"}]' if action == "finding" else b"[]\n")
+                    if action == "source_changed": (root / "a.log").write_bytes(b"changed source")
+                    if action == "source_added": P.client.write_new(root / "c.log", b"new unscanned original")
+                    if action == "snapshot_changed": (data / "00000000.log").write_bytes(b"changed copy")
+                    if action == "snapshot_extra": P.client.write_new(data / "extra.log", b"unknown copy")
+                    count = sum(len(value) for value in safe_bodies)
+                    if action == "coverage_short": count -= 1
+                    if action == "coverage_extra": count += 1
+                    display = "200.03 KB" if action == "valid_large" else f"{count} bytes"
+                    duration = "1µs" if action == "valid" else "1ms"
+                    footer = (f"3:04PM INF scanned ~{count} bytes ({display}) in {duration}\n"
+                              "3:04PM INF no leaks found\n").encode()
+                    if action == "coverage_missing": footer = b""
+                    if action == "coverage_duplicate": footer += footer
+                    if action == "coverage_malformed": footer = footer.replace(b"scanned ~", b"scanned ?")
+                    return (1 if action == "finding" else 0,
+                            b"[]" + b" " * 4096 if action == "stdout" else report_body,
+                            footer + b"partial scan warning" if action == "warning" else footer)
+                with mock.patch.object(F.tempfile, "mkdtemp", side_effect=allocate), \
+                        mock.patch.object(F.os, "open", side_effect=raced_open), \
+                        mock.patch.object(F.os, "read", side_effect=raced_read), \
+                        mock.patch.object(P.time, "monotonic", return_value=10), \
+                        mock.patch.object(F, "_run_log_scanner", side_effect=scanner) as invoked:
+                    if action in {"valid", "valid_large"}:
+                        P.scan_private_logs(root, "/scanner")
+                        self.assertEqual(invoked.call_count, 1)
+                        # The outer owner also uses explicit independent defaults.
+                        A.Commands(root, env={}).scan("/scanner")
+                        self.assertEqual(invoked.call_count, 2)
+                    else:
+                        with self.assertRaises(P.PackageFailure):
+                            P.scan_private_logs(root, "/scanner")
+                        self.assertEqual(invoked.call_count, 0 if action == "partial_copy_unknown_inode" else 1)
+                if action in {"source_partial_copy", "partial_copy_unknown_inode"}:
+                    self.assertEqual(replaced["partial_reads"], 2)
+                if action == "partial_copy_unknown_inode":
+                    self.assertTrue(replaced["unknown_snapshot"])
+                    self.assertEqual((snapshots[0] / "data/00000000.log").read_bytes(),
+                                     b"keep unknown replacement")
+                if action == "report_fifo":
+                    self.assertFalse(replaced["report_opened"])
+                self.assertEqual(foreign.read_bytes(), b"preserve this unrelated fixture")
+                if action in {"snapshot_changed", "snapshot_extra", "process_cleanup", "report_fifo", "partial_copy_unknown_inode"}:
+                    self.assertTrue(snapshots[0].exists())
+                elif snapshots:
+                    self.assertTrue(all(not path.exists() for path in snapshots))
+                if action not in {"symlink", "oversize", "source_changed", "source_fifo_race"}:
+                    self.assertEqual((root / "a.log").read_bytes(), bodies["a.log"])
+                if action == "source_fifo_race":
+                    self.assertTrue(replaced["source"])
+                    self.assertTrue(P.stat.S_ISFIFO((root / "a.log").lstat().st_mode))
+                self.assertEqual((root / "b.log").read_bytes(), bodies["b.log"])
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(P.time, "monotonic", return_value=10), \
+                mock.patch.object(F, "_run_log_scanner") as scanner:
+            with self.assertRaises(P.PackageFailure):
+                P.scan_private_logs(Path(temporary).resolve(), "/scanner", deadline=10)
+            scanner.assert_not_called()
+
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux private scanner ownership")
+    def test_private_scanner_interrupt_carries_original_and_known_stop_receipt(self):
+        import fixture_paths as F
+        for interruption in (KeyboardInterrupt(), SystemExit(7)):
+            for stop_fails in (False, True):
+                with self.subTest(kind=type(interruption).__name__, stop_fails=stop_fails):
+                    process = mock.Mock(stdout=FakePipe(81), stderr=FakePipe(82))
+                    process.poll.return_value = None
+                    process.wait.return_value = 0
+                    if stop_fails:
+                        process.kill.side_effect = OSError("synthetic private stop refusal")
+                    with mock.patch("subprocess.Popen", return_value=process), \
+                            mock.patch("select.select", side_effect=interruption), \
+                            mock.patch("time.monotonic", return_value=10), \
+                            self.assertRaises(F.PrivateLogScanError) as caught:
+                        F._run_log_scanner(["/unused-scanner"], cwd=Path("/tmp"), deadline=40)
+                    self.assertIs(caught.exception.interruption, interruption)
+                    self.assertIs(caught.exception.process_stopped, not stop_fails)
+                    process.kill.assert_called_once_with()
+                    if not stop_fails:
+                        self.assertGreaterEqual(process.wait.call_count, 1)
+                    self.assertTrue(process.stdout.closed and process.stderr.closed)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux private snapshot cleanup")
+    def test_interrupted_snapshot_cleanup_requires_stopped_scanner_and_exact_inventory(self):
+        import fixture_paths as F
+        allocate_real = tempfile.mkdtemp
+        for kind in (KeyboardInterrupt, SystemExit):
+            for mode in ("known_stop", "unknown_stop", "unknown_interrupt", "snapshot_extra", "snapshot_fifo"):
+                with self.subTest(kind=kind.__name__, mode=mode), tempfile.TemporaryDirectory() as temporary:
+                    fixture = Path(temporary).resolve()
+                    root = fixture / "source"
+                    root.mkdir(mode=0o700)
+                    log = root / "private.log"
+                    P.client.write_new(log, b"synthetic private log")
+                    snapshots = []
+                    interruption = kind()
+                    def allocate(*args, **options):
+                        path = Path(allocate_real(prefix=options["prefix"], dir=fixture))
+                        snapshots.append(path)
+                        return str(path)
+                    def scanner(arguments, *, cwd, deadline):
+                        self.assertEqual(arguments[arguments.index("--report-path") + 1], "-")
+                        self.assertEqual(set(Path(cwd).iterdir()),
+                                         {Path(cwd) / name for name in ("data", "gitleaks.toml", "empty.ignore")})
+                        if mode == "snapshot_extra":
+                            P.client.write_new(Path(cwd) / "unknown", b"preserve unknown bytes")
+                        if mode == "snapshot_fifo":
+                            F.os.mkfifo(Path(cwd) / "unknown", 0o600)
+                        if mode == "unknown_interrupt":
+                            raise interruption
+                        raise F.PrivateLogScanError(process_stopped=mode != "unknown_stop",
+                                                    interruption=interruption)
+                    with mock.patch.object(F.tempfile, "mkdtemp", side_effect=allocate), \
+                            mock.patch.object(F, "_run_log_scanner", side_effect=scanner), \
+                            self.assertRaises(kind) as caught:
+                        F.scan_owned_logs(root, Path("/scanner"))
+                    self.assertIs(caught.exception, interruption)
+                    self.assertEqual(len(snapshots), 1)
+                    retained = mode != "known_stop"
+                    self.assertEqual(snapshots[0].exists(), retained)
+                    self.assertEqual(log.read_bytes(), b"synthetic private log")
+                    if retained:
+                        self.assertEqual((snapshots[0] / "data/00000000.log").read_bytes(),
+                                         b"synthetic private log")
+                    if mode == "snapshot_extra":
+                        self.assertEqual((snapshots[0] / "unknown").read_bytes(), b"preserve unknown bytes")
+                    if mode == "snapshot_fifo":
+                        self.assertTrue(P.stat.S_ISFIFO((snapshots[0] / "unknown").lstat().st_mode))
+
     def invoke(self, root, *, stdout=b"okay", stderr=b"private", limit=4096, binary=False,
                timeout=10, status=0, cleanup_error=None, interrupt=False, progress=None,
                stdin_bytes=None, stderr_limit=8 * 1024 * 1024, expected_status=(0,)):

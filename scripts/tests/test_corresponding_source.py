@@ -798,11 +798,12 @@ class NativeLifecycleTests(unittest.TestCase):
 
     def test_stopped_native_cache_source_fixture_cannot_enter_the_real_command_log_scan(self):
         M = Q.P
+        import fixture_paths as F
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             root.chmod(0o700)
             (root / "capture-receipt.json").write_text('{"installed_capture_passed":true}')
-            events, scanned = [], []
+            events, scanned, scan_completed = [], [], []
             source = root / "native-source-inputs/cargo/registry/src/fixture/sample_session.log"
             def spawn(*_args, **_kwargs):
                 source.parent.mkdir(parents=True)
@@ -821,31 +822,47 @@ class NativeLifecycleTests(unittest.TestCase):
             def fixture(*_args):
                 events.append("fixture")
                 self.assertTrue(source.exists())
-            def scanner(_argv, **kwargs):
+            def scanner(argv, *, cwd, deadline):
                 self.assertEqual(events, ["stop", "fixture"])
                 self.assertFalse((root / "native-source-inputs/cargo").exists())
-                scanned.append(kwargs["input"])
-                return SimpleNamespace(returncode=0)
+                self.assertEqual(argv[:2], ["/reviewed-scanner", "dir"])
+                data = Path(argv[2])
+                values = [path.read_bytes() for path in sorted(data.iterdir())]
+                scanned.extend(values)
+                self.assertEqual(sorted(values), [b"", b"assembly diagnostic", b"fetch diagnostic"])
+                self.assertEqual(Path(argv[argv.index("--config") + 1]).read_bytes(),
+                                 b"[extend]\nuseDefault = true\n")
+                self.assertEqual(Path(argv[argv.index("--gitleaks-ignore-path") + 1]).read_bytes(), b"")
+                self.assertIn("--ignore-gitleaks-allow", argv)
+                self.assertEqual(argv[argv.index("--report-path") + 1], "-")
+                count = sum(map(len, values))
+                result = 0, b"[]\n", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
+                                   "3:04PM INF no leaks found\n").encode()
+                scan_completed.append(True)
+                return result
             with mock.patch.object(M.containment, "namespace_command", return_value=["/inert"]), \
                     mock.patch.object(M.containment, "status", return_value=0), \
                     mock.patch.object(M.containment, "stop_owned", side_effect=stop), \
                     mock.patch.object(M, "cleanup_owned_fixture", side_effect=fixture), \
                     mock.patch.object(M, "verify_native_sources", return_value={}), \
                     mock.patch.object(M.subprocess, "Popen", side_effect=spawn), \
-                    mock.patch.object(M.subprocess, "run", side_effect=scanner), \
+                    mock.patch.object(F, "_run_log_scanner", side_effect=scanner) as invoked, \
                     mock.patch.object(M.diagnostics, "Progress"):
                 receipt = M.contained(root, "/reviewed-scanner", {"cargo": "/cargo"}, {})
             self.assertTrue(receipt["installed_capture_passed"])
+            self.assertEqual(invoked.call_count, 1)
+            self.assertEqual(scan_completed, [True])
             self.assertIn(b"fetch diagnostic", scanned)
             self.assertIn(b"assembly diagnostic", scanned)
             self.assertNotIn(b"synthetic crate source-data fixture", scanned)
 
     def test_failed_namespace_stop_retains_cache_but_attempts_every_actual_log_scan(self):
         M = Q.P
+        import fixture_paths as F
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             root.chmod(0o700)
-            child, scanned = SimpleNamespace(pid=42), []
+            child, scanned, scan_completed = SimpleNamespace(pid=42), [], []
             def spawn(*_args, **_kwargs):
                 work = root / "native-source-inputs"
                 source = work / "cargo/registry/src/fixture/source.log"
@@ -859,48 +876,76 @@ class NativeLifecycleTests(unittest.TestCase):
                     log.write_bytes(value)
                     log.chmod(0o600)
                 return child
-            def scanner(_argv, **kwargs):
-                scanned.append(kwargs["input"])
-                return SimpleNamespace(returncode=0)
+            def scanner(argv, *, cwd, deadline):
+                self.assertEqual(argv[:2], ["/reviewed-scanner", "dir"])
+                values = [path.read_bytes() for path in sorted(Path(argv[2]).iterdir())]
+                scanned.extend(values)
+                self.assertEqual(sorted(values), [b"", b"acquisition output", b"assembly output"])
+                self.assertNotIn(b"source fixture is not a private command log", values)
+                self.assertEqual(argv[argv.index("--report-path") + 1], "-")
+                count = sum(map(len, values))
+                result = 0, b"[]\n", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
+                                   "3:04PM INF no leaks found\n").encode()
+                scan_completed.append(True)
+                return result
             with mock.patch.object(M.containment, "namespace_command", return_value=["/inert"]), \
                     mock.patch.object(M.containment, "status", return_value=0), \
                     mock.patch.object(M.containment, "stop_owned", side_effect=RuntimeError("private stop failure")), \
                     mock.patch.object(M, "cleanup_owned_fixture"), \
                     mock.patch.object(M, "verify_native_sources") as verified, \
                     mock.patch.object(M.subprocess, "Popen", side_effect=spawn), \
-                    mock.patch.object(M.subprocess, "run", side_effect=scanner), \
+                    mock.patch.object(F, "_run_log_scanner", side_effect=scanner) as invoked, \
                     mock.patch.object(M.diagnostics, "Progress"), \
                     mock.patch("sys.stderr", io.StringIO()), self.assertRaises(M.PackageFailure):
                 M.contained(root, "/reviewed-scanner", {"cargo": "/cargo"}, {})
             self.assertTrue((root / "native-source-inputs/cargo/registry/src/fixture/source.log").exists())
             self.assertIn(b"acquisition output", scanned)
             self.assertIn(b"assembly output", scanned)
+            self.assertEqual(invoked.call_count, 1)
+            self.assertEqual(scan_completed, [True])
+            self.assertNotIn(b"source fixture is not a private command log", scanned)
             verified.assert_not_called()
 
     def test_private_log_scan_uses_independent_defaults_and_cleans_config_on_failure(self):
         M = Q.P
+        import fixture_paths as F
         for status in (0, 1):
-            with self.subTest(status=status), tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP", str(ROOT))) as directory:
+            with self.subTest(status=status), tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP", tempfile.gettempdir())) as directory:
                 root = Path(directory).resolve()
                 log = root / "private.log"
                 log.write_bytes(b"synthetic private diagnostic")
                 log.chmod(0o600)
-                def scanner(argv, **kwargs):
+                scans = []
+                def scanner(argv, *, cwd, deadline):
+                    self.assertEqual(argv[:2], ["/reviewed-scanner", "dir"])
                     config = Path(argv[argv.index("--config") + 1])
                     ignore = Path(argv[argv.index("--gitleaks-ignore-path") + 1])
                     self.assertEqual(config.read_bytes(), b"[extend]\nuseDefault = true\n")
                     self.assertEqual(ignore.read_bytes(), b"")
-                    self.assertEqual(kwargs["cwd"], config.parent)
-                    self.assertEqual(kwargs["input"], b"synthetic private diagnostic")
+                    self.assertEqual(cwd, config.parent)
+                    data = Path(argv[2])
+                    self.assertEqual([path.read_bytes() for path in sorted(data.iterdir())],
+                                     [b"synthetic private diagnostic"])
                     self.assertIn("--ignore-gitleaks-allow", argv)
-                    return SimpleNamespace(returncode=status)
-                with mock.patch.object(M.subprocess, "run", side_effect=scanner):
+                    self.assertIn("--no-color", argv)
+                    self.assertEqual(argv[argv.index("--max-target-megabytes") + 1], "0")
+                    self.assertEqual(argv[argv.index("--log-level") + 1], "info")
+                    scans.append(config.parent)
+                    self.assertEqual(argv[argv.index("--report-path") + 1], "-")
+                    count = len(b"synthetic private diagnostic")
+                    return status, b"[]\n", (f"3:04PM INF scanned ~{count} bytes ({count} bytes) in 1ms\n"
+                                         "3:04PM INF no leaks found\n").encode()
+                with mock.patch.object(F, "_run_log_scanner", side_effect=scanner) as invoked:
                     if status:
                         with self.assertRaises(M.PackageFailure):
                             M.scan_private_logs(root, "/reviewed-scanner")
                     else:
                         M.scan_private_logs(root, "/reviewed-scanner")
+                self.assertEqual(invoked.call_count, 1)
+                self.assertEqual(len(scans), 1)
+                self.assertTrue(all(not path.exists() for path in scans))
                 self.assertEqual(list(root.iterdir()), [log])
+                self.assertEqual(log.read_bytes(), b"synthetic private diagnostic")
 
 
 if __name__ == "__main__":
