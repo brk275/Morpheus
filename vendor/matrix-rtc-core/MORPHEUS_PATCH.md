@@ -159,3 +159,27 @@ keep-alive behavior is preserved and is not claimed to drive this retry schedule
 ## Device-discovery own-membership renewal
 
 Morpheus now feeds bounded public device-list hints into the existing own-join renewal path. Only a current own join in a known encrypted open room can request an ordinary fresh own membership for a currently joined room user. A per-join finite device ledger, a single coalesced input marker and the existing ten-second send pacing bound churn. This adds no participant and changes no sender, encryption, trust, history, media-key or gossip policy. Leave and clone reset the ledger; ordinary membership-based renewal is preserved. This does not cause an unchanged stock peer to republish its own membership.
+
+## Exact participation provenance for inbound keys
+
+The existing authenticated key-origin and recipient checks now carry the
+verified member's `membership_ts` alongside the member ID through key-handler
+notifications. An authoritative membership-snapshot callback supplies current
+participation to the attachment guard; mapper observations are not authority.
+
+Stored inbound keys retain their verified timestamp and key vector under the
+same existing lock. Replay requires the current participation to match that
+provenance. A new timestamp replaces the old stored key set, so an old
+participation cannot suppress a freshly accepted key with the same index and
+bytes. A verified absent timestamp is distinct from missing provenance and
+from a later explicit timestamp. No timestamp is inferred from legacy key
+packets, and this does not admit historical or otherwise unverified keys.
+
+Existing identity/payload bounds include the added provenance fields. Original
+recipient, trust, key-origin, rotation, grace and renewal policies remain.
+Existing-module cases cover unchanged-timestamp refreshes, a timestamp rejoin
+without an observed leave, stale replay and fresh-generation duplicate handling.
+The companion `matrix-rtc-livekit` facade and transport handlers carry this
+admission through native imports; these are source changes awaiting affected
+hosted checks, not a real-call or cryptographic-readiness result. Upstream pin,
+dependencies, original license texts and provenance records are unchanged.

@@ -2090,6 +2090,9 @@ enum SessionEnd {
 fn session_end(end: RtcCallEnd) -> SessionEnd {
     match end {
         RtcCallEnd::SlotClosed => SessionEnd::Ended("the room call was closed"),
+        RtcCallEnd::IdentityRejected => {
+            SessionEnd::Ended("call identities could not be uniquely verified")
+        }
         // No local Leave was requested, so the membership ended without us,
         // e.g. its delayed leave fired while this device was offline.
         RtcCallEnd::Left => SessionEnd::Rejoin(RejoinCause::MembershipEnded),
@@ -3778,6 +3781,14 @@ async fn ensure_account(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identity_contract_refusal_is_terminal_without_rejoin() {
+        assert!(matches!(
+            session_end(RtcCallEnd::IdentityRejected),
+            SessionEnd::Ended(_)
+        ));
+    }
+
     use super::*;
     #[tokio::test]
     async fn attachment_audio_authority_ends_before_a_queued_or_opening_call_and_never_revives() {

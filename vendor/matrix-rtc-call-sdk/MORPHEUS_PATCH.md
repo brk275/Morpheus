@@ -141,3 +141,45 @@ this mismatch in hosted run `40522573451` (94 passed, one failed). This change
 adds no timer, key request, crypto acceptance, dependency or public interface.
 It is not a fix for unavailable historical membership keys or evidence that
 any real media or call acceptance gate passed. No candidate was executed locally.
+
+## Explicit authentication and participation ownership
+
+The native call facade now selects a complete `LiveKitAuthDialect`: token
+endpoint and participant-identity derivation stay paired. Membership carrier
+and room-slot spelling do not independently switch that contract. The sticky
+compatibility profile retains its direct-draft default; a caller can explicitly
+select the verified legacy service contract. There is no endpoint fallback.
+
+The private attachment guard bounds identity ownership and binds each inbound
+key import to the authoritative member and exact `membership_ts` participation.
+An unchanged-timestamp refresh preserves that lease; departure or a changed
+timestamp retires it, including when no feed observed an intervening leave.
+Mapper observations cannot advance authoritative generations. Imports for an
+old lease cannot become imports for its successor; same-alias ring operations
+remain serialized across the handover. Ambiguous ownership permanently refuses
+that call and propagates `IdentityRejected` rather than automatically rejoining.
+
+The engine retires adopted, queued and late-successful connections on refusal
+and fences capture, publication and unmute against retired call authority.
+Existing identity/payload bounds, OpenID URL and redirect restrictions, sender
+key adoption and retained-event ownership remain in force. Source regressions
+cover dialect selection, ownership collisions, timestamp transitions, delayed
+and replayed imports, and retirement. They require affected hosted execution;
+this patch does not establish stock-peer interoperability or native media
+acceptance. No dependency, upstream revision or license term changes.
+
+## Standalone Windows SDK test SQLite linkage
+
+The Windows-only dev-dependencies now enable `libsqlite3-sys =0.38.2` with
+`bundled-windows`, matching the existing application and standalone adapter
+test policy. The adapter's dev-dependencies do not propagate when the call SDK
+selects it as a dependency. SDK library tests with `matrix-sdk` therefore need
+their own development edge to avoid depending on an ambient `sqlite3.lib`.
+
+The lockfile adds only that edge to the call SDK package. No crate, version,
+checksum, normal dependency, production feature or build-hook source changes;
+the already locked bundled SQLite source supplies the test library. No system
+library download, linker bypass or test disablement is introduced. Fresh
+Windows SDK library tests with `--features matrix-sdk` remain required; source
+review is not a passing link or runtime result. Other platforms' dependency
+activation and ordinary application dependencies are unchanged.

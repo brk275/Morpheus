@@ -136,8 +136,14 @@ export component AttachmentQueue inherits Rectangle {
     property <length> row-height: max(32px,
         name-probe.preferred-height + status-probe.preferred-height + 2px + 6px,
         action-probe.preferred-height + 8px + 6px);
-    // Rows beyond three scroll inside the list.
-    out property <length> needed-height: root.items.length == 0 ? 0px : root.header-height + min(3, root.items.length) * root.row-height;
+    // Rows beyond three scroll inside the list. A constrained conversation
+    // may also budget fewer visible rows, while retaining the complete model.
+    in property <length> viewport-cap: 0px;
+    out property <length> natural-height: root.items.length == 0 ? 0px : root.header-height + min(3, root.items.length) * root.row-height;
+    out property <length> minimum-height: root.items.length == 0 ? 0px : root.header-height + root.row-height;
+    out property <length> needed-height: root.viewport-cap > 0px
+        ? min(root.natural-height, max(root.minimum-height, root.viewport-cap))
+        : root.natural-height;
 
     height: root.needed-height;
     background: transparent;

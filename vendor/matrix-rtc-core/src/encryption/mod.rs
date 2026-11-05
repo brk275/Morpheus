@@ -279,6 +279,25 @@ pub trait EncryptionKeySignalHandler: MaybeSend {
     /// * `signal` - Contains the raw key bytes, key index, and RTC backend identity
     async fn on_new_key_material(&self, signal: KeyMaterialSignal);
 
+    /// The already verified membership generation owning this key. A guarded
+    /// transport can fence late work across a same-device participation change.
+    /// Existing handlers keep their original signal-only contract by default.
+    async fn on_new_key_material_for_member(
+        &self,
+        signal: KeyMaterialSignal,
+        member_id: &str,
+        membership_ts: Option<u64>,
+    ) {
+        let _ = (member_id, membership_ts);
+        self.on_new_key_material(signal).await;
+    }
+
+    /// Current verified membership view, before this update's key processing.
+    /// Defaulted for existing handlers. Must not block or reenter the core.
+    fn on_memberships_updated(&self, memberships: &[JoinedMembership]) {
+        let _ = memberships;
+    }
+
     /// Called when a key was received but refused, with the reason.
     ///
     /// The media layer can only report *that* a participant's frames will not
@@ -341,7 +360,22 @@ impl DiscardedKey {
 /// identity) injects the derivation via [`EncryptionManager::set_identity_mapper`].
 /// When no mapper is set, the manager falls back to its default identity
 /// (`user_id:device_id` for the own key, `member_id` for inbound keys).
-pub type RtcIdentityMapper = Arc<dyn Fn(&str, &str, &str) -> String + Send + Sync>;
+/// The core supplies a captured membership observation; transport callers may
+/// pass `None` and use their subscribed view. Either view may lag the session's
+/// latest state: mapping must not advance or revoke participation generations.
+/// The synchronous verified-membership callback provides that lifecycle order.
+/// Callbacks must not retain the borrowed slice. `None` refuses a signal without
+/// inventing an empty identity; authenticated pending material stays by member id.
+pub type RtcIdentityMapper =
+    Arc<dyn Fn(&str, &str, &str, Option<&[JoinedMembership]>) -> Option<String> + Send + Sync>;
+
+#[derive(Clone)]
+struct StoredInboundKeys {
+    // A present entry with None is an attributed MSC4143 generation, not
+    // missing provenance. Replays cannot relabel held bytes after a rejoin.
+    membership_ts: Option<u64>,
+    keys: Vec<InboundEncryptionKey>,
+}
 
 /// The EncryptionManager manages encryption keys for an RTC session.
 ///
@@ -383,7 +417,7 @@ pub struct EncryptionManager<T: MatrixBackend> {
     outbound_key: Arc<RwLock<Option<OutboundEncryptionKey>>>,
 
     /// Inbound keys from other participants, keyed by member_id
-    inbound_keys: Arc<RwLock<HashMap<String, Vec<InboundEncryptionKey>>>>,
+    inbound_keys: Arc<RwLock<HashMap<String, StoredInboundKeys>>>,
 
     /// Configuration
     config: EncryptionConfig,
@@ -595,13 +629,27 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             return;
         };
 
-        let mut signals: Vec<KeyMaterialSignal> = Vec::new();
+        let mut signals: Vec<(KeyMaterialSignal, String, Option<u64>)> = Vec::new();
+        let memberships = {
+            let guard = self.get_memberships.lock().unwrap();
+            guard()
+        };
 
         // Our own outbound key, under the same identity `signal_key_to_app`
         // would use.
         if let Some(outbound) = self.get_outbound_key() {
             let rtc_backend_identity = match &self.identity_mapper {
-                Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
+                Some(mapper) => {
+                    let Some(identity) = mapper(
+                        &self.own_user_id,
+                        &self.own_device_id,
+                        &self.own_member_id,
+                        Some(&memberships),
+                    ) else {
+                        return;
+                    };
+                    identity
+                }
                 None => self.get_own_rtc_backend_identity(),
             };
             // Replay with whatever is *left* of this key's `delayBeforeUse`,
@@ -626,21 +674,22 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                     let elapsed = self.timestamp_ms().saturating_sub(signalled.at_ms);
                     signalled.use_after_ms.saturating_sub(elapsed)
                 });
-            signals.push(KeyMaterialSignal {
-                key: outbound.key.clone(),
-                key_index: outbound.key_index,
-                rtc_backend_identity,
-                use_after_ms,
-            });
+            signals.push((
+                KeyMaterialSignal {
+                    key: outbound.key.clone(),
+                    key_index: outbound.key_index,
+                    rtc_backend_identity,
+                    use_after_ms,
+                },
+                self.own_member_id.clone(),
+                None,
+            ));
         }
 
         // Peer keys, under the identity derived from their membership — the
         // same derivation `add_key_to_participant` performs.
-        let memberships = {
-            let guard = self.get_memberships.lock().unwrap();
-            guard()
-        };
-        for (member_id, keys) in self.get_all_inbound_keys() {
+        let held_keys = self.inbound_keys.read().unwrap().clone();
+        for (member_id, held) in held_keys {
             let Some(membership) = memberships
                 .iter()
                 .find(|membership| membership.member_id == member_id)
@@ -650,21 +699,34 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 log::debug!("not replaying keys for {member_id}: no known membership");
                 continue;
             };
+            if held.membership_ts != membership.membership_ts {
+                continue;
+            }
             let rtc_backend_identity = match &self.identity_mapper {
-                Some(mapper) => mapper(
-                    &membership.sender,
-                    membership.origin.sender_device_id().unwrap_or(""),
-                    &membership.member_id,
-                ),
+                Some(mapper) => {
+                    let Some(identity) = mapper(
+                        &membership.sender,
+                        membership.origin.sender_device_id().unwrap_or(""),
+                        &membership.member_id,
+                        Some(&memberships),
+                    ) else {
+                        continue;
+                    };
+                    identity
+                }
                 None => membership.member_id.clone(),
             };
-            for key in keys {
-                signals.push(KeyMaterialSignal {
-                    key: key.key.clone(),
-                    key_index: key.key_index,
-                    rtc_backend_identity: rtc_backend_identity.clone(),
-                    use_after_ms: 0,
-                });
+            for key in held.keys {
+                signals.push((
+                    KeyMaterialSignal {
+                        key: key.key.clone(),
+                        key_index: key.key_index,
+                        rtc_backend_identity: rtc_backend_identity.clone(),
+                        use_after_ms: 0,
+                    },
+                    membership.member_id.clone(),
+                    held.membership_ts,
+                ));
             }
         }
 
@@ -673,8 +735,10 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         }
 
         log::info!("replaying {} held key(s) to the new handler", signals.len());
-        for signal in signals {
-            handler.on_new_key_material(signal).await;
+        for (signal, member_id, membership_ts) in signals {
+            handler
+                .on_new_key_material_for_member(signal, &member_id, membership_ts)
+                .await;
         }
     }
 
@@ -801,6 +865,14 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             self.room_id,
             self.slot_id
         );
+    }
+
+    /// Admit the borrowed verified view before its watch snapshot is published.
+    /// The callback is synchronous and must not block or reenter the core.
+    pub(crate) fn on_membership_snapshot(&self, memberships: &[JoinedMembership]) {
+        if let Some(handler) = &self.signal_handler {
+            handler.on_memberships_updated(memberships);
+        }
     }
 
     /// Called when memberships change (join/leave events).
@@ -1781,8 +1853,22 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// eagerly so the transport is listening.
     async fn signal_key_to_app(&self, key: &OutboundEncryptionKey, use_after_ms: u64) {
         if let Some(handler) = &self.signal_handler {
+            let memberships = {
+                let guard = self.get_memberships.lock().unwrap();
+                guard()
+            };
             let rtc_backend_id = match &self.identity_mapper {
-                Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
+                Some(mapper) => {
+                    let Some(identity) = mapper(
+                        &self.own_user_id,
+                        &self.own_device_id,
+                        &self.own_member_id,
+                        Some(&memberships),
+                    ) else {
+                        return;
+                    };
+                    identity
+                }
                 None => self.get_own_rtc_backend_identity(),
             };
             let signal = KeyMaterialSignal {
@@ -1795,7 +1881,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             // Signal to app (async, fire-and-forget)
             // Note: We don't use tokio::spawn here because the handler's future might not be Send
             let handler_clone = handler.clone();
-            let _ = handler_clone.on_new_key_material(signal).await;
+            let _ = handler_clone
+                .on_new_key_material_for_member(signal, &self.own_member_id, None)
+                .await;
             *self.signalled_key.lock().unwrap() = Some(SignalledKey {
                 key_index: key.key_index,
                 at_ms: self.timestamp_ms(),
@@ -2063,19 +2151,33 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         // installed (e.g. the LiveKit transport's MSC4195 pseudonymous identity),
         // derive it from the membership's user/device/member triple; otherwise
         // fall back to the raw member_id (or `sender:device`).
+        let memberships = {
+            let guard = self.get_memberships.lock().unwrap();
+            guard()
+        };
+        if !memberships.iter().any(|current| {
+            current.member_id == membership.member_id
+                && current.sender == membership.sender
+                && current.origin.sender_device_id() == membership.origin.sender_device_id()
+                && current.membership_ts == membership.membership_ts
+        }) {
+            return;
+        }
         let rtc_backend_id = match &self.identity_mapper {
             Some(mapper) => mapper(
                 &membership.sender,
                 membership.origin.sender_device_id().unwrap_or(""),
                 &membership.member_id,
+                Some(&memberships),
             ),
-            None => membership.member_id.clone(),
+            None => Some(membership.member_id.clone()),
         };
 
         // Store the key: at most one entry per index, holding the newest material
         // we have seen for it.
         //
-        // Both halves matter. A re-delivered *identical* key — the sender
+        // Within one verified participation, both halves matter. A re-delivered
+        // *identical* key — the sender
         // re-distributing after a membership change, or two sticky updates racing
         // — must not be stored or signalled again: `OutdatedKeyFilter` cannot
         // catch it, because with no sender timestamp on the wire `creation_ts` is
@@ -2092,8 +2194,16 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         let map_key = key.member_id.clone();
         {
             let mut guard = self.inbound_keys.write().unwrap();
-            let held = guard.entry(map_key).or_default();
+            let held = guard.entry(map_key).or_insert_with(|| StoredInboundKeys {
+                membership_ts: membership.membership_ts,
+                keys: Vec::new(),
+            });
+            if held.membership_ts != membership.membership_ts {
+                held.keys.clear();
+                held.membership_ts = membership.membership_ts;
+            }
             match held
+                .keys
                 .iter_mut()
                 .find(|existing| existing.key_index == key.key_index)
             {
@@ -2117,12 +2227,17 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                     );
                     *existing = key.clone();
                 }
-                None => held.push(key.clone()),
+                None => held.keys.push(key.clone()),
             }
         }
 
-        // Signal to application
-        self.signal_inbound_key_to_app(key, rtc_backend_id).await;
+        // Retain authenticated pending material by member id even if the media
+        // contract cannot currently address it. Never install it under a made-up
+        // identity; a later valid replay performs the same admission again.
+        if let Some(rtc_backend_id) = rtc_backend_id {
+            self.signal_inbound_key_to_app(key, rtc_backend_id, membership.membership_ts)
+                .await;
+        }
     }
 
     /// Signals an inbound key to the application layer.
@@ -2130,6 +2245,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         &self,
         key: InboundEncryptionKey,
         rtc_backend_identity: String,
+        membership_ts: Option<u64>,
     ) {
         if let Some(handler) = &self.signal_handler {
             let signal = KeyMaterialSignal {
@@ -2143,14 +2259,19 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
             // Note: We don't use tokio::spawn here because the handler's future might not be Send
             let handler_clone = handler.clone();
-            let _ = handler_clone.on_new_key_material(signal).await;
+            let _ = handler_clone
+                .on_new_key_material_for_member(signal, &key.member_id, membership_ts)
+                .await;
         }
     }
 
     /// Gets all inbound keys for a specific participant by member_id.
     pub fn get_inbound_keys(&self, member_id: &str) -> Vec<InboundEncryptionKey> {
         let inbound_keys = self.inbound_keys.read().unwrap();
-        inbound_keys.get(member_id).cloned().unwrap_or_default()
+        inbound_keys
+            .get(member_id)
+            .map(|held| held.keys.clone())
+            .unwrap_or_default()
     }
 
     /// Gets the current outbound key.
@@ -2160,7 +2281,12 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
     /// Gets all stored inbound keys.
     pub fn get_all_inbound_keys(&self) -> HashMap<String, Vec<InboundEncryptionKey>> {
-        self.inbound_keys.read().unwrap().clone()
+        self.inbound_keys
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(member, held)| (member.clone(), held.keys.clone()))
+            .collect()
     }
 }
 
@@ -2290,6 +2416,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingHandler {
         signals: Mutex<Vec<KeyMaterialSignal>>,
+        members: Mutex<Vec<String>>,
+        membership_timestamps: Mutex<Vec<Option<u64>>>,
         discarded: Mutex<Vec<DiscardedKey>>,
     }
 
@@ -2309,6 +2437,20 @@ mod tests {
     impl EncryptionKeySignalHandler for RecordingHandler {
         async fn on_new_key_material(&self, signal: KeyMaterialSignal) {
             self.signals.lock().unwrap().push(signal);
+        }
+
+        async fn on_new_key_material_for_member(
+            &self,
+            signal: KeyMaterialSignal,
+            member_id: &str,
+            membership_ts: Option<u64>,
+        ) {
+            self.members.lock().unwrap().push(member_id.to_owned());
+            self.membership_timestamps
+                .lock()
+                .unwrap()
+                .push(membership_ts);
+            self.on_new_key_material(signal).await;
         }
 
         async fn on_key_discarded(&self, discarded: DiscardedKey) {
@@ -3085,8 +3227,8 @@ mod tests {
         let handler = Arc::new(RecordingHandler::default());
         manager.set_signal_handler(handler.clone());
         manager.set_identity_mapper(Arc::new(
-            |user_id: &str, device_id: &str, member_id: &str| {
-                format!("mapped:{user_id}/{device_id}/{member_id}")
+            |user_id: &str, device_id: &str, member_id: &str, _memberships| {
+                Some(format!("mapped:{user_id}/{device_id}/{member_id}"))
             },
         ));
 
@@ -3617,6 +3759,163 @@ mod tests {
         let keys = manager.get_inbound_keys("bob-device456-uuid");
         assert_eq!(keys.len(), 1, "only the genuine key should survive");
         assert_eq!(keys[0].key, vec![1u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn live_and_replayed_keys_keep_verified_member_generation() {
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let source = Arc::clone(&memberships);
+        let mut manager = EncryptionManager::new(
+            Arc::new(NoopBackend),
+            USER_ID.into(),
+            DEVICE_ID.into(),
+            MEMBER_ID.into(),
+            ROOM_ID.into(),
+            SLOT_ID.into(),
+            move || source.lock().unwrap().clone(),
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        manager.set_identity_mapper(Arc::new(|user, device, _member, _snapshot| {
+            Some(format!("{user}:{device}"))
+        }));
+        manager.receive_key(bob_key(vec![1; 32], 0)).await.unwrap();
+        assert_eq!(*handler.members.lock().unwrap(), vec!["bob-device456-uuid"]);
+        handler.members.lock().unwrap().clear();
+        let mut next = bob_membership();
+        next.member_id = "bob-next".into();
+        *memberships.lock().unwrap() = vec![next];
+        manager.replay_keys_to_handler().await;
+        assert!(handler.members.lock().unwrap().is_empty());
+        let mut key = bob_key(vec![2; 32], 0);
+        key.member_id = "bob-next".into();
+        manager.receive_key(key).await.unwrap();
+        manager.replay_keys_to_handler().await;
+        assert_eq!(
+            *handler.members.lock().unwrap(),
+            vec!["bob-next", "bob-next"]
+        );
+        assert_eq!(
+            manager.get_inbound_keys("bob-device456-uuid")[0].key,
+            vec![1; 32]
+        );
+        assert_eq!(manager.get_inbound_keys("bob-next")[0].key, vec![2; 32]);
+    }
+
+    #[tokio::test]
+    async fn same_id_timestamp_rejoin_never_relabels_held_inbound_keys() {
+        let mut first = bob_membership();
+        first.membership_ts = Some(1_000);
+        let memberships = Arc::new(Mutex::new(vec![first.clone()]));
+        let source = Arc::clone(&memberships);
+        let mut manager = EncryptionManager::new(
+            Arc::new(NoopBackend),
+            USER_ID.into(),
+            DEVICE_ID.into(),
+            MEMBER_ID.into(),
+            ROOM_ID.into(),
+            SLOT_ID.into(),
+            move || source.lock().unwrap().clone(),
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        manager.set_identity_mapper(Arc::new(|user, device, _member, _snapshot| {
+            Some(format!("{user}:{device}"))
+        }));
+        manager.receive_key(bob_key(vec![1; 32], 0)).await.unwrap();
+        assert_eq!(
+            *handler.membership_timestamps.lock().unwrap(),
+            vec![Some(1_000)]
+        );
+        handler.signals.lock().unwrap().clear();
+        handler.membership_timestamps.lock().unwrap().clear();
+        // A heartbeat changes no participation and still permits held replay.
+        memberships.lock().unwrap()[0].origin_server_ts = Some(2_000);
+        manager.replay_keys_to_handler().await;
+        assert_eq!(handler.signals.lock().unwrap().len(), 1);
+        assert_eq!(
+            *handler.membership_timestamps.lock().unwrap(),
+            vec![Some(1_000)]
+        );
+        handler.signals.lock().unwrap().clear();
+        handler.membership_timestamps.lock().unwrap().clear();
+        memberships.lock().unwrap()[0].membership_ts = Some(4_000);
+        manager.replay_keys_to_handler().await;
+        assert!(handler.signals.lock().unwrap().is_empty());
+        assert!(handler.membership_timestamps.lock().unwrap().is_empty());
+        // Work captured under the old tuple cannot replace current storage.
+        manager
+            .add_key_to_participant(
+                InboundEncryptionKey {
+                    member_id: first.member_id.clone(),
+                    key: vec![9; 32],
+                    key_index: 1,
+                    creation_ts: 0,
+                },
+                &first,
+            )
+            .await;
+        assert_eq!(manager.get_inbound_keys(&first.member_id).len(), 1);
+        // The same bytes/index newly verified against the current join are
+        // fresh admission, not an old-generation duplicate or implicit replay.
+        manager.receive_key(bob_key(vec![1; 32], 0)).await.unwrap();
+        assert_eq!(
+            *handler.membership_timestamps.lock().unwrap(),
+            vec![Some(4_000)]
+        );
+        assert_eq!(manager.get_inbound_keys(&first.member_id).len(), 1);
+        handler.signals.lock().unwrap().clear();
+        handler.membership_timestamps.lock().unwrap().clear();
+        manager.replay_keys_to_handler().await;
+        assert_eq!(handler.signals.lock().unwrap().len(), 1);
+        assert_eq!(
+            *handler.membership_timestamps.lock().unwrap(),
+            vec![Some(4_000)]
+        );
+        memberships.lock().unwrap()[0].membership_ts = None;
+        handler.signals.lock().unwrap().clear();
+        manager.replay_keys_to_handler().await;
+        assert!(handler.signals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallible_mapper_preserves_pending_material_without_empty_identity_signals() {
+        let memberships = Arc::new(Mutex::new(Vec::new()));
+        let source = Arc::clone(&memberships);
+        let mut manager = EncryptionManager::new(
+            Arc::new(NoopBackend),
+            USER_ID.into(),
+            DEVICE_ID.into(),
+            MEMBER_ID.into(),
+            ROOM_ID.into(),
+            SLOT_ID.into(),
+            move || source.lock().unwrap().clone(),
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        manager.set_identity_mapper(Arc::new(|user, device, member, snapshot| {
+            let present = snapshot?.iter().any(|entry| {
+                entry.sender == user
+                    && entry.member_id == member
+                    && entry.origin.sender_device_id() == Some(device)
+            });
+            present.then(|| format!("{user}:{device}"))
+        }));
+        manager.receive_key(bob_key(vec![7; 32], 0)).await.unwrap();
+        assert!(handler.identities().is_empty());
+        assert!(manager.get_inbound_keys("bob-device456-uuid").is_empty());
+        *memberships.lock().unwrap() = vec![bob_membership()];
+        manager.on_memberships_update().await.unwrap();
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
+        assert_eq!(handler.identities(), vec!["@bob:example.org:device456"]);
+        handler.signals.lock().unwrap().clear();
+        manager.replay_keys_to_handler().await;
+        assert_eq!(handler.identities(), vec!["@bob:example.org:device456"]);
+        manager.set_identity_mapper(Arc::new(|_, _, _, _| None));
+        handler.signals.lock().unwrap().clear();
+        manager.replay_keys_to_handler().await;
+        assert!(handler.identities().is_empty());
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
     }
 
     /// A discarded key must not occupy its (member, index) slot in the
