@@ -53,12 +53,21 @@ class InstalledUpdateTransactionBoundaryTests(unittest.TestCase):
     def test_actor_environment_does_not_forward_keys_loader_config_or_activation(self):
         environment = self.environment() | {"PATH": "/fixed/toolchain", "DYLD_IMAGE_SUFFIX": "foreign",
                                             "MORPHEUS_UPDATE_PUBLIC_KEY": "foreign", "GITHUB_TOKEN": "foreign",
-                                            "MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN": "/foreign"}
+                                            "MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN": "/foreign",
+                                            "CARGO_BUILD_JOBS": "99999", "CARGO_INCREMENTAL": "1",
+                                            "RUSTFLAGS": "foreign-compiler-flags"}
+        original = dict(environment)
         selected = update_qa.execution_environment(environment)
         self.assertEqual(selected["PATH"], "/fixed/toolchain")
         self.assertEqual(selected["GITHUB_ACTOR_ID"], "42")
+        self.assertEqual((selected["CARGO_BUILD_JOBS"], selected["CARGO_INCREMENTAL"]), ("2", "0"))
+        self.assertEqual(environment, original)
+        for supplied in ({}, {"CARGO_BUILD_JOBS": "0", "CARGO_INCREMENTAL": "invalid"},
+                         {"CARGO_BUILD_JOBS": "2", "CARGO_INCREMENTAL": "0"}):
+            bounded = update_qa.execution_environment(supplied)
+            self.assertEqual(bounded, {"CARGO_BUILD_JOBS": "2", "CARGO_INCREMENTAL": "0"})
         self.assertFalse({"DYLD_IMAGE_SUFFIX", "MORPHEUS_UPDATE_PUBLIC_KEY", "GITHUB_TOKEN",
-                          "MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN"}.intersection(selected))
+                          "MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN", "RUSTFLAGS"}.intersection(selected))
 
     def test_actor_deadline_preserves_owned_monitor_without_killing_orphan_pids(self):
         commands = object.__new__(update_qa.Commands)
