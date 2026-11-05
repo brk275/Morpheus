@@ -954,6 +954,32 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                 self.assertIsNone(update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,bad))
             for bad in (facts|{"winerror":True},facts|{"winerror":65536},facts|{"message":"private"},facts|{"category":"private"}):
                 self.assertIsNone(update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,bad))
+            # Observe the exact refusing inventory entry without following or deleting it.
+            root=Path(temporary).resolve()
+            root_info=types.SimpleNamespace(st_dev=7,st_ino=11)
+            for role,mode,kind,tag in (("native-target",update.stat.S_IFDIR,"directory",0xa0000003),
+                                      ("tools-home",update.stat.S_IFREG,"regular",0x80000017),
+                                      ("private-unrecognized",0,"other",0)):
+                info=types.SimpleNamespace(st_mode=mode,st_file_attributes=0x400,st_reparse_tag=tag)
+                with self.subTest(role=role),patch.object(update.os,"walk",return_value=[(root,[role],[])]), \
+                        patch.object(Path,"lstat",side_effect=[root_info,info]) as observed, \
+                        patch.object(update.shutil,"rmtree") as deleted:
+                    with self.assertRaises(update.Failure) as caught:
+                        update.remove_owned_root(root,(7,11),root.parent,(1,2))
+                    self.assertEqual(observed.call_count,2)
+                    deleted.assert_not_called()
+                fixed={"role":role if role in {"native-target","tools-home"} else "other",
+                       "kind":kind,"attributes":0x400,"tag":tag}
+                refusal=update._cleanup_refusal_diagnostic(caught.exception)
+                self.assertEqual(refusal,{"category":"guard","errno":None,"winerror":None,
+                                          "predicate":"inventory_reparse","reparse":fixed})
+                self.assertNotIn("private-",json.dumps(refusal))
+                self.assertEqual(update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,refusal)["cleanup_refusal"],refusal)
+                for changed in (fixed|{"role":"private-path"},fixed|{"kind":True},
+                                fixed|{"tag":True},fixed|{"attributes":0x100000000},
+                                fixed|{"target":"private-path"}):
+                    self.assertIsNone(update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,refusal|{"reparse":changed}))
+                self.assertIsNone(update.gate_failure_diagnostic(commands,"build-old","workspace",True,False,refusal|{"predicate":"inventory_limit"}))
 
     @unittest.skipUnless(sys.platform=="win32","actual Windows protected update workspace and source ACL reads")
     def test_update_workspace_actual_windows_acl_source_reads_and_cleanup_preserve_actor_parent(self):

@@ -364,6 +364,26 @@ def _cleanup_require(value, predicate):
         raise error
 
 
+def _cleanup_reparse_metadata(root, path, info):
+    """Closed metadata from the inventory's existing lstat, never follow/query."""
+    relative = path.relative_to(root)
+    first = relative.parts[0] if relative.parts else ""
+    role = first if first in {"native-target", "tools-home", "tiny-source", "synthetic-git", "logs"} else "other"
+    kind = "directory" if stat.S_ISDIR(info.st_mode) else "regular" if stat.S_ISREG(info.st_mode) else "other"
+    attributes = getattr(info, "st_file_attributes", None)
+    tag = getattr(info, "st_reparse_tag", None)
+    return {"role": role, "kind": kind,
+            "attributes": attributes if type(attributes) is int and 0 <= attributes <= 0xffffffff else None,
+            "tag": tag if type(tag) is int and 0 <= tag <= 0xffffffff else None}
+
+
+def _valid_cleanup_reparse(value):
+    return (type(value) is dict and set(value) == {"role", "kind", "attributes", "tag"}
+            and type(value["role"]) is str and value["role"] in {"native-target", "tools-home", "tiny-source", "synthetic-git", "logs", "other"}
+            and type(value["kind"]) is str and value["kind"] in {"directory", "regular", "other"}
+            and all(value[k] is None or type(value[k]) is int and 0 <= value[k] <= 0xffffffff for k in ("attributes", "tag")))
+
+
 def _cleanup_refusal_diagnostic(error):
     os_errors = {OSError, PermissionError, FileNotFoundError, FileExistsError,
                  NotADirectoryError, IsADirectoryError, InterruptedError, TimeoutError,
@@ -382,6 +402,10 @@ def _cleanup_refusal_diagnostic(error):
         predicate = getattr(error, "cleanup_predicate", None)
         if type(predicate) is str and predicate in _CLEANUP_PREDICATES:
             facts["predicate"] = predicate
+            if predicate == "inventory_reparse":
+                observed = getattr(error, "cleanup_reparse", None)
+                if _valid_cleanup_reparse(observed):
+                    facts["reparse"] = observed
     return facts
 
 
@@ -408,7 +432,9 @@ def gate_failure_diagnostic(commands, stage, cleanup_phase, scanned, cleaned, cl
                 or type(refusal["code"]) is not str or refusal["code"] not in capture.FAILURES
                 or type(refusal["operation"]) is not str or refusal["operation"] not in capture.OPERATIONS))
             or (cleanup_refusal is not None and (type(cleanup_refusal) is not dict
-                or set(cleanup_refusal) not in ({"category", "errno", "winerror"}, {"category", "errno", "winerror", "predicate"})
+                or set(cleanup_refusal) not in ({"category", "errno", "winerror"}, {"category", "errno", "winerror", "predicate"}, {"category", "errno", "winerror", "predicate", "reparse"})
+                or ("reparse" in cleanup_refusal and (cleanup_refusal.get("predicate") != "inventory_reparse"
+                    or not _valid_cleanup_reparse(cleanup_refusal["reparse"])))
                 or ("predicate" in cleanup_refusal and (cleanup_refusal.get("category") != "guard"
                     or type(cleanup_refusal["predicate"]) is not str or cleanup_refusal["predicate"] not in _CLEANUP_PREDICATES))
                 or type(cleanup_refusal["category"]) is not str
@@ -871,7 +897,14 @@ def remove_owned_root(root, identity, workspace, workspace_identity):
             path=Path(directory)/name; info=path.lstat(); count+=1
             _cleanup_require(count<=300000, "inventory_limit")
             _cleanup_require(not stat.S_ISLNK(info.st_mode), "inventory_symlink")
-            _cleanup_require(not getattr(info,"st_file_attributes",0)&0x400, "inventory_reparse")
+            try:
+                _cleanup_require(not getattr(info,"st_file_attributes",0)&0x400, "inventory_reparse")
+            except Failure as error:
+                try:
+                    error.cleanup_reparse = _cleanup_reparse_metadata(root, path, info)
+                except BaseException:
+                    pass  # Optional fixed observations cannot replace the refusal.
+                raise
     if os.name == "nt":
         def readonly(function, path, error):
             # Only the known readonly-unlink failure can authorize a retry.
