@@ -651,7 +651,7 @@ mod tests {
                 answer(
                     &mut stream,
                     401,
-                    r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":false}"#,
+                    r#"{"errcode":"M_UNKNOWN_TOKEN","error":"expired","soft_logout":false}"#,
                 )
                 .await;
             }
