@@ -184,7 +184,7 @@ export component AttachmentQueue inherits Rectangle {
         content-width: max(self.visible-width, rows.min-width);
         content-height: root.items.length * root.row-height;
         horizontal-scrollbar-policy: always-off;
-        accessible-role: list;
+        accessible-role: AccessibleRole.list;
         accessible-orientation: Orientation.vertical;
         rows := VerticalLayout {
             x: 0px; y: 0px;
