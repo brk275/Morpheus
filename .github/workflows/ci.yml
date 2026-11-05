@@ -264,7 +264,7 @@ jobs:
         run: cargo test --locked --no-fail-fast -p morpheus-config -p morpheus-matrix -p morpheus-rtc
       - name: Check desktop and Matrix crates
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
-        run: cargo check --locked -p morpheus-app -p morpheus-matrix
+        run: cargo check --locked -p morpheus-app -p morpheus-matrix --features morpheus-app/native-calls
       - name: Build desktop with native call and device adapters
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
         run: cargo build --locked -p morpheus-app --features native-calls

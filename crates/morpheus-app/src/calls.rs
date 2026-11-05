@@ -3367,9 +3367,9 @@ impl CallWorker {
         remaining: Duration,
     ) -> Result<CallInfo, JoinAttemptError> {
         if !self.profile_current() {
-            return Err(JoinAttemptError::Stopped(Err(
+            return Err(JoinAttemptError::Stopped(RejoinEnd::Stopped(Err(
                 CallControllerError::CallProfileChanged,
-            )));
+            ))));
         }
         let room_id = self.room_id.clone();
         let (joined, cancelled) = {
