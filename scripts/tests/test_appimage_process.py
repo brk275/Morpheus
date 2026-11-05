@@ -354,9 +354,10 @@ class ProcessTests(unittest.TestCase):
                     if action == "process_cleanup":
                         raise F.PrivateLogScanError(process_stopped=False)
                     if action == "report_fifo":
+                        report.unlink()
                         F.os.mkfifo(report, 0o600)
                     if action not in {"missing", "report_fifo"}:
-                        P.client.write_new(report, b"{bad" if action == "malformed" else
+                        report.write_bytes(b"{bad" if action == "malformed" else
                                            b'[{"RuleID":"synthetic"}]' if action == "finding" else b"[]\n")
                     if action == "source_changed": (root / "a.log").write_bytes(b"changed source")
                     if action == "source_added": P.client.write_new(root / "c.log", b"new unscanned original")
@@ -427,7 +428,7 @@ class ProcessTests(unittest.TestCase):
             clock = {"value":10}
             def scanned(arguments, *, cwd, deadline):
                 self.assertIn(deadline, (11, 40))
-                P.client.write_new(Path(arguments[arguments.index("--report-path") + 1]), b"[]\n")
+                Path(arguments[arguments.index("--report-path") + 1]).write_bytes(b"[]\n")
                 if deadline == 11: clock["value"] = 12
                 return 0, b"", b"3:04PM INF scanned ~26 bytes (26 bytes) in 1ms\n3:04PM INF no leaks found\n"
             with mock.patch.object(P.time, "monotonic", side_effect=lambda: clock["value"]), \
