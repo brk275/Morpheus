@@ -79,6 +79,196 @@ def _notice_report_failure(error):
           **numbers}, sort_keys=True), file=sys.stderr)
 
 
+def _notice_failure_site(error):
+    # Code metadata only: never inspect locals, arguments, exception text,
+    # chained errors or source lines. Only exact owned module files map to a
+    # fixed public enum; an unknown innermost frame suppresses the site.
+    try:
+        owned = {
+            os.path.normcase(str(ROOT / "scripts/native_notice_source.py")): "notice_source",
+            os.path.normcase(str(ROOT / "scripts/native_notice_windows.py")): "windows_security",
+            os.path.normcase(str(ROOT / "scripts/native_notices.py")): "native_notices",
+            os.path.normcase(str(ROOT / "packaging/linux/corresponding_source.py")): "source_catalogue",
+            os.path.normcase(str(ROOT / "scripts/run_windows_capture_acceptance.py")): "windows_processes",
+        }
+        trace, site, visited = error.__traceback__, None, 0
+        while trace is not None and visited < 32:
+            visited += 1
+            code = trace.tb_frame.f_code
+            filename = code.co_filename
+            module_file = trace.tb_frame.f_globals.get("__file__")
+            if (type(filename) is str and len(filename) <= 4096
+                    and type(module_file) is str and len(module_file) <= 4096
+                    and os.path.normcase(filename) == os.path.normcase(module_file)
+                    and os.path.normcase(filename) in owned):
+                # Retain the rejecting caller's predicate, not this generic
+                # helper's `raise`. Function names never enter the record.
+                if code.co_name != "require":
+                    line = trace.tb_lineno
+                    site = ({"module": owned[os.path.normcase(filename)], "line": line}
+                            if type(line) is int and 0 < line <= 99999 else None)
+            else:
+                site = None
+            trace = trace.tb_next
+        return site if trace is None else None
+    except BaseException:
+        # Diagnostics cannot replace the original closed failure with a new
+        # traceback if code metadata is unavailable or malformed.
+        return None
+
+def _cargo_stderr_classes(data):
+    require(type(data) is bytes and len(data) <= 8 * 1024**2)
+    lower = data.lower()
+    return sorted(name for name, markers in _CARGO_STDERR_MARKERS.items()
+                  if any(marker in lower for marker in markers)) or ["other"]
+
+def _cargo_fetch_failure_diagnostic(commands, scanned):
+    if (scanned is not True or getattr(commands, "logs_complete", None) is not True
+            or getattr(commands, "cleanup_failed", None) is not False
+            or getattr(commands, "retained", None) != []):
+        return None
+    failure = getattr(commands, "cargo_fetch_failure", None)
+    if type(failure) is not tuple or len(failure) != 3:
+        return None
+    path, status, size = failure
+    if (type(status) is not int or status == 0 or not -255 <= status <= 0xffffffff
+            or type(size) is not int or not 0 <= size <= 8 * 1024**2):
+        return None
+    path = Path(path)
+    require(path.parent == commands.logs and commands.logs == commands.root / "logs"
+            and re.fullmatch(r"[0-9]{5}\.err", path.name) is not None)
+    # Existing strict private-path and stable opened-file identity checks; no
+    # partial stderr, unsafe alias or changed byte count can become a hint.
+    checked(path, private=True)
+    data = N.read_regular(path, 8 * 1024**2, allow_empty=True)
+    require(len(data) == size)
+    return {"schema": 1, "check": "native_notice_cargo_fetch_failure", "status": status,
+            "stderr_classes": _cargo_stderr_classes(data)}
+
+def _notice_report_cargo_fetch_failure(commands, scanned):
+    try:
+        facts = _cargo_fetch_failure_diagnostic(commands, scanned)
+        if facts is not None:
+            print("MORPHEUS_NATIVE_NOTICE_CARGO_FETCH " + json.dumps(facts, sort_keys=True), file=sys.stderr)
+    except BaseException:
+        return  # Diagnostic refusal never replaces the original command error.
+
+def private_directory(path, *, parents=False, exist_ok=False):
+    path = Path(path)
+    if os.name == "nt":
+        return S.windows_security().private_directory(path, parents=parents, exist_ok=exist_ok)
+    path.mkdir(mode=0o700, parents=parents, exist_ok=exist_ok)
+    return path
+
+def workspace_repository(commands, root, revision, git, environment):
+    """Authenticate Windows source through an owned bare repository, not checkout ACLs.
+
+    The selected public commit is still authenticated by git_export/build's
+    complete raw commit/tree/blob checks. No checkout configuration, template,
+    hooks, alternate object store, credential helper or local transport is used.
+    """
+    if os.name != "nt":
+        return ROOT
+    require(type(revision) is str and re.fullmatch(r"[0-9a-f]{40}", revision) is not None
+            and revision != "0" * 40 and revision == R.expected_revision(environment))
+    require(Path(git) == system_git())
+    root = checked(root, directory=True, private=True)
+    cwd = checked(root/"fetch", directory=True, private=True)
+    repository = private_directory(root/"workspace.git")
+    base = [*S.safe_git(str(git), repository),
+            "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+            "-c", "http.sslVerify=true", "-c", "http.followRedirects=false",
+            "-c", "http.extraHeader=", "-c", "credential.helper=",
+            "-c", "credential.interactive=never", "-c", "core.askPass="]
+    clean = S.clean_git_environment(environment)
+    commands.run("workspace-init", [*base, "init", "--bare", "--quiet", "--template="],
+                 cwd=cwd, env=clean, timeout=30, output_limit=65536)
+    checked(repository, directory=True, private=True)
+    commands.run("workspace-fetch", [*base, "fetch", "--quiet", "--depth=1", "--no-tags",
+                 "--no-write-fetch-head", "--no-recurse-submodules", "--no-auto-maintenance",
+                 "https://github.com/brk275/Morpheus.git", revision], cwd=cwd,
+                 env=clean | {"GIT_ALLOW_PROTOCOL": "https"}, timeout=1200,
+                 output_limit=65536, stderr_limit=65536)
+    checked(repository, directory=True, private=True)
+    # Reuse the existing acquisition inventory limits: no links/reparse points,
+    # at most300000 entries/4GiB and each file within the source bundle ceiling.
+    check_cache(root)
+    return repository
+
+def _remove_readonly_owned_leaf(root, root_identity, function, path, error):
+    """Retry only an access-denied readonly unlink inside the authorized tree.
+
+    The caller has already proved stopped children, complete logs and a fresh
+    default scan. The original owner marker may be gone during rmtree; retain
+    its root inode authority instead of reopening a partially removed marker.
+    """
+    if (os.name != "nt" or (function is not os.unlink and function is not os.remove)
+            or not isinstance(error, PermissionError) or error.errno != 13
+            or getattr(error, "winerror", None) != 5):
+        raise error
+    root, path = Path(root), Path(path)
+    require(root.is_absolute() and re.fullmatch(r"morpheus-native-source-[a-z0-9_]{8,32}", root.name)
+            and path.is_absolute() and path != root and path.is_relative_to(root))
+    def validate_path():
+        checked(root, directory=True, private=True)
+        current = root.lstat()
+        require((current.st_dev, current.st_ino) == root_identity)
+        parent = path.parent
+        while parent != root:
+            checked(parent, directory=True, private=True)
+            parent = parent.parent
+        checked(path, private=True)
+        return path.lstat()
+    def identity(info):
+        born = info.st_birthtime_ns
+        require(type(born) is int and born > 0)
+        return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_nlink,
+                info.st_size, info.st_mtime_ns, born)
+    before = validate_path()
+    attributes = getattr(before, "st_file_attributes", 0)
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or not attributes & 0x1 or attributes & (0x400 | 0x10)
+            or not 0 <= before.st_size <= S.MAX_BUNDLE):
+        raise error
+    expected = identity(before)
+    descriptor = S.windows_security().open_read(path, private=True)
+    try:
+        # The existing handle denies write/delete sharing while the only
+        # intended mutation clears the Windows readonly attribute. Attribute
+        # access is not blocked by the file's sharing mode; ACLs are unchanged.
+        require(identity(os.fstat(descriptor)) == expected)
+        os.chmod(path, stat.S_IWRITE)
+        after = validate_path()
+        after_attributes = getattr(after, "st_file_attributes", 0)
+        require(identity(after) == expected and identity(os.fstat(descriptor)) == expected
+                and not after_attributes & 0x1
+                and after_attributes & ~(0x1 | 0x80) == attributes & ~(0x1 | 0x80))
+    finally:
+        os.close(descriptor)
+    # Close the deny-delete handle before retry, then recheck the private root,
+    # path/ACL and exact file identity once more. No directory or foreign leaf
+    # is chmod'ed, and a second deletion error propagates without another try.
+    final = validate_path()
+    require(identity(final) == expected
+            and not getattr(final, "st_file_attributes", 0) & 0x1
+            and getattr(final, "st_file_attributes", 0) & ~(0x1 | 0x80)
+                == attributes & ~(0x1 | 0x80))
+    function(path)
+
+_CARGO_STDERR_MARKERS = {
+    "manifest": (b"failed to parse manifest", b"failed to load manifest", b"no targets specified in the manifest"),
+    "lockfile": (b"needs to be updated but --locked was passed", b"failed to parse lock file", b"lock file needs to be updated"),
+    "checkout": (b"failed to checkout", b"failed to clone", b"failed to fetch into:", b"filename too long", b"path too long", b"invalid path"),
+    "network": (b"failed to download", b"network failure", b"could not resolve host", b"connection timed out", b"failed to connect", b"connection reset"),
+    "tls": (b"ssl certificate problem", b"certificate verify failed", b"certificate verification", b"schannel", b"peer certificate", b"tls handshake"),
+    "auth": (b"authentication required", b"authentication failed", b"failed to authenticate", b"unauthorized"),
+}
+
+
+def system_git():
+    require(os.name == "nt" and sys.platform == "win32")
+    return S.windows_security().system_git()
+
 def require(value):
     if not value:
         raise ValueError("Native notice source preparation failed")
@@ -199,11 +389,7 @@ def tools(environment):
     directory = rustup / ("toolchains/1.99.0-" + host) / "bin"
     cargo, rustc = (_notice_checked(name, directory / (name + suffix)) for name in ("cargo", "rustc"))
     _notice_phase("git")
-    if os.name == "nt":
-        program = Path(environment["PROGRAMFILES"])
-        git = _notice_checked("git", program / "Git/cmd/git.exe")
-    else:
-        git = _notice_checked("git", Path("/usr/bin/git"))
+    git = system_git() if os.name == "nt" else _notice_checked("git", Path("/usr/bin/git"))
     return cargo, rustc, git, rustup
 
 
@@ -237,13 +423,21 @@ class Commands:
     def __init__(self, root, environment):
         self.root, self.environment = root, environment
         self.logs = root/"logs"; self.sequence = 0; self.cleanup_failed = False
-        self.retained = []; self.bytes = 0; self.logs_complete = True; self.deadline = time.monotonic() + 1800
+        self.retained = []; self.bytes = 0; self.logs_complete = True; self.cargo_fetch_failure = None; self.deadline = time.monotonic() + 1800
 
     def run(self, stage, command, *, cwd, env, timeout, output_limit, stderr_limit=65536, log_root=None,
             expected_status=(0,), binary_output=False, stdin_bytes=None):
         require(self.sequence < 16000 and 0 < timeout <= 1200 and 0 < output_limit <= 128*1024**2
                 and 0 < stderr_limit <= 8*1024**2)
-        checked(Path(command[0])); checked(cwd, directory=True)
+        # Revalidate only the exact protected provider Git at EVERY spawn,
+        # including all Windows ACLs. Source/scanner/data and all other tools
+        # retain checked()'s strict single-link admission.
+        if (os.name == "nt" and sys.platform == "win32"
+                and str(command[0]) == str(Path(os.environ["PROGRAMFILES"]) / "Git/cmd/git.exe")):
+            require(system_git() == Path(command[0]))
+        else:
+            checked(Path(command[0]))
+        checked(cwd, directory=True)
         timeout = min(timeout, self.deadline - time.monotonic()); require(timeout > 0)
         self.sequence += 1
         output, errors = ((self.logs if log_root is None else log_root)/(str(self.sequence).zfill(5) + suffix)
@@ -348,6 +542,11 @@ class Commands:
                 destinations[0].seek(0)
                 data=destinations[0].read(output_limit+1)
                 require(len(data)==counts[0] and len(data)<=output_limit)
+        if stage == "fetch" and status not in expected_status:
+            # This is after the owned Job/group stopped, pipes reached EOF and
+            # both exact streams were flushed/fsynced/closed. Publish nothing
+            # here; the complete default scan must succeed first.
+            self.cargo_fetch_failure = (errors, status, counts[1])
         require(status in expected_status)
         if not binary_output:
             data=S.read_owned(output,output_limit,private=True) if counts[0] else b""
@@ -361,7 +560,7 @@ class Commands:
         # own report. Reuse retained command ownership and separate raw streams.
         self.deadline = max(self.deadline, time.monotonic() + 120)
         scan_logs = self.root/"scanner-logs"
-        scan_logs.mkdir(mode=0o700, exist_ok=True)
+        private_directory(scan_logs, exist_ok=True)
         self.run("scan", [str(scanner),"dir","--no-banner","--config",str(config),
             "--gitleaks-ignore-path",str(ignore),"--ignore-gitleaks-allow","--redact=100",
             "--max-target-megabytes","0",str(self.logs)], cwd=self.root, env=self.environment,
@@ -435,7 +634,7 @@ def owned_source_root(environment):
 
 def fetch_export(root, files, identity):
     """Copy authenticated source data only; Cargo never reads ambient checkout files."""
-    target = root/"fetch-source";target.mkdir(mode=0o700)
+    target = private_directory(root/"fetch-source")
     require(set(files) == set(identity["files"]))
     names={}
     for name,data in sorted(files.items()):
@@ -444,7 +643,7 @@ def fetch_export(root, files, identity):
         # Current supported workspace is regular-only. Do not invent Windows
         # symlink creation or follow a repository-provided link during fetch.
         require(entry["mode"] in {"100644","100755"} and S.digest(data)==entry["sha256"])
-        path=target/name;path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+        path=target/name;private_directory(path.parent, parents=True, exist_ok=True)
         write_new(path,data)
         if os.name!="nt":path.chmod(0o700 if entry["mode"]=="100755" else 0o600)
     return target
@@ -466,14 +665,21 @@ def prepare(environment, scanner):
     # Irreversible phase marker precedes every Commands/child admission. A
     # killed/partial acquisition can never resemble an untouched reservation.
     write_new(root/"acquisition-started.json", json.dumps({"schema":1, "source_revision":revision}).encode()+b"\n")
-    for name in ("home","cargo","fetch","target","temp","logs","output"):(root/name).mkdir(mode=0o700)
+    for name in ("home","cargo","fetch","target","temp","logs","output"):private_directory(root/name)
+    if os.name == "nt":
+        # The pinned Cargo/libgit2 checkout reads this private HOME config.
+        # Only working-tree path length support changes; CLI Git still has its
+        # isolated null global config, and every external path/ACL guard stays.
+        write_new(root/"home"/".gitconfig", b"[core]\n\tlongpaths = true\n")
+        checked(root/"home"/".gitconfig", private=True)
     controlled=environment_for_acquisition(environment,root,cargo,rustc,git,rustup)
     commands=Commands(root,controlled);success=False;scanned=False
     try:
         for tool,prefix in ((cargo,b"cargo 1.99.0 "),(rustc,b"rustc 1.99.0 ")):
             version=commands.run("version",[str(tool),"--version"],cwd=root/"fetch",env=controlled,timeout=30,output_limit=256)
             require(version.startswith(prefix) and version.endswith(b"\n") and version.count(b"\n")==1)
-        _,source,files=S.git_export(commands,ROOT,revision,str(git),controlled,S.Budget())
+        repository=workspace_repository(commands,root,revision,git,controlled)
+        _,source,files=S.git_export(commands,repository,revision,str(git),controlled,S.Budget())
         packages=source_inputs(files)
         fetched_source=fetch_export(root,files,source)
         for directory in (root/"fetch",root,*root.parents):
@@ -481,15 +687,18 @@ def prepare(environment, scanner):
         commands.run("fetch",[str(cargo),"--config","net.git-fetch-with-cli=false","--config","net.retry=0",
             "--config","registry.global-credential-providers=[]","fetch","--locked","--manifest-path",str(fetched_source/"Cargo.toml")],
             cwd=root/"fetch",env=controlled,timeout=1200,output_limit=8*1024**2,stderr_limit=8*1024**2)
-        check_cache(root/"cargo")
+        check_cache(root if os.name == "nt" else root/"cargo")
         plan=input_plan(root/"cargo",packages,commands,controlled,git)
         write_new(root/"plan.json",json.dumps(plan,sort_keys=True).encode()+b"\n")
-        receipt=S.build(commands,root/"output",ROOT,revision,str(git),controlled,root/"plan.json")
+        receipt=S.build(commands,root/"output",repository,revision,str(git),controlled,root/"plan.json")
         require(receipt["source_tree"]==source["tree"])
         write_new(root/"receipt.json",json.dumps(receipt,sort_keys=True).encode()+b"\n")
         success=True
     finally:
-        try:commands.scan(scanner);scanned=True
+        try:
+            commands.scan(scanner);scanned=True
+            if os.name == "nt" and not success:
+                _notice_report_cargo_fetch_failure(commands, scanned)
         finally:
             write_new(root/"state.json",json.dumps({"schema":1,"source_revision":revision,
                 "prepared":success,"logs_scanned":scanned,"logs_complete":commands.logs_complete,
@@ -527,7 +736,14 @@ def finish(environment, scanner):
     commands.scan(scanner)
     require(not commands.cleanup_failed)
     # Stop receipt + exact private root identity authorizes only this tree.
-    shutil.rmtree(root)
+    if os.name == "nt":
+        require(owned_source_root(environment) == root)
+        _notice_phase("cleanup")
+        info = root.lstat(); root_identity = (info.st_dev, info.st_ino)
+        shutil.rmtree(root, onexc=lambda function, path, error:
+                      _remove_readonly_owned_leaf(root, root_identity, function, path, error))
+    else:
+        shutil.rmtree(root)
     print('{"check":"native_notice_sources_removed","passed":true,"distribution_ready":false}')
 
 

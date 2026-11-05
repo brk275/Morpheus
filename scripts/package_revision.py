@@ -14,7 +14,7 @@ import re
 import subprocess
 import stat
 import tarfile
-from pathlib import PurePosixPath
+from pathlib import PurePosixPath, PureWindowsPath
 
 
 class SourceRevisionError(ValueError):
@@ -63,7 +63,56 @@ def verify_checkout(root, expected):
 
 UPDATE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-updateqa\.[12]")
 UPDATE_VERSION_PATHS = frozenset({"crates/morpheus-app/Cargo.toml", "Cargo.lock"})
-MAX_EXPORT_BYTES = 64 * 1024 * 1024
+# A complete reviewed workspace currently exceeds 64 MiB. Keep the same
+# 128 MiB source-content ceiling used by the corresponding-source catalogue.
+# Only these two canonical committed JSON inventories need larger file limits;
+# they remain byte-for-byte authenticated, never source-identity exclusions.
+MAX_EXPORT_BYTES = 128 * 1024 * 1024
+MAX_EXPORT_ENTRIES = 5000
+MAX_EXPORT_FILE_BYTES = 8 * 1024 * 1024
+EXPORT_MANIFEST_LIMITS = {
+    "native/webrtc/linux/expected-linux-overlay.json": 16 * 1024 * 1024,
+    "native/webrtc/linux/selected-linux-build-inputs.json": 32 * 1024 * 1024,
+}
+
+
+def source_export_members(archive):
+    """Validate every source header and bound the whole export before extraction.
+
+    Input must come from the caller's authenticated clean Git revision. Limits
+    apply to all members, including the two named large inventories; no member
+    is omitted from the later complete version-only source comparison.
+    """
+    if type(archive) is not bytes or not 1 <= len(archive) <= MAX_EXPORT_BYTES:
+        raise SourceRevisionError("checkout")
+    members, names, expanded = [], set(), 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as source:
+            for member in source:
+                pure = PurePosixPath(member.name)
+                if (not member.name or "\\" in member.name or "\0" in member.name
+                        or pure.is_absolute() or PureWindowsPath(member.name).drive or ".." in pure.parts
+                        or str(pure) != member.name.rstrip("/") or pure in names
+                        or not (member.isdir() or member.isfile()) or member.sparse is not None):
+                    raise SourceRevisionError("checkout")
+                names.add(pure)
+                limit = EXPORT_MANIFEST_LIMITS.get(member.name, MAX_EXPORT_FILE_BYTES)
+                if len(names) > MAX_EXPORT_ENTRIES or not 0 <= member.size <= limit:
+                    raise SourceRevisionError("checkout")
+                if member.isfile():
+                    if member.mode not in (0o644, 0o664, 0o755, 0o775):
+                        raise SourceRevisionError("checkout")
+                    if not 0 <= member.offset_data <= len(archive) - member.size:
+                        raise SourceRevisionError("checkout")
+                    expanded += member.size
+                    if expanded > MAX_EXPORT_BYTES:
+                        raise SourceRevisionError("checkout")
+                elif member.size != 0:
+                    raise SourceRevisionError("checkout")
+                members.append(member)
+    except (OSError, ValueError, tarfile.TarError):
+        raise SourceRevisionError("checkout") from None
+    return members
 
 
 def versioned_source_bytes(path, data, version):
@@ -105,24 +154,14 @@ def verify_versioned_export(root, archive, version):
     The caller must first authenticate the clean reviewed checkout/revision and
     obtain these bytes from Git itself. This allows no arbitrary file exclusion.
     """
-    if type(archive) is not bytes or not 1 <= len(archive) <= MAX_EXPORT_BYTES:
-        raise SourceRevisionError("checkout")
+    members = source_export_members(archive)
     root = Path(root)
     expected = {}
     expanded = 0
     try:
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as source:
-            names = set()
-            for member in source:
+            for member in members:
                 pure = PurePosixPath(member.name)
-                if (not member.name or "\\" in member.name or "\0" in member.name
-                        or pure.is_absolute() or ".." in pure.parts
-                        or str(pure) != member.name.rstrip("/") or pure in names
-                        or not (member.isdir() or member.isfile())):
-                    raise SourceRevisionError("checkout")
-                names.add(pure)
-                if len(names) > 5000 or member.size > 8 * 1024 * 1024:
-                    raise SourceRevisionError("checkout")
                 if member.isfile():
                     # Git's default tar.umask=0002 emits 0664/0775;
                     # explicit umask=0022 emits 0644/0755. Both retain the
@@ -140,7 +179,7 @@ def verify_versioned_export(root, archive, version):
         actual = set()
         records = []
         for index, path in enumerate(root.rglob("*"), 1):
-            if index > 5000:
+            if index > MAX_EXPORT_ENTRIES:
                 raise SourceRevisionError("checkout")
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:

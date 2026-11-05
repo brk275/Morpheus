@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import tarfile
 from pathlib import Path
 import subprocess
@@ -226,6 +227,105 @@ class RevisionIdentityTests(unittest.TestCase):
                     revision.verify_checkout(Path("source"), "b" * 40)
             self.assertEqual(error.exception.reason, "dirty")
             self.assertNotIn("private", str(error.exception))
+
+
+    def test_large_committed_source_inventories_keep_complete_version_only_identity(self):
+        originals = {
+            "crates/morpheus-app/Cargo.toml": b'[package]\nname = "morpheus-app"\nversion = "0.1.0"\n',
+            "Cargo.lock": b'[[package]]\nname = "morpheus-app"\nversion = "0.1.0"\n',
+        }
+        # Exact sizes from the immutable reviewed 83878ed source tree. These
+        # are complete inert JSON documents, not truncated reads or exclusions.
+        sizes = {"native/webrtc/linux/expected-linux-overlay.json": 10_353_166,
+                 "native/webrtc/linux/selected-linux-build-inputs.json": 16_775_086}
+        prefix, suffix = b'{"reviewed_fixture":"', b'"}\n'
+        for name, size in sizes.items():
+            content = prefix + b"x" * (size - len(prefix) - len(suffix)) + suffix
+            self.assertEqual(len(content), size)
+            self.assertIn("reviewed_fixture", json.loads(content))
+            originals[name] = content
+        # The full real source is also over 64 MiB. Exercise that former outer
+        # failure with ordinary individually bounded source members as well.
+        for index in range(6):
+            originals[f"native/retained-source-{index}.txt"] = b"x" * (8 * 1024 * 1024)
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as stream:
+            for name, content in originals.items():
+                member = tarfile.TarInfo(name)
+                member.size, member.mode = len(content), 0o644
+                stream.addfile(member, io.BytesIO(content))
+        raw = archive.getvalue()
+        self.assertGreater(len(raw), 64 * 1024 * 1024)
+        self.assertLess(len(raw), revision.MAX_EXPORT_BYTES)
+        self.assertEqual(len(revision.source_export_members(raw)), len(originals))
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            root = parent / "canonical"
+            root.mkdir()
+            for name, content in originals.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(revision.versioned_source_bytes(name, content, "0.1.0-updateqa.1"))
+                path.chmod(0o600)
+            result = revision.verify_versioned_export(root, raw, "0.1.0-updateqa.1")
+            self.assertEqual(result["files"], len(originals))
+            self.assertEqual(result["allowed_paths"], sorted(revision.UPDATE_VERSION_PATHS))
+            # A same-sized change in an admitted large inventory still fails
+            # the full byte comparison. Its larger cap is not an exclusion.
+            with (root / next(iter(sizes))).open("r+b") as changed:
+                changed.write(b"!")
+            with self.assertRaises(revision.SourceRevisionError):
+                revision.verify_versioned_export(root, raw, "0.1.0-updateqa.1")
+
+
+    def test_source_export_manifest_limits_reject_aliases_and_over_bound_members(self):
+        # Oversized headers must be refused before reading their advertised
+        # body. No enormous allocation or extraction is needed to prove this.
+        entries = [
+            ("native/webrtc/linux/expected-linux-overlay.json", 16 * 1024 * 1024 + 1),
+            ("native/webrtc/linux/selected-linux-build-inputs.json", 32 * 1024 * 1024 + 1),
+            ("native/webrtc/linux/unrelated.json", 8 * 1024 * 1024 + 1),
+            ("native/webrtc/linux/EXPECTED-LINUX-OVERLAY.json", 8 * 1024 * 1024 + 1),
+            ("other/selected-linux-build-inputs.json", 8 * 1024 * 1024 + 1),
+            ("native/webrtc/linux/./expected-linux-overlay.json", 1),
+            ("native/webrtc/linux/../expected-linux-overlay.json", 1),
+            ("/native/webrtc/linux/expected-linux-overlay.json", 1),
+            ("C:/native/webrtc/linux/expected-linux-overlay.json", 1),
+            ("C:native/webrtc/linux/expected-linux-overlay.json", 1),
+            ("native\\webrtc\\linux\\expected-linux-overlay.json", 1),
+        ]
+        for name, size in entries:
+            with self.subTest(name=name, size=size):
+                member = tarfile.TarInfo(name)
+                member.size, member.mode = size, 0o644
+                raw = member.tobuf() + b"\0" * 1024
+                with self.assertRaises(revision.SourceRevisionError):
+                    revision.source_export_members(raw)
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE, tarfile.GNUTYPE_SPARSE):
+            with self.subTest(kind=kind):
+                member = tarfile.TarInfo("native/webrtc/linux/expected-linux-overlay.json")
+                member.type, member.mode, member.linkname = kind, 0o644, "outside"
+                with self.assertRaises(revision.SourceRevisionError):
+                    revision.source_export_members(member.tobuf() + b"\0" * 1024)
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as stream:
+            for name in ("one", "two"):
+                member = tarfile.TarInfo(name)
+                member.mode = 0o644
+                stream.addfile(member)
+        with patch.object(revision, "MAX_EXPORT_ENTRIES", 1), self.assertRaises(revision.SourceRevisionError):
+            revision.source_export_members(archive.getvalue())
+        with patch.object(revision, "MAX_EXPORT_BYTES", len(archive.getvalue()) - 1), \
+                self.assertRaises(revision.SourceRevisionError):
+            revision.source_export_members(archive.getvalue())
+        truncated = tarfile.TarInfo("truncated.txt")
+        truncated.size, truncated.mode = 32, 0o644
+        first = tarfile.TarInfo("valid-first.txt")
+        first.size, first.mode = 3, 0o644
+        for raw in (truncated.tobuf() + b"short",
+                    first.tobuf() + b"one" + b"\0" * 509 + truncated.tobuf() + b"short"):
+            with self.subTest(truncated_archive_bytes=len(raw)), self.assertRaises(revision.SourceRevisionError):
+                revision.source_export_members(raw)
 
 
 class PackageSourceScopeTests(unittest.TestCase):

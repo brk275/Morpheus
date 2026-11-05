@@ -10,7 +10,7 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import secrets
 import shutil
@@ -24,12 +24,14 @@ import tomllib
 
 if __package__:
     from . import package as package, native_notices as notices
+    from . import native_notice_source as notice_source
     from . import package_revision as revision
     from . import prepare_windows_update as producer
     from . import run_windows_capture_acceptance as capture
 else:
     import package
     import native_notices as notices
+    import native_notice_source as notice_source
     import package_revision as revision
     import prepare_windows_update as producer
     import run_windows_capture_acceptance as capture
@@ -122,27 +124,131 @@ def private_environment(environment, home):
     result.setdefault("CARGO_HOME", str(original / ".cargo"))
     result.setdefault("RUSTUP_HOME", str(original / ".rustup"))
     for name in ("home", "roaming", "local", "temp"):
-        (home / name).mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            notice_source.private_directory(home / name, parents=True, exist_ok=True)
+        else:
+            (home / name).mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        # Cargo/libgit2 reads its own controlled HOME. The notice-fetch HOME
+        # is separate; do not inherit ambient Git configuration or credentials.
+        config = home / "home" / ".gitconfig"
+        expected = b"[core]\n\tlongpaths = true\n"
+        notice_source.checked(config.parent, directory=True, private=True)
+        if not config.exists():
+            write_new(config, expected)
+        notice_source.checked(config, private=True)
+        require(notices.read_regular(config, 128) == expected)
     result.update(HOME=str(home/"home"), USERPROFILE=str(home/"home"), APPDATA=str(home/"roaming"),
         LOCALAPPDATA=str(home/"local"), TEMP=str(home/"temp"), TMP=str(home/"temp"),
         RUST_LOG="warn", RUST_BACKTRACE="0", CARGO_INCREMENTAL="0", CARGO_BUILD_JOBS="2",
         RUSTUP_TOOLCHAIN="1.99.0", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
     return result
 
+
+def msvc_build_environment(environment):
+    """Select protected provider x64 tools; never resolve GNU link from PATH.
+
+    Rust's vcvars shortcut can accept the first link.exe when its architecture
+    probe is unavailable. Derive the complete fixed native toolchain instead
+    of forwarding more ambient vcvars/compiler overrides or running setup hooks.
+    """
+    result = dict(environment)
+    program_files = Path(environment["PROGRAMFILES"])
+    installations = [program_files / "Microsoft Visual Studio" / name / "Enterprise"
+                     for name in ("18", "2022")]
+    installation = next((path for path in installations if path.exists()), None)
+    require(installation is not None)
+    notice_source.checked(installation, directory=True)
+    metadata = installation / "VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt"
+    notice_source.checked(metadata)
+    version = notices.read_regular(metadata, 64).decode("ascii").strip()
+    require(re.fullmatch(r"14\.[0-9]{1,2}\.[0-9]{3,6}", version) is not None)
+    tool_root = installation / "VC/Tools/MSVC" / version
+    binaries = tool_root / "bin/Hostx64/x64"
+    notice_source.checked(binaries, directory=True)
+    for name in ("link.exe", "cl.exe", "lib.exe"):
+        tool = notice_source.checked(binaries / name)
+        require(tool.stat().st_size > 0)
+    libraries = [tool_root / "lib/x64"]
+    includes = [tool_root / "include"]
+    atl = tool_root / "atlmfc"
+    if atl.exists():
+        notice_source.checked(atl, directory=True)
+        libraries.append(atl / "lib/x64")
+        includes.append(atl / "include")
+    sdk = Path(environment["PROGRAMFILES(X86)"]) / "Windows Kits/10"
+    notice_source.checked(sdk / "Lib", directory=True)
+    versions = []
+    for index, path in enumerate((sdk / "Lib").iterdir(), 1):
+        require(index <= 64)
+        if re.fullmatch(r"10\.0\.[0-9]{4,6}\.[0-9]{1,5}", path.name):
+            notice_source.checked(path, directory=True)
+            try:
+                for part, library in (("um", "kernel32.lib"), ("ucrt", "ucrt.lib")):
+                    parent = notice_source.checked(path / part / "x64", directory=True)
+                    notice_source.checked(parent / library)
+            except FileNotFoundError:
+                continue  # A partial installed SDK is not a complete candidate.
+            versions.append(path.name)
+    require(versions)
+    sdk_version = max(versions, key=lambda value: tuple(map(int, value.split("."))))
+    for part, library in (("um", "kernel32.lib"), ("ucrt", "ucrt.lib")):
+        path = sdk / "Lib" / sdk_version / part / "x64"
+        notice_source.checked(path / library)
+        libraries.append(path)
+    includes.extend(sdk / "Include" / sdk_version / name for name in ("ucrt", "shared", "um", "winrt", "cppwinrt"))
+    for path in libraries + includes:
+        notice_source.checked(path, directory=True)
+    result.update(CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=str(binaries / "link.exe"),
+        PATH=str(binaries) + os.pathsep + environment["PATH"],
+        LIB=os.pathsep.join(map(str, libraries)), INCLUDE=os.pathsep.join(map(str, includes)),
+        LIBPATH=os.pathsep.join(map(str, libraries)),
+        VSINSTALLDIR=str(installation) + os.sep, VCINSTALLDIR=str(installation / "VC") + os.sep,
+        VCTOOLSINSTALLDIR=str(tool_root) + os.sep, VCTOOLSVERSION=version,
+        VSCMD_ARG_TGT_ARCH="x64", WINDOWSSDKDIR=str(sdk) + os.sep,
+        WINDOWSSDKVERSION=sdk_version + os.sep, UNIVERSALCRTSDKDIR=str(sdk) + os.sep,
+        UCRTVERSION=sdk_version)
+    return result
+
+
 class Commands:
     def __init__(self, root, environment):
         self.root, self.environment = root, environment
         self.logs = root / "logs"; self.logs.mkdir()
         self.sequence = 0
+        self.build_substage = "unavailable"
+        self.failed_command = None
+        # Closed observations only; never retain command text or private output.
+        self.command_phase = "unavailable"
+        self.close_state = "unattempted"
+        self.close_refusal = None
+        self.scan_phase = "unattempted"
+        self.scan_counts = dict(success=0, exit_one=0, other_exit=0, timeout=0, refusal=0)
         self.cleanup_failed = False
         self.deadline = time.monotonic() + 6900
     def close_job(self, job):
+        self.close_state = "attempted"
+        self.close_refusal = None
         try:
             job.close()
-        except BaseException:
+            self.close_state = "complete"
+        except BaseException as error:
             self.cleanup_failed = True
+            try:
+                self.close_state = "failed"
+                if (type(error) is capture.Failure and type(error.code) is str
+                        and error.code in capture.FAILURES and type(error.operation) is str
+                        and error.operation in capture.OPERATIONS):
+                    self.close_refusal = {"code": error.code, "operation": error.operation}
+            except BaseException:
+                pass  # Optional observations cannot replace failed Job containment.
             raise
     def start(self, job, args, environment=None, cwd=ROOT):
+        # Only the fixed protected system Git may retain provider hardlinks.
+        # Recheck its complete path/ACL contract immediately before each spawn;
+        # a same-named alias cannot borrow the initial selection's admission.
+        if args and Path(args[0]).name.casefold() == "git.exe":
+            require(Path(args[0]) == notice_source.system_git())
         checked(cwd, directory=True)
         self.sequence += 1
         log = self.logs / (str(self.sequence).zfill(4) + ".log")
@@ -162,7 +268,9 @@ class Commands:
     def wait(self, job, handle, seconds):
         end = min(self.deadline, time.monotonic() + seconds)
         while True:
+            self.command_phase = "wait_log_bounds"
             self.bounded_logs()
+            self.command_phase = "process_wait"
             state = job.kernel.WaitForSingleObject(handle, 0)
             if state == 0:
                 return job.wait(handle, 0)
@@ -170,48 +278,260 @@ class Commands:
             time.sleep(.025)
     def empty(self, job, seconds=30):
         end = min(self.deadline, time.monotonic()+seconds)
+        self.command_phase = "job_query"
         while job.active():
+            self.command_phase = "drain_log_bounds"
             self.bounded_logs()
+            self.command_phase = "drain_deadline"
             require(time.monotonic() < end)
             time.sleep(.025)
+            self.command_phase = "job_query"
+        self.command_phase = "drained_log_bounds"
         self.bounded_logs()
     def run(self, args, *, environment=None, cwd=ROOT, seconds=180):
+        self.failed_command = None
+        status = None
+        self.command_phase = "job_create"
         job = capture.WindowsJob()
         try:
+            self.command_phase = "start"
             handle, log = self.start(job,args,environment,cwd)
-            require(self.wait(job, handle, seconds) == 0)
+            status = self.wait(job, handle, seconds)
+            self.command_phase = "exit_status"
+            require(status == 0)
             self.empty(job)
+            self.command_phase = "result_log_bounds"
             require(log.stat().st_size <= 8*1024*1024)
-            return log.read_bytes()
+            self.command_phase = "result_log_read"
+            result = log.read_bytes()
+            self.command_phase = "complete"
+            return result
         finally:
             self.close_job(job)
+            if type(status) is int and status != 0:
+                try:
+                    self.failed_command = (log, status, log.stat().st_size)
+                except OSError:
+                    pass  # Optional metadata must not replace the refusal.
+    def compile_app(self, cargo, exported, target, environment):
+        # A successful compiler driver may leave an owned helper running.
+        # Release that Job and prove zero descendants BEFORE reading results;
+        # ordinary installer/actor commands retain their natural-drain policy.
+        expected = checked(Path(self.environment["RUSTUP_HOME"]) /
+                           "toolchains/1.99.0-x86_64-pc-windows-msvc/bin/cargo.exe")
+        require(Path(cargo) == expected and Path(target) == self.root / "native-target"
+                and Path(exported).parent == self.root and Path(exported).name in {"old-source", "new-source"})
+        self.failed_command = None
+        status = None
+        self.command_phase = "job_create"
+        job = capture.WindowsJob()
+        try:
+            self.command_phase = "start"
+            handle, log = self.start(job, [expected, "build", "--release", "--locked", "-p", "morpheus-app",
+                "--features", "native-calls", "--target-dir", target], environment, exported)
+            status = self.wait(job, handle, 3600)
+            self.command_phase = "exit_status"
+            require(status == 0)
+        finally:
+            self.close_job(job)  # Verified kill/drain/handle close; failure cannot return success.
+            if type(status) is int and status != 0:
+                try:
+                    self.failed_command = (log, status, log.stat().st_size)
+                except OSError:
+                    pass  # Preserve the existing production diagnostic contract.
+        self.command_phase = "result_log_bounds"
+        require(time.monotonic() < self.deadline)
+        self.bounded_logs()
+        require(log.stat().st_size <= 8*1024*1024)
+        self.command_phase = "result_log_read"
+        result = log.read_bytes()
+        require(time.monotonic() < self.deadline)
+        self.command_phase = "complete"
+        return result
     def scan(self, scanner):
+        self.scan_phase = "configuration"
         config, ignore = self.root/"default-gitleaks.toml", self.root/"empty.ignore"
         write_new(config,b"[extend]\nuseDefault = true\n"); write_new(ignore,b"")
         failed = False
+        self.scan_phase = "enumeration"
         for log in sorted(self.logs.glob("*.log")):
             try:
+                self.scan_phase = "owned_log_read"
                 require(log.stat().st_size <= 8*1024*1024)
                 with checked(log).open("rb") as stream:
+                    self.scan_phase = "scanner"
                     result = subprocess.run([str(scanner),"stdin","--config",str(config),"--gitleaks-ignore-path",str(ignore),
                         "--ignore-gitleaks-allow","--redact=100","--no-banner"],stdin=stream,
                         stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,cwd=self.root,
                         env=self.environment,timeout=60,check=False)
-                if result.returncode: failed = True
-            except (Failure,OSError,subprocess.SubprocessError):
+                if result.returncode:
+                    failed = True
+                    self.scan_counts["exit_one" if result.returncode == 1 else "other_exit"] += 1
+                else:
+                    self.scan_counts["success"] += 1
+            except subprocess.TimeoutExpired:
+                self.scan_counts["timeout"] += 1
                 failed = True
+            except (Failure,OSError,subprocess.SubprocessError):
+                self.scan_counts["refusal"] += 1
+                failed = True
+        self.scan_phase = "result"
         require(not failed)
+        self.scan_phase = "complete"
+
+# Closed source-location metadata only. Never inspect command output, exception
+# messages, arguments, paths, fixture keys or transaction contents here.
+_FAILURE_STAGES = frozenset(("source-export", "build-old", "build-new", "signing", *CASES))
+_BUILD_SUBSTAGES = frozenset(("unavailable", "source_export", "notices_prepare", "cargo_build",
+                             "payload", "config", "producer", "cargo_packager"))
+
+
+
+def _cleanup_refusal_diagnostic(error):
+    os_errors = {OSError, PermissionError, FileNotFoundError, FileExistsError,
+                 NotADirectoryError, IsADirectoryError, InterruptedError, TimeoutError,
+                 BlockingIOError, ChildProcessError, ConnectionError, BrokenPipeError,
+                 ConnectionAbortedError, ConnectionRefusedError, ConnectionResetError,
+                 ProcessLookupError}
+    category = "os_error" if type(error) in os_errors else (
+        "guard" if type(error) is Failure else "value_error" if type(error) is ValueError else "other")
+    values = {"errno": None, "winerror": None}
+    if category == "os_error":
+        for name in values:
+            value = getattr(error, name, None)
+            values[name] = value if type(value) is int and 0 <= value <= 65535 else None
+    return {"category": category, **values}
+
+
+def gate_failure_diagnostic(commands, stage, cleanup_phase, scanned, cleaned, cleanup_refusal=None):
+    """Own fixed observations only; not a log scan or transaction verdict."""
+    if scanned is True and cleaned is True:
+        return None
+    command = getattr(commands, "command_phase", None)
+    close = getattr(commands, "close_state", None)
+    scan = getattr(commands, "scan_phase", None)
+    counts = getattr(commands, "scan_counts", None)
+    refusal = getattr(commands, "close_refusal", None)
+    if (type(stage) is not str or stage not in _FAILURE_STAGES | {"complete"}
+            or type(cleanup_phase) is not str or cleanup_phase not in {
+                "scan", "credentials", "job_gate", "registry", "scan_gate", "workspace", "complete"}
+            or type(command) is not str or command not in {
+                "unavailable", "job_create", "start", "wait_log_bounds", "process_wait",
+                "exit_status", "job_query", "drain_log_bounds", "drain_deadline",
+                "drained_log_bounds", "result_log_bounds", "result_log_read", "complete"}
+            or type(close) is not str or close not in {"unattempted", "attempted", "complete", "failed"}
+            or type(scan) is not str or scan not in {
+                "unattempted", "configuration", "enumeration", "owned_log_read", "scanner", "result", "complete"}
+            or (refusal is not None and (type(refusal) is not dict or set(refusal) != {"code", "operation"}
+                or type(refusal["code"]) is not str or refusal["code"] not in capture.FAILURES
+                or type(refusal["operation"]) is not str or refusal["operation"] not in capture.OPERATIONS))
+            or (cleanup_refusal is not None and (type(cleanup_refusal) is not dict
+                or set(cleanup_refusal) != {"category", "errno", "winerror"}
+                or type(cleanup_refusal["category"]) is not str
+                or cleanup_refusal["category"] not in {"os_error", "guard", "value_error", "other"}
+                or any(v is not None and (type(v) is not int or not 0 <= v <= 65535)
+                       for v in (cleanup_refusal["errno"], cleanup_refusal["winerror"]))))
+            or type(counts) is not dict or set(counts) != {"success", "exit_one", "other_exit", "timeout", "refusal"}
+            or any(type(value) is not int or not 0 <= value <= 128 for value in counts.values())
+            or sum(counts.values()) > 128 or type(scanned) is not bool or type(cleaned) is not bool
+            or type(getattr(commands, "cleanup_failed", None)) is not bool):
+        return None
+    return {"schema": 1, "check": "windows_update_gate_diagnostic", "stage": stage,
+            "command_phase": command, "job_close": close, "job_close_refusal": None if refusal is None else dict(refusal),
+            "scan_phase": scan,
+            "scan_counts": dict(counts), "cleanup_phase": cleanup_phase,
+            "cleanup_refusal": None if cleanup_refusal is None else dict(cleanup_refusal),
+            "job_cleanup_failed": commands.cleanup_failed,
+            "private_log_scan_passed": scanned, "cleanup_passed": cleaned,
+            "passed": False, "distribution_ready": False}
+
+def failure_diagnostic(commands, stage, site, scanned, cleaned):
+    if (scanned is not True or cleaned is not True
+            or getattr(commands, "cleanup_failed", None) is not False
+            or type(stage) is not str or stage not in _FAILURE_STAGES):
+        return None
+    substage = getattr(commands, "build_substage", None)
+    if stage not in {"build-old", "build-new"} or type(substage) is not str or substage not in _BUILD_SUBSTAGES:
+        substage = "unavailable"
+    if site is not None and (type(site) is not dict or set(site) != {"module", "line"}
+            or type(site["module"]) is not str
+            or site["module"] not in {"notice_source", "windows_security", "native_notices",
+                                       "source_catalogue", "windows_processes"}
+            or type(site["line"]) is not int or not 0 < site["line"] <= 99999):
+        return None
+    return {"schema": 1, "check": "windows_update_failure_diagnostic", "stage": stage,
+            "build_substage": substage, "site": site,
+            "private_log_scan_passed": True, "cleanup_passed": True,
+            "passed": False, "distribution_ready": False}
+
+
+def cargo_failure_diagnostic(commands, stage, scanned):
+    """Fixed build hints, captured after full scan and emitted after cleanup."""
+    try:
+        if (scanned is not True or getattr(commands, "cleanup_failed", None) is not False
+                or stage not in {"build-old", "build-new"}
+                or getattr(commands, "build_substage", None) != "cargo_build"):
+            return None
+        failure = getattr(commands, "failed_command", None)
+        if type(failure) is not tuple or len(failure) != 3:
+            return None
+        path, status, size = failure
+        if (type(status) is not int or status == 0 or not 0 <= status <= 0xffffffff
+                or type(size) is not int or not 0 <= size <= 8 * 1024 * 1024):
+            return None
+        path = Path(path)
+        if (commands.logs != commands.root / "logs" or path.parent != commands.logs
+                or re.fullmatch(r"[0-9]{4}\.log", path.name) is None):
+            return None
+        notice_source.checked(path, private=True)
+        data = notices.read_regular(path, 8 * 1024 * 1024, allow_empty=True)
+        if len(data) != size:
+            return None
+        codes = set()
+        for match in re.finditer(rb"\berror\[(E[0-9]{4})\]|\b(?:fatal error|error) (C[0-9]{4}|LNK[0-9]{4})\b", data):
+            codes.add((match[1] or match[2]).decode("ascii"))
+            if len(codes) > 16:
+                return None
+        classes = notice_source._cargo_stderr_classes(data)
+        lower = data.lower()
+        extra = set()
+        if any(token in lower for token in (b"native sdk download", b"native sdk archive",
+                                           b"no reviewed native sdk", b"cannot publish verified native sdk")):
+            extra.add("native_sdk")
+        if any(token in lower for token in (b"linking with", b"link.exe failed", b"linker `link.exe` not found")):
+            extra.add("linker")
+        if any(token in lower for token in (b"could not execute process", b"toolchain is not installed")):
+            extra.add("toolchain")
+        if extra:
+            classes = sorted(set(classes) - {"other"} | extra)
+        return {"schema": 1, "check": "windows_update_cargo_failure", "status": status,
+                "error_codes": sorted(codes), "stderr_classes": classes,
+                "private_log_scan_passed": True, "passed": False, "distribution_ready": False}
+    except BaseException:
+        # A missing/changed/unsafe log is not a replacement failure or raw text.
+        return None
+
 
 def export_source(commands, source, archive, version, label):
-    destination = commands.root / (label+"-source"); destination.mkdir()
+    require(label in {"old", "new"})
+    members = revision.source_export_members(archive)
+    names = {}
+    for member in members:
+        notices.portable_source_name(str(PurePosixPath(member.name)), names, windows=True)
+    security = notice_source.S.windows_security()
+    destination = security.private_directory(commands.root / (label+"-source"))
     with tarfile.open(fileobj=io.BytesIO(archive),mode="r:") as tar:
-        for member in tar.getmembers():
-            name = Path(member.name)
-            require(not name.is_absolute() and ".." not in name.parts and (member.isdir() or member.isfile()))
-        tar.extractall(destination,filter="data")
-    for name in revision.UPDATE_VERSION_PATHS:
-        path = destination/name
-        path.write_bytes(revision.versioned_source_bytes(name,path.read_bytes(),version))
+        for member in members:
+            name = str(PurePosixPath(member.name)); path = destination.joinpath(*PurePosixPath(name).parts)
+            if member.isdir():
+                security.private_directory(path, parents=True, exist_ok=True)
+                continue
+            security.private_directory(path.parent, parents=True, exist_ok=True)
+            with tar.extractfile(member) as stream:
+                data = stream.read(member.size + 1)
+            require(len(data) == member.size)
+            write_new(path, revision.versioned_source_bytes(name, data, version))
+            security.path(path, private=True)
     proof = revision.verify_versioned_export(destination,archive,version)
     return destination,proof
 
@@ -246,25 +566,34 @@ def instrumented_entry(data, nonce):
 
 
 def build(commands, source, archive, version, nonce, label, cargo, notice_bundle, notice_receipt, reviewed):
+    commands.build_substage = "source_export"
     exported,proof = export_source(commands,source,archive,version,label)
-    notice_dir=commands.root/(label+"-notices"); notice_dir.mkdir(mode=0o700)
+    notice_dir=notice_source.S.windows_security().private_directory(commands.root/(label+"-notices"))
+    commands.build_substage = "notices_prepare"
     notice_contents=notices.prepare(notice_bundle,notice_receipt,notice_dir,revision=reviewed,
                                     platform="win32",version=version,working=exported)
     target = commands.root/"native-target"
-    environment = {"MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD":nonce,"MORPHEUS_PACKAGE_FORMAT":"nsis-payload-v2"}
-    commands.run([cargo,"build","--release","--locked","-p","morpheus-app","--features","native-calls",
-        "--target-dir",target],environment=environment,cwd=exported,seconds=3600)
+    commands.build_substage = "config"
+    environment = msvc_build_environment(commands.environment)
+    environment.update(MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD=nonce, MORPHEUS_PACKAGE_FORMAT="nsis-payload-v2")
+    commands.build_substage = "cargo_build"
+    commands.compile_app(cargo,exported,target,environment)
+    commands.build_substage = "payload"
     require(revision.verify_versioned_export(exported,archive,version) == proof)
     binary = exported/"target/release/morpheus-app.exe"
     binary.parent.mkdir(parents=True); shutil.copyfile(target/"release/morpheus-app.exe",binary)
     identity = instrumented_entry(read(binary,LIMIT),nonce); require(identity["version"] == version)
     output = commands.root/(label+"-package"); output.mkdir()
+    commands.build_substage = "config"
     config = package.package_config(exported,"win32")
     config.update(version=version,**{"out-dir":str(output)})
     stage = commands.root/(label+"-producer"); stage.mkdir()
+    commands.build_substage = "producer"
     prepared,payload = producer.prepare(config,exported,stage,notice_contents=notice_contents)
+    commands.build_substage = "cargo_packager"
     commands.run([cargo,"packager","--release","--formats","nsis","--config",json.dumps(prepared)],
         environment=environment,cwd=exported,seconds=900)
+    commands.build_substage = "payload"
     setups = list(output.glob("*.exe")); require(len(setups)==1)
     final = output/payload.name; shutil.copyfile(payload,final)
     return {"setup":checked(setups[0]),"payload":checked(final),"identity":identity,
@@ -315,6 +644,32 @@ def await_file(path, job, seconds=15):
         require(job.active()>0 and time.monotonic()<end)
         time.sleep(.025)
     checked(path)
+
+def actor_verbatim_drive_path(value):
+    """Encode only an already-resolved ordinary drive path for the Rust plan.
+
+    Filesystem guards continue to use ordinary paths. The actor compares plan
+    fields to GetFinalPathNameByHandleW's verbatim drive representation; no UNC,
+    device path or arbitrary prefix is stripped or accepted here.
+    """
+    require(type(value) is str and 3 < len(value) <= 30000
+            and re.fullmatch(r"[A-Za-z]:\\[^\x00]*", value))
+    parts = value[3:].split("\\")
+    require(all(part not in {"", ".", ".."} and not part.endswith((" ", "."))
+                and not any(character in part for character in '<>:"/|?*\0') for part in parts))
+    return "\\\\?\\" + value
+
+
+def actor_plan_windows_paths(plan):
+    # Keep the caller's ordinary paths for cleanup and process arguments. Only
+    # these three hashed JSON fields are canonicalized for the Windows actor.
+    result = dict(plan)
+    for name, directory in (("root", True), ("install", True), ("payload", False)):
+        require(type(plan.get(name)) is str)
+        path = checked(Path(plan[name]), directory=directory)
+        result[name] = actor_verbatim_drive_path(str(path.resolve(strict=True)))
+    return result
+
 
 def actor_environment(case, plan, base):
     raw=json.dumps(plan,sort_keys=True,separators=(",",":")).encode()+b"\n"
@@ -480,6 +835,8 @@ def run_case(commands, case_name, old, new, nonce, signatures):
             "payload":str(new["payload"]),"payload_sha256":new["payload_sha256"],"old":old["identity"],"new":new["identity"],
             "old_executable_sha256":old["executable_sha256"],"new_executable_sha256":new["executable_sha256"],
             "signature":signatures[1],"wrong_signature":signatures[0],"public_key":signatures[2]}
+        if os.name == "nt":
+            plan = actor_plan_windows_paths(plan)
         environment=actor_environment(case,plan,base)
         job=capture.WindowsJob()
         try:
@@ -521,16 +878,120 @@ def run_case(commands, case_name, old, new, nonce, signatures):
             require(environment is not None and uninstall_hash is not None)
             cleanup_case(commands,case,old,new,uninstall_hash,environment)
 
-def remove_owned_root(root, identity):
+def remove_owned_root(root, identity, workspace, workspace_identity, *, deadline=None):
+    if deadline is not None:
+        require(type(deadline) in (int,float) and 0 < deadline-time.monotonic() <= 6900)
     info=root.lstat(); require((info.st_dev,info.st_ino)==identity)
+    def unreadable_subtree(_error):
+        raise Failure() from None  # No filesystem path or exception body is reflected.
     count=0
-    for directory, dirs, files in os.walk(root,followlinks=False):
+    junctions=[]
+    profile=root/"tools-home/home"
+    for directory, dirs, files in os.walk(root,followlinks=False,onerror=unreadable_subtree):
         for name in dirs+files:
+            if deadline is not None: require(time.monotonic()<deadline)
             path=Path(directory)/name; info=path.lstat(); count+=1
-            require(count<=300000 and not stat.S_ISLNK(info.st_mode)
-                    and not getattr(info,"st_file_attributes",0)&0x400)
-    shutil.rmtree(root)
+            require(count<=300000 and not stat.S_ISLNK(info.st_mode))
+            if getattr(info,"st_file_attributes",0)&0x400:
+                # Do not descend or delete during the complete preflight. Only
+                # this private runtime-profile mount-point kind can be queued.
+                require(os.name=="nt" and name in dirs and stat.S_ISDIR(info.st_mode)
+                        and getattr(info,"st_reparse_tag",0)==0xa0000003
+                        and path!=profile and path.is_relative_to(profile))
+                require(len(junctions)<64)  # Bound new handle work independently of ordinary files.
+                token=(info.st_dev,info.st_ino,info.st_birthtime_ns,info.st_mtime_ns,
+                       info.st_file_attributes,info.st_reparse_tag,info.st_nlink,info.st_size)
+                require(all(type(value) is int for value in token) and token[0]>=0 and token[1]>0
+                        and token[2]>0 and token[3]>=0 and 0<=token[4]<=0xffffffff
+                        and token[4]&0x410==0x410 and token[6]==1 and token[7]==0)
+                junctions.append((path,token));dirs.remove(name)
+    if junctions:
+        security=notice_source.S.windows_security()
+        for path,token in junctions:
+            security.unlink_private_profile_junction(workspace,workspace_identity,root,identity,
+                                                     path,token,deadline=deadline)
+        # A replacement or a newly appearing reparse point still cannot enter
+        # generic recursive removal, including Windows directory junctions.
+        count=0
+        for directory,dirs,files in os.walk(root,followlinks=False,onerror=unreadable_subtree):
+            for name in dirs+files:
+                require(time.monotonic()<deadline)
+                info=(Path(directory)/name).lstat();count+=1
+                require(count<=300000 and not stat.S_ISLNK(info.st_mode)
+                        and not getattr(info,"st_file_attributes",0)&0x400)
+    if deadline is not None: require(time.monotonic()<deadline)
+    if os.name == "nt":
+        def readonly(function, path, error):
+            # Only the known readonly-unlink failure can authorize a retry.
+            if ((function is not os.unlink and function is not os.remove)
+                    or not isinstance(error, PermissionError) or error.errno != 13
+                    or getattr(error, "winerror", None) != 5):
+                raise error
+            require(root.parent == workspace
+                    and re.fullmatch(r"morpheus-windows-updateqa-[0-9a-f]{32}", root.name)
+                    and Path(path).is_absolute() and Path(path) != root
+                    and Path(path).is_relative_to(root))
+            notice_source.S.windows_security().path(root, directory=True, private=True)
+            current = root.lstat()
+            require((current.st_dev, current.st_ino) == identity)
+            # Reuse the exact protected-leaf handle/ACL/link/identity checks.
+            # The outer native-source root retains its original inode authority
+            # even after rmtree has consumed files in the inner nonce tree.
+            notice_source._remove_readonly_owned_leaf(
+                workspace, workspace_identity, function, path, error)
+        shutil.rmtree(root, onexc=readonly)
+    else:
+        shutil.rmtree(root)
     require(not root.exists())
+
+def remove_unused_workspace(workspace, identity):
+    """Before Commands exists, remove only this captured empty private tree.
+
+    There are no child processes or command logs yet. Any unexpected file,
+    alias, changed identity or ACL retains the failed tree instead of repair.
+    """
+    require(workspace.parent==Path.home().resolve(strict=True) and re.fullmatch(r"morpheus-native-source-[0-9a-f]{32}",workspace.name))
+    security = notice_source.S.windows_security()
+    security.path(workspace, directory=True, private=True)
+    info = workspace.lstat(); require((info.st_dev,info.st_ino)==identity)
+    directories=[]
+    for directory, dirs, files in os.walk(workspace,followlinks=False):
+        require(not files and len(directories)<32)
+        current=security.path(Path(directory),directory=True,private=True)
+        directories.append(current)
+        for name in dirs:security.path(current/name,directory=True,private=True)
+    for path in reversed(directories):path.rmdir()
+    require(not workspace.exists())
+
+
+def reserve_workspace(nonce):
+    require(type(nonce) is str and re.fullmatch(r"[0-9a-f]{32}",nonce))
+    security = notice_source.S.windows_security()
+    parent = security.path(Path.home().resolve(strict=True),directory=True)
+    workspace = security.create_root(parent)
+    info=workspace.lstat(); workspace_identity=(info.st_dev,info.st_ino)
+    try:
+        root=security.private_directory(workspace/("morpheus-windows-updateqa-"+nonce))
+        info=root.lstat(); identity=(info.st_dev,info.st_ino)
+        return workspace,workspace_identity,root,identity
+    except BaseException:
+        try:remove_unused_workspace(workspace,workspace_identity)
+        except BaseException:pass  # Retain unexpected private evidence; preserve the original refusal.
+        raise
+
+
+def remove_owned_workspace(workspace, workspace_identity, root, identity, *, deadline=None):
+    require(root.parent==workspace and re.fullmatch(r"morpheus-windows-updateqa-[0-9a-f]{32}",root.name))
+    require(workspace.parent==Path.home().resolve(strict=True) and re.fullmatch(r"morpheus-native-source-[0-9a-f]{32}",workspace.name))
+    security=notice_source.S.windows_security()
+    security.path(workspace,directory=True,private=True)
+    info=workspace.lstat();require((info.st_dev,info.st_ino)==workspace_identity)
+    security.path(root,directory=True,private=True)
+    remove_owned_root(root,identity,workspace,workspace_identity,deadline=deadline)
+    security.path(workspace,directory=True,private=True)
+    info=workspace.lstat();require((info.st_dev,info.st_ino)==workspace_identity and not any(workspace.iterdir()))
+    workspace.rmdir();require(not workspace.exists())
+
 
 def execute(args):
     guard(os.environ)
@@ -541,17 +1002,31 @@ def execute(args):
     require(type(args.gitleaks_sha256) is str and re.fullmatch(r"[0-9a-f]{64}",args.gitleaks_sha256)
             and digest(scanner,32*1024*1024)==args.gitleaks_sha256)
     nonce=secrets.token_hex(16)
-    root=Path(os.environ["RUNNER_TEMP"]).resolve()/ ("morpheus-windows-updateqa-"+nonce)
-    root.mkdir(); identity=(root.stat().st_dev,root.stat().st_ino)
-    commands=Commands(root,private_environment(os.environ,root/"tools-home"))
+    workspace,workspace_identity,root,identity=reserve_workspace(nonce)
+    try:
+        environment=private_environment(os.environ,root/"tools-home")
+        # The Rust actor keeps its exact RUNNER_TEMP/nonce-child/case contract;
+        # only this synthetic child's temporary parent becomes privately owned.
+        environment["RUNNER_TEMP"]=str(workspace)
+        commands=Commands(root,environment)
+    except BaseException:
+        try:remove_unused_workspace(workspace,workspace_identity)
+        except BaseException:pass  # No child exists; retain any unexpected private tree.
+        raise
     stage,results,scan,clean="source-export",[],False,False
+    failed, failure_site = False, None
+    cargo_failure = None
+    cleanup_refusal = None
     keys = {}
     try:
         # Use the already provisioned exact toolchain binary, not a rustup
         # proxy that could select or auto-install an ambient toolchain.
         cargo=checked(Path(commands.environment["RUSTUP_HOME"]) /
                       "toolchains/1.99.0-x86_64-pc-windows-msvc/bin/cargo.exe")
-        git=checked(Path(shutil.which("git") or "").resolve())
+        # Use the same parameter-free protected provider Git as source notices.
+        # PATH Git can be another hardlinked launcher; private inputs still
+        # require checked()'s original single-link contract.
+        git=notice_source.system_git()
         require(commands.run([cargo,"packager","--version"]).strip()==b"cargo-packager 0.11.8")
         archive_path=root/"source.tar"
         commands.run([git,"archive","--format=tar","--output="+str(archive_path),reviewed],cwd=source)
@@ -579,26 +1054,69 @@ def execute(args):
             stage=case; results.append(run_case(commands,case,old,new,nonce,signatures))
         # Reinstall/uninstall is exercised by every following genuine NSIS case.
         stage="complete"
+    except BaseException as error:
+        failed = True
+        failure_site = notice_source._notice_failure_site(error)
+        raise
     finally:
+        cleanup_phase = "scan"
         try:
-            commands.scan(scanner); scan=True
+            try:
+                commands.scan(scanner); scan=True
+                if failed:
+                    cargo_failure = cargo_failure_diagnostic(commands, stage, scan)
+            finally:
+                cleanup_phase = "credentials"
+                # Generated fixture credentials are removed even if a transaction
+                # remains pending; never remove a changed/foreign file or registry.
+                key_failure = False
+                for path, (identity_key, expected_hash) in keys.items():
+                    try:
+                        info = checked(path).stat()
+                        require((info.st_dev,info.st_ino)==identity_key and digest(path,4096)==expected_hash)
+                        path.unlink()
+                    except (Failure,OSError):
+                        key_failure = True
+                require(not key_failure)
+                # A pending/foreign registration retains this owned tree privately;
+                # such a cleanup is a failure, never an installed acceptance pass.
+                cleanup_phase = "job_gate"
+                require(not commands.cleanup_failed)
+                cleanup_phase = "registry"
+                absent_registry()
+                cleanup_phase = "scan_gate"
+                # The reused readonly primitive requires a fresh complete scan.
+                # Keep the original scanner exception and the owned tree when
+                # that prerequisite failed; key/job/registry teardown ran above.
+                if scan is True:
+                    cleanup_phase = "workspace"
+                    try:
+                        remove_owned_workspace(workspace,workspace_identity,root,identity,deadline=commands.deadline); clean=True
+                    except BaseException as error:
+                        try:
+                            cleanup_refusal = _cleanup_refusal_diagnostic(error)
+                        except BaseException:
+                            pass  # Closed observation failure never replaces cleanup refusal.
+                        raise
+                    cleanup_phase = "complete"
+            if failed:
+                diagnostic = failure_diagnostic(commands, stage, failure_site, scan, clean)
+                if diagnostic is not None:
+                    print("MORPHEUS_WINDOWS_UPDATE_FAILURE_DIAGNOSTIC " + json.dumps(diagnostic, sort_keys=True),
+                          file=sys.stderr, flush=True)
+                    if cargo_failure is not None:
+                        print("MORPHEUS_WINDOWS_UPDATE_CARGO_DIAGNOSTIC "
+                              + json.dumps(cargo_failure, sort_keys=True), file=sys.stderr, flush=True)
         finally:
-            # Generated fixture credentials are removed even if a transaction
-            # remains pending; never remove a changed/foreign file or registry.
-            key_failure = False
-            for path, (identity_key, expected_hash) in keys.items():
-                try:
-                    info = checked(path).stat()
-                    require((info.st_dev,info.st_ino)==identity_key and digest(path,4096)==expected_hash)
-                    path.unlink()
-                except (Failure,OSError):
-                    key_failure = True
-            require(not key_failure)
-            # A pending/foreign registration retains this owned tree privately;
-            # such a cleanup is a failure, never an installed acceptance pass.
-            require(not commands.cleanup_failed)
-            absent_registry()
-            remove_owned_root(root,identity); clean=True
+            # This channel contains no private content and never substitutes
+            # for the original full-scan/cleanup gates on source/compiler hints.
+            try:
+                gate = gate_failure_diagnostic(commands, stage, cleanup_phase, scan, clean, cleanup_refusal)
+                if gate is not None:
+                    print("MORPHEUS_WINDOWS_UPDATE_GATE_DIAGNOSTIC " + json.dumps(gate, sort_keys=True),
+                          file=sys.stderr, flush=True)
+            except BaseException:
+                pass  # Observation failure must not replace the original refusal.
     require(stage=="complete" and len(results)==len(CASES) and scan and clean)
     print(json.dumps({"check":"windows_installed_update_mechanism","passed":True,"source_revision":reviewed,
         "cohort":old["identity"]["persistence"],"old_source":old["source"],"new_source":new["source"],
