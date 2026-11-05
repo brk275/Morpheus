@@ -1,0 +1,221 @@
+# TEMP owner-only fixed-source validation adapter. NEVER MERGE this workflow.
+# Only the exact non-main branch below may trigger it. Results are partial.
+# HELD source proposal: no native job, Matrix live suite or packaging execution.
+name: TEMP RTC media selector helper checks (partial)
+
+on:
+  push:
+    branches: [codex/temp-rtc-media-helpers-20261105]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temp-rtc-media-helpers-f2eeaee62c3af882b16882b5d7adc3eb33547c21
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  scope:
+    name: TEMP fixed-source security and helper-only selection (partial)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/temp-rtc-media-helpers-20261105' && github.repository == 'brk275/Morpheus' && github.repository_owner == 'brk275' && github.event.repository.private == false && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.login == 'brk275' && github.event.sender.id > 0 && github.event.sender.id == github.event.repository.owner.id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      helper_only: ${{ steps.scope.outputs.helper_only }}
+      native: ${{ steps.scope.outputs.native }}
+      config: ${{ steps.scope.outputs.config }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: f2eeaee62c3af882b16882b5d7adc3eb33547c21
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out fixed reviewed validation inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: f2eeaee62c3af882b16882b5d7adc3eb33547c21
+          path: trusted
+          persist-credentials: false
+      - name: Verify fixed source and record truthful workflow provenance
+        shell: bash
+        env:
+          FIXED_SOURCE: f2eeaee62c3af882b16882b5d7adc3eb33547c21
+          FIXED_TREE: 93e5e345613f221dc65b2b0a213c02ba6b5fa425
+          WORKFLOW_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          test "$WORKFLOW_HEAD" != "$FIXED_SOURCE"
+          test "$(git -C candidate rev-parse HEAD)" = "$FIXED_SOURCE"
+          test "$(git -C trusted rev-parse HEAD)" = "$FIXED_SOURCE"
+          test "$(git -C candidate rev-parse 'HEAD^{tree}')" = "$FIXED_TREE"
+          test "$(git -C trusted rev-parse 'HEAD^{tree}')" = "$FIXED_TREE"
+          printf 'Actual event: push; workflow head: %s; fixed source: %s; fixed tree: %s\n' "$WORKFLOW_HEAD" "$FIXED_SOURCE" "$FIXED_TREE"
+      - name: Scan committed history for credentials
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
+          mkdir "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          # Scanner code and exact fixture manifest come from the reviewed base.
+          # The candidate's ignore files, attributes and config are not trusted.
+          python3 -I ../trusted/scripts/scan_history.py \
+            --candidate "$PWD" --scanner "$RUNNER_TEMP/gitleaks/gitleaks" \
+            --manifest ../trusted/scripts/public-fixtures.json \
+            --evidence "$RUNNER_TEMP/morpheus-history-scan"
+      - name: Select only existing helper checks (partial evidence)
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo 'helper_only=true'
+            echo 'native=false'
+            echo 'config=false'
+          } >> "$GITHUB_OUTPUT"
+  helpers:
+    name: Validation helper tests
+    needs: scope
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/temp-rtc-media-helpers-20261105' && github.repository == 'brk275/Morpheus' && github.repository_owner == 'brk275' && github.event.repository.private == false && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.login == 'brk275' && github.event.sender.id > 0 && github.event.sender.id == github.event.repository.owner.id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: f2eeaee62c3af882b16882b5d7adc3eb33547c21
+          persist-credentials: false
+      - name: Verify fixed source and record truthful workflow provenance
+        shell: bash
+        env:
+          FIXED_SOURCE: f2eeaee62c3af882b16882b5d7adc3eb33547c21
+          FIXED_TREE: 93e5e345613f221dc65b2b0a213c02ba6b5fa425
+          WORKFLOW_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          test "$WORKFLOW_HEAD" != "$FIXED_SOURCE"
+          test "$(git rev-parse HEAD)" = "$FIXED_SOURCE"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$FIXED_TREE"
+          printf 'Actual event: push; workflow head: %s; fixed source: %s; fixed tree: %s\n' "$WORKFLOW_HEAD" "$FIXED_SOURCE" "$FIXED_TREE"
+      - name: Tighten hosted notice tree permissions before candidate imports
+        timeout-minutes: 5
+        shell: bash
+        env:
+          FIXED_SOURCE: f2eeaee62c3af882b16882b5d7adc3eb33547c21
+        run: |
+          set -euo pipefail
+          [[ "$FIXED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          # Bootstrap from the verified fixed source, not the TEMP workflow head.
+          git show --no-ext-diff --no-textconv "$FIXED_SOURCE:scripts/harden_linux_notice_host.py" |
+            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,ImageOS /usr/bin/python3 -I -B -
+      - name: Check scope and packaging helpers
+        run: |
+          python3 -m unittest discover -s scripts/tests -v
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+          python3 -m compileall -q scripts
+          node --check scripts/element_call_peer.mjs
+          node --check scripts/element_call_stock_peer.mjs
+          python3 scripts/package.py --check
+
+  temp_acceptance:
+    name: TEMP fixed-source helper-only acceptance (partial; never merge)
+    needs: [scope, helpers]
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/codex/temp-rtc-media-helpers-20261105' && github.repository == 'brk275/Morpheus' && github.repository_owner == 'brk275' && github.event.repository.private == false && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.login == 'brk275' && github.event.sender.id > 0 && github.event.sender.id == github.event.repository.owner.id
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 2
+    steps:
+      # This is a separate fixed owner-push aggregate, not canonical CI acceptance.
+      # No checkout, candidate import, cache, artifact or release operation.
+      - name: Require the exact fixed-source partial route and real owner push
+        env:
+          CHECK_RESULTS: ${{ toJSON(needs) }}
+          CHECK_EVENT: ${{ github.event_name }}
+          CHECK_REPOSITORY: ${{ github.repository }}
+          CHECK_REF: ${{ github.ref }}
+          CHECK_ACTOR: ${{ github.actor }}
+          CHECK_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          CHECK_WORKFLOW_HEAD: ${{ github.sha }}
+          CHECK_WORKFLOW_REF: ${{ github.workflow_ref }}
+          FIXED_SOURCE: f2eeaee62c3af882b16882b5d7adc3eb33547c21
+          FIXED_TREE: 93e5e345613f221dc65b2b0a213c02ba6b5fa425
+        shell: bash
+        run: |
+          python3 - <<'PY_TEMP_FIXED_ACCEPTANCE'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          def fixed_source_acceptance_error(needs, event, environment):
+              expected_ref = "refs/heads/codex/temp-rtc-media-helpers-20261105"
+              workflow_ref = "brk275/Morpheus/.github/workflows/fixed-source-rtc-media-helpers.yml@" + expected_ref
+              head = environment.get("CHECK_WORKFLOW_HEAD", "")
+              if (environment.get("CHECK_EVENT") != "push"
+                      or environment.get("GITHUB_EVENT_NAME") != "push"
+                      or environment.get("CHECK_REPOSITORY") != "brk275/Morpheus"
+                      or environment.get("CHECK_REF") != expected_ref
+                      or environment.get("CHECK_WORKFLOW_REF") != workflow_ref
+                      or environment.get("CHECK_ACTOR") != "brk275"
+                      or environment.get("CHECK_TRIGGERING_ACTOR") != "brk275"
+                      or not re.fullmatch(r"[0-9a-f]{40}", head)
+                      or environment.get("GITHUB_SHA") != head
+                      or head == "f2eeaee62c3af882b16882b5d7adc3eb33547c21"
+                      or environment.get("FIXED_SOURCE") != "f2eeaee62c3af882b16882b5d7adc3eb33547c21"
+                      or environment.get("FIXED_TREE") != "93e5e345613f221dc65b2b0a213c02ba6b5fa425"):
+                  return "TEMP fixed-source workflow context is missing or malformed."
+              if not isinstance(event, dict):
+                  return "Actual push payload is missing or malformed."
+              repository, sender = event.get("repository"), event.get("sender")
+              if not isinstance(repository, dict) or not isinstance(sender, dict):
+                  return "Actual push owner identity is missing."
+              owner = repository.get("owner")
+              if (not isinstance(owner, dict)
+                      or repository.get("full_name") != "brk275/Morpheus"
+                      or repository.get("private") is not False
+                      or owner.get("login") != "brk275"
+                      or sender.get("login") != "brk275"
+                      or type(owner.get("id")) is not int or owner["id"] <= 0
+                      or type(sender.get("id")) is not int or sender["id"] != owner["id"]
+                      or event.get("ref") != expected_ref
+                      or event.get("after") != head
+                      or event.get("deleted") is not False):
+                  return "Actual push is not the exact public owner branch update."
+              if (not isinstance(needs, dict) or set(needs) != {"scope", "helpers"}
+                      or any(not isinstance(value, dict) for value in needs.values())
+                      or any(value.get("result") != "success" for value in needs.values())):
+                  return "Fixed-source history security and existing helper checks must both succeed."
+              expected_outputs = {"helper_only": "true", "native": "false", "config": "false"}
+              if needs["scope"].get("outputs") != expected_outputs:
+                  return "Scope disagrees with the exact fixed helper-only selection."
+              return None
+
+          try:
+              needs = json.loads(os.environ["CHECK_RESULTS"])
+              event = json.loads(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+              error = fixed_source_acceptance_error(needs, event, os.environ)
+          except (KeyError, OSError, UnicodeError, ValueError, TypeError):
+              error = "TEMP fixed-source dependency conclusions or event data are malformed."
+          if error:
+              print(error, file=sys.stderr)
+              raise SystemExit(1)
+          print("TEMP helper-only validation succeeded; no native, Matrix live or release result is claimed.")
+          print(json.dumps({"actual_event": "push", "workflow_head": os.environ["CHECK_WORKFLOW_HEAD"],
+                            "fixed_source": os.environ["FIXED_SOURCE"], "fixed_tree": os.environ["FIXED_TREE"],
+                            "checks": "helpers", "platform": "ubuntu-24.04",
+                            "native_executed": False, "partial": True}, sort_keys=True))
+          PY_TEMP_FIXED_ACCEPTANCE
