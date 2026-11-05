@@ -119,6 +119,7 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
     """Scan exact separate owned log snapshots once, never repair source data."""
     import hashlib
     import json
+    import re
     import stat
     import sys
     import time
@@ -159,22 +160,34 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
         check_time()
         if directory_identity(root) != source_root:
             raise PrivateLogScanError()
-        result = {}
-        def refused(error):
-            raise PrivateLogScanError() from None
+        result, invalid = {}, {}
+        def refused(_error):
+            check_time()
+            invalid["walk-error-" + str(len(invalid))] = None
         for directory, dirs, files, descriptor in os.fwalk(".", dir_fd=source_fd,
                                                           follow_symlinks=False, onerror=refused):
             check_time()
-            if any(name.endswith(".log") for name in dirs):
-                raise PrivateLogScanError()
-            # fwalk anchors directories; a selected leaf is always O_NOFOLLOW.
+            for name in dirs:
+                check_time()
+                if name.endswith(".log"):
+                    invalid[str(Path(directory) / name)] = None
+            # Record unsafe leaves without opening them; still scan other exact
+            # private command logs, but never accept this incomplete batch.
             for name in files:
                 check_time()
                 if not name.endswith(".log"):
                     continue
-                details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                result[str(Path(directory) / name)] = file_info(details)
-        return result
+                path = str(Path(directory) / name)
+                try:
+                    details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                except OSError:
+                    invalid[path] = None
+                    continue
+                try:
+                    result[path] = file_info(details)
+                except PrivateLogScanError:
+                    invalid[path] = identity(details)
+        return result, invalid
 
     def copy_or_hash(path, expected, destination=None):
         check_time()
@@ -276,7 +289,7 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
         except (OSError, PrivateLogScanError):
             return False
 
-    copies, hashes = {}, {}
+    copies, hashes, copied_paths = {}, {}, {}
     try:
         check_time()
         if sys.platform != "linux" or root.resolve(strict=True) != root or root.is_relative_to(REPOSITORY):
@@ -285,7 +298,8 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
         source_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         if (os.fstat(source_fd).st_dev, os.fstat(source_fd).st_ino) != source_root[:2]:
             raise PrivateLogScanError()
-        original = inventory()
+        original, invalid_original = inventory()
+        incomplete = bool(invalid_original)
         # Neutral fixed POSIX path avoids default filename/path allowlists.
         base = Path("/tmp")
         info = base.lstat()
@@ -301,16 +315,34 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
         create("gitleaks.toml", b"[extend]\nuseDefault = true\n")
         create("empty.ignore", b"")
         for index, (path, details) in enumerate(sorted(original.items())):
+            check_time()
             name = str(index).zfill(8) + ".log"
             descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                  0o600, dir_fd=data_fd)
             try:
-                hashes[name] = copy_or_hash(path, details, descriptor)
+                initial = file_info(os.fstat(descriptor))
+                try:
+                    digest = copy_or_hash(path, details, descriptor)
+                except (OSError, PrivateLogScanError):
+                    incomplete = True
+                    # Never adopt partial bytes after a replaced/refused source.
+                    # Unlink only this exact exclusively created private leaf.
+                    current = file_info(os.fstat(descriptor))
+                    if (current[:6] != initial[:6]
+                            or identity(os.stat(name, dir_fd=data_fd, follow_symlinks=False)) != current):
+                        can_cleanup = False
+                        raise PrivateLogScanError()
+                    os.unlink(name, dir_fd=data_fd)
+                else:
+                    hashes[name] = digest
+                    copies[name] = file_info(os.fstat(descriptor))
+                    copied_paths[name] = (path, details)
             finally:
-                copies[name] = identity(os.fstat(descriptor))
                 os.close(descriptor)
-        if snapshot_inventory() != copies or inventory() != original:
+        if snapshot_inventory() != copies:
             raise PrivateLogScanError()
+        if inventory() != (original, invalid_original):
+            incomplete = True
         for name, details in copies.items():
             if copy_or_hash(snapshot / "data" / name, details) != hashes[name]:
                 raise PrivateLogScanError()
@@ -319,7 +351,8 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
             result, output, errors = _run_log_scanner(
                 [str(scanner), "dir", str(snapshot / "data"), "--config", str(snapshot / "gitleaks.toml"),
                  "--gitleaks-ignore-path", str(snapshot / "empty.ignore"), "--ignore-gitleaks-allow",
-                 "--max-target-megabytes", "0", "--log-level", "warn", "--redact=100", "--no-banner",
+                 "--max-target-megabytes", "0", "--max-decode-depth", "5", "--max-archive-depth", "0",
+                 "--log-level", "info", "--no-color", "--redact=100", "--no-banner",
                  "--report-format", "json", "--report-path", str(snapshot / "report.json")],
                 cwd=snapshot, deadline=end)
         except PrivateLogScanError as error:
@@ -336,7 +369,21 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o022:
                 raise PrivateLogScanError()
             created["report.json"] = identity(info)
-            if result != 0 or output or errors or not 0 < info.st_size <= 4096:
+            # Pinned Gitleaks counts raw fragments once, before decoding/rules.
+            # Its directory source can otherwise silently skip a failed file open.
+            # Accept only the two fixed no-color INFO footer lines and the exact
+            # captured byte total; a clean report alone is not coverage evidence.
+            messages = errors.decode("utf-8").splitlines()
+            stamp = r"(?:[1-9]|1[0-2]):[0-5][0-9](?:AM|PM) INF "
+            summary = re.fullmatch(
+                stamp + r"scanned ~([0-9]{1,20}) bytes "
+                r"\((?:0|[0-9]+(?:\.[0-9]{2})? (?:bytes|KB|MB|GB))\) in "
+                r"(?:[0-9]+(?:\.[0-9]+)?(?:ns|µs|ms|s|m|h)){1,4}",
+                messages[0] if len(messages) == 2 else "")
+            if (summary is None or summary[1] != str(sum(details[6] for details in copies.values()))
+                    or re.fullmatch(stamp + "no leaks found", messages[1]) is None):
+                raise PrivateLogScanError()
+            if result != 0 or output or not 0 < info.st_size <= 4096:
                 raise PrivateLogScanError()
             raw = os.read(report_fd, 4097)
             if (len(raw) != info.st_size or identity(os.fstat(report_fd)) != created["report.json"]
@@ -344,16 +391,23 @@ def scan_owned_logs(root: Path, scanner: Path, *, deadline=None) -> None:
                 raise PrivateLogScanError()
         finally:
             os.close(report_fd)
-        if snapshot_inventory() != copies or inventory() != original:
+        if snapshot_inventory() != copies:
             raise PrivateLogScanError()
-        for index, (path, details) in enumerate(sorted(original.items())):
-            name = str(index).zfill(8) + ".log"
-            if (copy_or_hash(path, details) != hashes[name]
-                    or copy_or_hash(snapshot / "data" / name, copies[name]) != hashes[name]):
+        if inventory() != (original, invalid_original):
+            incomplete = True
+        for name, (path, details) in copied_paths.items():
+            try:
+                if copy_or_hash(path, details) != hashes[name]:
+                    incomplete = True
+            except (OSError, PrivateLogScanError):
+                incomplete = True
+            if copy_or_hash(snapshot / "data" / name, copies[name]) != hashes[name]:
                 raise PrivateLogScanError()
         if set(os.listdir(root_fd)) != set(created) | {"data"}:
             raise PrivateLogScanError()
         check_time()
+        if incomplete:
+            raise PrivateLogScanError()
     except BaseException as error:
         primary = error
     finally:
