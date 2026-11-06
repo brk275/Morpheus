@@ -80,6 +80,13 @@ pub use wire::wire_event_type;
 #[cfg(feature = "testing")]
 pub mod testing {
     pub use crate::host::backend::{MockBackend, MockRoomSubscription, MockToDeviceSubscription};
+
+    /// Public deterministic media-key fixture: bytes 0 through 15, padded base64.
+    pub fn sequential_test_media_key() -> String {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        STANDARD.encode([0_u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+    }
 }
 
 #[cfg(test)]
