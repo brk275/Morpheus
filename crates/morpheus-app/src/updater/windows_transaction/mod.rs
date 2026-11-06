@@ -384,9 +384,15 @@ impl WindowsSession {
         Ok((manifest, marker, entry, registration))
     }
     pub fn acknowledge_before_store(&mut self) -> Result<(), UpdateError> {
-        let Some(id) = self.trial.take() else {
+        if self.trial.is_none() {
             return Ok(());
-        };
+        }
+        let outcome = self.commit_before_store();
+        complete_store_acknowledgement(&mut self.trial, outcome)
+    }
+
+    fn commit_before_store(&self) -> Result<(), UpdateError> {
+        let id = self.trial.as_deref().ok_or(UpdateError::RecoveryRequired)?;
         let mut journal = self.journal()?.ok_or(UpdateError::RecoveryRequired)?;
         if journal.id != id
             || journal.phase != Phase::AwaitingHealth
@@ -412,6 +418,17 @@ impl WindowsSession {
         )?;
         Ok(())
     }
+}
+
+fn complete_store_acknowledgement(
+    trial: &mut Option<String>,
+    outcome: Result<(), UpdateError>,
+) -> Result<(), UpdateError> {
+    // Clear authority only after every original validation and durable write.
+    // An ambiguous visible commit or failed health write remains closed.
+    outcome?;
+    *trial = None;
+    Ok(())
 }
 
 fn valid_transition(old: Phase, next: Phase) -> bool {

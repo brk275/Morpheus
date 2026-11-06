@@ -25,7 +25,9 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # The per-subscription tasks and their wake/retry timers; the SDK brings the
 # runtime.
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "=0.10.9"
 
 # Upstream matrix-rust-sdk (rev in the workspace manifest). Keeps its default
 # features (e2e-encryption, sqlite, rustls-aws-lc-rs,
@@ -58,8 +60,9 @@ matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6a
 matrix-sdk-base = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", features = ["e2e-encryption"] }
 
 [dev-dependencies]
+rustls = { version = "=0.23.46", features = ["aws_lc_rs"] }
 matrix-rtc-core = { git = "https://github.com/element-hq/matrix-rust-rtc", tag = "v0.5.0-rc.2", features = ["testing"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync", "net", "io-util"] }
 
 # Standalone adapter tests do not select morpheus-matrix, which normally
 # enables this exact Windows-only bundled SQLite policy for the application.

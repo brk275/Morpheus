@@ -120,6 +120,7 @@ fn call_error(value: CallControllerError) {
         CallControllerError::AlreadyBusy => "busy",
         CallControllerError::Cancelled => "cancelled",
         CallControllerError::AccountChanged => "account_changed",
+        CallControllerError::CallProfileChanged => "call_profile_changed",
         CallControllerError::StaleCall => "stale",
         CallControllerError::IncomingOfferUnavailable => "incoming_offer_unavailable",
         CallControllerError::RoomNotLoaded => "room_not_loaded",
@@ -226,18 +227,10 @@ impl ActorAcceptance {
         let preferences = fixture_preferences(morpheus_config::ConfigStore::at(
             case.profile.path().join("incoming-config.toml"),
         ))?;
-        // Set this before actor registration. Answer must use the admitted
-        // dialect, not an account/room's different saved outgoing preference.
+        // Match the explicit local profile before actor registration. The
+        // offer must retain this choice and epoch through Answer.
         preferences
-            .set_room_call_mode(
-                &account.id,
-                case.room_id.as_str(),
-                match case.mode {
-                    InteropMode::Current => RoomCallMode::ElementCallMatrix2,
-                    InteropMode::Sticky2025 => RoomCallMode::Standard,
-                    InteropMode::RoomState => return Err(()),
-                },
-            )
+            .set_room_call_mode(&account.id, case.room_id.as_str(), case.room_mode)
             .map_err(|_| error("unavailable"))?;
         let worker = IncomingWorker::start(
             &tokio::runtime::Handle::current(),
@@ -466,11 +459,12 @@ impl ActorAcceptance {
                 && self
                     .preferences
                     .room_call_mode(&self.account.id, case.room_id.as_str())
-                    != match case.mode {
-                        InteropMode::Current => RoomCallMode::Standard,
-                        InteropMode::Sticky2025 => RoomCallMode::ElementCallMatrix2,
-                        InteropMode::RoomState => return Err(()),
-                    },
+                    == case.room_mode
+                && target.profile()
+                    == self
+                        .preferences
+                        .room_call_profile(&self.account.id, case.room_id.as_str())
+                        .ok_or(())?,
         )?;
         actor_fact("admitted_target_preserved");
         self.phase(ActorStage::TransitionLock);
@@ -571,12 +565,81 @@ impl ActorAcceptance {
         )?;
         quiet.check(&self.account.user_id)?;
         actor_fact("accepted_leave_observed");
-        if case.mode == InteropMode::Current && case.dm {
+        self.profile_aba(case, caller, alice, rtc, info, bob_room)
+            .await?;
+        if case.room_mode == RoomCallMode::Standard && case.dm {
             self.account_aba(case, caller, alice, rtc, info, bob_room, observer)
                 .await?;
         }
         Ok(())
     }
+    async fn profile_aba(
+        &mut self,
+        case: &Case,
+        caller: &AccountInfo,
+        alice: &AccountManager,
+        rtc: &RtcService,
+        info: &CallInfo,
+        bob_room: &Room,
+    ) -> Result<(), ()> {
+        let row = self
+            .fresh_offer(case, caller, alice, rtc, info, bob_room)
+            .await?;
+        let accepted = self
+            .worker
+            .handle()
+            .answer(row.token.ui_key())
+            .await
+            .map_err(controller_error)?;
+        let original = accepted.target().map_err(controller_error)?.profile();
+        let slot = server_slot(rtc.client(), &case.room_id, case.mode).await?;
+        let alternate = match case.room_mode {
+            RoomCallMode::Standard => RoomCallMode::ElementCallMatrix2,
+            RoomCallMode::ElementCallMatrix2 => RoomCallMode::Standard,
+            RoomCallMode::ElementCallLegacy => return Err(()),
+        };
+        self.preferences
+            .set_room_call_mode(&self.account.id, case.room_id.as_str(), alternate)
+            .map_err(|_| error("unavailable"))?;
+        check(matches!(accepted.target(), Err(ControllerFailure::Revoked)))?;
+        self.preferences
+            .set_room_call_mode(&self.account.id, case.room_id.as_str(), case.room_mode)
+            .map_err(|_| error("unavailable"))?;
+        check(matches!(accepted.target(), Err(ControllerFailure::Revoked)))?;
+        check(
+            self.preferences
+                .room_call_profile(&self.account.id, case.room_id.as_str())
+                != Some(original),
+        )?;
+        let transition = self.transition.lock().await;
+        check(matches!(
+            self.calls
+                .start_accepted_audio(
+                    accepted,
+                    self.devices.clone(),
+                    self.preferences.clone(),
+                    &transition,
+                )
+                .await,
+            Err(CallControllerError::IncomingOfferUnavailable)
+        ))?;
+        drop(transition);
+        check(self.calls.status() == CallStatus::Idle)?;
+        let video = self.calls.subscribe_local_video().borrow().clone();
+        check(video.camera.phase == CapturePhase::Off && video.screen.phase == CapturePhase::Off)?;
+        check(rtc.participants(&info.room_id).is_ok_and(|roster| {
+            roster.len() == 1
+                && roster[0].is_local
+                && roster[0].user_id == caller.user_id
+                && roster[0].device_id.as_deref() == Some(caller.device_id.as_str())
+                && roster[0].member_id == info.membership_id
+        }))?;
+        check(server_slot(rtc.client(), &case.room_id, case.mode).await? == slot)?;
+        self.redact_observed(rtc, bob_room).await?;
+        actor_fact("profile_change_revokes_pending");
+        Ok(())
+    }
+
     fn assert_receive_only(
         &self,
         rtc: &RtcService,

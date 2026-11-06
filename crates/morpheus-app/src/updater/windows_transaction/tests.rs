@@ -468,26 +468,47 @@ fn windows_committed_recovery_requires_the_journal_flush_before_accepting_stores
     .unwrap();
     let journal_path = state.path.join("journal.json");
     native::write_new(&journal_path, &serde_json::to_vec(&journal).unwrap()).unwrap();
-    confirm_commit_data(
+    let mut trial = Some(journal.id.clone());
+    let health = state.path.join("health");
+    let committed = confirm_commit_data(
         &root.path,
         &journal_path,
         &journal,
         &journal.new_registration,
     )
-    .unwrap();
+    .and_then(|()| native::write_new(&health, journal.new_marker.as_bytes()));
+    complete_store_acknowledgement(&mut trial, committed).unwrap();
+    assert!(trial.is_none());
+    complete_store_acknowledgement(&mut trial, Ok(())).unwrap();
+    assert!(trial.is_none());
+    assert_eq!(
+        native::read(&health, MARKER_LIMIT as u64).unwrap(),
+        journal.new_marker.as_bytes()
+    );
+    // An already published health file makes the original create-new write
+    // refuse. Even after a durable journal commit, that error retains authority.
+    trial = Some(journal.id.clone());
+    for _ in 0..2 {
+        let refused = native::write_new(&health, journal.new_marker.as_bytes());
+        assert!(refused.is_err());
+        assert!(complete_store_acknowledgement(&mut trial, refused).is_err());
+        assert_eq!(trial.as_deref(), Some(journal.id.as_str()));
+    }
     fs::remove_file(&journal_path).unwrap();
     // Correct payload/registry alone cannot authorize stores when the checked
     // journal flush cannot run. A visible commit is still final and never turns
     // into rollback intent merely because durability needs a retry.
-    assert!(
-        confirm_commit_data(
+    for _ in 0..2 {
+        let refused = confirm_commit_data(
             &root.path,
             &journal_path,
             &journal,
-            &journal.new_registration
-        )
-        .is_err()
-    );
+            &journal.new_registration,
+        );
+        assert!(refused.is_err());
+        assert!(complete_store_acknowledgement(&mut trial, refused).is_err());
+        assert_eq!(trial.as_deref(), Some(journal.id.as_str()));
+    }
     assert_eq!(journal.phase, Phase::Committed);
     assert!(!valid_transition(journal.phase, Phase::RollbackIntent));
     check_tree(

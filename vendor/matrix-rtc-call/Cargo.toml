@@ -1,0 +1,37 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[package]
+name = "matrix-rtc-call"
+version = "0.5.0-rc.2"
+edition = "2024"
+license = "AGPL-3.0-only OR LicenseRef-Element-Commercial"
+publish = false
+description = "The call application over matrix-rtc-core: Element Call reactions, the raised hand, and MSC4075 notifications."
+
+[dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+# Sync primitives only: tasks and timers go through `matrix_rtc_core::executor`,
+# never `tokio::time`, which panics on wasm32-unknown-unknown.
+tokio = { version = "1", features = ["rt", "sync"] }
+log = "0.4"
+# `DialectBackend` wraps the host's `MatrixBackend`, an async trait.
+async-trait = "0.1"
+# Element Call keeps only the first grapheme of a reaction's emoji; a grapheme
+# is not a `char` (one visible emoji can be several code points joined), so
+# this pure-Rust, wasm-safe segmenter does the split.
+unicode-segmentation = "1"
+
+# `std::time::SystemTime::now()` PANICS on wasm32-unknown-unknown (std has no
+# clock there); web-time is the drop-in that reads `Date.now()` instead.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+web-time = "1"
+
+[dev-dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }

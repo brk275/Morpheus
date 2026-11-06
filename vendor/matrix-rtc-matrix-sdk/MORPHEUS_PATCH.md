@@ -77,3 +77,28 @@ locked crate's SQLite C source instead of assuming a system `sqlite3.lib` is
 installed. Normal adapter dependencies, default SDK crypto features and
 non-Windows target features are unchanged; no package version or checksum is
 changed. The lockfile adds only the adapter's edge to the already locked crate.
+
+## Bounded account-homeserver RTC authorization
+
+The backend's CS API token method validates its configured account homeserver,
+expected account and device before reading the account token. A peer SFU URL and
+its Matrix server name remain JSON request data. A boundary-owned client preserves
+the legitimate homeserver base path, follows no redirects, and limits the complete
+exchange to 30 seconds with each response streamed under 64 KiB. Response bodies,
+JWTs and reflected errors never become diagnostics.
+
+Only a well-formed M_UNKNOWN_TOKEN response can invoke the existing SDK's common
+refresh API once. The SDK retains auth-mode dispatch, serialization, refresh-token
+ownership and existing persistence/session callbacks. Soft logout fails closed;
+a retry requires a different access-token snapshot and the same account and
+authority. Backend clones remember only a SHA256 digest of a rejected snapshot
+in ephemeral private memory and refuse to replay it until the SDK supplies another token. No token
+persistence or raw refresh implementation is introduced. SDK-owned OAuth refresh
+completion can continue after caller cancellation; this preserves the SDK's own
+rotation rules and does not claim that cancellation aborts that work.
+
+The new dependency edges select the existing locked reqwest 0.12.28, sha2 0.10.9
+and test-only rustls 0.23.46 identities; no registry version, checksum or build hook changes.
+Synthetic existing-module cases cover redirect destinations, response bounds,
+reflection, SDK-managed refresh and fresh retry, soft logout, account mismatch,
+clone replay refusal and dropped authorization. They have not been run locally.

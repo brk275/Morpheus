@@ -96,10 +96,16 @@ export component TextAction inherits ActionRect {
     in property <color> outline;
     in property <float> text-scale: 1;
     in property <bool> wrap-caption: false;
+    // Opt-in limit for controls inside a finite scroll viewport; zero preserves
+    // the existing unconstrained caption minimum at every other call site.
+    in property <length> max-control-width: 0px;
     label: text;
     // Stacked actions must accept the pane's width rather than exporting an
     // unbroken caption's intrinsic width into the surrounding layout.
-    min-width: root.wrap-caption ? 32px : max(32px, caption.preferred-width + 2 * StyleTokens.control-padding * root.text-scale);
+    min-width: root.wrap-caption ? 32px
+        : root.max-control-width > 0px
+            ? min(root.max-control-width, max(32px, caption.preferred-width + 2 * StyleTokens.control-padding * root.text-scale))
+            : max(32px, caption.preferred-width + 2 * StyleTokens.control-padding * root.text-scale);
     preferred-width: root.wrap-caption ? 32px : self.min-width;
     min-height: root.wrap-caption ? max(32px * root.text-scale, caption.preferred-height + 16px * root.text-scale) : 32px * root.text-scale;
     horizontal-stretch: root.wrap-caption ? 1 : 0;

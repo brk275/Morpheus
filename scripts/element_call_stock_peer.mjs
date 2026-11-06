@@ -245,65 +245,120 @@ async function main() {
       return decodedSamples >= 3;
     }, "Browser did not decode native video");
     check("browser_video");
+    // Pinned 0.28.2 keeps LiveKit objects inside its SDK. Observe the public
+    // wrapper, its exact remote member and the actual inbound decoded DOM track.
+    // No stock functions, capture APIs, membership or keys are replaced.
+    await page.evaluate(() => {
+      const propsFor = (element) => {
+        const keys = Object.keys(element).filter((key) => key.startsWith("__reactFiber$"));
+        if (keys.length !== 1) return [];
+        let fiber = Object.getOwnPropertyDescriptor(element, keys[0])?.value;
+        const props = [];
+        for (let depth = 0; fiber && depth < 32; depth++) {
+          const value = Object.getOwnPropertyDescriptor(fiber, "memoizedProps")?.value;
+          if (value && typeof value === "object") props.push(value);
+          fiber = Object.getOwnPropertyDescriptor(fiber, "return")?.value;
+        }
+        return props;
+      };
+      const transportId = (raw) => raw && JSON.stringify(raw, Object.keys(raw).sort());
+      const binding = async (owner, kind, source, expectedMembers, deadline) => {
+        const client = window.matrixclient;
+        const session = window.rtcSession;
+        const managed = client?.matrixRTC.roomSessions.get(owner.room_id);
+        const members = session?.memberships ?? [];
+        if (!managed || managed !== session || session.room?.roomId !== owner.room_id ||
+            members.length !== expectedMembers || managed.memberships.length !== expectedMembers ||
+            client.getDeviceId() === owner.device_id) return null;
+        const owners = members.filter((member) => member.userId === owner.user_id &&
+          member.deviceId === owner.device_id && member.memberId === owner.member_id &&
+          member.backendIdentities?.includes(owner.identity));
+        if (owners.length !== 1) return null;
+        const membership = owners[0];
+        const audios = [...document.querySelectorAll("audio")];
+        const elements = kind === "audio" ? audios : [...document.querySelectorAll("video")];
+        if (audios.length > 32 || elements.length > 32) throw new Error("Media element bound exceeded");
+        // MemberAudioRenderer owns this array, and MemberAudio receives the
+        // same tracks$ object. The SDK filters remote members on their transport.
+        const remoteMembers = new Set();
+        for (const audio of audios) for (const props of propsFor(audio)) {
+          if (!Array.isArray(props.members)) continue;
+          if (props.members.length !== expectedMembers - 1) continue;
+          for (const member of props.members) {
+            if (member?.local === false && member.userId === owner.user_id &&
+                member.deviceId === owner.device_id && member.memberId === owner.member_id &&
+                member.backendIdentities?.includes(owner.identity)) remoteMembers.add(member);
+          }
+        }
+        if (remoteMembers.size !== 1) return null;
+        const participant = [...remoteMembers][0];
+        const transport = participant.transport$?.value;
+        if (transport?.type !== "livekit" || transport.id !== transportId(transport.raw) ||
+            !membership.transports.some((raw) => transportId(raw) === transport.id)) return null;
+        const tracks = participant.tracks$?.value;
+        if (!Array.isArray(tracks) || tracks.length > 32) return null;
+        const matches = [];
+        for (const element of elements) {
+          const props = propsFor(element);
+          const wrappers = new Set(props.map((value) => kind === "audio" ? value.track : value.video).filter(Boolean));
+          for (const track of wrappers) {
+            if (Date.now() >= deadline) return null;
+            const stream = element.srcObject;
+            const mediaTracks = stream instanceof MediaStream ?
+              (kind === "audio" ? stream.getAudioTracks() : stream.getVideoTracks()) : [];
+            const media = mediaTracks[0];
+            if (tracks.filter((value) => value === track).length !== 1 ||
+                track.kind !== kind || track.source !== source || track.encrypted !== true ||
+                typeof track.id !== "string" || !track.id || track.id.length > 1_024 ||
+                (owner.track_sid && track.id !== owner.track_sid) ||
+                track.muted$?.value !== false || typeof track.stats$ !== "function" ||
+                mediaTracks.length !== 1 || media?.kind !== kind || media.readyState !== "live" || !media.enabled ||
+                (kind === "audio" && (element.paused || element.muted || element.volume === 0)) ||
+                (kind === "audio" && !props.some((value) => value.tracks$ === participant.tracks$))) continue;
+            let subscription;
+            let timer;
+            let settled = false;
+            const stats = await new Promise((resolve) => {
+              const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
+              timer = setTimeout(() => finish(null), Math.max(0, Math.min(1_000, deadline - Date.now())));
+              try {
+                subscription = track.stats$(200).subscribe({
+                  next: (value) => finish(value), error: () => finish(null), complete: () => finish(null),
+                });
+              } catch { finish(null); }
+            }).finally(() => { clearTimeout(timer); subscription?.unsubscribe(); });
+            // stats$ polls this exact wrapper's publication. A subscribed remote
+            // RTP receiver's trackIdentifier binds that publication to srcObject.
+            if (Date.now() >= deadline || !stats || stats.type !== "inbound-rtp" || stats.kind !== kind ||
+                stats.trackIdentifier !== media.id || !(stats.bytesReceived > 0) ||
+                !(stats.packetsReceived > 0) ||
+                (kind === "video" && !(stats.framesDecoded > 0))) continue;
+            // Async stats must not validate a DOM/member binding replaced while
+            // the receiver was being polled.
+            const currentMedia = kind === "audio" ? stream.getAudioTracks() : stream.getVideoTracks();
+            if (window.rtcSession !== session || client.matrixRTC.roomSessions.get(owner.room_id) !== managed ||
+                session.memberships.length !== expectedMembers || !session.memberships.includes(membership) ||
+                !membership.backendIdentities?.includes(owner.identity) ||
+                element.srcObject !== stream || currentMedia.length !== 1 || currentMedia[0] !== media ||
+                media.readyState !== "live" || !media.enabled || track.muted$?.value !== false ||
+                !participant.tracks$?.value?.includes(track) || participant.transport$?.value !== transport ||
+                !membership.transports.some((raw) => transportId(raw) === transport.id))
+              continue;
+            if (!matches.some((value) => value.element === element && value.track === track))
+              matches.push({ element, track, media, participant, publication: track.id, transport: transport.id });
+          }
+        }
+        return matches.length === 1 ? matches[0] : null;
+      };
+      window.__morpheusStockBinding = binding;
+    });
     mark("browser_receive_audio");
     async function observeAudio(owner, frequency, expectedMembers, original = false) {
       await page.evaluate(async ({ owner, frequency, expectedMembers, original }) => {
-        // Read-only inspection of the pinned RC's React AudioTrack binding.
-        // MatrixAudioRenderer -> AudioTrackWithAudioNodes -> AudioTrack supplies
-        // trackRef. Never patch the stock peer, its SDK, or capture APIs. An
-        // absent/changed binding fails closed instead of selecting any audio.
-        const binding = () => {
-          const client = window.matrixclient;
-          const session = window.rtcSession;
-          const managed = client?.matrixRTC.roomSessions.get(owner.room_id);
-          const members = session?.memberships ?? [];
-          if (!managed || managed !== session || session.room?.roomId !== owner.room_id ||
-              members.length !== expectedMembers || managed.memberships.length !== expectedMembers ||
-              client.getDeviceId() === owner.device_id ||
-              members.filter((member) => member.userId === owner.user_id &&
-                member.deviceId === owner.device_id && member.memberId === owner.member_id &&
-                member.rtcBackendIdentity === owner.identity).length !== 1) return null;
-          const audios = [...document.querySelectorAll("audio")];
-          if (audios.length > 32) throw new Error("Audio element bound exceeded");
-          const matches = [];
-          for (const element of audios) {
-            const keys = Object.keys(element).filter((key) => key.startsWith("__reactFiber$"));
-            if (keys.length !== 1) continue;
-            let fiber = Object.getOwnPropertyDescriptor(element, keys[0])?.value;
-            const refs = new Set();
-            for (let depth = 0; fiber && depth < 32; depth++) {
-              const props = Object.getOwnPropertyDescriptor(fiber, "memoizedProps")?.value;
-              const ref = props && Object.getOwnPropertyDescriptor(props, "trackRef")?.value;
-              if (ref) refs.add(ref);
-              fiber = Object.getOwnPropertyDescriptor(fiber, "return")?.value;
-            }
-            for (const ref of refs) {
-              const { participant, publication } = ref;
-              const track = publication?.track;
-              const media = track?.mediaStreamTrack;
-              const stream = element.srcObject;
-              if (participant?.isLocal !== false || participant.identity !== owner.identity ||
-                  ref.source !== "microphone" || publication?.source !== "microphone" ||
-                  publication.kind !== "audio" || publication.isLocal !== false ||
-                  publication.isSubscribed !== true || !publication.isEncrypted ||
-                  publication.isMuted || !publication.trackSid || track?.sid !== publication.trackSid ||
-                  (owner.track_sid && publication.trackSid !== owner.track_sid) ||
-                  track.kind !== "audio" || track.source !== "microphone" ||
-                  participant.audioTrackPublications?.get(publication.trackSid) !== publication ||
-                  participant.getTrackPublicationBySid(publication.trackSid) !== publication ||
-                  !track.attachedElements.includes(element) || !(stream instanceof MediaStream) ||
-                  stream.getAudioTracks().length !== 1 || stream.getAudioTracks()[0] !== media ||
-                  media?.kind !== "audio" || media.readyState !== "live" || !media.enabled ||
-                  element.paused || element.muted || element.volume === 0) continue;
-              if (!matches.some((match) => match.element === element && match.track === track))
-                matches.push({ element, track, media, participant, publication });
-            }
-          }
-          return matches.length === 1 ? matches[0] : null;
-        };
+        const binding = () => window.__morpheusStockBinding(owner, "audio", "microphone", expectedMembers, deadline);
         const deadline = Date.now() + 45_000;
         let selected;
-        while (!(selected = binding())) {
+        while (!(selected = await binding())) {
           if (Date.now() >= deadline) throw new Error("Native remote microphone binding missing");
           await new Promise((resolve) => setTimeout(resolve, 200));
         }
@@ -312,7 +367,7 @@ async function main() {
           if (!state || state.invalid || state.session !== window.rtcSession)
             throw new Error("Original microphone key owner changed");
           if (!state.audio) state.audio = selected;
-          if (["track", "media", "publication", "participant"].some((key) => state.audio[key] !== selected[key]))
+          if (["track", "media", "publication", "participant", "transport"].some((key) => state.audio[key] !== selected[key]))
             throw new Error("Original microphone binding changed");
         }
         const context = new AudioContext();
@@ -345,10 +400,10 @@ async function main() {
           const binHz = context.sampleRate / analyser.fftSize;
           let consecutive = 0;
           while (Date.now() < deadline) {
-            const current = binding();
+            const current = await binding();
             if (!current || current.element !== selected.element || current.track !== selected.track ||
                 current.media !== selected.media || current.participant !== selected.participant ||
-                current.publication !== selected.publication || context.state !== "running")
+                current.publication !== selected.publication || current.transport !== selected.transport || context.state !== "running")
               throw new Error("Native remote microphone ownership changed");
             analyser.getFloatTimeDomainData(samples);
             analyser.getFloatFrequencyData(spectrum);
@@ -414,57 +469,16 @@ async function main() {
 
     async function observeScreen(changed, expectedMembers) {
       await page.evaluate(async ({ owner, changed, expectedMembers }) => {
-        const binding = () => {
-          const session = window.rtcSession;
-          const managed = window.matrixclient?.matrixRTC.roomSessions.get(owner.room_id);
-          if (!session || session !== managed || session.memberships.length !== expectedMembers ||
-              session.memberships.filter((member) => member.userId === owner.user_id &&
-                member.deviceId === owner.device_id && member.memberId === owner.member_id &&
-                member.rtcBackendIdentity === owner.identity).length !== 1) return null;
-          const videos = [...document.querySelectorAll('video[data-lk-source="screen_share"]')];
-          if (videos.length > 32) throw new Error("Screen element bound exceeded");
-          const matches = [];
-          for (const element of videos) {
-            const keys = Object.keys(element).filter((key) => key.startsWith("__reactFiber$"));
-            if (keys.length !== 1) continue;
-            let fiber = Object.getOwnPropertyDescriptor(element, keys[0])?.value;
-            const refs = new Set();
-            for (let depth = 0; fiber && depth < 32; depth++) {
-              const props = Object.getOwnPropertyDescriptor(fiber, "memoizedProps")?.value;
-              const ref = props && Object.getOwnPropertyDescriptor(props, "trackRef")?.value;
-              if (ref) refs.add(ref);
-              fiber = Object.getOwnPropertyDescriptor(fiber, "return")?.value;
-            }
-            for (const ref of refs) {
-              const { participant, publication } = ref;
-              const track = publication?.track;
-              const media = track?.mediaStreamTrack;
-              const stream = element.srcObject;
-              if (participant?.isLocal !== false || participant.identity !== owner.identity ||
-                  ref.source !== "screen_share" || publication?.source !== "screen_share" ||
-                  publication.kind !== "video" || publication.isLocal !== false || !publication.isEncrypted ||
-                  publication.isSubscribed !== true || publication.isMuted || publication.trackSid !== owner.track_sid ||
-                  track?.sid !== owner.track_sid || track.kind !== "video" || track.source !== "screen_share" ||
-                  participant.videoTrackPublications?.get(owner.track_sid) !== publication ||
-                  participant.getTrackPublicationBySid(owner.track_sid) !== publication ||
-                  !track.attachedElements.includes(element) || !(stream instanceof MediaStream) ||
-                  stream.getVideoTracks().length !== 1 || stream.getVideoTracks()[0] !== media ||
-                  media?.kind !== "video" || media.readyState !== "live" || !media.enabled) continue;
-              if (!matches.some((value) => value.element === element && value.track === track))
-                matches.push({ element, track, media, publication, participant });
-            }
-          }
-          return matches.length === 1 ? matches[0] : null;
-        };
+        const binding = () => window.__morpheusStockBinding(owner, "video", "screenShare", expectedMembers, deadline);
         const state = window.__morpheusInteropKeys;
         if (!state || state.invalid || state.session !== window.rtcSession) throw new Error("Screen key owner changed");
         const deadline = Date.now() + 45_000;
         let consecutive = 0;
         while (Date.now() < deadline) {
-          const current = binding();
+          const current = await binding();
           if (current) {
             if (!state.screen) state.screen = current;
-            if (["track", "media", "publication", "participant"].some((key) => state.screen[key] !== current[key]))
+            if (["track", "media", "publication", "participant", "transport"].some((key) => state.screen[key] !== current[key]))
               throw new Error("Original screen binding changed");
             const video = current.element;
             if (video.readyState >= 2 && video.videoWidth >= 160 && video.videoHeight >= 90) {
@@ -527,6 +541,7 @@ async function main() {
   } finally {
     try {
       if (page && !page.isClosed()) await page.evaluate(() => {
+        delete window.__morpheusStockBinding;
         const state = window.__morpheusInteropKeys;
         if (state) {
           state.session.off("encryption_key_changed", state.listener);

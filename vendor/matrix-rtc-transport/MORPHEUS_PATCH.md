@@ -105,3 +105,53 @@ pre-track observations, and track/connection retirement. The call SDK's existing
 engine test module also checks that a same-ID restoration can resume an eligible
 hidden key probe without a repeated failure event, preserving explicit release
 and low-bandwidth constraints. These source tests still require hosted execution.
+
+## Authentication dialect and irreversible call retirement
+
+`LiveKitAuthDialect` pairs the legacy `/sfu/get` service with its user/device
+identity contract, or the explicit direct-draft `/get_token` route with its
+user/device/member identity contract. Legacy service admission accepts only
+the standard upper-case room slot; direct draft retains custom-slot support.
+The standard native call path now resolves its contract from the typed
+advertised transport before joining, independently of the membership profile.
+A standard service publisher uses the legacy identity; a service subscriber
+uses the direct token endpoint with its separate subscriber identity. An SFU
+`url` locator uses the account's own homeserver CS API and the current two-part
+user/member identity. An optional standard `server_name` is retained as request
+data and a connection grouping key, never an account-token HTTP destination.
+The older direct-draft publisher remains an explicit separately scoped
+compatibility operation and does not claim current stock-peer compatibility.
+No endpoint failure selects a different contract or identity.
+
+Member-attributed imports carry the authoritative participation lease through
+ring application, delayed activation and sender registration. Retired leases
+cannot activate queued keys or reopen pending member notifications. The pool's
+call-retirement path closes its inbox, releases membership/track/key state,
+returns adopted and queued successful connections for closure, and closes
+late successful connections instead of admitting them. This does not promise
+that an arbitrary already-entered external backend operation can be cancelled
+or that every native resource has synchronously stopped.
+
+Existing constraint ordering and receiver-generation rules remain. Focused
+source cases cover contract selection, held-import handover, delayed-key and
+pending-notification retirement, and late connection ownership. Hosted native
+and integration acceptance remain separate requirements; no stock-peer,
+package or release result is claimed. Retained upstream preimages and license
+declarations remain unchanged.
+
+## Transport-bound publisher ownership
+
+Remote tracks, mute state, speakers and encryption reports are attributed only
+on the member's selected advertised transport. Buffered receivers obey the same
+rule; a publication change retires old receivers immediately and removes old
+identity mappings. Participation leases also bind the publication endpoints and
+issuer metadata. Historical direct scope refuses modern CS API publications;
+standard scope derives each peer's publisher identity from its own descriptor.
+An ambiguous multi-contract publication fails closed instead of accepting aliases.
+
+Bounded JWT consistency checks preserve authorized opaque room names and
+LiveKit permission defaults. The SFU handshake remains responsible for signature
+verification; the actual participant and room must then match the exact checked
+claims. Subscriber handles cannot publish local tracks or activate sender keys,
+even when the service grants them permission to publish. No token payload is
+retained in diagnostics. These source regressions have not been executed locally.

@@ -1043,6 +1043,7 @@ fn apply_appearance(
     appearance::apply_config(ui, config);
     appearance::apply_theme(ui, config, theme);
     if project_editors {
+        appearance::project_font_inputs(ui, config);
         // After the theme, so the workspace reads the colors now shown.
         appearance_editor::project(ui, config, theme);
         metric_editor::project(ui, config);
@@ -2356,8 +2357,13 @@ fn run_application(
             let Some(selection) = call_live.manager.account_selection(&account_id) else {
                 return;
             };
-            let mode =
-                CallJoinMode::from(call_live.voice_spaces.room_call_mode(&account_id, &room_id));
+            let Some(profile) = call_live
+                .voice_spaces
+                .room_call_profile(&account_id, &room_id)
+            else {
+                return;
+            };
+            let mode = CallJoinMode::from(profile.mode());
             if mode == CallJoinMode::ElementCallRoomState {
                 return;
             }
@@ -2370,7 +2376,15 @@ fn run_application(
             let weak = weak.clone();
             handle.spawn(async move {
                 let _transition = call_live.account_transition.lock().await;
-                let result = calls.open_slot(selection.clone(), &room_id, mode).await;
+                let result = calls
+                    .open_slot(
+                        selection.clone(),
+                        &room_id,
+                        mode,
+                        profile,
+                        call_live.voice_spaces.clone(),
+                    )
+                    .await;
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     drop(ring_request);
                     ui.set_native_call_request_pending(false);
@@ -2711,8 +2725,13 @@ fn run_application(
             };
             // Read the account-scoped checked preferences, not a potentially
             // queued UI snapshot. The worker owns this immutable choice.
-            let mode =
-                CallJoinMode::from(call_live.voice_spaces.room_call_mode(&account_id, &room_id));
+            let Some(profile) = call_live
+                .voice_spaces
+                .room_call_profile(&account_id, &room_id)
+            else {
+                return;
+            };
+            let mode = CallJoinMode::from(profile.mode());
             if intent == CallStartIntent::Notify
                 && (mode == CallJoinMode::ElementCallRoomState
                     || window.get_active_voice_local()
@@ -2746,6 +2765,7 @@ fn run_application(
                         selection.clone(),
                         &room_id,
                         mode,
+                        profile,
                         audio_selection,
                         intent,
                         call_live.voice_spaces.clone(),
