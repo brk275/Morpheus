@@ -467,6 +467,14 @@ jobs:
         # candidate at the final gate instead of rebuilding just to reach it.
         continue-on-error: true
         run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
+      - name: Test call authentication and media ownership libraries
+        id: rtc-library-tests
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor')
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          SLINT_EMIT_DEBUG_INFO: "1"
+        run: cargo test --locked --no-fail-fast -p morpheus-rtc -p matrix-rtc-core -p matrix-rtc-call -p matrix-rtc-call-sdk -p matrix-rtc-transport -p matrix-rtc-matrix-sdk -p matrix-rtc-livekit --features morpheus-rtc/native-rtc,morpheus-rtc/native-devices --lib
       - name: Test native device and call guards
         id: device-tests
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'devices')
@@ -807,6 +815,7 @@ jobs:
           WINDOWS_CAPTURE_OUTCOME: ${{ steps.windows-capture-tests.outcome }}
           WAYLAND_OUTCOME: ${{ steps.wayland-tests.outcome }}
           VENDOR_OUTCOME: ${{ steps.vendor-tests.outcome }}
+          RTC_LIBRARY_OUTCOME: ${{ steps.rtc-library-tests.outcome }}
           VIDEO_SOURCE_OUTCOME: ${{ steps.video-source-tests.outcome }}
           SDK_OUTCOME: ${{ steps.sdk-receipt-tests.outcome }}
           MATRIX_OUTCOME: ${{ steps.matrix-tests.outcome }}
@@ -842,6 +851,7 @@ jobs:
                   "windows-capture-tests": runner == "Windows" and route in ("all", "devices"),
                   "wayland-tests": runner == "Linux" and wayland == "true",
                   "vendor-tests": route in ("all", "vendor"),
+                  "rtc-library-tests": route in ("all", "vendor"),
                   "video-source-tests": route in ("all", "vendor", "desktop-video"),
                   "sdk-receipt-tests": route in ("all", "sdk"),
                   "matrix-tests": runner == "Linux" and route in ("all", "matrix"),
@@ -862,6 +872,7 @@ jobs:
               ("model-tests", "MODEL_OUTCOME"), ("desktop-tests", "DESKTOP_OUTCOME"),
               ("device-tests", "DEVICE_OUTCOME"), ("windows-capture-tests", "WINDOWS_CAPTURE_OUTCOME"),
               ("wayland-tests", "WAYLAND_OUTCOME"), ("vendor-tests", "VENDOR_OUTCOME"),
+              ("rtc-library-tests", "RTC_LIBRARY_OUTCOME"),
               ("video-source-tests", "VIDEO_SOURCE_OUTCOME"),
               ("sdk-receipt-tests", "SDK_OUTCOME"), ("matrix-tests", "MATRIX_OUTCOME"),
               ("preview-capture", "PREVIEW_OUTCOME"), ("preview-upload", "PREVIEW_UPLOAD_OUTCOME"))}
