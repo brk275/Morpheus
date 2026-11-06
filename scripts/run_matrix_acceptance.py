@@ -1587,8 +1587,9 @@ class Acceptance:
         return record
 
     def script(self, name: str, command: str) -> str:
+        cleanup = command in ("down", "destroy")
         return self.run(f"{name}-{command}", [sys.executable, f"scripts/{name}.py", command],
-                        seconds=120 if command == "down" else 300, cleanup=command == "down")
+                        seconds=120 if cleanup else 300, cleanup=cleanup)
 
     def test(self, name: str, fixture: Path, *, extra=None, rtc=False):
         env = {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)} | (extra or {})
@@ -1846,8 +1847,8 @@ class Acceptance:
         """Prove cleanup using checked inventories, not unchecked inspect failures.
 
         Raw Docker output uses the same private logs and credential scanning
-        as the acceptance commands. Retained volumes and private fixture data
-        are intentional; this checks only the owned containers and network.
+        as the acceptance commands. Check the same owned containers, volumes,
+        and network whose absence admitted this run; private logs stay local.
         """
         query_failed = False
         resource_remains = False
@@ -1855,6 +1856,9 @@ class Acceptance:
             ("verify-fixture-container-cleanup",
              ["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
              FIXTURE_CONTAINERS),
+            ("verify-fixture-volume-cleanup",
+             ["docker", "volume", "ls", "--format", "{{.Name}}"],
+             FIXTURE_VOLUMES),
             ("verify-fixture-network-cleanup",
              ["docker", "network", "ls", "--format", "{{.Name}}"],
              (FIXTURE_NETWORK,)),
@@ -2142,9 +2146,12 @@ def main():
         # Summary errors and interrupts must not prevent either cleanup. Keep
         # any original body exception; otherwise cleanup failure is fatal.
         cleanup_failures = []
-        for name in ("local_matrix_rtc", "local_matrix_env"):
+        # Startup admitted these fixed names only after checking that no
+        # container, volume or network existed. Destroy this run's disposable
+        # Synapse data so a following suite cannot inherit accounts or keys.
+        for name, command in (("local_matrix_rtc", "down"), ("local_matrix_env", "destroy")):
             try:
-                acceptance.script(name, "down")
+                acceptance.script(name, command)
             except BaseException:
                 cleanup_failures.append(name)
         try:

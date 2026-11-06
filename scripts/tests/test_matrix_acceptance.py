@@ -675,7 +675,7 @@ class FinalizationTests(unittest.TestCase):
         runner.verify_fixture_absence.side_effect = absence_error
 
         def script(name, command):
-            if command == "down" and name in cleanup_errors:
+            if command in ("down", "destroy") and name in cleanup_errors:
                 raise cleanup_errors[name]
             return "private-fixture"
 
@@ -694,11 +694,25 @@ class FinalizationTests(unittest.TestCase):
 
     def assert_both_cleanups(self, runner):
         self.assertEqual(
-            [item.args for item in runner.script.call_args_list if item.args[1] == "down"],
-            [("local_matrix_rtc", "down"), ("local_matrix_env", "down")],
+            [item.args for item in runner.script.call_args_list if item.args[1] in ("down", "destroy")],
+            [("local_matrix_rtc", "down"), ("local_matrix_env", "destroy")],
         )
         runner.verify_fixture_absence.assert_called_once_with()
         self.assertEqual(runner.mock_calls[-1][0], "verify_fixture_absence")
+
+    def test_destroy_uses_the_same_reserved_cleanup_budget_as_down(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with patch.object(runner, "run") as run:
+                for name, command in (("local_matrix_rtc", "down"), ("local_matrix_env", "destroy")):
+                    runner.script(name, command)
+                    run.assert_called_with(f"{name}-{command}",
+                                           [sys.executable, f"scripts/{name}.py", command],
+                                           seconds=120, cleanup=True)
+                runner.script("local_matrix_env", "up")
+                run.assert_called_with("local_matrix_env-up",
+                                       [sys.executable, "scripts/local_matrix_env.py", "up"],
+                                       seconds=300, cleanup=False)
 
     def test_successful_body_and_cleanup_return_success(self):
         with self.mocked_main() as (runner, visible):
@@ -745,7 +759,7 @@ class FinalizationTests(unittest.TestCase):
                 self.assertEqual([call.args for call in runner.script.call_args_list], [
                     ("local_matrix_env", "up"), ("local_matrix_rtc", "up"),
                     ("local_matrix_rtc", "probe"), ("local_matrix_rtc", "down"),
-                    ("local_matrix_env", "down"),
+                    ("local_matrix_env", "destroy"),
                 ])
                 runner.start_keyring.assert_called_once_with()
                 runner.require_containment.assert_called_once_with()
@@ -784,7 +798,7 @@ class FinalizationTests(unittest.TestCase):
                 self.assertEqual([call.args for call in runner.script.call_args_list], [
                     ("local_matrix_env", "up"), ("local_matrix_rtc", "up"),
                     ("local_matrix_rtc", "probe"), ("local_matrix_rtc", "down"),
-                    ("local_matrix_env", "down"),
+                    ("local_matrix_env", "destroy"),
                 ])
                 runner.start_keyring.assert_called_once_with()
                 runner.require_containment.assert_called_once_with()
@@ -818,7 +832,7 @@ class FinalizationTests(unittest.TestCase):
                 runner.require_containment.assert_called_once_with()
                 self.assertEqual(acceptance_module.SUITES["oauth-only"], acceptance_module.OAUTH_LABELS)
                 self.assertEqual([call.args for call in runner.script.call_args_list],
-                                 [("local_matrix_rtc", "down"), ("local_matrix_env", "down")])
+                                 [("local_matrix_rtc", "down"), ("local_matrix_env", "destroy")])
                 runner.test.assert_not_called()
                 runner.app_timeline.assert_not_called()
                 runner.app_recovery.assert_not_called()
@@ -1111,31 +1125,34 @@ class FixtureAbsenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             runner = Acceptance(Path(folder), "unused-scanner")
             visible = io.StringIO()
-            with (patch.object(runner, "run", side_effect=["private-unrelated-container\n", "private-unrelated-network\n"]) as run,
+            with (patch.object(runner, "run", side_effect=["private-unrelated-container\n", "private-unrelated-volume\n", "private-unrelated-network\n"]) as run,
                   contextlib.redirect_stdout(visible), contextlib.redirect_stderr(visible)):
                 runner.verify_fixture_absence()
         self.assertEqual(visible.getvalue(), "")
         self.assertEqual([item.args[1] for item in run.call_args_list], [
             ["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
+            ["docker", "volume", "ls", "--format", "{{.Name}}"],
             ["docker", "network", "ls", "--format", "{{.Name}}"],
         ])
         self.assertTrue(all(item.kwargs == {"seconds": 30, "cleanup": True} for item in run.call_args_list))
 
-    def test_every_owned_container_or_network_remaining_rejects_cleanup(self):
-        cases = [(name + "\n", "") for name in acceptance_module.FIXTURE_CONTAINERS]
-        cases.append(("", acceptance_module.FIXTURE_NETWORK + "\n"))
+    def test_every_owned_container_volume_or_network_remaining_rejects_cleanup(self):
+        cases = [(name + "\n", "", "") for name in acceptance_module.FIXTURE_CONTAINERS]
+        cases.extend(("", name + "\n", "") for name in acceptance_module.FIXTURE_VOLUMES)
+        cases.append(("", "", acceptance_module.FIXTURE_NETWORK + "\n"))
         for outputs in cases:
             with self.subTest(outputs=outputs), tempfile.TemporaryDirectory() as folder:
                 runner = Acceptance(Path(folder), "unused-scanner")
                 with patch.object(runner, "run", side_effect=outputs) as run:
                     with self.assertRaisesRegex(RuntimeError, "resources remain"):
                         runner.verify_fixture_absence()
-                self.assertEqual(run.call_count, 2)
+                self.assertEqual(run.call_count, 3)
 
-    def test_failed_inventory_cannot_be_treated_as_empty_and_both_queries_are_attempted(self):
-        for outputs in ((RuntimeError("private daemon output"), ""),
-                        ("", OSError("private Docker socket")),
-                        (RuntimeError("private daemon output"), OSError("private Docker socket"))):
+    def test_failed_inventory_cannot_be_treated_as_empty_and_all_queries_are_attempted(self):
+        failure_types = (RuntimeError, OSError, RuntimeError)
+        for failed in range(1, 8):
+            outputs = tuple(failure_types[index]("private inventory failure") if failed & (1 << index) else ""
+                            for index in range(3))
             with self.subTest(failed_queries=sum(isinstance(item, BaseException) for item in outputs)), tempfile.TemporaryDirectory() as folder:
                 runner = Acceptance(Path(folder), "unused-scanner")
                 visible = io.StringIO()
@@ -1143,7 +1160,7 @@ class FixtureAbsenceTests(unittest.TestCase):
                       contextlib.redirect_stdout(visible), contextlib.redirect_stderr(visible),
                       self.assertRaisesRegex(RuntimeError, "absence could not be verified") as caught):
                     runner.verify_fixture_absence()
-                self.assertEqual(run.call_count, 2)
+                self.assertEqual(run.call_count, 3)
                 self.assertNotIn("private", visible.getvalue() + str(caught.exception))
 
 
@@ -1920,7 +1937,7 @@ class LiveEvidenceTests(unittest.TestCase):
                     self.assertTrue(indexes)
                     self.assertTrue(all(i < rtc_up for i in indexes))
                 self.assertEqual(calls[-4:], [call.summary(), call.script("local_matrix_rtc", "down"),
-                                             call.script("local_matrix_env", "down"), call.verify_fixture_absence()])
+                                             call.script("local_matrix_env", "destroy"), call.verify_fixture_absence()])
                 if failed:
                     runner.outgoing_ring_cases.assert_not_called()
                     runner.rtc_cases.assert_not_called()
