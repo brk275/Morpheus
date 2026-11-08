@@ -140,13 +140,16 @@ class FocusedSuiteTests(unittest.TestCase):
             self.assertNotIn("Full suite:", summary.read_text())
 
     def test_app_timeline_completion_and_summary_cannot_claim_other_checks(self):
-        self.assertEqual(acceptance_module.SUITES["app-timeline"], ("app-live-timeline",))
+        self.assertEqual(acceptance_module.SUITES["app-timeline"], ("app-live-timeline", "app-live-people"))
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             runner = Acceptance(root, "scanner", suite="app-timeline")
             with self.assertRaises(RuntimeError):
                 runner.finish_checks()
             runner.results = [{"check": "app-live-timeline", "passed": 1, "seconds": 1}]
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+            runner.results.append({"check": "app-live-people", "passed": 1, "seconds": 1})
             runner.finish_checks()
             full = Acceptance(root, "scanner")
             full.results = list(runner.results)
@@ -159,8 +162,8 @@ class FocusedSuiteTests(unittest.TestCase):
             self.assertEqual(report["suite"], "app-timeline")
             self.assertEqual(report["not_run"], {})
             text = summary.read_text()
-            self.assertIn("Only app-live-timeline ran", text)
-            self.assertIn("member publication and cleanup", text)
+            self.assertIn("Only app-live-timeline and app-live-people ran", text)
+            self.assertIn("member publication, busy creation and cleanup", text)
             self.assertIn("No draft recovery, moderation, OAuth or RTC checks", text)
             self.assertIn("not full acceptance", text)
             self.assertNotIn("Full suite:", text)
@@ -205,7 +208,7 @@ class FocusedSuiteTests(unittest.TestCase):
 
     def test_timeline_read_completion_requires_all_selected_checks_and_reports_partial_scope(self):
         expected = ("live_local", "formatted_local", "media_local", "moderation_local",
-                    "search_local", "search_local-classic", "recovery_local", "unsupported_transport_local", "app-live-timeline")
+                    "search_local", "search_local-classic", "recovery_local", "unsupported_transport_local", "app-live-timeline", "app-live-people")
         self.assertEqual(acceptance_module.TIMELINE_READ_CHECKS, expected)
         self.assertEqual(acceptance_module.SUITES["full"], acceptance_module.PLANNED_CHECKS)
         with tempfile.TemporaryDirectory() as folder:
@@ -575,14 +578,38 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             fixture = root / "fixture.json"
             with patch.object(runner, "run") as run:
                 runner.app_timeline(fixture)
-            args, options = run.call_args
+            self.assertEqual(run.call_count, 2)
+            args, options = run.call_args_list[0]
             self.assertEqual(args[0], acceptance_module.APP_TIMELINE_LABEL)
             self.assertEqual(args[1], ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
                                       "--bin", "morpheus-app", acceptance_module.APP_TIMELINE_CASE,
-                                      "--", "--exact", "--nocapture", "--test-threads=1"])
+                                      "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"])
             self.assertEqual(options, {"extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture),
                                                 "SLINT_EMIT_DEBUG_INFO": "1"},
                                        "seconds": 480, "test": True, "pid_namespace": True})
+            people_args, people_options = run.call_args_list[1]
+            self.assertEqual(people_args[0], acceptance_module.APP_PEOPLE_LABEL)
+            self.assertEqual(people_args[1], args[1][:9] + [acceptance_module.APP_PEOPLE_CASE,
+                             "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"])
+            self.assertEqual(people_options, options)
+
+    def test_people_completion_rejects_missing_duplicate_false_and_unknown_records(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "scanner", suite="app-timeline")
+            marker = "MORPHEUS_LIVE_PEOPLE_CHECK busy_creation=true"
+            summary = "test result: ok. 1 passed; 0 failed; 0 ignored;"
+            arguments = {"ring_case": None, "oauth_checks": None, "element_checks": None}
+            record = runner.validated_record(acceptance_module.APP_PEOPLE_LABEL,
+                                             marker + "\n" + summary, test=True, **arguments)
+            self.assertEqual(record["app_people_checks"], {"busy_creation": True})
+            for records in ("", marker + "\n" + marker, marker.replace("true", "false"),
+                            marker.replace("busy_creation", "unknown"), marker + " private"):
+                with self.subTest(records=records), self.assertRaises(RuntimeError):
+                    runner.validated_record(acceptance_module.APP_PEOPLE_LABEL,
+                                            records + "\n" + summary, test=True, **arguments)
+            with self.assertRaises(RuntimeError):
+                runner.validated_record(acceptance_module.APP_PEOPLE_LABEL,
+                                        marker + "\n" + summary, test=False, **arguments)
 
     def test_live_ui_case_remains_required_in_full_and_timeline_profiles(self):
         for suite in ("full", "timeline-reads"):

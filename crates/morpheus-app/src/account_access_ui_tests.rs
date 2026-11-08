@@ -3120,6 +3120,56 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_released");
 }
 
+// Run this exact ignored case in its own process: Slint's testing backend is
+// process-global. The default account UI case above keeps every transition;
+// a live timeline deadline must not also pay for that separate offline suite.
+#[test]
+#[ignore = "requires disposable Matrix accounts and an isolated fixture vault"]
+fn live_slint_timeline_controller() {
+    run_live_controller_ui(false);
+}
+
+#[test]
+#[ignore = "requires disposable Matrix accounts and an isolated fixture vault"]
+fn live_slint_people_controller() {
+    run_live_controller_ui(true);
+}
+
+fn run_live_controller_ui(people: bool) {
+    assert!(
+        std::env::var_os("MORPHEUS_MATRIX_TEST_ACCOUNTS").is_some(),
+        "live controller acceptance requires a disposable fixture"
+    );
+    i_slint_backend_testing::init_integration_test_with_mock_time();
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    let entered = runtime.enter();
+    let runtime_handle = runtime.handle().clone();
+    slint::spawn_local(async move {
+        if people {
+            eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_entered");
+            crate::people_directory::live_tests::run_if_configured(runtime_handle).await;
+            eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_returned");
+        } else {
+            crate::live::timeline_controller_tests::run_if_configured(runtime_handle).await;
+        }
+        slint::quit_event_loop().unwrap();
+        eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL quit_requested");
+    })
+    .unwrap();
+    slint::run_event_loop_until_quit().unwrap();
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL loop_returned");
+    drop(entered);
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_release");
+    drop(runtime);
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_released");
+}
+
 #[cfg(not(morpheus_timeline_acceptance))]
 fn exercise_startup_recovery() {
     use morpheus_matrix::MatrixCoreError;

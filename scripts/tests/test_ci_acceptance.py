@@ -407,8 +407,23 @@ class NativeRouteWorkflowTests(unittest.TestCase):
             "--features morpheus-rtc/native-rtc,morpheus-rtc/native-devices --lib"
         )
         self.assertIn("        run: " + command + "\n", step)
+        compile_start = "      - name: Compile focused call libraries before regression deadline\n"
+        self.assertEqual(source.count(compile_start), 1)
+        compile_step = source.split(compile_start, 1)[1].split(start, 1)[0]
+        self.assertIn("        if: needs.scope.outputs.check_route == 'vendor'\n", compile_step)
+        self.assertIn('          SLINT_EMIT_DEBUG_INFO: "1"\n', compile_step)
+        self.assertIn("        run: " + command + " --no-run\n", compile_step)
+        self.assertNotIn("continue-on-error:", compile_step)
+        self.assertNotIn("timeout-minutes:", compile_step)
+        self.assertLess(source.index(compile_start), source.index(start))
         self.assertIn("RTC_LIBRARY_OUTCOME: ${{ steps.rtc-library-tests.outcome }}", source)
         self.assertIn('("rtc-library-tests", "RTC_LIBRARY_OUTCOME")', source)
+
+    def test_native_compile_budget_covers_cold_mac_graphs_without_changing_windows(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        compile_job = source.split("  compile:\n", 1)[1].split("    strategy:\n", 1)[0]
+        self.assertIn("    timeout-minutes: ${{ (matrix.os == 'macos-15' || matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}\n", compile_job)
+        self.assertNotIn("windows-2025", compile_job)
 
     def test_native_video_step_selects_exact_synthetic_cases_and_is_required(self):
         source = WORKFLOW.read_text(encoding="utf-8")

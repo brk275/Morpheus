@@ -1,8 +1,9 @@
 //! Opt-in live coverage for the desktop room and thread timeline controllers.
 //!
 //! Slint's event-loop proxy is process-wide, so this scenario never creates a
-//! backend of its own: the single real-window harness in the account access UI
-//! tests calls `run_if_configured` on its event loop after its own scenario.
+//! backend of its own: an exact ignored harness in the account access UI tests
+//! calls `run_if_configured` on its own event loop. The separate default account
+//! UI case retains all offline account scenarios.
 //! Without MORPHEUS_MATRIX_TEST_ACCOUNTS (a disposable local fixture from
 //! `scripts/local_matrix_env.py`) it returns at once, so ordinary CI runs are
 //! unchanged. With a fixture it needs real local homeservers. The existing
@@ -12,8 +13,8 @@
 //! ```text
 //! MORPHEUS_MATRIX_TEST_ACCOUNTS=<fixture.json> cargo test --locked -p morpheus-app \
 //!   --features native-calls --bin morpheus-app \
-//!   account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation \
-//!   -- --nocapture --test-threads=1
+//!   account_access::ui_tests::live_slint_timeline_controller \
+//!   -- --ignored --exact --nocapture --test-threads=1
 //! ```
 //!
 //! Real SDK room and thread feeds publish into a real generated `AppWindow`
@@ -362,7 +363,7 @@ async fn exercise(runtime: Handle, alice: FixtureAccount, carol: FixtureAccount,
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
     )));
-    // A second generated window on the harness's single event loop. Feed
+    // A generated window on the harness's single event loop. Feed
     // callbacks publish to its properties and models, which is what the
     // desktop renders from; it need not be shown for that.
     stage!(setup_window);

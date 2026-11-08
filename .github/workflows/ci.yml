@@ -162,8 +162,8 @@ jobs:
     concurrency:
       group: native-${{ github.sha }}-${{ matrix.os }}
       cancel-in-progress: false
-    # Linux and Intel cold native graphs need compile room; test deadlines stay fixed.
-    timeout-minutes: ${{ (matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}
+    # Mac and Linux cold native graphs need compile room; test deadlines stay fixed.
+    timeout-minutes: ${{ (matrix.os == 'macos-15' || matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
@@ -467,6 +467,13 @@ jobs:
         # candidate at the final gate instead of rebuilding just to reach it.
         continue-on-error: true
         run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
+      - name: Compile focused call libraries before regression deadline
+        if: needs.scope.outputs.check_route == 'vendor'
+        # Full native checks already compile the app graph. A focused vendor
+        # route must finish its cold compilation before the bounded test step.
+        env:
+          SLINT_EMIT_DEBUG_INFO: "1"
+        run: cargo test --locked --no-fail-fast -p morpheus-rtc -p matrix-rtc-core -p matrix-rtc-call -p matrix-rtc-call-sdk -p matrix-rtc-transport -p matrix-rtc-matrix-sdk -p matrix-rtc-livekit --features morpheus-rtc/native-rtc,morpheus-rtc/native-devices --lib --no-run
       - name: Test call authentication and media ownership libraries
         id: rtc-library-tests
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor')

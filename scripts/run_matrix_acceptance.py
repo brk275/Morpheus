@@ -110,7 +110,9 @@ APP_MARKER_AUTHORITY_TEST = (
 )
 APP_MARKER_AUTHORITY_COMPLETE = "MORPHEUS_APP_MARKER_AUTHORITY_CHECK complete=true"
 APP_TIMELINE_LABEL = "app-live-timeline"
-APP_TIMELINE_CASE = "account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation"
+APP_TIMELINE_CASE = "account_access::ui_tests::live_slint_timeline_controller"
+APP_PEOPLE_LABEL = "app-live-people"
+APP_PEOPLE_CASE = "account_access::ui_tests::live_slint_people_controller"
 APP_TIMELINE_CHECKS = frozenset((
     "room_delivery", "thread_delivery", "thread_root_excluded", "feeds_running",
     "message_copy_callbacks", "message_copy_account_aba", "message_copy_renewed_delivery",
@@ -597,7 +599,7 @@ ELEMENT_TEST_STAGES = frozenset((
     "browser_group_departure", "browser_key_rotation",
 ))
 RTC_CHECKS = ("unsupported_transport_local", *RING_LABELS, *RTC_LABELS, ELEMENT_LABEL)
-PLANNED_CHECKS = (*CHAT_CHECKS, APP_TIMELINE_LABEL, APP_RECOVERY_LABEL, "recovery_local", *OAUTH_LABELS, *RTC_CHECKS)
+PLANNED_CHECKS = (*CHAT_CHECKS, APP_TIMELINE_LABEL, APP_PEOPLE_LABEL, APP_RECOVERY_LABEL, "recovery_local", *OAUTH_LABELS, *RTC_CHECKS)
 # A focused retry still establishes the identity required by moderation and
 # runs every app recovery guard. It cannot stand in for full acceptance.
 DRAFT_RECOVERY_CHECKS = ("drafts_local", "formatted_local", "moderation_local", APP_RECOVERY_LABEL)
@@ -605,12 +607,12 @@ DRAFT_ONLY_CHECKS = ("drafts_local",)
 # These fixtures call snapshot/room/thread feed reads. Preserve the formatting
 # prerequisite for moderation, both search sync paths and real key recovery.
 TIMELINE_READ_TESTS = ("live_local", "formatted_local", "media_local", "moderation_local", "search_local")
-TIMELINE_READ_CHECKS = (*TIMELINE_READ_TESTS, "search_local-classic", "recovery_local", "unsupported_transport_local", APP_TIMELINE_LABEL)
+TIMELINE_READ_CHECKS = (*TIMELINE_READ_TESTS, "search_local-classic", "recovery_local", "unsupported_transport_local", APP_TIMELINE_LABEL, APP_PEOPLE_LABEL)
 # Retry the two failed binaries and formatting's dependent moderation check.
 # Passing room/thread UI, media and search cases retain their own evidence.
 TIMELINE_FAILURE_CHECKS = ("formatted_local", "moderation_local", "recovery_local")
 # App-only live controller coverage keeps its existing fixture and cleanup.
-APP_TIMELINE_ONLY_CHECKS = (APP_TIMELINE_LABEL,)
+APP_TIMELINE_ONLY_CHECKS = (APP_TIMELINE_LABEL, APP_PEOPLE_LABEL)
 MEDIA_ONLY_CHECKS = ("media_local",)
 SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS,
@@ -1570,6 +1572,12 @@ class Acceptance:
             except RuntimeError:
                 print(json.dumps({"check": label, "app_timeline_diagnostics": app_timeline_diagnostics(output)}), flush=True)
                 raise
+        if label == APP_PEOPLE_LABEL:
+            markers = [line for line in output.splitlines() if line.startswith("MORPHEUS_LIVE_PEOPLE_CHECK")]
+            if (not test or record.get("passed") != 1
+                    or markers != ["MORPHEUS_LIVE_PEOPLE_CHECK busy_creation=true"]):
+                raise RuntimeError("Live People UI evidence is incomplete")
+            record["app_people_checks"] = {"busy_creation": True}
         if label == "moderation_local":
             # A green moderation result must exercise an existing, unverified
             # account identity on this fresh device without changing trust.
@@ -1621,12 +1629,22 @@ class Acceptance:
         self.run(
             APP_TIMELINE_LABEL,
             ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
-             "--bin", "morpheus-app", APP_TIMELINE_CASE, "--", "--exact",
+             "--bin", "morpheus-app", APP_TIMELINE_CASE, "--", "--ignored", "--exact",
              "--nocapture", "--test-threads=1"],
             extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture), "SLINT_EMIT_DEBUG_INFO": "1"},
-            # The existing account harness has a 20-second bound before the
-            # live scenario's 420-second bound. Preserve time for both plus
-            # process startup; final credential scanning has its own reserve.
+            # The exact ignored live harness owns its event loop and profile.
+            # Keep the 420-second live bound plus process startup and cleanup;
+            # the separate offline account UI suite runs in desktop tests.
+            seconds=480, test=True, pid_namespace=True,
+        )
+        self.run(
+            APP_PEOPLE_LABEL,
+            ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+             "--bin", "morpheus-app", APP_PEOPLE_CASE, "--", "--ignored", "--exact",
+             "--nocapture", "--test-threads=1"],
+            extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture), "SLINT_EMIT_DEBUG_INFO": "1"},
+            # A separate process gives the unchanged 300-second People scenario
+            # its own startup/cleanup reserve instead of sharing timeline time.
             seconds=480, test=True, pid_namespace=True,
         )
 
@@ -1680,7 +1698,7 @@ class Acceptance:
             self.test("unsupported_transport_local", gate, rtc=True,
                       extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})
         self.group(("unsupported_transport_local",), unsupported_case)
-        self.group((APP_TIMELINE_LABEL,), lambda: self.app_timeline(fixture))
+        self.group(APP_TIMELINE_ONLY_CHECKS, lambda: self.app_timeline(fixture))
 
     def rtc_cases(self):
         # Every run gets different users/room: existing devices and keys would
@@ -1923,12 +1941,12 @@ class Acceptance:
                                  "No app recovery, moderation, OAuth or RTC checks; this is not full acceptance.\n\n")
                 elif self.suite == "app-timeline":
                     output.write("Focused generated-window timeline checks: real Synapse and an ephemeral OS Secret Service. "
-                                 "Only app-live-timeline ran, covering model delivery, stale callback rejection, member publication and cleanup. "
+                                 "Only app-live-timeline and app-live-people ran, covering model delivery, stale callback rejection, member publication, busy creation and cleanup. "
                                  "No draft recovery, moderation, OAuth or RTC checks; this is not full acceptance.\n\n")
                 elif self.suite == "native-call":
                     output.write("Focused generated-window timeline and encrypted invitation/incoming actor checks: "
                                  "one disposable Synapse, OS Secret Service and LiveKit lifecycle. "
-                                 "Includes app-live-timeline followed by fresh Standard and saved Matrix2 alias (both Sticky2025) DM/room cases. "
+                                 "Includes app-live-timeline and app-live-people followed by fresh Standard and saved Matrix2 alias (both Sticky2025) DM/room cases. "
                                  "No OAuth, broader call interoperability, physical-device or installed-package "
                                  "checks; this is not full acceptance. "
                                  "The invitation cases do not exercise live cross-device Decline.\n\n")
@@ -2109,7 +2127,7 @@ def main():
                 formatted_passed = succeeded
         acceptance.group(("search_local-classic",), lambda: acceptance.test(
             "search_local", fixture, extra={"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"}))
-        acceptance.group((APP_TIMELINE_LABEL,), lambda: acceptance.app_timeline(fixture))
+        acceptance.group(APP_TIMELINE_ONLY_CHECKS, lambda: acceptance.app_timeline(fixture))
         acceptance.group((APP_RECOVERY_LABEL,), lambda: acceptance.app_recovery(fixture))
         def recovery_case():
             recovery = fixture_from_output(acceptance.script("local_matrix_env", "recovery-fixture"), root)
