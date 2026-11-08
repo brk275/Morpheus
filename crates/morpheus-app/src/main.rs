@@ -1763,6 +1763,7 @@ fn run_application(
     #[cfg(target_os = "macos")]
     let macos_application = macos_termination::Application::install()?;
     let ui = AppWindow::new()?;
+    timeline_model::register_thread_rows(&ui);
     ui.set_login_loading(true);
     ui.show()?;
     #[cfg(all(windows, feature = "native-calls"))]

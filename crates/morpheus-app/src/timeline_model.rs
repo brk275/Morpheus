@@ -9,11 +9,13 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
+    pin::Pin,
     rc::{Rc, Weak},
     sync::Arc,
 };
 
 use morpheus_matrix::{MessageInfo, MessageSnapshot};
+use slint::private_unstable_api::re_exports::{ModelChangeListener, ModelChangeListenerBox};
 use slint::{Model, ModelNotify, ModelRc, ModelTracker};
 
 use crate::MessageItem;
@@ -182,6 +184,88 @@ impl TextCache {
             },
         );
     }
+}
+
+// One stable virtual header followed by source row indices. No MessageItem
+// projection or plaintext copy happens in this adapter. Offset notifications
+// preserve mounted reply delegates when replies are appended/prepended.
+struct ThreadIndices(ModelChangeListenerBox<ThreadIndicesInner>);
+
+struct ThreadIndicesInner {
+    source: ModelRc<MessageItem>,
+    notify: ModelNotify,
+    generation: Cell<i32>,
+}
+
+impl ThreadIndicesInner {
+    fn invalidate_read(&self) {
+        // Header data is a scalar invalidation token, never a reply payload.
+        // Observing it does not mount the header or project any source row.
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.notify.row_changed(0);
+    }
+}
+
+impl ModelChangeListener for ThreadIndicesInner {
+    fn row_changed(self: Pin<&Self>, row: usize) {
+        self.invalidate_read();
+        self.notify.row_changed(row + 1);
+    }
+    fn row_added(self: Pin<&Self>, index: usize, count: usize) {
+        self.invalidate_read();
+        self.notify.row_added(index + 1, count);
+    }
+    fn row_removed(self: Pin<&Self>, index: usize, count: usize) {
+        self.invalidate_read();
+        self.notify.row_removed(index + 1, count);
+    }
+    fn reset(self: Pin<&Self>) {
+        self.invalidate_read();
+        self.notify.reset();
+    }
+}
+
+impl ThreadIndices {
+    fn new(source: ModelRc<MessageItem>) -> Self {
+        let inner = ModelChangeListenerBox::new(ThreadIndicesInner {
+            source,
+            notify: ModelNotify::default(),
+            generation: Cell::new(0),
+        });
+        inner
+            .source
+            .model_tracker()
+            .attach_peer(inner.as_ref().model_peer());
+        Self(inner)
+    }
+}
+
+impl Model for ThreadIndices {
+    type Data = i32;
+
+    fn row_count(&self) -> usize {
+        self.0.source.row_count().saturating_add(1)
+    }
+    fn row_data(&self, row: usize) -> Option<i32> {
+        if row == 0 {
+            Some(self.0.generation.get())
+        } else {
+            (row < self.row_count()).then(|| i32::try_from(row).unwrap_or(i32::MAX))
+        }
+    }
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &self.0.notify
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Installed before a window is shown, including preview/test windows. The
+/// pure UI binding is called only when the authoritative source model changes;
+/// its existing notifications update this adapter without replacing it.
+pub(crate) fn register_thread_rows(ui: &crate::AppWindow) {
+    ui.on_thread_list_rows(|source| ModelRc::new(ThreadIndices::new(source)));
 }
 
 struct TimelineModel {

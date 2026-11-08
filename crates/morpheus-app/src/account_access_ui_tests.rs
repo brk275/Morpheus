@@ -1795,342 +1795,313 @@ async fn assert_seek_policy_and_thread_keeper(
 
     phase.set(97);
 
-    // The open thread: 60 mixed replies under a short root.
+    assert_thread_virtual_read_reporting(ui).await;
+
+    // The open thread is a real virtual list: its root/history context is
+    // virtual item zero; only mounted replies project their rich text.
     ui.invoke_show_thread_panel();
     let root = message_item(&rich_fixture(30_000));
     ui.set_thread_root_id("$fixture-30000:example.org".into());
     ui.set_thread_root_sender(root.sender);
     ui.set_thread_root_rich_body(root.rich_body);
     ui.set_thread_root_rich_accessible_body(root.rich_accessible_body);
-    let mut replies: Vec<_> = (30_001..30_061)
+    let old_draft = ui.get_thread_composer_text();
+    ui.set_thread_composer_text("A retained thread draft".into());
+    let mut replies: Vec<_> = (30_001..30_401)
         .map(|i| Arc::new(rich_fixture(i)))
         .collect();
+    Arc::make_mut(&mut replies[320]).sender = "@quinn:example.org".into();
     ui.set_thread_messages(update_shared(ModelRc::default(), replies.clone()));
     keep_thread_for_test(live);
     settle(ui).await;
+    assert_eq!(
+        control_bounds(ui, "REPLIES · 400").len(),
+        1,
+        "root context scrolls with the replies"
+    );
+    assert!(
+        control_bounds(ui, &replies[320].body).is_empty(),
+        "a far reply has no mounted subtree"
+    );
     let thread = |event: &str| seek_for_test(ui, live, Pane::Thread, event, None, None);
-    assert!(thread("$fixture-30030:example.org"));
-    assert!(thread_seek_stopped(ui).await, "the reply is placed");
+    assert!(thread("$fixture-30321:example.org"));
+    assert!(thread_seek_stopped(ui).await, "the virtual reply is approached and placed");
     settle(ui).await;
-    // The reader's anchor: a reply above 30,030 across the pane's top.
-    let reader = || {
-        let index = usize::try_from(ui.get_thread_anchor_index()).expect("an anchor");
-        let reply = rich_fixture(30_001 + index);
-        let event = format!("$fixture-{}:example.org", 30_001 + index);
-        assert_eq!(ui.get_thread_anchor_event().as_str(), event);
-        (index, control_bounds(ui, &reply.body))
+    assert_eq!(
+        control_bounds(ui, &replies[320].body).len(),
+        1,
+        "the actual requested reply is mounted"
+    );
+    assert!(
+        control_bounds(ui, &replies[0].body).is_empty(),
+        "the first reply is released outside the virtual range"
+    );
+    assert!(control_bounds(ui, "REPLIES · 400").is_empty(), "offscreen header is virtual too");
+    assert_eq!(ui.get_thread_composer_text().as_str(), "A retained thread draft");
+
+    // Same-count edits must update the source row through tracked indexing,
+    // not wait for another model-length change. Old text must disappear.
+    let old_body = replies[320].body.clone();
+    let edited = Arc::make_mut(&mut replies[320]);
+    edited.body = "An edited visible virtual reply".into();
+    edited.rich_markdown = Some(edited.body.clone());
+    edited.rich_accessible = Some(edited.body.clone());
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    settle(ui).await;
+    assert!(control_bounds(ui, &old_body).is_empty());
+    assert_eq!(control_bounds(ui, &replies[320].body).len(), 1);
+
+    // Appending must preserve the real focused control, not recreate every
+    // mounted delegate by replacing an integer-count model.
+    let seen = "Seen in this thread: who has read up to this reply from quinn";
+    request_bridge_focus(ui, seen);
+    let focused_reply = control_with_label(ui, seen);
+    replies.push(Arc::new(rich_fixture(30_401)));
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, seen), "append retains actual focus");
+    assert!(
+        control_with_label(ui, seen) == focused_reply,
+        "append retains the same action instance"
+    );
+    assert_eq!(ui.get_thread_composer_text().as_str(), "A retained thread draft");
+
+    // Prepending changes the target index. The existing production anchor-seek
+    // admission resolves by event again, using a reply index (no header offset).
+    let held_event = ui.get_thread_anchor_event();
+    let held_offset = ui.get_thread_anchor_offset();
+    let held_index = usize::try_from(ui.get_thread_anchor_index()).unwrap();
+    let held_text = replies[held_index].body.clone();
+    let held = control_bounds(ui, &held_text);
+    assert_eq!(held.len(), 1);
+    let mut prepended: Vec<_> = (29_990..29_995)
+        .map(|i| Arc::new(rich_fixture(i)))
+        .collect();
+    prepended.extend(replies);
+    replies = prepended;
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    keep_thread_for_test(live);
+    assert!(seek_for_test(
+        ui,
+        live,
+        Pane::Thread,
+        held_event.as_str(),
+        Some(held_offset),
+        None
+    ));
+    assert_eq!(ui.get_thread_seek_index(), i32::try_from(held_index + 5).unwrap());
+    assert!(thread_seek_stopped(ui).await, "the shifted reply is resolved and kept");
+    settle(ui).await;
+    let kept = control_bounds(ui, &held_text);
+    assert_eq!(kept.len(), 1);
+    assert!(
+        (kept[0].top - held[0].top).abs() <= 1.0,
+        "prepend preserves reading position: {held:?} {kept:?}"
+    );
+
+    // Reflow a mounted row, not an offscreen reply. The actual text height
+    // changes; ListView may intrinsically retain its first drawn row. Custom
+    // keeper authority is checked separately rather than crediting that layout
+    // behavior to a client move.
+    let mounted_event = ui.get_thread_anchor_event();
+    let mounted_index = replies
+        .iter()
+        .position(|reply| reply.event_id.as_deref() == Some(mounted_event.as_str()))
+        .unwrap();
+    let row_bounds = |label: &str| {
+        let item = control_with_label(ui, label);
+        // StyledText is a native item inside the mounted conditional reply
+        // tree; physical root zero is that reply's own Rectangle.
+        let row = slint::private_unstable_api::re_exports::ItemRc::new(item.item_tree().clone(), 0);
+        let bounds = item_bounds(&row);
+        assert!(bounds.bottom - bounds.top >= item_bounds(&item).bottom - item_bounds(&item).top);
+        bounds
     };
-    let (index, held) = reader();
-    assert!((1..29).contains(&index), "below the first reply: {index}");
-    assert_eq!(held.len(), 1, "the anchor reply is laid out once");
-    let at = |index: usize| control_bounds(ui, &rich_fixture(30_001 + index).body);
-    // The first reply (always above the reader) becomes `lines` lines long.
-    // Hard line breaks, as Matrix sends them, so its growth never depends
-    // on word wrapping in the window's current width, fonts or styling.
-    let grow = |replies: &mut Vec<Arc<morpheus_matrix::MessageInfo>>, lines: usize| {
-        let more = vec!["It grew one line longer."; lines - 1].join("\n");
-        let row = Arc::make_mut(&mut replies[0]);
-        row.body = format!("Edited first reply.\n{more}");
+    let grow_mounted = |rows: &mut Vec<Arc<morpheus_matrix::MessageInfo>>, lines: usize| {
+        let row = Arc::make_mut(&mut rows[mounted_index]);
+        row.body = vec!["A mounted reply reflows."; lines].join("\n");
         row.rich_markdown = Some(row.body.replace('\n', "  \n"));
         row.rich_accessible = Some(row.body.clone());
-        ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+        let body = row.body.clone();
+        ui.set_thread_messages(update_shared(ui.get_thread_messages(), rows.clone()));
+        body
     };
-    // A text's laid-out height, from its real generated geometry. Every
-    // change above the reader below must really change the layout there:
-    // a place kept across no change would prove nothing.
-    let height_of = |label: &str| {
-        let bounds = control_bounds(ui, label);
-        assert_eq!(bounds.len(), 1, "laid out once: {label}");
-        bounds[0].bottom - bounds[0].top
-    };
-
-    // A reply above the reader grows: the anchor reply stays where it was.
-    let shorter = height_of(&replies[0].body);
-    grow(&mut replies, 6);
+    let before = row_bounds(&replies[mounted_index].body);
+    let text = control_bounds(ui, &replies[mounted_index].body)[0];
+    keep_thread_for_test(live);
+    assert!(ui.invoke_viewport_anchor_admit(), "the current keeper is admitted");
+    let body = grow_mounted(&mut replies, 32);
     settle(ui).await;
-    let grown = height_of(&replies[0].body) - shorter;
-    assert!(grown > 1.0, "the first reply grew: {grown}");
-    let kept = at(index);
-    assert!(
-        (kept[0].top - held[0].top).abs() <= 1.0,
-        "{held:?} {kept:?}"
-    );
+    let grown = control_bounds(ui, &body)[0];
+    assert!(grown.bottom - grown.top > text.bottom - text.top + 1.0, "mounted text really grew");
+    let after = row_bounds(&body);
+    assert!((after.top - before.top).abs() <= 1.0, "the actual anchored row stays in place");
 
-    // The root above every reply reflows, from one line to four: it stays
-    // there too.
-    let root_label = rich_fixture(30_000).body;
-    let short_root = height_of(&root_label);
-    let longer = message_item(&rich_fixture(30_107));
-    ui.set_thread_root_rich_body(longer.rich_body);
+    // A header that is currently virtual performs no hidden layout work when
+    // its root text changes, and cannot disturb the mounted reader.
+    let root_body = "A reflowed thread root\nWith a second line\nAnd a third line\nStill in the same scroll context";
+    ui.set_thread_root_rich_body(StyledText::from_plain_text(root_body));
+    ui.set_thread_root_rich_accessible_body(root_body.into());
     settle(ui).await;
-    let grown = height_of(&root_label) - short_root;
-    assert!(grown > 1.0, "the root grew: {grown}");
-    let kept = at(index);
-    assert!(
-        (kept[0].top - held[0].top).abs() <= 1.0,
-        "{held:?} {kept:?}"
-    );
+    assert!(control_bounds(ui, root_body).is_empty(), "the offscreen root stays virtual");
+    assert!((row_bounds(&body).top - after.top).abs() <= 1.0);
 
-    // The person scrolls: the anchor follows them, and the keeper then
-    // keeps the new place rather than pulling the old one back.
-    // An anchor can be mostly clipped, so its text center is not a valid
-    // wheel target. Aim inside the actual viewport containing that reply.
-    let target = control_with_label(ui, &rich_fixture(30_001 + index).body);
-    let mut viewports = Vec::new();
-    for node in geometry_nodes(ui) {
-        if node
-            .downcast::<slint::private_unstable_api::re_exports::Flickable>()
-            .is_none()
-        {
-            continue;
-        }
-        let contains_target = node
-            .visit_descendants(|item| {
-                if item == &target {
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            })
-            .is_some();
-        if contains_target {
-            viewports.push(item_bounds(&node));
-        }
-    }
-    assert_eq!(viewports.len(), 1, "one actual thread scroll viewport");
-    let viewport = viewports[0];
-    assert!(inside_window(ui, viewport), "{viewport:?}");
-    let position = slint::LogicalPosition::new(
-        (viewport.left + viewport.right) / 2.0,
-        (viewport.top + viewport.bottom) / 2.0,
-    );
-    assert_eq!(
-        ui.window()
-            .dispatch_event_with_result(WindowEvent::PointerScrolled {
-                position,
-                delta_x: 0.0,
-                delta_y: -120.0,
-            })
-            .unwrap(),
-        slint::platform::WindowEventDispatchResult::Accepted,
-        "the wheel was accepted inside the thread viewport: {viewport:?}"
-    );
-    settle(ui).await;
-    let (moved, scrolled) = reader();
-    let followed = moved != index || (scrolled[0].top - kept[0].top).abs() > 1.0;
-    assert!(
-        followed,
-        "the anchor followed the scroll: viewport={viewport:?}, anchor={index}/{moved}, before={kept:?}, after={scrolled:?}"
-    );
-    let shorter = height_of(&replies[0].body);
-    grow(&mut replies, 9);
-    settle(ui).await;
-    let grown = height_of(&replies[0].body) - shorter;
-    assert!(grown > 1.0, "the first reply grew: {grown}");
-    let kept = at(moved);
-    assert!(
-        (kept[0].top - scrolled[0].top).abs() <= 1.0,
-        "{scrolled:?} {kept:?}"
-    );
-
-    // Behind a protected surface the keeper moves nothing: the reply moves
-    // with the layout, by exactly the growth above it, and its place is
-    // taken again.
     ui.set_member_confirm_open(true);
     settle(ui).await;
-    let shorter = height_of(&replies[0].body);
-    // Where the first two replies' texts start, for the diagnostic below.
-    let (first_before, second_before) = (control_bounds(ui, &replies[0].body), at(1));
-    grow(&mut replies, 12);
+    assert!(!ui.invoke_viewport_anchor_admit(), "a modal withdraws the custom keeper");
+    let body = grow_mounted(&mut replies, 40);
     settle(ui).await;
-    let grown = height_of(&replies[0].body) - shorter;
-    assert!(grown > 1.0, "the first reply grew: {grown}");
-    let after = at(moved);
-    if after[0].top <= kept[0].top + 1.0 || (after[0].top - kept[0].top - grown).abs() > 1.0 {
-        // The one bounded diagnostic of this point, for a hosted log:
-        // numbers and booleans only. The first reply's top moving is
-        // scrolling; the second reply not moving below the first is the
-        // layout; Rust admitting the keeper here is the keeper.
-        let top = |bounds: &[Bounds]| bounds.first().map_or(f32::NAN, |b| b.top);
-        let (first_now, second_now) = (control_bounds(ui, &replies[0].body), at(1));
-        let bottom = first_now.first().map_or(f32::NAN, |b| b.bottom);
-        eprintln!(
-            concat!(
-                "MORPHEUS_THREAD_KEEPER_BLOCKED grown={:.1} first={:.1}/{:.1}",
-                " first_bottom={:.1} second={:.1}/{:.1} reader={:.1}/{:.1}",
-                " modal={} allowed={} admit={} anchor={} offset={:.1} seek={}"
-            ),
-            grown,
-            top(&first_before),
-            top(&first_now),
-            bottom,
-            top(&second_before),
-            top(&second_now),
-            kept[0].top,
-            after[0].top,
-            ui.get_member_confirm_open(),
-            ui.get_viewport_seek_allowed(),
-            ui.invoke_viewport_anchor_admit(),
-            ui.get_thread_anchor_index(),
-            ui.get_thread_anchor_offset(),
-            ui.get_thread_seek_id()
-        );
-    }
-    assert!(after[0].top > kept[0].top + 1.0, "moved with the layout");
-    let shift = after[0].top - kept[0].top;
-    assert!(
-        (shift - grown).abs() <= 1.0,
-        "by that growth: {shift} {grown}"
-    );
+    assert!(!ui.invoke_viewport_anchor_admit());
+    assert_eq!(ui.get_thread_seek_id(), 0, "no seek is started by protected reflow");
+    let protected = row_bounds(&body);
     ui.set_member_confirm_open(false);
-    settle(ui).await;
-
-    // Nothing moves late once it closes: the keeper ended when the surface
-    // came up and stays stopped until the thread's next publication binds
-    // it again. The reply across the top takes the anchor again, and the
-    // next layout change above it is still not corrected.
-    for _ in 0..2 {
+    for _ in 0..3 {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
         settle(ui).await;
     }
-    let closed = at(moved);
+    assert!(!ui.invoke_viewport_anchor_admit(), "closing a modal never resumes the old keeper");
     assert!(
-        (closed[0].top - after[0].top).abs() <= 1.0,
-        "no late move: {after:?} {closed:?}"
+        (row_bounds(&body).top - protected.top).abs() <= 1.0,
+        "no late client movement after close"
     );
-    assert!(
-        ui.get_thread_anchor_index() >= 0,
-        "the anchor is taken again"
-    );
-    let shorter = height_of(&replies[0].body);
-    grow(&mut replies, 13);
+    let _body = grow_mounted(&mut replies, 48);
     settle(ui).await;
-    let grown = height_of(&replies[0].body) - shorter;
-    assert!(grown > 1.0, "the first reply grew: {grown}");
-    let later = at(moved);
-    let shift = later[0].top - closed[0].top;
-    assert!(
-        (shift - grown).abs() <= 1.0,
-        "not corrected: {shift} {grown}"
-    );
+    assert!(!ui.invoke_viewport_anchor_admit(), "another layout cannot renew withdrawn authority");
+    assert_eq!(ui.get_thread_seek_id(), 0);
 
-    // A brief protected entry (opened and closed before any change handler
-    // runs) also stops the thread keeper, at once, until the thread's next
-    // publication binds it again: the next layout change is not corrected.
+    // A protected entry that opens and closes in the same turn withdraws at
+    // the entry itself; deferred UI change handlers cannot revive the keeper.
     keep_thread_for_test(live);
-    for _ in 0..2 {
-        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
-        settle(ui).await;
-    }
-    let (index, before) = reader();
+    assert!(ui.invoke_viewport_anchor_admit());
     crate::matrix_links::clear(ui);
     ui.set_account_menu_open(true);
     ui.set_account_menu_open(false);
-    grow(&mut replies, 14);
+    assert!(!ui.invoke_viewport_anchor_admit(), "brief entry withdraws synchronously");
+    let _body = grow_mounted(&mut replies, 56);
     settle(ui).await;
-    let after = at(index);
-    assert!(after[0].top > before[0].top + 1.0, "the keeper was stopped");
+    assert!(!ui.invoke_viewport_anchor_admit());
+    assert_eq!(ui.get_thread_seek_id(), 0);
 
-    // An older link's stale cleanup leaves the keeper bound: after a hidden
-    // link A's timer and read's completion, once a newer open moved A's
-    // navigation, the next layout change is still corrected.
+    // Cleanup from an older link is not a new entry and cannot revoke a
+    // keeper belonging to the newer navigation/publication.
     keep_thread_for_test(live);
-    for _ in 0..2 {
-        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
-        settle(ui).await;
-    }
-    let (index, before) = reader();
     let was_live = live.is_live.swap(true, Ordering::AcqRel);
     let clicked = live.current_navigation_epoch();
     live.invalidate_navigation();
     crate::matrix_links::tests::end_stale_reads(ui, live, clicked);
     live.is_live.store(was_live, Ordering::Release);
-    let shorter = height_of(&replies[0].body);
-    grow(&mut replies, 15);
+    assert!(ui.invoke_viewport_anchor_admit(), "stale cleanup preserves the newer keeper");
+    let before = row_bounds(&replies[mounted_index].body);
+    let body = grow_mounted(&mut replies, 64);
     settle(ui).await;
-    let grown = height_of(&replies[0].body) - shorter;
-    assert!(grown > 1.0, "the first reply grew: {grown}");
-    let after = at(index);
-    assert!(
-        (after[0].top - before[0].top).abs() <= 1.0,
-        "{before:?} {after:?}"
-    );
+    assert!(ui.invoke_viewport_anchor_admit());
+    assert!((row_bounds(&body).top - before.top).abs() <= 1.0);
+
+    // Protected surfaces and security generation changes still retire seeks
+    // before the virtual list can approach another reply, with no late resume.
+    ui.set_member_confirm_open(true);
+    settle(ui).await;
+    assert!(thread("$fixture-29990:example.org"));
+    assert_eq!(ui.get_thread_seek_id(), 0, "no move behind a protected surface");
+    assert!(control_bounds(ui, &replies[0].body).is_empty());
+    ui.set_member_confirm_open(false);
+    settle(ui).await;
+    assert!(thread("$fixture-29990:example.org"));
+    let step = live.security_gate.try_account_access().expect("idle gate");
+    assert!(thread_seek_stopped(ui).await, "security transition retires the virtual seek");
+    drop(step);
+    assert_eq!(ui.get_thread_seek_id(), 0, "no late resume");
 
     phase.set(98);
-
-    // The thread's scrollbar wheel moves the replies without reporting as
-    // scrolled. A seek waiting for its reply sees that scrolling and ends
-    // without moving anything once the reply arrives. The bar is the
-    // pane's last 14 px, beyond the 12 px padding of the replies' layout,
-    // whose full width the REPLIES heading takes.
-    let heading = control_bounds(ui, "REPLIES · 60");
-    assert_eq!(heading.len(), 1, "the replies heading");
-    assert!(thread("$fixture-30061:example.org"));
+    // A missing reply waits without a speculative MAX index move. The person's
+    // scrollbar movement wins before that reply arrives; publication must not
+    // pull them to the late target.
+    assert!(thread("$fixture-30321:example.org"));
+    assert!(thread_seek_stopped(ui).await);
     settle(ui).await;
-    assert_ne!(ui.get_thread_seek_id(), 0, "waiting for its reply");
-    let before = at(moved);
-    let bar = slint::LogicalPosition::new(
-        heading[0].right + 5.0,
-        (before[0].top + before[0].bottom) / 2.0,
+    let current_event = ui.get_thread_anchor_event();
+    let current_offset = ui.get_thread_anchor_offset();
+    let current_index = usize::try_from(ui.get_thread_anchor_index()).unwrap();
+    let current_text = replies[current_index].body.clone();
+    let target = control_with_label(ui, &current_text);
+    let mut viewports = Vec::new();
+    for node in geometry_nodes(ui) {
+        if node
+            .downcast::<slint::private_unstable_api::re_exports::Flickable>()
+            .is_some()
+            && node
+                .visit_descendants(|item| {
+                    if item == &target {
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    }
+                })
+                .is_some()
+        {
+            viewports.push(item_bounds(&node));
+        }
+    }
+    assert_eq!(viewports.len(), 1);
+    let viewport = viewports[0];
+    assert!(inside_window(ui, viewport));
+    assert!(thread("$fixture-30402:example.org"));
+    assert_ne!(ui.get_thread_seek_id(), 0, "waiting for a not-yet-loaded reply");
+    let position = slint::LogicalPosition::new(
+        viewport.right - 3.0,
+        (viewport.top + viewport.bottom) / 2.0,
     );
     ui.window().dispatch_event(WindowEvent::PointerScrolled {
-        position: bar,
+        position,
         delta_x: 0.0,
         delta_y: -120.0,
     });
     settle(ui).await;
-    let wheeled = at(moved);
-    assert!((wheeled[0].top - before[0].top).abs() > 1.0, "moved");
-    // Not reported as scrolled: only the seek's own check can end it.
-    assert_ne!(ui.get_thread_seek_id(), 0, "the bar's wheel is silent");
-    replies.push(Arc::new(rich_fixture(30_061)));
+    let scrolled_event = ui.get_thread_anchor_event();
+    let scrolled_offset = ui.get_thread_anchor_offset();
+    assert!(
+        scrolled_event != current_event || (scrolled_offset - current_offset).abs() > 1.0,
+        "the actual scrollbar moved"
+    );
+    replies.push(Arc::new(rich_fixture(30_402)));
     ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
-    // Force the matching row's actual conditional holders and geometry. Its
-    // init/layout must not end and destroy its own seek holder synchronously.
-    assert_eq!(control_bounds(ui, &replies.last().unwrap().body).len(), 1);
-    assert_ne!(ui.get_thread_seek_id(), 0, "placement waits for its frame");
-    assert!(thread_seek_stopped(ui).await, "the seek ended");
-    let after = at(moved);
-    assert!((after[0].top - wheeled[0].top).abs() <= 1.0, "kept");
-
-    // The same with a pane created only after its seek began: a reveal set
-    // before the thread's pane exists, which its own init then joins. The
-    // pane goes away, and the panel is shown again with a seek for a missing
-    // reply, both before any settle.
+    assert!(thread_seek_stopped(ui).await, "the person's scrolling ends the waiting seek");
+    settle(ui).await;
+    assert_eq!(ui.get_thread_anchor_event(), scrolled_event, "late reply cannot take the viewport");
+    assert!((ui.get_thread_anchor_offset() - scrolled_offset).abs() <= 1.0);
+    assert!(
+        control_bounds(ui, &replies.last().unwrap().body).is_empty(),
+        "late target stays virtual"
+    );
+    // A list mounted after its seek began still detects the person's first
+    // scroll. Its old window anchor belongs to the previous list, not this one.
     ui.set_thread_root_id("".into());
     settle(ui).await;
-    assert!(control_bounds(ui, "REPLIES · 61").is_empty(), "no pane");
-    ui.invoke_show_thread_panel();
     ui.set_thread_root_id("$fixture-30000:example.org".into());
-    assert!(thread("$fixture-30062:example.org"));
-    assert_ne!(ui.get_thread_seek_id(), 0, "before the pane exists");
+    assert!(thread("$fixture-30403:example.org"));
+    assert_ne!(ui.get_thread_seek_id(), 0, "the pane has not mounted yet");
     settle(ui).await;
-    let heading = control_bounds(ui, "REPLIES · 61");
-    assert_eq!(heading.len(), 1, "the new pane is laid out");
-    let bar = slint::LogicalPosition::new(
-        heading[0].right + 5.0,
-        (heading[0].top + heading[0].bottom) / 2.0,
-    );
+    assert_eq!(control_bounds(ui, &format!("REPLIES · {}", replies.len())).len(), 1);
     ui.window().dispatch_event(WindowEvent::PointerScrolled {
-        position: bar,
+        position,
         delta_x: 0.0,
-        delta_y: -120.0,
+        delta_y: -480.0,
     });
     settle(ui).await;
-    let wheeled = control_bounds(ui, "REPLIES · 61");
-    assert!((wheeled[0].top - heading[0].top).abs() > 1.0, "moved");
-    assert_ne!(ui.get_thread_seek_id(), 0, "the bar's wheel is silent");
-    replies.push(Arc::new(rich_fixture(30_062)));
+    let recreated_event = ui.get_thread_anchor_event();
+    let recreated_offset = ui.get_thread_anchor_offset();
+    replies.push(Arc::new(rich_fixture(30_403)));
     ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
-    assert_eq!(control_bounds(ui, &replies.last().unwrap().body).len(), 1);
-    assert_ne!(
-        ui.get_thread_seek_id(),
-        0,
-        "the recreated pane defers placement"
+    assert!(thread_seek_stopped(ui).await);
+    settle(ui).await;
+    assert_eq!(
+        ui.get_thread_anchor_event(),
+        recreated_event,
+        "late placement cannot move a recreated pane"
     );
-    assert!(thread_seek_stopped(ui).await, "the seek ended");
-    let after = control_bounds(ui, "REPLIES · 62");
-    assert!((after[0].top - wheeled[0].top).abs() <= 1.0, "kept");
+    assert!((ui.get_thread_anchor_offset() - recreated_offset).abs() <= 1.0);
+    assert!(control_bounds(ui, &replies.last().unwrap().body).is_empty());
+    ui.set_thread_composer_text(old_draft);
 
     ui.set_thread_messages(ModelRc::new(VecModel::<MessageItem>::default()));
     ui.set_thread_root_id("".into());
@@ -2142,6 +2113,248 @@ async fn assert_seek_policy_and_thread_keeper(
     ui.set_show_side_panel(old_side);
     ui.set_live_session(old_live);
     settle(ui).await;
+}
+
+/// The existing generated-UI phase owns a separate stand-in window here so
+/// capturing read reports never replaces the main fixture's installed owner.
+async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
+    use crate::timeline_model::{tests::rich_fixture, update_shared};
+    use std::{
+        cell::{Cell, RefCell},
+        ops::ControlFlow,
+        rc::Rc,
+    };
+
+    let ui = AppWindow::new().unwrap();
+    crate::timeline_model::register_thread_rows(&ui);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_show_sign_in(false);
+    ui.set_live_session(true);
+    ui.set_page(0);
+    ui.set_active_account_local_id("thread-read-fixture".into());
+    ui.set_active_room_id("!thread-read:example.org".into());
+    ui.set_thread_root_id("$thread-read-root:example.org".into());
+    ui.set_thread_root_sender("quinn".into());
+    ui.set_thread_root_rich_body(slint::StyledText::from_plain_text("A scrollable thread root"));
+    ui.set_thread_root_rich_accessible_body("A scrollable thread root".into());
+    ui.invoke_show_thread_panel();
+    let reports = Rc::new(RefCell::new(Vec::<(bool, String)>::new()));
+    let observed = reports.clone();
+    ui.global::<RoomActivity>().on_read_view(move |thread, event| {
+        observed.borrow_mut().push((thread, event.to_string()));
+    });
+    let contexts = Rc::new(Cell::new(0));
+    let observed = contexts.clone();
+    ui.global::<RoomActivity>().on_context_changed(move || {
+        observed.set(observed.get() + 1);
+    });
+    let mut rows: Vec<_> = (31_000..31_400)
+        .map(|i| Arc::new(rich_fixture(i)))
+        .collect();
+    let first = rows[0].body.clone();
+    let last = rows.last().unwrap().event_id.as_ref().unwrap().clone();
+    ui.set_thread_messages(update_shared(ModelRc::default(), rows.clone()));
+    ui.show().unwrap();
+    ui.window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
+    settle(&ui).await;
+    for _ in 0..4 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+    }
+    assert!(control_bounds(&ui, &rows.last().unwrap().body).is_empty());
+    assert!(
+        reports.borrow().iter().all(|(_, event)| event.is_empty()),
+        "a virtual tail cannot mark the last reply read"
+    );
+    let target = control_with_label(&ui, &first);
+    let viewports: Vec<_> = geometry_nodes(&ui)
+        .into_iter()
+        .filter(|node| {
+            node.downcast::<slint::private_unstable_api::re_exports::Flickable>()
+                .is_some()
+                && node
+                    .visit_descendants(|item| {
+                        if item == &target {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    })
+                    .is_some()
+        })
+        .map(|node| item_bounds(&node))
+        .collect();
+    assert_eq!(viewports.len(), 1);
+    let viewport = viewports[0];
+    let position = slint::LogicalPosition::new(
+        (viewport.left + viewport.right) / 2.0,
+        (viewport.top + viewport.bottom) / 2.0,
+    );
+    let wheel = |delta| {
+        ui.window().dispatch_event(WindowEvent::PointerScrolled {
+            position,
+            delta_x: 0.0,
+            delta_y: delta,
+        });
+    };
+    wheel(-1_000_000.0);
+    for _ in 0..40 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+        if reports
+            .borrow()
+            .iter()
+            .any(|(thread, event)| *thread && event == &last)
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        control_bounds(&ui, &rows.last().unwrap().body).len(),
+        1,
+        "the actual tail is mounted"
+    );
+    assert!(
+        reports
+            .borrow()
+            .iter()
+            .any(|(thread, event)| *thread && event == &last),
+        "only the laid-out visible tail reports progress"
+    );
+
+    let at = reports.borrow().len();
+    wheel(1_000_000.0);
+    settle(&ui).await;
+    assert!(
+        control_bounds(&ui, &rows.last().unwrap().body).is_empty(),
+        "scrolling releases the tail"
+    );
+    assert!(
+        reports.borrow()[at..]
+            .iter()
+            .any(|(thread, event)| *thread && event.is_empty()),
+        "scroll-away revokes before the tail disappears"
+    );
+    for _ in 0..4 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+    }
+    assert!(
+        reports.borrow()[at..].iter().all(|(_, event)| event.is_empty()),
+        "an unmounted tail cannot rearm"
+    );
+
+    wheel(-1_000_000.0);
+    for _ in 0..40 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+        if reports
+            .borrow()
+            .last()
+            .is_some_and(|(thread, event)| *thread && event == &last)
+        {
+            break;
+        }
+    }
+    assert!(
+        reports
+            .borrow()
+            .last()
+            .is_some_and(|(_, event)| event == &last)
+    );
+    let at = reports.borrow().len();
+    rows.push(Arc::new(rich_fixture(31_400)));
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), rows.clone()));
+    settle(&ui).await;
+    assert!(
+        reports.borrow()[at..]
+            .first()
+            .is_some_and(|(thread, event)| *thread && event.is_empty()),
+        "append revokes the previous last-row authority first"
+    );
+    assert!(reports.borrow()[at..].iter().all(|(_, event)| event != &last));
+
+    // Replace the model with the same row count: no extent/count delta is
+    // allowed to keep the old read authority alive. Its header token is read
+    // without mounting a header or touching any MessageItem.
+    let at = reports.borrow().len();
+    let reset: Vec<_> = (32_000..32_401)
+        .map(|i| Arc::new(rich_fixture(i)))
+        .collect();
+    ui.set_thread_messages(update_shared(ModelRc::default(), reset));
+    settle(&ui).await;
+    assert!(
+        reports.borrow()[at..]
+            .first()
+            .is_some_and(|(thread, event)| *thread && event.is_empty()),
+        "same-count model replacement revokes first"
+    );
+    let at = reports.borrow().len();
+    // A real same-model reset also invalidates the scalar generation even
+    // when the count is unchanged (the existing source's bulk reset path).
+    let reset: Vec<_> = (33_000..33_401)
+        .map(|i| Arc::new(rich_fixture(i)))
+        .collect();
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), reset));
+    settle(&ui).await;
+    assert!(
+        reports.borrow()[at..]
+            .first()
+            .is_some_and(|(thread, event)| *thread && event.is_empty()),
+        "same-count source reset revokes first"
+    );
+
+    wheel(-1_000_000.0);
+    for _ in 0..40 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+        if reports
+            .borrow()
+            .last()
+            .is_some_and(|(_, event)| !event.is_empty())
+        {
+            break;
+        }
+    }
+    assert!(
+        reports
+            .borrow()
+            .last()
+            .is_some_and(|(_, event)| !event.is_empty())
+    );
+    let at = reports.borrow().len();
+    ui.set_member_confirm_open(true);
+    settle(&ui).await;
+    assert!(
+        reports.borrow()[at..]
+            .first()
+            .is_some_and(|(_, event)| event.is_empty()),
+        "protected entry revokes the bridge"
+    );
+    for _ in 0..4 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+    }
+    assert!(
+        reports.borrow()[at..].iter().all(|(_, event)| event.is_empty()),
+        "a protected tail never rearms"
+    );
+    ui.set_member_confirm_open(false);
+    settle(&ui).await;
+    let before = contexts.get();
+    ui.set_show_side_panel(false);
+    settle(&ui).await;
+    assert!(
+        contexts.get() > before,
+        "unmounting the pane sends the existing owner context withdrawal"
+    );
+    ui.set_live_session(false);
+    ui.hide().unwrap();
+    settle(&ui).await;
+    main_ui
+        .window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
 }
 
 /// Run the window until its thread seek ended, bounded at 60 passes of 16 ms.
@@ -6844,6 +7057,7 @@ async fn exercise_account_ui(
     let manager =
         Arc::new(morpheus_matrix::AccountManager::open(directory.path().join("profile")).unwrap());
     let ui = AppWindow::new().unwrap();
+    crate::timeline_model::register_thread_rows(&ui);
     assert_live_font_projections(&ui);
     ui.set_show_sign_in(false);
     ui.window().set_size(slint::PhysicalSize::new(1280, 900));
@@ -9429,7 +9643,11 @@ fn assert_record_scroll_range(ui: &AppWindow, labels: &[&str], threaded: bool) {
         root.visit_descendants(|item| {
             if let Some(flickable) = item.downcast::<Flickable>() {
                 let contains = item.visit_descendants(|child| {
-                    if child == &target { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+                    if child == &target {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
                 }).is_some();
                 if contains {
                     ancestors += 1;
@@ -13432,6 +13650,7 @@ async fn assert_inline_audio_card_layout() {
     const EVENT: &str = "$audio-layout:example.org";
     const STATUS: &str = "Playing in memory. This synthetic status wraps in a narrow pane without covering any playback action.";
     let ui = AppWindow::new().unwrap();
+    crate::timeline_model::register_thread_rows(&ui);
     ui.window().set_size(slint::PhysicalSize::new(1280, 900));
     ui.set_show_sign_in(false);
     ui.set_page(0);

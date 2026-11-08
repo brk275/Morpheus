@@ -368,6 +368,7 @@ async fn exercise(runtime: Handle, alice: FixtureAccount, carol: FixtureAccount,
     // desktop renders from; it need not be shown for that.
     stage!(setup_window);
     let ui = AppWindow::new().unwrap();
+    crate::timeline_model::register_thread_rows(&ui);
     stage!(setup_controller);
     let live = LiveUi::new(manager.clone(), runtime.clone(), ui.as_weak(), voices);
     // Same generated-window/controller path as main, but the Copy callback's

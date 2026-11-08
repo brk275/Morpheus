@@ -4447,21 +4447,42 @@ export component AppWindow inherits Window {
     in-out property <string> timeline-anchor-event;
     in-out property <int> timeline-anchor-index: -1;
     in-out property <length> timeline-anchor-offset: 0px;
-    // The same for the open thread's replies (all laid out, never
-    // approached); a thread hit's reply is the jump event above.
+    pure callback thread-list-rows([MessageItem]) -> [int];
+    // The open thread uses the same bounded virtual-list seek, with reply
+    // indices kept zero-based; its root/context header is virtual item zero.
     in-out property <int> thread-seek-id: 0;
     in-out property <string> thread-seek-event;
+    in-out property <int> thread-seek-index: -1;
     in-out property <bool> thread-seek-reveal: true;
     in-out property <length> thread-seek-offset: 0px;
+    // List passes, the pass and seek in which the row was last drawn, the
+    // last approach, and the last placement with its waits for a layout.
+    property <int> thread-seek-pass: 0;
+    property <int> thread-seek-heard: 0;
+    property <int> thread-seek-heard-id: 0;
+    property <int> thread-seek-approached: 0;
+    property <int> thread-seek-approached-id: 0;
     property <int> thread-seek-moved-id: 0;
     property <length> thread-seek-moved-top: 0px;
     property <length> thread-seek-moved-y: 0px;
     property <int> thread-seek-waits: 0;
-    // The thread's content-y as its running seek last saw or set it; only
-    // the person's scrolling (its scrollbar's wheel or arrows included)
-    // changes it otherwise.
+    // The reader's top row as the running seek last accepted it: at its
+    // start, then only after its own move or jump, or when Rust says its
+    // rows changed (thread-seek-rows). Any other change of that row, or of
+    // how far above the top it is drawn, is the person's scrolling, such as
+    // a scrollbar's wheel or arrow buttons, which never report as scrolled.
     property <int> thread-seek-seen-id: 0;
-    property <length> thread-seek-seen-y: 0px;
+    property <int> thread-seek-seen-index: -1;
+    property <length> thread-seek-seen-offset: 0px;
+    property <bool> thread-seek-expect: false;
+    // A list created while its seek already ran (page 0 shown again after the
+    // seek started): until the seek's own first move, or the list's first
+    // report of its top row, the baseline is the list's content-y as created.
+    // The window's anchor then belongs to an older list or is unknown, which
+    // proves nothing about scrolling.
+    property <int> thread-seek-created-id: 0;
+    property <length> thread-seek-created-y: 0px;
+    in-out property <int> thread-seek-rows: 0;
     in-out property <string> thread-anchor-event;
     in-out property <int> thread-anchor-index: -1;
     in-out property <length> thread-anchor-offset: 0px;
@@ -12174,52 +12195,187 @@ export component AppWindow inherits Window {
                         hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
                         open-recovery => { root.open-timeline-recovery(true, root.thread-recovery-serial); }
                     }
-                    if root.thread-root-id != "" : thread-scroll := ScrollView {
+                    if root.thread-root-id != "" : thread-scroll := ListView {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
-                        // Automatic read receipts (room activity) for this thread.
-                        property <bool> at-bottom: self.content-height <= self.visible-height + 1px || -self.content-y >= self.content-height - self.visible-height - 24px;
-                        property <string> read-key: root.live-session && root.page == 0 && root.show-side-panel && root.side-panel-tab == 1 && self.at-bottom && root.thread-messages.length > 0 ? root.thread-messages[root.thread-messages.length - 1].event-id : "";
-                        changed read-key => { RoomActivity.read-view(true, self.read-key); }
-                        // A pane created while a seek already runs takes its starting point
-                        // here: `changed seek-id` below never fires for the first id it sees.
-                        init => {
-                            RoomActivity.read-view(true, self.read-key);
-                            self.watch-start();
+                        accessible-label: "Messages in this thread";
+                        property <int> read-pass: 0;
+                        property <[MessageItem]> source-rows: root.thread-messages;
+                        property <[int]> row-model: root.thread-list-rows(self.source-rows);
+                        // A tracked scalar token invalidates read authority even when a
+                        // same-count reset leaves all estimated extents unchanged.
+                        property <int> read-source-generation: self.row-model[0];
+                        property <bool> read-allowed: root.live-session && root.page == 0
+                            && root.show-side-panel && root.side-panel-tab == 1
+                            && root.viewport-seek-allowed && !root.settings-reveal-protected;
+                        property <int> reply-count: root.thread-messages.length;
+                        function invalidate-read() {
+                            // The old last-row delegate can be unmounted by this
+                            // change. Revoke first; only a newly laid-out visible
+                            // last row can report again after its deferred check.
+                            RoomActivity.read-view(true, "");
+                            self.read-pass += 1;
                         }
-                        // As in the conversation: the person's scrolling wins over a seek.
+                        changed content-y => { self.invalidate-read(); }
+                        changed content-height => { self.invalidate-read(); }
+                        changed visible-height => { self.invalidate-read(); }
+                        changed visible-width => { self.invalidate-read(); }
+                        changed reply-count => { self.invalidate-read(); }
+                        changed source-rows => { self.invalidate-read(); }
+                        changed read-source-generation => { self.invalidate-read(); }
+                        changed read-allowed => { self.invalidate-read(); }
+                        init => { self.invalidate-read(); self.watch-created(); }
                         scrolled => {
-                            if root.thread-seek-id != 0 {
-                                root.viewport-seek-ended(root.thread-seek-id, 0);
-                            }
+                            if root.thread-seek-id != 0 { root.viewport-seek-ended(root.thread-seek-id, 0); }
                         }
-                        // Only a seek's moves and the person's scrolling change content-y
-                        // here (no list re-anchors it). A running seek takes it when it
-                        // starts and after each of its moves; any other change is the
-                        // person's, a scrollbar's wheel or arrows included, which never
-                        // report as scrolled, and ends the seek.
+                        // A new seek to a far row jumps at once, before the next frame is
+                        // drawn; a near row may be drawn already and places itself.
                         property <int> seek-id: root.thread-seek-id;
-                        changed seek-id => { self.watch-start(); }
+                        changed seek-id => {
+                            self.watch-start();
+                            self.approach-seek(true);
+                        }
+                        // Rows changed under the running seek (Rust resolved its row
+                        // again): the top row the list then draws is its new baseline.
+                        property <int> seek-rows: root.thread-seek-rows;
+                        changed seek-rows => { root.thread-seek-expect = true; }
+                        // The running seek's baseline: the reader's top row when it starts.
                         function watch-start() {
                             let id = root.thread-seek-id;
                             if id != 0 && root.thread-seek-seen-id != id {
                                 root.thread-seek-seen-id = id;
-                                root.thread-seek-seen-y = self.content-y;
+                                root.thread-seek-seen-index = root.thread-anchor-index;
+                                root.thread-seek-seen-offset = root.thread-anchor-offset;
+                                root.thread-seek-expect = root.thread-anchor-index < 0;
                             }
                         }
-                        // Place the seek's reply (laid out at `row-y` with height `tall`),
-                        // like timeline-list's place-seek; every reply is laid out here.
+                        // The baseline of a seek that ran before this list existed: its
+                        // content-y as created. No row of this list has reported the top
+                        // yet, so its first report becomes the baseline only while the
+                        // list is still where it was created.
+                        function watch-created() {
+                            let id = root.thread-seek-id;
+                            if id != 0 {
+                                root.thread-seek-seen-id = id;
+                                root.thread-seek-seen-index = -1;
+                                root.thread-seek-expect = false;
+                                root.thread-seek-created-id = id;
+                                root.thread-seek-created-y = self.content-y;
+                            }
+                        }
+                        // The list moved since it was created under seek `id`, before
+                        // that seek moved it: the person scrolled.
+                        pure function moved-since-created(id: int) -> bool {
+                            root.thread-seek-created-id == id
+                                && abs(self.content-y - root.thread-seek-created-y) > 0.01px
+                        }
+                        // The top row reported again (after a layout). A change the seek
+                        // expects (its own move or jump, or changed rows) becomes its
+                        // baseline; any other change is the person's scrolling, which ends
+                        // it. The list's own re-anchoring keeps the top row where it is.
+                        function watch-seek() {
+                            let id = root.thread-seek-id;
+                            if id == 0 || root.thread-seek-seen-id != id {
+                                return;
+                            }
+                            // Created under this seek: its first report counts only if the
+                            // list is still where it was created.
+                            if root.thread-seek-created-id == id {
+                                if self.moved-since-created(id) {
+                                    root.viewport-seek-ended(id, 0);
+                                    return;
+                                }
+                                root.thread-seek-created-id = 0;
+                            }
+                            let moved = root.thread-anchor-index != root.thread-seek-seen-index
+                                || abs(root.thread-anchor-offset - root.thread-seek-seen-offset) > 0.5px;
+                            if root.thread-seek-expect || root.thread-seek-seen-index < 0 {
+                                if moved || root.thread-seek-seen-index < 0 {
+                                    root.thread-seek-seen-index = root.thread-anchor-index;
+                                    root.thread-seek-seen-offset = root.thread-anchor-offset;
+                                    root.thread-seek-expect = false;
+                                }
+                            } else if moved {
+                                root.viewport-seek-ended(id, 0);
+                            }
+                        }
+                        // While the seek's row is not drawn (no row placed itself in the
+                        // last 3 passes), move towards it: a far row straight to its
+                        // estimated position (a jump the list lays out from that row), a
+                        // near one by most of a screen, in the direction of the measured top
+                        // row, never in the seek's first 2 passes. Every move is admitted by
+                        // Rust (which also resolves the row's index again if rows changed);
+                        // one move per 2 passes.
+                        function approach-seek(first: bool) {
+                            let id = root.thread-seek-id;
+                            let h = self.visible-height;
+                            let rows = root.thread-messages.length;
+                            if id == 0 || h <= 0px || rows == 0 { return; }
+                            // Even a reply not loaded yet cannot overrule a person
+                            // scrolling a list created while its seek was pending.
+                            if self.moved-since-created(id) {
+                                root.viewport-seek-ended(id, 0);
+                                return;
+                            }
+                            if root.thread-seek-index < 0 || root.thread-seek-index >= rows { return; }
+                            if root.thread-seek-heard-id == id && root.thread-seek-pass - root.thread-seek-heard < 3 {
+                                return;
+                            }
+                            if root.thread-seek-approached-id == id && root.thread-seek-pass - root.thread-seek-approached < 2 {
+                                return;
+                            }
+                            let top = root.thread-anchor-index;
+                            let average = self.content-height / (rows + 1);
+                            let far = top < 0 || abs(root.thread-seek-index - top) * average > 2 * h;
+                            root.thread-seek-approached-id = id;
+                            root.thread-seek-approached = root.thread-seek-pass;
+                            if first && !far {
+                                return;
+                            }
+                            // Not where it was created: the person scrolled first.
+                            if self.moved-since-created(id) {
+                                root.viewport-seek-ended(id, 0);
+                                return;
+                            }
+                            if !root.viewport-seek-admit(id) || root.thread-seek-id != id {
+                                return;
+                            }
+                            // Admission can resolve this reply again after a publication.
+                            let k = root.thread-seek-index;
+                            if k < 0 || k >= root.thread-messages.length {
+                                return;
+                            }
+                            let limit = max(0px, self.content-height - h);
+                            // This move's new top row becomes the baseline.
+                            self.watch-start();
+                            root.thread-seek-expect = true;
+                            root.thread-seek-created-id = 0;
+                            if far {
+                                // The rows drawn there are new; the top row reports again.
+                                root.thread-anchor-index = -1;
+                                self.content-y = -min(limit, (k + 1.5) * average);
+                            } else if k > top {
+                                self.content-y = -min(limit, 0.8 * h - self.content-y);
+                            } else {
+                                self.content-y = -max(0px, -self.content-y - 0.8 * h);
+                            }
+                        }
+                        // The drawn seek row at content position `row-y` with height `tall`:
+                        // in place (or as close as the ends allow) ends the seek; otherwise
+                        // move it there once Rust admits it. After its move, the row is not
+                        // moved again until the list was laid out (at most 3 waits); found
+                        // anywhere but where that move put it, someone else moved it (the
+                        // person, such as with a scrollbar's wheel or arrows, which never
+                        // report as scrolled, or a layout above it), and the seek ends
+                        // there rather than move it back.
                         function place-seek(row-y: length, tall: length) {
                             let id = root.thread-seek-id;
                             let h = self.visible-height;
                             if id == 0 || h <= 0px {
                                 return;
                             }
-                            self.watch-start();
-                            if abs(self.content-y - root.thread-seek-seen-y) > 0.01px {
-                                root.viewport-seek-ended(id, 0);
-                                return;
-                            }
+                            root.thread-seek-heard-id = id;
+                            root.thread-seek-heard = root.thread-seek-pass;
                             let top = row-y + self.content-y;
                             if root.thread-seek-moved-id == id && root.thread-seek-waits < 3
                                 && abs(top - root.thread-seek-moved-top) < 0.01px
@@ -12235,14 +12391,20 @@ export component AppWindow inherits Window {
                                 }
                                 return;
                             }
+                            if root.thread-seek-moved-id == id || self.moved-since-created(id) {
+                                root.viewport-seek-ended(id, 0);
+                                return;
+                            }
                             if !root.viewport-seek-admit(id) || root.thread-seek-id != id {
                                 return;
                             }
+                            self.watch-start();
+                            root.thread-seek-expect = true;
+                            root.thread-seek-created-id = 0;
                             root.thread-seek-moved-id = id;
                             root.thread-seek-moved-top = top;
                             root.thread-seek-moved-y = goal;
                             root.thread-seek-waits = 0;
-                            root.thread-seek-seen-y = goal;
                             self.content-y = goal;
                         }
                         // The keeper's one move: put the anchor reply, now laid out at
@@ -12264,243 +12426,280 @@ export component AppWindow inherits Window {
                                 root.thread-anchor-index = -1;
                             }
                         }
-                        VerticalLayout {
-                            width: parent.width;
-                            padding: 12px;
-                            spacing: 10px;
-                            alignment: start;
-                            vertical-stretch: 0;
-                            Rectangle {
-                                vertical-stretch: 0;
-                                background: root.row-surface(false, false, root.thread-root-is-own, transparent);
-                                border-radius: StyleTokens.radius * 0.8;
-                                VerticalLayout {
-                                    padding: root.thread-root-is-own && StyleTokens.roles.own-surface.present ? min(8px, root.content-inset) : 0px;
-                                    spacing: 10px;
-                                    // The root message follows the message font, the sender size and,
-                                    // two pixels smaller as before, the message size.
-                                    Text {
-                                        text: root.thread-root-sender;
-                                        color: root.sender-ink(false, root.thread-root-is-own, root.thread-root-palette-index, root.thread-root-accent);
-                                        font-family: root.message-font-family;
-                                        font-size: root.sender-font-px > 0px ? root.sender-font-px : 12px * root.text-scale;
-                                        font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750;
-                                        wrap: word-wrap; min-width: 0px; vertical-stretch: 0;
-                                        accessible-role: text;
-                                        accessible-label: root.thread-root-sender;
+                        // The stable index model allocates no reply vector. Each mounted
+                        // delegate reads its own tracked source row. Header/context stays
+                        // in the same scroll surface, as virtual item zero.
+                        for item[index] in thread-scroll.row-model : thread-item := Rectangle {
+                            width: thread-scroll.visible-width;
+                            min-height: max(1px, thread-item-content.min-height);
+                            height: self.min-height;
+                            thread-item-content := VerticalLayout {
+                                padding-left: 12px; padding-right: 12px;
+                                padding-top: index == 0 ? 12px : 0px;
+                                padding-bottom: index == root.thread-messages.length ? 12px : 10px;
+                                spacing: 10px; alignment: start; vertical-stretch: 0;
+                                if index == 0 : VerticalLayout {
+                                    spacing: 10px; alignment: start; vertical-stretch: 0;
+                                    Rectangle {
+                                        vertical-stretch: 0;
+                                        background: root.row-surface(false, false, root.thread-root-is-own, transparent);
+                                        border-radius: StyleTokens.radius * 0.8;
+                                        VerticalLayout {
+                                            padding: root.thread-root-is-own && StyleTokens.roles.own-surface.present ? min(8px, root.content-inset) : 0px;
+                                            spacing: 10px;
+                                            // The root message follows the message font, the sender size and,
+                                            // two pixels smaller as before, the message size.
+                                            Text {
+                                                text: root.thread-root-sender;
+                                                color: root.sender-ink(false, root.thread-root-is-own, root.thread-root-palette-index, root.thread-root-accent);
+                                                font-family: root.message-font-family;
+                                                font-size: root.sender-font-px > 0px ? root.sender-font-px : 12px * root.text-scale;
+                                                font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750;
+                                                wrap: word-wrap; min-width: 0px; vertical-stretch: 0;
+                                                accessible-role: text;
+                                                accessible-label: root.thread-root-sender;
+                                            }
+                                            if root.thread-root-copy-token != "" : TextAction {
+                                                text: "Copy text"; accessible-label: "Copy text from thread root";
+                                                ink: root.ink; muted: root.muted; surface: transparent; hover-surface: root.hover;
+                                                outline: root.divider; text-scale: root.text-scale;
+                                                enabled: root.viewport-seek-allowed && !root.settings-reveal-protected;
+                                                activated => { root.copy-message-text(root.thread-root-copy-token, true); }
+                                            }
+                                            StyledText {
+                                                text: root.thread-root-rich-body;
+                                                default-color: root.body-ink(false, root.thread-root-is-own);
+                                                default-font-size: max(10px * root.text-scale, root.message-font-px - 2px * root.text-scale);
+                                                default-font-family: root.message-font-family;
+                                                link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
+                                                accessible-role: text;
+                                                accessible-label: root.thread-root-rich-accessible-body;
+                                                link-clicked(url) => { root.open-message-link(url); }
+                                            }
+                                        }
                                     }
-                                    if root.thread-root-copy-token != "" : TextAction {
-                                        text: "Copy text"; accessible-label: "Copy text from thread root";
-                                        ink: root.ink; muted: root.muted; surface: transparent; hover-surface: root.hover;
-                                        outline: root.divider; text-scale: root.text-scale;
-                                        enabled: root.viewport-seek-allowed && !root.settings-reveal-protected;
-                                        activated => { root.copy-message-text(root.thread-root-copy-token, true); }
+                                    Rectangle { height: StyleTokens.line-width; background: root.divider; }
+                                    // A thread feed starts with its latest replies; earlier
+                                    // replies load on request, a page at a time.
+                                    if root.live-session : TextAction {
+                                        ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                        outline: root.divider; text-scale: root.text-scale; wrap-caption: true;
+                                        text: root.thread-history-loading ? "Loading earlier replies…" : root.thread-history-at-start ? "Start of thread" : "Load earlier replies";
+                                        enabled: !root.thread-history-loading && !root.thread-history-at-start;
+                                        accessible-label: root.thread-history-at-start ? "Start of thread reached" : "Load earlier replies in this thread";
+                                        activated => { root.load-older-thread-replies(); }
                                     }
-                                    StyledText {
-                                        text: root.thread-root-rich-body;
-                                        default-color: root.body-ink(false, root.thread-root-is-own);
-                                        default-font-size: max(10px * root.text-scale, root.message-font-px - 2px * root.text-scale);
-                                        default-font-family: root.message-font-family;
-                                        link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
-                                        accessible-role: text;
-                                        accessible-label: root.thread-root-rich-accessible-body;
-                                        link-clicked(url) => { root.open-message-link(url); }
+                                    if root.thread-history-error != "" : Text {
+                                        text: root.thread-history-error;
+                                        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483;
+                                        font-size: 11px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
+                                        accessible-live-region: polite;
                                     }
+                                    Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
                                 }
-                            }
-                            Rectangle { height: StyleTokens.line-width; background: root.divider; }
-                            // A thread feed starts with its latest replies; earlier
-                            // replies load on request, a page at a time.
-                            if root.live-session : TextAction {
-                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
-                                outline: root.divider; text-scale: root.text-scale; wrap-caption: true;
-                                text: root.thread-history-loading ? "Loading earlier replies…" : root.thread-history-at-start ? "Start of thread" : "Load earlier replies";
-                                enabled: !root.thread-history-loading && !root.thread-history-at-start;
-                                accessible-label: root.thread-history-at-start ? "Start of thread reached" : "Load earlier replies in this thread";
-                                activated => { root.load-older-thread-replies(); }
-                            }
-                            if root.thread-history-error != "" : Text {
-                                text: root.thread-history-error;
-                                color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483;
-                                font-size: 11px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
-                                accessible-live-region: polite;
-                            }
-                            Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
-                            for reply[index] in root.thread-messages : thread-reply := Rectangle {
-                                property <string> time-label: root.message-time-label(reply);
-                                // The reply a search hit or a jump opened, highlighted like a
-                                // selected conversation row.
-                                property <bool> search-hit: reply.event-id != ""
-                                    && (reply.event-id == root.room-search-selected-event-id || reply.event-id == root.timeline-jump-event-id);
-                                // At least 43 px and never less than its content. A repeated
-                                // row's explicit minimum replaces the one its content gives, and
-                                // the thread's scroll content is sized from the rows' minimums,
-                                // so a bare 43 px squeezed long replies into the next ones.
-                                min-height: max(43px, reply-body.min-height);
-                                vertical-stretch: 0;
-                                background: root.row-surface(thread-reply.search-hit, false, reply.is-own, root.elevated);
-                                border-radius: StyleTokens.radius * 0.8;
-                                // The reply across the viewport's top (with the spacing below it)
-                                // is the reader's anchor; above the first reply there is none.
-                                property <length> shown-top: self.y + thread-scroll.content-y;
-                                property <bool> at-top: self.shown-top <= 0px && self.shown-top + self.height + 10px > 0px;
-                                property <bool> above: index == 0 && self.shown-top > 0px;
-                                property <int> top-index: self.at-top ? index : -1;
-                                property <string> top-event: self.at-top ? reply.event-id : "";
-                                property <length> top-offset: self.at-top ? self.shown-top : 1px;
-                                changed top-index => { self.report-top(); }
-                                changed top-event => { self.report-top(); }
-                                changed top-offset => { self.report-top(); }
-                                changed above => { self.report-top(); }
-                                // A known anchor is taken again only by scrolling (the person's or
-                                // a seek's), never by a layout change above the reader: the keeper
-                                // below puts that reply back instead.
-                                function report-top() {
-                                    if root.thread-anchor-index >= 0 && thread-scroll.content-y == root.thread-anchor-scroll {
-                                        return;
-                                    }
-                                    if self.at-top {
-                                        root.thread-anchor-index = index;
-                                        root.thread-anchor-event = reply.event-id;
-                                        root.thread-anchor-offset = self.shown-top;
-                                        root.thread-anchor-scroll = thread-scroll.content-y;
-                                    } else if self.above {
-                                        root.thread-anchor-index = -1;
-                                        root.thread-anchor-event = "";
-                                        root.thread-anchor-scroll = thread-scroll.content-y;
-                                    }
-                                }
-                                // The reader's anchor reply keeps its measured place when the
-                                // layout above it changes (the root or earlier replies reflow, a
-                                // font or width change), as the conversation's list keeps its first
-                                // drawn row. Only a layout moves `laid-y`; scrolling does not.
-                                if root.thread-seek-id == 0 && root.thread-anchor-index >= 0 && reply.event-id != "" && reply.event-id == root.thread-anchor-event : Rectangle {
-                                    width: 0px; height: 0px;
-                                    property <length> laid-y: thread-reply.y;
-                                    changed laid-y => { thread-scroll.keep-anchor(thread-reply.y); }
-                                }
-                                // Placement can end a seek and remove this conditional holder.
-                                // Use the existing frame timer after creation/layout, rather than
-                                // invalidating this holder from its own init or geometry handlers.
-                                // The outer ScrollView still captures the scroll origin at start.
-                                if root.thread-seek-id != 0 && reply.event-id != "" && reply.event-id == root.thread-seek-event : Rectangle {
-                                    width: 0px; height: 0px;
+                                if index > 0 : thread-reply := Rectangle {
+                                    property <int> reply-index: index - 1;
+                                    property <MessageItem> reply: root.thread-messages[self.reply-index];
+                                    // Defer the first read observation until a layout pass.
+                                    property <bool> read-ready: false;
+                                    property <int> read-pass: thread-scroll.read-pass;
+                                    changed read-pass => { self.read-ready = false; }
+                                    property <string> read-key: self.read-ready && thread-scroll.read-allowed
+                                        && self.reply-index == root.thread-messages.length - 1 && self.height > 0px
+                                        && self.shown-top + self.height > 0px
+                                        && self.shown-top + self.height <= thread-scroll.visible-height + 24px
+                                        ? self.reply.event-id : "";
+                                    changed read-key => { RoomActivity.read-view(true, self.read-key); }
                                     Timer {
                                         interval: 16ms;
-                                        running: root.thread-seek-id != 0;
-                                        triggered => { thread-scroll.place-seek(thread-reply.y, thread-reply.height); }
+                                        running: !thread-reply.read-ready && thread-reply.reply-index == root.thread-messages.length - 1;
+                                        triggered => { thread-reply.read-ready = true; }
                                     }
-                                }
-                                // An unknown anchor (another thread or feed) is reported again by
-                                // the reply across the top.
-                                if root.thread-anchor-index < 0 && thread-reply.at-top : Rectangle {
-                                    width: 0px; height: 0px;
-                                    Timer {
-                                        interval: 16ms;
-                                        running: true;
-                                        triggered => { thread-reply.report-top(); }
+                                    property <string> time-label: root.message-time-label(reply);
+                                    // The reply a search hit or a jump opened, highlighted like a
+                                    // selected conversation row.
+                                    property <bool> search-hit: reply.event-id != ""
+                                        && (reply.event-id == root.room-search-selected-event-id || reply.event-id == root.timeline-jump-event-id);
+                                    // At least 43 px and never less than its content. A repeated
+                                    // row's explicit minimum replaces the one its content gives, and
+                                    // the thread's scroll content is sized from the rows' minimums,
+                                    // so a bare 43 px squeezed long replies into the next ones.
+                                    min-height: max(43px, reply-body.min-height);
+                                    vertical-stretch: 0;
+                                    background: root.row-surface(thread-reply.search-hit, false, reply.is-own, root.elevated);
+                                    border-radius: StyleTokens.radius * 0.8;
+                                    // The reply across the viewport's top (with the spacing below it)
+                                    // is the reader's anchor; above the first reply there is none.
+                                    property <length> laid-y: thread-item.y + self.y;
+                                    property <length> shown-top: self.laid-y + thread-scroll.content-y;
+                                    property <bool> at-top: self.shown-top <= 0px && self.shown-top + self.height + 10px > 0px;
+                                    property <bool> above: self.reply-index == 0 && self.shown-top > 0px;
+                                    property <int> top-index: self.at-top ? self.reply-index : -1;
+                                    property <string> top-event: self.at-top ? reply.event-id : "";
+                                    property <length> top-offset: self.at-top ? self.shown-top : 1px;
+                                    changed top-index => { self.report-top(); }
+                                    changed top-event => { self.report-top(); }
+                                    changed top-offset => { self.report-top(); }
+                                    changed above => { self.report-top(); }
+                                    // A known anchor is taken again only by scrolling (the person's or
+                                    // a seek's), never by a layout change above the reader: the keeper
+                                    // below puts that reply back instead.
+                                    function report-top() {
+                                        if root.thread-anchor-index >= 0 && thread-scroll.content-y == root.thread-anchor-scroll {
+                                            return;
+                                        }
+                                        if self.at-top {
+                                            root.thread-anchor-index = self.reply-index;
+                                            root.thread-anchor-event = reply.event-id;
+                                            root.thread-anchor-offset = self.shown-top;
+                                            root.thread-anchor-scroll = thread-scroll.content-y;
+                                            thread-scroll.watch-seek();
+                                        } else if self.above {
+                                            root.thread-anchor-index = -1;
+                                            root.thread-anchor-event = "";
+                                            root.thread-anchor-scroll = thread-scroll.content-y;
+                                        }
                                     }
-                                }
-                                reply-body := VerticalLayout {
-                                    padding: min(12px, root.content-inset); spacing: max(2px, root.message-row-gap);
-                                    HorizontalLayout {
-                                        spacing: 6px;
-                                        Text { text: reply.sender; color: root.sender-ink(thread-reply.search-hit, reply.is-own, reply.sender-palette-index, reply.accent); font-family: root.message-font-family; font-size: root.sender-font-px > 0px ? root.sender-font-px : 11px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 700; wrap: word-wrap; horizontal-stretch: 0; min-width: 0px; accessible-label: reply.sender; }
-                                        // Reply clocks keep the timestamp role and the delivery status
-                                        // text even when optional timestamps are hidden.
-                                        if (root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send") && thread-reply.time-label != "" : Text {
-                                            text: "· " + thread-reply.time-label; color: root.clock-ink(thread-reply.search-hit); font-family: root.monospace-font-family;
-                                            font-size: root.timestamp-font-px; vertical-alignment: top; horizontal-stretch: 0; accessible-label: thread-reply.time-label;
+                                    // The reader's anchor reply keeps its measured place when the
+                                    // layout above it changes (the root or earlier replies reflow, a
+                                    // font or width change), as the conversation's list keeps its first
+                                    // drawn row. Only a layout moves `laid-y`; scrolling does not.
+                                    if root.thread-seek-id == 0 && root.thread-anchor-index >= 0 && reply.event-id != "" && reply.event-id == root.thread-anchor-event : Rectangle {
+                                        width: 0px; height: 0px;
+                                        property <length> laid-y: thread-reply.laid-y;
+                                        changed laid-y => { thread-scroll.keep-anchor(thread-reply.laid-y); }
+                                    }
+                                    // Placement can end a seek and remove this conditional holder.
+                                    // Use the existing frame timer after creation/layout, rather than
+                                    // invalidating this holder from its own init or geometry handlers.
+                                    // The outer ListView still captures the scroll origin at start.
+                                    if root.thread-seek-id != 0 && reply.event-id != "" && reply.event-id == root.thread-seek-event : Rectangle {
+                                        width: 0px; height: 0px;
+                                        Timer {
+                                            interval: 16ms;
+                                            running: root.thread-seek-id != 0;
+                                            triggered => { thread-scroll.place-seek(thread-reply.laid-y, thread-reply.height); }
                                         }
-                                        Rectangle { horizontal-stretch: 1; min-width: 0px; }
-                                        if reply.copy-token != "" : IconAction {
-                                            quiet: true; width: 24px; height: 20px; icon: "⧉";
-                                            label: "Copy text from " + reply.sender;
-                                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
-                                            enabled: root.viewport-seek-allowed && !root.settings-reveal-protected;
-                                            activated => { root.copy-message-text(reply.copy-token, false); }
+                                    }
+                                    // An unknown anchor (another thread or feed) is reported again by
+                                    // the reply across the top.
+                                    if root.thread-anchor-index < 0 && thread-reply.at-top : Rectangle {
+                                        width: 0px; height: 0px;
+                                        Timer {
+                                            interval: 16ms;
+                                            running: true;
+                                            triggered => { thread-reply.report-top(); }
                                         }
-                                        // This thread's read receipts at or after the reply (room activity).
-                                        // Focus comes back here when the view it opened closes.
-                                        if reply.event-id != "" : IconAction {
-                                            quiet: true;
-                                            width: 24px; height: 20px; icon: "✓✓"; label: "Seen in this thread: who has read up to this reply from " + reply.sender;
-                                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
-                                            enabled: root.live-session;
-                                            property <string> return-to;
-                                            property <bool> seen-open: RoomActivity.seen-open;
-                                            changed seen-open => {
-                                                if !self.seen-open && self.return-to != "" {
-                                                    if self.return-to == reply.event-id { self.focus(); }
-                                                    self.return-to = "";
+                                    }
+                                    reply-body := VerticalLayout {
+                                        padding: min(12px, root.content-inset); spacing: max(2px, root.message-row-gap);
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            Text { text: reply.sender; color: root.sender-ink(thread-reply.search-hit, reply.is-own, reply.sender-palette-index, reply.accent); font-family: root.message-font-family; font-size: root.sender-font-px > 0px ? root.sender-font-px : 11px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 700; wrap: word-wrap; horizontal-stretch: 0; min-width: 0px; accessible-label: reply.sender; }
+                                            // Reply clocks keep the timestamp role and the delivery status
+                                            // text even when optional timestamps are hidden.
+                                            if (root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send") && thread-reply.time-label != "" : Text {
+                                                text: "· " + thread-reply.time-label; color: root.clock-ink(thread-reply.search-hit); font-family: root.monospace-font-family;
+                                                font-size: root.timestamp-font-px; vertical-alignment: top; horizontal-stretch: 0; accessible-label: thread-reply.time-label;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; min-width: 0px; }
+                                            if reply.copy-token != "" : IconAction {
+                                                quiet: true; width: 24px; height: 20px; icon: "⧉";
+                                                label: "Copy text from " + reply.sender;
+                                                ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                                enabled: root.viewport-seek-allowed && !root.settings-reveal-protected;
+                                                activated => { root.copy-message-text(reply.copy-token, false); }
+                                            }
+                                            // This thread's read receipts at or after the reply (room activity).
+                                            // Focus comes back here when the view it opened closes.
+                                            if reply.event-id != "" : IconAction {
+                                                quiet: true;
+                                                width: 24px; height: 20px; icon: "✓✓"; label: "Seen in this thread: who has read up to this reply from " + reply.sender;
+                                                ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                                enabled: root.live-session;
+                                                property <string> return-to;
+                                                property <bool> seen-open: RoomActivity.seen-open;
+                                                changed seen-open => {
+                                                    if !self.seen-open && self.return-to != "" {
+                                                        if self.return-to == reply.event-id { self.focus(); }
+                                                        self.return-to = "";
+                                                    }
+                                                }
+                                                activated => {
+                                                    RoomActivity.show-seen-by(reply.event-id, true);
+                                                    if RoomActivity.seen-open { self.return-to = reply.event-id; }
                                                 }
                                             }
-                                            activated => {
-                                                RoomActivity.show-seen-by(reply.event-id, true);
-                                                if RoomActivity.seen-open { self.return-to = reply.event-id; }
+                                        }
+                                        StyledText {
+                                            text: reply.rich-body;
+                                            default-color: root.body-ink(thread-reply.search-hit, reply.is-own);
+                                            default-font-size: root.message-font-px;
+                                            default-font-family: root.message-font-family;
+                                            link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
+                                            accessible-role: text;
+                                            accessible-label: reply.rich-accessible-body;
+                                            link-clicked(url) => { root.open-message-link(url); }
+                                        }
+                                        if reply.poll.present : PollCard {
+                                            data: reply.poll;
+                                            event-id: reply.event-id;
+                                            thread-root: root.thread-root-id;
+                                            enabled: root.live-session;
+                                            palette: root.poll-palette;
+                                            text-scale: root.text-scale;
+                                            corner: StyleTokens.radius * 0.8;
+                                        }
+                                        // The window's token-drawn action: control radius, padding,
+                                        // line and focus widths and control states apply.
+                                        if reply.attachment-is-audio && reply.event-id != "" : AudioAttachment {
+                                            title: reply.attachment; active: root.attachment-audio-event == reply.event-id && root.attachment-audio-thread;
+                                            playing: self.active && root.attachment-audio-playing; loading: self.active && root.attachment-audio-loading;
+                                            position: root.attachment-audio-position; duration: root.attachment-audio-duration; status: root.attachment-audio-status;
+                                            enabled: root.live-session && root.native-call-enabled && !root.call-connected && !root.native-call-request-pending && !root.incoming-call-answering && root.viewport-seek-allowed && !root.settings-reveal-protected;
+                                            save-enabled: root.live-session && reply.event-id != root.downloading-event-id;
+                                            ink: root.ink; muted: root.muted; surface: root.elevated; hover: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                            play => { root.play-attachment-audio(reply.event-id, true); }
+                                            stop => { root.stop-attachment-audio(); }
+                                            save => { root.save-attachment(reply.event-id, reply.attachment); }
+                                        }
+                                        if reply.attachment-is-image && reply.event-id != "" : HorizontalLayout {
+                                            alignment: start;
+                                            TextAction {
+                                                text: "Preview image"; label: "Preview image " + reply.attachment;
+                                                enabled: root.live-session;
+                                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                                outline: root.divider; text-scale: root.text-scale;
+                                                activated => { root.preview-image-attachment(reply.event-id, reply.attachment); }
                                             }
                                         }
-                                    }
-                                    StyledText {
-                                        text: reply.rich-body;
-                                        default-color: root.body-ink(thread-reply.search-hit, reply.is-own);
-                                        default-font-size: root.message-font-px;
-                                        default-font-family: root.message-font-family;
-                                        link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
-                                        accessible-role: text;
-                                        accessible-label: reply.rich-accessible-body;
-                                        link-clicked(url) => { root.open-message-link(url); }
-                                    }
-                                    if reply.poll.present : PollCard {
-                                        data: reply.poll;
-                                        event-id: reply.event-id;
-                                        thread-root: root.thread-root-id;
-                                        enabled: root.live-session;
-                                        palette: root.poll-palette;
-                                        text-scale: root.text-scale;
-                                        corner: StyleTokens.radius * 0.8;
-                                    }
-                                    // The window's token-drawn action: control radius, padding,
-                                    // line and focus widths and control states apply.
-                                    if reply.attachment-is-audio && reply.event-id != "" : AudioAttachment {
-                                        title: reply.attachment; active: root.attachment-audio-event == reply.event-id && root.attachment-audio-thread;
-                                        playing: self.active && root.attachment-audio-playing; loading: self.active && root.attachment-audio-loading;
-                                        position: root.attachment-audio-position; duration: root.attachment-audio-duration; status: root.attachment-audio-status;
-                                        enabled: root.live-session && root.native-call-enabled && !root.call-connected && !root.native-call-request-pending && !root.incoming-call-answering && root.viewport-seek-allowed && !root.settings-reveal-protected;
-                                        save-enabled: root.live-session && reply.event-id != root.downloading-event-id;
-                                        ink: root.ink; muted: root.muted; surface: root.elevated; hover: root.hover; outline: root.divider; text-scale: root.text-scale;
-                                        play => { root.play-attachment-audio(reply.event-id, true); }
-                                        stop => { root.stop-attachment-audio(); }
-                                        save => { root.save-attachment(reply.event-id, reply.attachment); }
-                                    }
-                                    if reply.attachment-is-image && reply.event-id != "" : HorizontalLayout {
-                                        alignment: start;
-                                        TextAction {
-                                            text: "Preview image"; label: "Preview image " + reply.attachment;
-                                            enabled: root.live-session;
-                                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
-                                            outline: root.divider; text-scale: root.text-scale;
-                                            activated => { root.preview-image-attachment(reply.event-id, reply.attachment); }
-                                        }
-                                    }
-                                    // The timeline pin rule: shown once the pinned list is known, for
-                                    // anyone who may change it, and as a disabled marker on pinned
-                                    // replies otherwise. Rust rechecks the account, room and scope.
-                                    if reply.event-id != "" && root.pinned-state-loaded && (root.pinned-can-edit || reply.pinned) : HorizontalLayout {
-                                        alignment: end;
-                                        TextAction {
-                                            text: reply.pinned ? "Unpin" : "Pin";
-                                            ink: root.ink; muted: root.muted; surface: transparent;
-                                            hover-surface: root.hover; outline: root.divider;
-                                            text-scale: root.text-scale;
-                                            accessible-label: (reply.pinned ? "Unpin reply from " : "Pin reply from ") + reply.sender;
-                                            enabled: root.live-session && root.pinned-can-edit && !root.pinned-busy;
-                                            activated => {
-                                                root.toggle-message-pin(root.active-account-local-id, root.active-room-id, reply.event-id, !reply.pinned);
+                                        // The timeline pin rule: shown once the pinned list is known, for
+                                        // anyone who may change it, and as a disabled marker on pinned
+                                        // replies otherwise. Rust rechecks the account, room and scope.
+                                        if reply.event-id != "" && root.pinned-state-loaded && (root.pinned-can-edit || reply.pinned) : HorizontalLayout {
+                                            alignment: end;
+                                            TextAction {
+                                                text: reply.pinned ? "Unpin" : "Pin";
+                                                ink: root.ink; muted: root.muted; surface: transparent;
+                                                hover-surface: root.hover; outline: root.divider;
+                                                text-scale: root.text-scale;
+                                                accessible-label: (reply.pinned ? "Unpin reply from " : "Pin reply from ") + reply.sender;
+                                                enabled: root.live-session && root.pinned-can-edit && !root.pinned-busy;
+                                                activated => {
+                                                    root.toggle-message-pin(root.active-account-local-id, root.active-room-id, reply.event-id, !reply.pinned);
+                                                }
                                             }
                                         }
                                     }
                                 }
+                            }
+                        }
+                        Timer {
+                            interval: 16ms;
+                            running: root.thread-seek-id != 0;
+                            triggered => {
+                                root.thread-seek-pass += 1;
+                                thread-scroll.approach-seek(false);
                             }
                         }
                     }
