@@ -60,13 +60,21 @@ verified against exact size and SHA256 before execution. There is no fallback
 to mutable latest URLs or a user-owned populated cache. The two deployment-tool
 assets use exact public GitHub API asset IDs and constant
 `Accept: application/octet-stream`; only the expected repository paths are
-accepted, without an API token. Deletion fails closed. Their original payloads,
-digests and source targets remain unchanged:
+accepted, without an API token. Deletion fails closed. The linuxdeploy continuous release replaced its deleted October asset; the
+reviewed November asset below retains the same immutable source target. The
+separately pinned AppImage output plugin remains byte-for-byte unchanged:
 
 | Component | Asset ID | Immutable source target | SHA256 |
 | --- | ---: | --- | --- |
-| Official linuxdeploy x64 | 602438599 | 07333c6e942c7d71782b66be924c5d867f9dfdfc | 8aea8da0f7f7039d2a2cecb14657d752a222a5e1d3825caeef186c82f751cdd1 |
+| Official linuxdeploy x64 | 699514588 | 07333c6e942c7d71782b66be924c5d867f9dfdfc | df908b19f1ed1cdafa79508d415aa12d6c56ce4d56d4149aa8c09286718706e5 |
 | Official AppImage output plugin | 602435573 | 536b068787179ea901964bd7dabc7bf61e4941c3 | 49d6a17160675a6bd1781699aae6bdf7692d98552e02a3671d2183d10547842e |
+
+The reviewed tool combination requires the existing exclusive private-cache
+layout: both verified AppImages are adjacent, and linuxdeploy selects the
+unchanged external output plugin from its original AppImage directory before
+bundled duplicates. Duplicate plugin metadata probes return without running the
+bundled image builder. This review covers that canonical path, not arbitrary
+standalone use of bundled tools. Fresh Linux package acceptance is still required.
 
 The previously pinned standalone runtime asset was deleted. Its later signed
 replacement contained Squashfuse 0.5.2 without the known malformed-image fixes.

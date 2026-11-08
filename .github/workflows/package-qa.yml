@@ -650,6 +650,8 @@ jobs:
       - name: Build unsigned QA package
         if: runner.os != 'Linux' && needs.scope.outputs.native_updates != 'true'
         shell: bash
+        # Windows consumes the exact protected export authenticated during notice preparation.
+        working-directory: ${{ runner.os == 'Windows' && format('{0}/fetch-source', env.MORPHEUS_NATIVE_SOURCE_ROOT) || github.workspace }}
         run: python3 scripts/package.py --formats ${{ matrix.formats }} --native-source-bundle "$MORPHEUS_NATIVE_SOURCE_BUNDLE" --native-source-receipt "$MORPHEUS_NATIVE_SOURCE_RECEIPT"
       - name: Build and inspect canonical Linux QA AppImage
         if: runner.os == 'Linux' && !inputs.appimage_updates
@@ -657,6 +659,8 @@ jobs:
       - name: Install, inspect, launch and remove unsigned packages
         if: needs.scope.outputs.native_updates != 'true' && (runner.os != 'Linux' || !inputs.appimage_updates)
         timeout-minutes: 35
+        # Windows consumes the exact protected export authenticated during notice preparation.
+        working-directory: ${{ runner.os == 'Windows' && format('{0}/fetch-source', env.MORPHEUS_NATIVE_SOURCE_ROOT) || github.workspace }}
         run: python3 scripts/package_smoke.py --target ${{ matrix.label }} --formats ${{ matrix.formats }}
       - name: Test installed AppImage update and rollback
         if: runner.os == 'Linux' && inputs.appimage_updates

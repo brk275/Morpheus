@@ -252,7 +252,8 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(classify([".github/workflows/ci.yml"])["native_matrix"]["os"], list(PLATFORMS))
 
     def test_manual_capture_driver_changes_do_not_rerun_system_native_acceptance(self):
-        for path in ("packaging/linux/package_appimage.py",
+        for path in ("packaging/linux/appimage-tools.json",
+                     "packaging/linux/package_appimage.py",
                      "packaging/linux/appimage_capture.py",
                      "packaging/linux/appimage_capture_worker.py",
                      "packaging/linux/appimage_diagnostics.py",
@@ -272,7 +273,7 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual(classify([path], force_all=True)["native_matrix"]["os"], list(PLATFORMS))
         # The peer is compiled by native CI; unknown package inputs fail closed.
         for path in ("packaging/linux/appimage_peer.rs", "packaging/linux/new-helper.py",
-                     "packaging/linux/AppRun", "packaging/linux/appimage-tools.json",
+                     "packaging/linux/AppRun", "packaging/linux/appimage-tools-local.json",
                      "packaging/linux/runtime-build-local.json",
                      "packaging/linux/runtime-patches/type2-runtime-fedfad51-path-bounds.patch.extra",
                      "packaging/linux/runtime-patches/type2-runtime-path-regression-other.c"):

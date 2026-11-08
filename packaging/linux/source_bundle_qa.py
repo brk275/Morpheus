@@ -32,6 +32,19 @@ PINS = frozenset({
     "git+https://github.com/matrix-org/matrix-rust-sdk?rev=c6ad52ecc09eaa36601f55effb0a48a533eb87dd#c6ad52ecc09eaa36601f55effb0a48a533eb87dd",
 })
 
+RTC_SOURCE = "git+https://github.com/element-hq/matrix-rust-rtc?tag=v0.5.0-rc.2#53880ef1ef66b62df555ce71ccd1d6c85b813596"
+RTC_REPOSITORY = "https://github.com/element-hq/matrix-rust-rtc"
+RTC_REVISION = "53880ef1ef66b62df555ce71ccd1d6c85b813596"
+RTC_VERSION = "0.5.0-rc.2"
+RTC_PROVENANCE = {
+    "matrix-rtc-call": "UPSTREAM.json",
+    "matrix-rtc-call-sdk": "MORPHEUS_PATCH.md",
+    "matrix-rtc-core": "MORPHEUS_PROVENANCE.json",
+    "matrix-rtc-livekit": "README.md",
+    "matrix-rtc-matrix-sdk": "UPSTREAM_FILES.json",
+    "matrix-rtc-transport": "MORPHEUS_PATCH.md",
+}
+
 
 def guard(environment, *, checkout=True):
     P.public_hosted_environment(environment)
@@ -88,10 +101,52 @@ def environment_for_acquisition(environment, root, cargo, rustc):
     return result
 
 
+def lock_git_sources(packages):
+    sources = frozenset(p["source"] for p in packages if p.get("source", "").startswith("git+"))
+    # Two closed cohorts, never an arbitrary subset of the known origins.
+    S.require(sources in (PINS, PINS - {RTC_SOURCE}))
+    return sources
+
+
+def vendored_rtc_sources(files, packages, catalog):
+    patches = S.toml_file(files, "Cargo.toml").get("patch", {}).get(RTC_REPOSITORY)
+    S.require(type(patches) is dict and set(patches) == set(RTC_PROVENANCE))
+    locked = [p for p in packages if p["name"].startswith("matrix-rtc-")]
+    S.require(len(locked) == len(RTC_PROVENANCE)
+            and {p["name"] for p in locked} == set(RTC_PROVENANCE)
+            and all(p["version"] == RTC_VERSION and p.get("source") is None for p in locked))
+    for name, provenance in RTC_PROVENANCE.items():
+        path = "vendor/" + name
+        S.require(patches[name] == {"path": path})
+        local = catalog.get((name, RTC_VERSION))
+        S.require(type(local) is dict and local["manifest"] == path + "/Cargo.toml"
+                and {path + "/LICENSE", path + "/LICENSE-COMMERCIAL"}
+                    <= set(local["license_text_candidates"]))
+        body = files.get(path + "/" + provenance)
+        S.require(type(body) is bytes and 0 < len(body) <= 64 * 1024)
+        if provenance.endswith(".json"):
+            record = S.unique_json(body)
+            repository = "upstream_repository" if name == "matrix-rtc-core" else "repository"
+            S.require(type(record) is dict and record.get(repository) == RTC_REPOSITORY
+                    and record.get("revision") == RTC_REVISION)
+            if name == "matrix-rtc-core":
+                S.require(record.get("package") == name and record.get("version") == RTC_VERSION)
+            elif name == "matrix-rtc-call":
+                S.require(record.get("crate_path") == "crates/" + name and record.get("version") == RTC_VERSION)
+            else:
+                S.require(record.get("package_path") == "crates/" + name)
+        else:
+            S.require(RTC_REVISION.encode() in body and name.encode() in body and RTC_VERSION.encode() in body)
+
+
 def source_inputs(files):
     packages = S.lock_packages(files)
-    S.require({p["source"] for p in packages if p.get("source", "").startswith("git+")} == PINS, "lock")
+    sources = lock_git_sources(packages)
     catalog = S.package_catalog(files)
+    if RTC_SOURCE not in sources:
+        vendored_rtc_sources(files, packages, catalog)
+    # Keep all three exact manifest origins: local RTC patches still declare
+    # their authenticated upstream tag; only fetched mirrors follow the lock.
     documents = {"Cargo.toml"} | {record["manifest"] for record in catalog.values()}
     expected = set()
     for source in PINS:
@@ -154,7 +209,7 @@ def input_plan(home, packages, runner, environment):
     S.require(0 < len(mirrors) <= 16, "bounds")
     git = P.owned_tool("/usr/bin/git", root_owned=True)
     plan = {}
-    for source in sorted(PINS):
+    for source in sorted(lock_git_sources(packages)):
         revision = source.rsplit("#", 1)[1]
         matches = []
         for mirror in mirrors:
