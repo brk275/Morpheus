@@ -590,6 +590,8 @@ OAUTH_LABELS = tuple("oauth-local-" + phase.replace("_", "-") for phase in OAUTH
 RING_LABELS = tuple(f"outgoing-ring-{mode}-{target}" for mode, target in RING_CASES)
 RTC_LABELS = ("local_rtc", "local_rtc-late-join", "local_rtc-sticky-2025-late-join")
 ELEMENT_LABEL = "element-call-rc-sticky2025-presynced"
+PATCHED_SDK_LABEL = "patched-sdk-element-real-crypto-diagnostic"
+PATCHED_SDK_SUITE = "patched-sdk-element"
 # Setup/build/browser-install stages never prove that a peer check entered.
 ELEMENT_TEST_STAGES = frozenset((
     "browser_login", "browser_identity", "browser_room_sync", "native_join_wait",
@@ -619,7 +621,8 @@ SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
           "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS,
           "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS), "oauth-only": OAUTH_LABELS,
-          "rtc-recovery": OUTAGE_LABELS, "rtc-media": RTC_LABELS, "element-interop": (ELEMENT_LABEL,)}
+          "rtc-recovery": OUTAGE_LABELS, "rtc-media": RTC_LABELS, "element-interop": (ELEMENT_LABEL,),
+          PATCHED_SDK_SUITE: (PATCHED_SDK_LABEL,)}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -1256,10 +1259,19 @@ class RecoveryTestBinary:
 
 
 class Acceptance:
-    def __init__(self, root: Path, gitleaks: str, *, started=None, suite="full"):
+    def __init__(self, root: Path, gitleaks: str, *, started=None, suite="full",
+                 patched_sdk_receipt=None, patched_sdk_receipt_sha256=None):
         if suite not in SUITES:
             raise ValueError("Unknown acceptance suite")
         self.suite = suite
+        self.patched_sdk_receipt = patched_sdk_receipt
+        self.patched_sdk_receipt_sha256 = patched_sdk_receipt_sha256
+        if (suite == PATCHED_SDK_SUITE) != (patched_sdk_receipt is not None
+                                           and patched_sdk_receipt_sha256 is not None):
+            raise RuntimeError("Patched SDK diagnostic requires its explicit bound asset receipt")
+        if suite != PATCHED_SDK_SUITE and (patched_sdk_receipt is not None
+                                          or patched_sdk_receipt_sha256 is not None):
+            raise RuntimeError("Stock acceptance does not accept patched SDK assets")
         self.planned_checks = SUITES[suite]
         self.root = private_directory(root)
         self.logs = private_directory(root / "logs")
@@ -1480,7 +1492,8 @@ class Acceptance:
             if label == "moderation_local":
                 evidence["moderation_diagnostics"] = moderation_diagnostics(output)
             if element_checks:
-                evidence["element_checks"] = element_evidence(output)
+                evidence["patched_sdk_checks" if self.suite == PATCHED_SDK_SUITE else "element_checks"] = element_evidence(
+                    output, patched_sdk=self.suite == PATCHED_SDK_SUITE)
                 evidence["element_diagnostics"] = element_diagnostics(output)
                 if timed_out:
                     evidence["element_diagnostics"]["failure"] = "deadline"
@@ -1589,9 +1602,21 @@ class Acceptance:
         if oauth_checks:
             record["oauth_checks"] = oauth_evidence(output, oauth_checks)
         if element_checks:
-            record["element_checks"] = element_evidence(output, complete=True)
-            record["element_peer"] = {"version": ELEMENT_VERSION, "image_digest": ELEMENT_IMAGE_DIGEST,
-                                      "protocol": "matrix_2_0_sticky2025", "baseline": "presynced"}
+            if self.suite == PATCHED_SDK_SUITE:
+                if (label != PATCHED_SDK_LABEL
+                        or output.splitlines().count("MORPHEUS_PATCHED_SDK_DIAGNOSTIC stock_interoperability=false") != 1):
+                    raise RuntimeError("Patched SDK diagnostic identity is incomplete")
+                record["patched_sdk_checks"] = element_evidence(output, complete=True, patched_sdk=True)
+                record["stock_interoperability"] = False
+                record["official_application_assets"] = False
+                record["patched_sdk_receipt_sha256"] = self.patched_sdk_receipt_sha256
+                record["diagnostic_kind"] = "patched_sdk_element_real_crypto_diagnostic"
+            else:
+                if label != ELEMENT_LABEL or "MORPHEUS_PATCHED_SDK_DIAGNOSTIC" in output:
+                    raise RuntimeError("Stock Element acceptance rejects patched SDK evidence")
+                record["element_checks"] = element_evidence(output, complete=True)
+                record["element_peer"] = {"version": ELEMENT_VERSION, "image_digest": ELEMENT_IMAGE_DIGEST,
+                                          "protocol": "matrix_2_0_sticky2025", "baseline": "presynced"}
         return record
 
     def script(self, name: str, command: str) -> str:
@@ -1833,12 +1858,15 @@ class Acceptance:
     def element_case(self):
         self.require_containment()
         fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-group-fixture"), self.root)
-        root = self.root / "element-interop"
+        patched_sdk = self.suite == PATCHED_SDK_SUITE
+        root = self.root / (PATCHED_SDK_SUITE if patched_sdk else "element-interop")
+        extra_args = (["--patched-sdk-receipt", str(self.patched_sdk_receipt),
+                       "--patched-sdk-receipt-sha256", self.patched_sdk_receipt_sha256] if patched_sdk else [])
         try:
-            self.run("element-call-rc-sticky2025-presynced", [
+            self.run(PATCHED_SDK_LABEL if patched_sdk else ELEMENT_LABEL, [
                 sys.executable, "scripts/run_element_acceptance.py", "--root", str(root),
                 "--fixture", str(fixture), "--gitleaks", self.gitleaks,
-            ], element_checks=True, seconds=1800, pid_namespace=True)
+            ] + extra_args, element_checks=True, seconds=1800, pid_namespace=True)
         finally:
             # A separate cleanup also covers a killed helper, using only its
             # private nonce ownership record. It never touches shared services.
@@ -1920,6 +1948,10 @@ class Acceptance:
                                  "and complete bounded notification history "
                                  "after a real sync barrier. This does not exercise a stock Element peer, incoming-app automatic rejoin, "
                                  "physical audio/video, installed-package or whole-beta acceptance.\n\n")
+                elif self.suite == PATCHED_SDK_SUITE:
+                    output.write("Patched SDK diagnostic: source-built Element frontend with exactly two reviewed SDK production changes. "
+                                 "Same three-party native/browser encryption and media assertions. "
+                                 "This does not qualify unchanged stock Element interoperability or beta readiness.\n\n")
                 elif self.suite == "element-interop":
                     output.write("Focused stock Element interoperability: only the existing Element peer case ran "
                                  "with disposable Matrix and RTC services. "
@@ -2008,9 +2040,19 @@ def main():
     parser.add_argument("--gitleaks", required=True)
     parser.add_argument("--suite", choices=tuple(SUITES), default="full",
                         help="Focused retries do not establish full acceptance (default: full)")
+    parser.add_argument("--patched-sdk-receipt", type=Path)
+    parser.add_argument("--patched-sdk-receipt-sha256")
     args = parser.parse_args()
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_OS") != "Linux":
         raise RuntimeError("This harness is restricted to ephemeral Linux GitHub runners")
+    if args.suite == PATCHED_SDK_SUITE:
+        from element_peer_fixture import patched_sdk_assets
+        if args.patched_sdk_receipt is None or args.patched_sdk_receipt_sha256 is None:
+            raise RuntimeError("Patched SDK diagnostic requires its bound asset receipt")
+        # Validate before synthetic services/accounts or cleanup ownership start.
+        patched_sdk_assets(args.patched_sdk_receipt, args.patched_sdk_receipt_sha256)
+    elif args.patched_sdk_receipt is not None or args.patched_sdk_receipt_sha256 is not None:
+        raise RuntimeError("Stock acceptance does not accept patched SDK assets")
     if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
         raise RuntimeError("Run the harness inside dbus-run-session")
     for command in ("docker", "cargo", "gnome-keyring-daemon", "secret-tool", args.gitleaks):
@@ -2032,7 +2074,9 @@ def main():
         if set(result.stdout.splitlines()).intersection(names):
             raise RuntimeError("Pre-existing Matrix fixture found; refusing to modify it")
     root = Path(tempfile.mkdtemp(prefix="morpheus-hosted-acceptance-", dir=os.environ.get("RUNNER_TEMP")))
-    acceptance = Acceptance(root, args.gitleaks, started=started, suite=args.suite)
+    acceptance = Acceptance(root, args.gitleaks, started=started, suite=args.suite,
+                            patched_sdk_receipt=args.patched_sdk_receipt,
+                            patched_sdk_receipt_sha256=args.patched_sdk_receipt_sha256)
     body_failed = False
     try:
         acceptance.start_keyring()
@@ -2054,12 +2098,13 @@ def main():
             acceptance.group(RTC_LABELS, rtc_media_checks)
             acceptance.finish_checks()
             return
-        if args.suite == "element-interop":
+        if args.suite in ("element-interop", PATCHED_SDK_SUITE):
             def element_interop_checks():
                 acceptance.script("local_matrix_rtc", "up")
                 acceptance.script("local_matrix_rtc", "probe")
                 acceptance.element_case()
-            acceptance.group((ELEMENT_LABEL,), element_interop_checks)
+            acceptance.group((PATCHED_SDK_LABEL if args.suite == PATCHED_SDK_SUITE else ELEMENT_LABEL,),
+                             element_interop_checks)
             acceptance.finish_checks()
             return
         if args.suite == "rtc-recovery":
