@@ -400,7 +400,7 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
         self.assertTrue(runner.run.call_args.kwargs["binary_output"])
         self.assertNotIn("--header", args)
         api_urls = (
-            "https://api.github.com/repos/linuxdeploy/linuxdeploy/releases/assets/602438599",
+            "https://api.github.com/repos/linuxdeploy/linuxdeploy/releases/assets/699514588",
             "https://api.github.com/repos/linuxdeploy/linuxdeploy-plugin-appimage/releases/assets/602435573",
             "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/657374641",
         )
