@@ -211,3 +211,36 @@ fn windows_cache_leaf_uses_exact_immutable_asset_without_duplicate_nesting() {
         );
     }
 }
+
+#[test]
+fn download_response_admission_keeps_exact_status_length_and_closed_failure_facts() {
+    use reqwest::StatusCode;
+
+    assert!(super::validate_download_response(StatusCode::OK, None, &ABC).is_ok());
+    assert!(super::validate_download_response(StatusCode::OK, Some(ABC.bytes), &ABC).is_ok());
+    for (status, length, expected) in [
+        (
+            StatusCode::FORBIDDEN,
+            None,
+            "Native SDK download response does not match the reviewed release: status=403 content_length=None expected_bytes=3",
+        ),
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(0),
+            "Native SDK download response does not match the reviewed release: status=429 content_length=Some(0) expected_bytes=3",
+        ),
+        (
+            StatusCode::OK,
+            Some(4),
+            "Native SDK download response does not match the reviewed release: status=200 content_length=Some(4) expected_bytes=3",
+        ),
+        (
+            StatusCode::OK,
+            Some(u64::MAX),
+            "Native SDK download response does not match the reviewed release: status=200 content_length=Some(18446744073709551615) expected_bytes=3",
+        ),
+    ] {
+        let error = super::validate_download_response(status, length, &ABC).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
+}

@@ -217,6 +217,24 @@ pub fn configure_jni_symbols() -> Result<()> {
     Ok(())
 }
 
+fn validate_download_response(
+    status: StatusCode,
+    content_length: Option<u64>,
+    pin: &pins::Pin,
+) -> Result<()> {
+    if status != StatusCode::OK || content_length.is_some_and(|size| size != pin.bytes) {
+        // Closed numeric facts only: never include a request URL, redirect,
+        // response body, header value or credential in a Cargo build failure.
+        return Err(anyhow!(
+            "Native SDK download response does not match the reviewed release: status={} content_length={:?} expected_bytes={}",
+            status.as_u16(),
+            content_length,
+            pin.bytes
+        ));
+    }
+    Ok(())
+}
+
 pub fn download_webrtc() -> Result<()> {
     let dir = scratch::path(SCRATH_PATH);
     fs::create_dir_all(&dir).context("Failed to create scratch_path")?;
@@ -260,15 +278,7 @@ pub fn download_webrtc() -> Result<()> {
         .header(reqwest::header::USER_AGENT, "morpheus-native-sdk")
         .send()
         .map_err(|_| anyhow!("Native SDK download request failed"))?;
-    if response.status() != StatusCode::OK
-        || response
-            .content_length()
-            .is_some_and(|size| size != pin.bytes)
-    {
-        return Err(anyhow!(
-            "Native SDK download response does not match the reviewed release"
-        ));
-    }
+    validate_download_response(response.status(), response.content_length(), &pin)?;
 
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?

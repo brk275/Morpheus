@@ -171,6 +171,22 @@ class AcceptanceTests(unittest.TestCase):
         source = WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(source.count("github.event_name != 'workflow_dispatch' && needs.scope.outputs.check_route != 'all'"), 2)
 
+    def test_sdk_archive_aggregate_requires_exact_manual_matrix_and_cannot_claim_full_checks(self):
+        choices = {"all":list(PLATFORMS), "linux":["ubuntu-24.04"], "windows":["windows-2025"],
+                   "macos-arm":["macos-15"], "macos-intel":["macos-15-intel"]}
+        for platform, platforms in choices.items():
+            value = snapshot(True, platforms=platforms, wayland=False)
+            value["scope"]["outputs"].update(manual="true", manual_platform=platform, check_route="sdk-archive")
+            self.assertIsNone(acceptance_error(value, "workflow_dispatch"))
+            for event in ("push", "pull_request"):
+                self.assertIsNotNone(acceptance_error(value, event))
+            for key, bad in (("wayland","true"), ("config","true"), ("matrix_suite","recovery-only")):
+                changed = json.loads(json.dumps(value)); changed["scope"]["outputs"][key] = bad
+                self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
+            for result in ("skipped", "failure", "cancelled", None):
+                changed = json.loads(json.dumps(value)); changed["compile"]["result"] = result
+                self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
+
     def test_oauth_only_manual_result_requires_exact_linux_matrix_scope_and_passed_job(self):
         value = snapshot(True, platforms=["ubuntu-24.04"], wayland=False)
         value["scope"]["outputs"].update(manual="true", manual_platform="linux", check_route="matrix", matrix_suite="oauth-only")
@@ -316,7 +332,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
     def test_selected_steps_must_pass_and_unselected_steps_must_be_skipped(self):
         validate = load_native_validator()
         for runner in ("Linux","Windows","macOS"):
-            for route in ("all","models","desktop","desktop-video","devices","vendor","sdk","matrix","wayland"):
+            for route in ("all","models","desktop","desktop-video","devices","vendor","sdk","sdk-archive","matrix","wayland"):
                 if route in ("matrix","wayland") and runner!="Linux":
                     continue
                 wayland = "true" if runner=="Linux" and route in ("all","wayland") else "false"
@@ -325,6 +341,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
                             "rtc-library-tests":route in ("all","vendor"),
                             "video-source-tests":route in ("all","vendor","desktop-video"),
                             "sdk-receipt-tests":route in ("all","sdk"),
+                            "sdk-archive-tests":route == "sdk-archive",
                             "windows-capture-tests":runner=="Windows" and route in ("all","devices"),
                             "wayland-tests":wayland=="true", "matrix-tests":runner=="Linux" and route in ("all","matrix")}
                 outcomes={name:{"outcome":"success" if yes else "skipped"} for name,yes in selected.items()}
@@ -363,11 +380,11 @@ class NativeRouteWorkflowTests(unittest.TestCase):
                 "model-tests", "desktop-tests", "device-tests", "vendor-tests", "rtc-library-tests",
                 "video-source-tests", "sdk-receipt-tests")}
             outcomes.update({name: {"outcome": "skipped"} for name in (
-                "wayland-tests", "matrix-tests", "preview-capture", "preview-upload")})
+                "wayland-tests", "matrix-tests", "sdk-archive-tests", "preview-capture", "preview-upload")})
             outcomes["windows-capture-tests"] = {"outcome": "success" if runner == "Windows" else "skipped"}
             self.assertIsNone(validate("all", runner, project("all", runner, "true"), outcomes))
             self.assertIsNotNone(validate("all", runner, "true", outcomes))
-            for route in ("models", "desktop", "desktop-video", "devices", "vendor", "sdk", "matrix", "wayland", "foreign"):
+            for route in ("models", "desktop", "desktop-video", "devices", "vendor", "sdk", "sdk-archive", "matrix", "wayland", "foreign"):
                 # Only the legitimate whole-matrix route may project true.
                 # Invalid route/global-Wayland pairs must stay fail-closed.
                 self.assertEqual(project(route, runner, "true"), "true")
@@ -547,6 +564,24 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertIn('grep -Fxc -- "test $rtc_constraint_test ... ok"', source)
         self.assertIn("VENDOR_OUTCOME: ${{ steps.vendor-tests.outcome }}", source)
         self.assertIn('("vendor-tests", "VENDOR_OUTCOME")', source)
+
+    def test_sdk_archive_workflow_only_runs_exact_archive_helper_with_positive_results(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        step = source.split("      - name: Check SDK archive helper formatting\n", 1)[1].split(
+            "      - name: Prepare the pinned owned native PipeWire client\n", 1)[0]
+        self.assertIn("if: needs.scope.outputs.check_route == 'sdk-archive'", step)
+        self.assertIn("id: sdk-archive-tests", step)
+        self.assertIn("cargo fmt --package webrtc-sys-build -- --check", step)
+        self.assertIn("cargo test --locked -p webrtc-sys-build --lib -- --list", step)
+        self.assertIn("cargo test --locked -p webrtc-sys-build --lib -- --test-threads=1", step)
+        self.assertIn("archive_tests::download_response_admission_keeps_exact_status_length_and_closed_failure_facts", step)
+        self.assertIn('grep -Fxc -- "test $sdk_archive_test ... ok"', step)
+        self.assertIn("0 failed; 0 ignored; 0 measured; 0 filtered out", step)
+        for excluded in ("morpheus-app", "morpheus-rtc", "matrix-sdk", "native-devices", "apt-get", "--ignored"):
+            self.assertNotIn(excluded, step)
+        self.assertIn("SDK_ARCHIVE_OUTCOME: ${{ steps.sdk-archive-tests.outcome }}", source)
+        self.assertIn('("sdk-archive-tests", "SDK_ARCHIVE_OUTCOME")', source)
+        self.assertIn("if: runner.os == 'Linux' && needs.scope.outputs.check_route != 'sdk-archive'", source)
 
     def test_manual_inputs_and_fixed_routes_keep_existing_security_and_commands(self):
         source=WORKFLOW.read_text(encoding="utf-8")

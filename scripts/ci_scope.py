@@ -179,7 +179,7 @@ MANUAL_PLATFORMS = {
     "macos-arm": ("macos-15",),
     "macos-intel": ("macos-15-intel",),
 }
-MANUAL_CHECKS = frozenset({"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk",
+MANUAL_CHECKS = frozenset({"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "sdk-archive",
                            "matrix", "wayland", "config", "helpers"})
 # Exact existing suites from run_matrix_acceptance.py; no new test composition.
 MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-reads",
@@ -254,8 +254,8 @@ AUTOMATIC_CONTROL_INPUTS = frozenset((
     "scripts/ci_scope.py", "scripts/tests/test_ci_scope.py",
     ".github/workflows/ci.yml", "scripts/tests/test_ci_acceptance.py",
 ))
-REVIEWED_CONTROL_WORKFLOW_SHA256 = "f7ba2016331c9f05478786cf7d2a8f1c79154bc0754e0afb7f593b28d7fed5f9"
-REVIEWED_CONTROL_WORKFLOW_BYTES = 68493
+REVIEWED_CONTROL_WORKFLOW_SHA256 = "7f43ebf6dd514acab961953484f55fc2968dc8150d73b98a849f153f3eac9d1b"
+REVIEWED_CONTROL_WORKFLOW_BYTES = 71315
 
 
 # The shared archive downloader is exercised by the existing four-platform

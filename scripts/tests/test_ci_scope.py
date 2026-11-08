@@ -368,8 +368,21 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual(result["wayland"], "ubuntu-24.04" in platforms)
                 self.assertEqual((result["check_route"], result["matrix_suite"]), ("all", "full"))
 
+    def test_sdk_archive_is_explicit_partial_native_only_on_each_supported_platform(self):
+        for platform, platforms in MANUAL_PLATFORMS.items():
+            inputs = {"platform":platform, "checks":"sdk-archive", "matrix_suite":"full"}
+            selected = event_selection({"inputs":inputs}, "workflow_dispatch")
+            self.assertEqual(selected, {"native":True, "native_matrix":{"os":list(platforms)},
+                "config":False, "wayland":False, "manual":True, "manual_platform":platform,
+                "check_route":"sdk-archive", "matrix_suite":"full"})
+            for suite in MATRIX_SUITES - {"full"}:
+                with self.subTest(platform=platform, suite=suite), self.assertRaises(ValueError):
+                    event_selection({"inputs":inputs | {"matrix_suite":suite}}, "workflow_dispatch")
+        with patch.object(ci_scope, "changed_paths", return_value=(["vendor/webrtc-sys-build/src/lib.rs"], False)):
+            self.assertNotEqual(event_selection({}, "push")["check_route"], "sdk-archive")
+
     def test_manual_routes_are_exact_existing_checks_and_matrix_suites(self):
-        self.assertEqual(MANUAL_CHECKS, {"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk",
+        self.assertEqual(MANUAL_CHECKS, {"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "sdk-archive",
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
                                          "timeline-failures", "recovery-only", "media-only", "app-timeline",
@@ -664,9 +677,9 @@ class ScopeTests(unittest.TestCase):
         # comparisons with owned fixture bytes under test-only pins, so a
         # future different workflow can safely fall back all without requiring
         # its execution layout to be admitted by this exemption.
-        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 68493)
+        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 71315)
         self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
-                         "f7ba2016331c9f05478786cf7d2a8f1c79154bc0754e0afb7f593b28d7fed5f9")
+                         "7f43ebf6dd514acab961953484f55fc2968dc8150d73b98a849f153f3eac9d1b")
         import hashlib
         with patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_BYTES", len(workflow)), \
                 patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_SHA256", hashlib.sha256(workflow).hexdigest()):
