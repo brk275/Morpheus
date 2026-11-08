@@ -582,10 +582,40 @@ def windows_installed_launches(executable):
             print(json.dumps({"check": "windows_profile_retained", "status": "failed"}, sort_keys=True), flush=True)
 
 
+def windows_smoke_root():
+    # The controller reserves this private USERPROFILE child before exporting
+    # this exact source. Shared runner TEMP ancestors need not satisfy the
+    # installed notice reader's unchanged writer/owner policy.
+    if __package__:
+        from . import native_notice_source as source
+    else:
+        import native_notice_source as source
+    environment = dict(os.environ)
+    require(os.name == "nt" and sys.platform == "win32" and all(
+        environment.get(key) == value for key, value in {
+            "GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+            "GITHUB_REPOSITORY": "brk275/Morpheus", "GITHUB_REF": "refs/heads/main",
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_ACTOR": "brk275",
+            "GITHUB_TRIGGERING_ACTOR": "brk275", "RUNNER_OS": "Windows",
+        }.items()), "Windows package smoke requires the owned hosted source reservation")
+    root = source.owned_source_root(environment)
+    require(ROOT == root / "fetch-source", "Windows package smoke source is outside its reservation")
+    source.checked(ROOT, directory=True, private=True)
+    state = source.S.unique_json(source.S.read_owned(root / "state.json", 4096, private=True))
+    require(type(state) is dict and type(state.get("schema")) is int
+            and all(type(state.get(key)) is bool for key in (
+                "prepared", "logs_scanned", "logs_complete", "owned_processes_stopped", "distribution_ready"))
+            and state == {"schema": 1, "source_revision": source.R.expected_revision(environment),
+                          "prepared": True, "logs_scanned": True, "logs_complete": True,
+                          "owned_processes_stopped": True, "distribution_ready": False},
+            "Windows package smoke requires completed source preparation")
+    return root
+
+
 def windows_smoke(dist):
     package = artifact(dist, ".exe")
     require(not uninstall_registry(), "Refusing to replace an existing Morpheus installation")
-    with tempfile.TemporaryDirectory(prefix="morpheus-package-") as temp:
+    with tempfile.TemporaryDirectory(prefix="morpheus-package-", dir=windows_smoke_root()) as temp:
         work = Path(temp).resolve(strict=True)
         installed = work / "Installed Morpheus"  # Exercise NSIS paths containing spaces.
         run(nsis_command(package, installed))

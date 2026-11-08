@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch, MagicMock, call
 
 from scripts import package_smoke
@@ -139,6 +140,7 @@ class PackageSmokeTests(unittest.TestCase):
     def test_windows_install_uses_one_canonical_owned_temp_root_for_all_operations(self):
         alias = Path("/synthetic/SHORT~1/owned")
         canonical = Path("/synthetic/Long User/owned")
+        anchor = Path("/synthetic/private/source")
         installed = canonical / "Installed Morpheus"
         executable = installed / "morpheus-app.exe"
         uninstaller = installed / "uninstall.exe"
@@ -155,7 +157,8 @@ class PackageSmokeTests(unittest.TestCase):
             return canonical / suffix
         entries = [{"DisplayName":"Morpheus", "DisplayVersion":"0.1.0",
                     "InstallLocation":str(installed)}]
-        with patch.object(package_smoke.tempfile, "TemporaryDirectory", return_value=temporary) as allocate, \
+        with patch.object(package_smoke, "windows_smoke_root", return_value=anchor) as admit, \
+                patch.object(package_smoke.tempfile, "TemporaryDirectory", return_value=temporary) as allocate, \
                 patch.object(Path, "resolve", autospec=True, side_effect=resolve) as resolved, \
                 patch.object(Path, "exists", autospec=True, side_effect=lambda path:path == uninstaller), \
                 patch.object(package_smoke, "artifact", return_value=setup), \
@@ -168,7 +171,8 @@ class PackageSmokeTests(unittest.TestCase):
                 patch.object(package_smoke.shutil, "copy2") as copy, \
                 patch.object(package_smoke, "record"):
             package_smoke.windows_smoke(dist)
-        allocate.assert_called_once_with(prefix="morpheus-package-")
+        admit.assert_called_once_with()
+        allocate.assert_called_once_with(prefix="morpheus-package-", dir=anchor)
         self.assertEqual(resolved.call_args_list[0], call(alias, strict=True))
         pe.assert_called_once_with(executable)
         resources.assert_called_once_with(installed, dist)
@@ -177,6 +181,71 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(run.call_args_list, [call(package_smoke.nsis_command(setup, installed)),
                                               call(package_smoke.nsis_command(copied, installed, uninstall=True))])
         temporary.__exit__.assert_called_once()
+
+    def test_windows_smoke_root_requires_owned_prepared_source_without_step_context(self):
+        from scripts import native_notice_source as source
+        anchor = Path("/synthetic/private/source")
+        environment = {
+            "GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+            "GITHUB_REPOSITORY": "brk275/Morpheus", "GITHUB_REF": "refs/heads/main",
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_ACTOR": "brk275",
+            "GITHUB_TRIGGERING_ACTOR": "brk275", "RUNNER_OS": "Windows",
+        }
+        state = {"schema": 1, "source_revision": "a" * 40, "prepared": True,
+                 "logs_scanned": True, "logs_complete": True,
+                 "owned_processes_stopped": True, "distribution_ready": False}
+        with patch.object(package_smoke, "os", SimpleNamespace(name="nt", environ=environment)), \
+                patch.object(package_smoke.sys, "platform", "win32"), \
+                patch.object(package_smoke, "ROOT", anchor / "fetch-source"), \
+                patch.object(source, "owned_source_root", return_value=anchor) as owned, \
+                patch.object(source, "checked") as checked, \
+                patch.object(source.S, "read_owned", return_value=b"state") as read, \
+                patch.object(source.S, "unique_json", return_value=state) as decode, \
+                patch.object(source.R, "expected_revision", return_value="a" * 40):
+            self.assertEqual(package_smoke.windows_smoke_root(), anchor)
+            owned.assert_called_once_with(environment)
+            checked.assert_called_once_with(anchor / "fetch-source", directory=True, private=True)
+            read.assert_called_once_with(anchor / "state.json", 4096, private=True)
+            self.assertNotIn("MORPHEUS_NATIVE_PACKAGE_CONTEXT", package_smoke.os.environ)
+            for key, value in [("prepared", False), ("logs_scanned", False),
+                               ("logs_complete", False), ("owned_processes_stopped", False),
+                               ("distribution_ready", True), ("schema", True),
+                               ("source_revision", "b" * 40), ("logs_complete", 1),
+                               ("extra", True)]:
+                decode.return_value = {**state, key: value}
+                with self.subTest(state_key=key, value=value), self.assertRaises(RuntimeError):
+                    package_smoke.windows_smoke_root()
+            decode.return_value = state
+            with patch.object(package_smoke, "ROOT", anchor / "unrelated"), self.assertRaises(RuntimeError):
+                package_smoke.windows_smoke_root()
+            checked.side_effect = ValueError("Rejected source ACL")
+            with self.assertRaises(ValueError):
+                package_smoke.windows_smoke_root()
+            checked.side_effect = None
+            for invalid in (None, {}, [], {key: value for key, value in state.items() if key != "prepared"}):
+                decode.return_value = invalid
+                with self.subTest(invalid_state=invalid), self.assertRaises(RuntimeError):
+                    package_smoke.windows_smoke_root()
+            decode.return_value = state
+            owned.side_effect = ValueError("Rejected reservation")
+            with self.assertRaises(ValueError):
+                package_smoke.windows_smoke_root()
+            owned.reset_mock()
+            for key in environment:
+                with patch.dict(package_smoke.os.environ, {key: "untrusted"}), self.assertRaises(RuntimeError):
+                    package_smoke.windows_smoke_root()
+            owned.assert_not_called()
+
+    def test_windows_smoke_rejected_reservation_cannot_allocate_or_install(self):
+        with patch.object(package_smoke, "artifact"), \
+                patch.object(package_smoke, "uninstall_registry", return_value=[]), \
+                patch.object(package_smoke, "windows_smoke_root", side_effect=ValueError("Rejected reservation")), \
+                patch.object(package_smoke.tempfile, "TemporaryDirectory") as allocate, \
+                patch.object(package_smoke, "run") as run:
+            with self.assertRaises(ValueError):
+                package_smoke.windows_smoke(Path("/synthetic/dist"))
+        allocate.assert_not_called()
+        run.assert_not_called()
 
     def test_nsis_last_option_keeps_destination_unquoted(self):
         for uninstall, flag in [(False, "/D="), (True, "_?=")]:
