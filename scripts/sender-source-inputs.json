@@ -1,10 +1,10 @@
 {
-  "proposal_sha256": "c0d643de8ad286901a0f69c80ba9e660546313b70c9cb4bbecfa79ebe63af898",
+  "proposal_sha256": "dfb3ba1131b998c98b99d1c4299ba184475950caf4c7c03ada85c7a61cb102a7",
   "proposal_files": {
     "spec/unit/matrixrtc/MembershipManager.spec.ts": {
       "before_sha256": "82cfc9ac48444ce30a9071e7e4181b0b8aca059bcfd5d9b4aa4e97e9a7782250",
-      "after_sha256": "061571db8a884331a1aa03f634086e6f818e48427891e903f55e2b0337eb79f1",
-      "after_bytes": 114927
+      "after_sha256": "5490809d7d68510ecbd48a128b2aaf5599c0e50953d7c2e20cf93c2f79f40be9",
+      "after_bytes": 114977
     },
     "spec/unit/matrixrtc/mocks.ts": {
       "before_sha256": "53ab9a4d3ba45427d77d90c28e40cfaecf9e809e43d9b060565be969b3dca269",

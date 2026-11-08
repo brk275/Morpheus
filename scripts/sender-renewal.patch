@@ -311,9 +311,9 @@
 +
 +            it("replaces a cancelled delayed leave before one throttled current-membership retry", async () => {
 +                const { manager, own } = await joined();
-+                const expiry = internals(manager).scheduler.actions
-+                    .filter((action) => action.type === MembershipActionType.UpdateExpiry)
-+                    .map(({ ts, type }) => ({ ts, type }));
++                const queued = internals(manager).scheduler.actions;
++                const expiryActions = queued.filter((action) => action.type === MembershipActionType.UpdateExpiry);
++                const expiry = expiryActions.map(({ ts, type }) => ({ ts, type }));
 +                expect(expiry).toHaveLength(1);
 +                vi.mocked(client._unstable_restartScheduledDelayedEvent).mockRejectedValueOnce(notFoundError());
 +                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
