@@ -71,6 +71,28 @@ class PackageConfigTests(unittest.TestCase):
         uninstall = template.split("Section Uninstall\n", 1)[1].split("SectionEnd", 1)[0]
         self.assertLess(uninstall.index("!insertmacro MorpheusAcquireLifetimeLock"), uninstall.index('Delete "$INSTDIR'))
 
+    def test_windows_fresh_destination_normalization_allows_an_absent_leaf(self):
+        root = Path(__file__).resolve().parents[2]
+        template = (root / "packaging/windows/morpheus-installer.nsi").read_text()
+        admission = template.split("Function MorpheusRequireFreshDestination\n", 1)[1].split("FunctionEnd", 1)[0]
+        call = 'System::Call \'kernel32::GetFullPathNameW(w "$INSTDIR", i ${NSIS_MAX_STRLEN}, w .R8, p 0)i.R9\''
+        self.assertEqual(admission.count(call), 1)
+        self.assertNotRegex(admission, r"(?m)^\s*GetFullPathName\b")
+        self.assertIn("IntCmp $R9 0 morpheus_bad_destination morpheus_bad_destination", admission)
+        self.assertIn("IntCmp $R9 ${NSIS_MAX_STRLEN} morpheus_bad_destination morpheus_normalized_destination morpheus_bad_destination", admission)
+        self.assertLess(admission.index(call), admission.index("StrCpy $INSTDIR $R8"))
+        for guard in ['kernel32::GetDriveTypeW(w r0)i.r1',
+                      'kernel32::GetFileAttributesW(w "$INSTDIR")i.r0 ?e',
+                      "StrCmp $1 2 morpheus_check_parents", "StrCmp $1 3 morpheus_check_parents",
+                      "IntOp $1 $0 & 0x400", "IntOp $1 $0 & 0x10"]:
+            self.assertIn(guard, admission)
+        contract = json.loads((root / "packaging/windows/update-contract.json").read_bytes())
+        self.assertEqual(contract["template_sha256"], hashlib.sha256(template.encode()).hexdigest())
+        digest = hashlib.sha256(prepare_windows_update.canonical(contract)).hexdigest()
+        self.assertEqual(prepare_windows_update.CONTRACT_SHA256, digest)
+        payload = (root / "crates/morpheus-app/src/updater/windows_transaction/payload.rs").read_text()
+        self.assertIn('"' + digest + '"', payload)
+
     def test_windows_uninstall_clears_only_the_exact_owned_manufacturer_default(self):
         root = Path(__file__).resolve().parents[2]
         template = (root / "packaging/windows/morpheus-installer.nsi").read_text()

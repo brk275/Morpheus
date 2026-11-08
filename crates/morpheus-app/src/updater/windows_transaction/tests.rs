@@ -105,9 +105,14 @@ fn windows_payload_rejects_uninstaller_drift_unknown_paths_and_cohorts() {
         value.files[0].path = path.into();
         assert!(Manifest::parse(&serde_json::to_vec(&value).unwrap()).is_err());
     }
-    let mut value = manifest.clone();
-    value.uninstaller_contract = "b".repeat(64);
-    assert!(Manifest::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+    for contract in [
+        "b".repeat(64),
+        "f76b4492cc3281c91c5ec703c39f69d732aa892427dbff5aa8d3f4b335bd02b6".into(),
+    ] {
+        let mut value = manifest.clone();
+        value.uninstaller_contract = contract;
+        assert!(Manifest::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
     let mut value = manifest.clone();
     value.files.push(value.files[0].clone());
     assert!(Manifest::parse(&serde_json::to_vec(&value).unwrap()).is_err());

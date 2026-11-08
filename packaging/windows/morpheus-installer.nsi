@@ -215,8 +215,13 @@ Function MorpheusRequireFreshDestination
   !insertmacro MorpheusRejectRegisteredInstallation 0x80000002 0x101
   !insertmacro MorpheusRejectRegisteredInstallation 0x80000002 0x201
   ClearErrors
-  GetFullPathName $R8 "$INSTDIR"
-  IfErrors morpheus_bad_destination
+  ; Normalize without requiring the final component to exist. NSIS 3.09
+  ; GetFullPathName performs an existence/case lookup, which rejects a fresh leaf.
+  ; The System string buffer holds NSIS_MAX_STRLEN WCHARs; reject zero/overflow.
+  System::Call 'kernel32::GetFullPathNameW(w "$INSTDIR", i ${NSIS_MAX_STRLEN}, w .R8, p 0)i.R9'
+  IntCmp $R9 0 morpheus_bad_destination morpheus_bad_destination
+  IntCmp $R9 ${NSIS_MAX_STRLEN} morpheus_bad_destination morpheus_normalized_destination morpheus_bad_destination
+  morpheus_normalized_destination:
   StrLen $R9 $R8
   IntCmp $R9 3 morpheus_bad_destination morpheus_bad_destination
   StrCpy $0 $R8 1 1

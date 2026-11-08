@@ -18,7 +18,7 @@ MARKER_LIMIT = 16 * 1024
 FILES = ("LICENSE", "licenses/Symphonia-MPL-2.0.txt", "licenses/Symphonia-NOTICE.txt",
          "morpheus-app.exe", "themes/aurora.toml",
          "licenses/THIRD-PARTY-NOTICES.txt", "licenses/THIRD-PARTY-NOTICES.json")
-CONTRACT_SHA256 = "f76b4492cc3281c91c5ec703c39f69d732aa892427dbff5aa8d3f4b335bd02b6"
+CONTRACT_SHA256 = "573e1701d439be21dd0bcc22a00fe2bb5976e613bb7287e8a601a5def0518390"
 
 
 def require(condition, message):

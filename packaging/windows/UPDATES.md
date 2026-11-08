@@ -65,7 +65,7 @@ reviewed manual installation; a version-only claim is insufficient.
 
 Marker schema 2 and `windows-payload-v2` bind the exact seven paths in
 `update-contract.json`; its canonical SHA-256 is
-`f76b4492cc3281c91c5ec703c39f69d732aa892427dbff5aa8d3f4b335bd02b6`.
+`573e1701d439be21dd0bcc22a00fe2bb5976e613bb7287e8a601a5def0518390`.
 The two added resources are exactly `licenses/THIRD-PARTY-NOTICES.txt` and
 `licenses/THIRD-PARTY-NOTICES.json`. NSIS receives those exact explicit resources;
 no wildcard or optional arbitrary resource is admitted. The original template
@@ -209,3 +209,19 @@ accepted. It does not prove normal UI exit, live calls, HTTP download/system tru
 public signing, devices, migrations, licensing or full beta/distribution readiness.
 The atomic call lease check uses a synthetic lease, not a live call. All such gates
 remain open, and a partial synthetic result must not enable production updates.
+
+## Fresh destination normalization
+
+Initial installation normalizes its path with bounded Win32 GetFullPathNameW,
+which permits the required nonexistent final directory. The NSIS 3.09 command
+also checks existence while recovering path capitalization and rejects this
+valid fresh destination. Zero or overflowing normalization results still fail
+closed. Fixed-drive, absent-destination, every-parent directory/no-reparse,
+registration and lifetime-lock checks remain mandatory before writing files.
+
+This functional template change changes the exact update contract fingerprint.
+The schema-2 windows-payload-v2 wire format remains the same, but old consumers
+reject new payloads and new consumers reject old installed markers and recovery
+journals. No previous fingerprint is admitted. A fresh reviewed manual install
+and new installed update/rollback/recovery verification are required; previous
+Windows acceptance results do not qualify this contract transition.
