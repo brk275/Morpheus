@@ -103,6 +103,37 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(target.diagnostics(target.NATIVE_FAILURE_PREFIX + "group_roster_timeout",
                                            include_native=False), {})
 
+    def test_group_roster_diagnostics_keep_fixed_roles_counts_and_unknown_members(self):
+        original = target.GROUP_ROSTER_PREFIX + "original total=2 alice=1 bob=1 carol=0 local=1"
+        late = target.GROUP_ROSTER_PREFIX + "late total=4 alice=1 bob=1 carol=1 local=1"
+        expected = {
+            "original": {"total": 2, "alice": 1, "bob": 1, "carol": 0, "local": 1, "unknown": 0},
+            "late": {"total": 4, "alice": 1, "bob": 1, "carol": 1, "local": 1, "unknown": 1},
+        }
+        output = original + "\n" + late
+        self.assertEqual(target.group_rosters(output), expected)
+        self.assertEqual(target.diagnostics(output), {"group_rosters": expected})
+        self.assertEqual(target.diagnostics(output, include_native=False), {})
+        self.assertEqual(target.group_roster_markers(expected), (original, late))
+        self.assertEqual(target.group_rosters("ordinary private log"), {})
+        self.assertEqual(target.group_roster_markers({}), ())
+        unavailable = (target.GROUP_ROSTER_PREFIX + "original unavailable\n"
+                       + target.GROUP_ROSTER_PREFIX + "late invalid")
+        self.assertEqual(target.group_rosters(unavailable),
+                         {"original": {"state": "unavailable"}, "late": {"state": "invalid"}})
+        for malformed in (
+                original, original + "\n" + original, output + "\n" + late,
+                output.replace("late ", "private_role "), output + " private",
+                output.replace("total=4", "total=65"), output.replace("total=4", "total=3").replace("local=1", "local=4"),
+                output.replace("total=2", "total=1"), output.replace("alice=1", "alice=01"),
+                output.replace("alice=1", "alice=-1"), output.replace("carol=0", "carol=private"),
+                target.GROUP_ROSTER_PREFIX + "original " + "x" * 193):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(target.group_rosters(malformed), {"state": "invalid"})
+        invalid_marker = target.group_roster_markers({"state": "invalid"})
+        self.assertEqual(invalid_marker, (target.GROUP_ROSTER_PREFIX + "invalid",))
+        self.assertEqual(target.group_rosters(invalid_marker[0]), {"state": "invalid"})
+
     def test_native_group_stages_are_closed_ordered_and_bounded(self):
         lines = [target.NATIVE_STAGE_PREFIX + value for value in target.NATIVE_STAGES]
         for count in range(1, len(lines) + 1):
@@ -135,6 +166,8 @@ class EvidenceTests(unittest.TestCase):
                     + f"thread '{target.TEST_NAME}' (1234) panicked at crates/morpheus-rtc/tests/element_call_peer.rs:484:6:\n"
                     + "Three-member native rosters did not converge: Elapsed(())\n"
                     + f"test {target.TEST_NAME} ... FAILED\n"
+                    + target.GROUP_ROSTER_PREFIX + "original total=2 alice=1 bob=1 carol=0 local=1\n"
+                    + target.GROUP_ROSTER_PREFIX + "late total=3 alice=1 bob=1 carol=1 local=1\n"
                     + target.NATIVE_STAGE_PREFIX + "microphone_cryptor\n"
                     + target.NATIVE_STAGE_PREFIX + "late_login\n").encode())
                 browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
@@ -200,6 +233,10 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(target.diagnostics(output).get("native_failure"),
                                  "group_roster_timeout" if allowed else None)
                 self.assertNotIn("Three-member native rosters", output)
+                self.assertEqual(target.diagnostics(output).get("group_rosters"), {
+                    "original": {"total": 2, "alice": 1, "bob": 1, "carol": 0, "local": 1, "unknown": 0},
+                    "late": {"total": 3, "alice": 1, "bob": 1, "carol": 1, "local": 1, "unknown": 0},
+                } if allowed else None)
 
     @staticmethod
     def anchored_log(runner, name, data):

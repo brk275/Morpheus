@@ -51,6 +51,8 @@ NATIVE_STAGES = ("microphone_cryptor", "late_login", "late_sync", "late_bootstra
 NATIVE_STAGE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_STAGE "
 NATIVE_TERMINAL_PREFIX = "MORPHEUS_ELEMENT_NATIVE_TERMINAL "
 NATIVE_FAILURE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_FAILURE "
+GROUP_ROSTER_PREFIX = "MORPHEUS_ELEMENT_GROUP_ROSTER "
+GROUP_ROLES = ("original", "late")
 ROSTER_TIMEOUT = re.compile(
     r"^thread '" + re.escape(TEST_NAME) + r"'(?: \([0-9]{1,10}\))? panicked at "
     r"crates/morpheus-rtc/tests/element_call_peer\.rs:[0-9]{1,6}:[0-9]{1,6}:\n"
@@ -141,7 +143,61 @@ def native_terminal_diagnostics(output: str) -> dict[str, str | int]:
     return result
 
 
-def diagnostics(output: str, *, include_native=True) -> dict[str, str | int]:
+def group_rosters(output: str) -> dict:
+    """Closed role counts only; missing facts never establish roster health."""
+    result = {}
+    cursor = 0
+    while (start := output.find(GROUP_ROSTER_PREFIX.rstrip(), cursor)) >= 0:
+        cursor = start + len(GROUP_ROSTER_PREFIX)
+        if start and output[start - 1] != "\n":
+            continue
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        if len(result) >= 2 or end - start > 192:
+            return {"state": "invalid"}
+        line = output[start:end]
+        state = re.fullmatch(re.escape(GROUP_ROSTER_PREFIX) + r"(original|late) (invalid|unavailable)", line)
+        counts = re.fullmatch(re.escape(GROUP_ROSTER_PREFIX)
+                              + r"(original|late) total=([0-9]{1,2}) alice=([0-9]{1,2}) bob=([0-9]{1,2})"
+                              + r" carol=([0-9]{1,2}) local=([0-9]{1,2})", line)
+        if state:
+            role, value = state.groups()
+            fact = {"state": value}
+        elif counts:
+            role, *digits = counts.groups()
+            values = list(map(int, digits))
+            total, alice, bob, carol, local = values
+            if (any(str(value) != digit or not 0 <= value <= 64 for value, digit in zip(values, digits))
+                    or alice + bob + carol > total or local > total):
+                return {"state": "invalid"}
+            fact = dict(zip(("total", "alice", "bob", "carol", "local"), values))
+            fact["unknown"] = total - alice - bob - carol
+        else:
+            return {"state": "invalid"}
+        if role in result:
+            return {"state": "invalid"}
+        result[role] = fact
+    return result if not result or set(result) == set(GROUP_ROLES) else {"state": "invalid"}
+
+
+def group_roster_markers(facts: dict) -> tuple[str, ...]:
+    """Format only the closed parser's fixed fields, never a raw log line."""
+    if not facts:
+        return ()
+    if facts.get("state") == "invalid":
+        return (GROUP_ROSTER_PREFIX + "invalid",)
+    result = []
+    for role in GROUP_ROLES:
+        fact = facts[role]
+        if "state" in fact:
+            result.append(GROUP_ROSTER_PREFIX + role + " " + fact["state"])
+        else:
+            result.append(GROUP_ROSTER_PREFIX + role + " "
+                          + " ".join(f"{key}={fact[key]}" for key in ("total", "alice", "bob", "carol", "local")))
+    return tuple(result)
+
+
+def diagnostics(output: str, *, include_native=True) -> dict:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
     failures = [value for value in FAILURE_PATTERN.findall(output) if value in FAILURES]
@@ -153,6 +209,8 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str | int]:
         if native := native_stages(output):
             result["native_stage"] = native[-1]
         result.update(native_terminal_diagnostics(output))
+        if rosters := group_rosters(output):
+            result["group_rosters"] = rosters
     return result
 
 
@@ -544,6 +602,9 @@ def execute(root: Path, fixture: Path, gitleaks: str):
                 print(marker, flush=True)
             if known_roster_timeout(native_output):
                 print(NATIVE_FAILURE_PREFIX + "group_roster_timeout", flush=True)
+            if rosters := group_rosters(native_output):
+                for marker in group_roster_markers(rosters):
+                    print(marker, flush=True)
     # Cleanup is required but must not erase the last useful failure stage.
     diagnostic_output = output.replace("MORPHEUS_ELEMENT_STAGE element_cleanup\n", "")
     if found := diagnostics(diagnostic_output, include_native=False):

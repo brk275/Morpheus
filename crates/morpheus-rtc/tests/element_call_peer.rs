@@ -473,15 +473,41 @@ async fn group_and_screen(
         .await
         .expect("Late-peer join failed");
     eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE group_roster");
-    timeout(Duration::from_secs(90), async {
+    let converged = timeout(Duration::from_secs(90), async {
         while !exact_roster(rtc, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
             || !exact_roster(&late, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
         {
             sleep(Duration::from_millis(200)).await;
         }
     })
-    .await
-    .expect("Three-member native rosters did not converge");
+    .await;
+    if converged.is_err() {
+        // Sample each failed observation once, without exposing identities or
+        // changing the exact three-member predicate or its deadline.
+        for (role, service) in [("original", &*rtc), ("late", &late)] {
+            match service.participants(room) {
+                Ok(members) if members.len() <= 64 => {
+                    let count = |user: &str| {
+                        members
+                            .iter()
+                            .filter(|member| member.user_id == user)
+                            .count()
+                    };
+                    eprintln!(
+                        "MORPHEUS_ELEMENT_GROUP_ROSTER {role} total={} alice={} bob={} carol={} local={}",
+                        members.len(),
+                        count(&alice.user_id),
+                        count(&bob.user_id),
+                        count(&carol.user_id),
+                        members.iter().filter(|member| member.is_local).count(),
+                    );
+                }
+                Ok(_) => eprintln!("MORPHEUS_ELEMENT_GROUP_ROSTER {role} invalid"),
+                Err(_) => eprintln!("MORPHEUS_ELEMENT_GROUP_ROSTER {role} unavailable"),
+            }
+        }
+    }
+    converged.expect("Three-member native rosters did not converge");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_group_roster=true");
 
     // A newly created device must actually decrypt the already-running sender,
