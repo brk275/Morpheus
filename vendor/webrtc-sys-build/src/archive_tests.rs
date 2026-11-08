@@ -55,6 +55,7 @@ fn fixture(name: &str, mode: u32) -> Vec<u8> {
 }
 
 const ABC: Pin = Pin {
+    asset_id: 0,
     bytes: 3,
     sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
 };
@@ -170,4 +171,20 @@ fn cached_receipts_and_roots_cannot_be_links() {
         fs::read(outside.0.join("identity")).unwrap(),
         ABC.sha256.as_bytes()
     );
+}
+
+#[test]
+fn reviewed_asset_download_uses_the_fixed_official_api_identity() {
+    let arm = super::pins::for_triple("mac-arm64-release").unwrap();
+    assert_eq!(arm.asset_id, 419683228);
+    assert_eq!(arm.bytes, 265849959);
+    assert_eq!(
+        arm.sha256,
+        "f9be49b9fee9cd1588da8a40c85bda21f5ea49c4ed82662dc889b1c919569a08"
+    );
+    assert_eq!(
+        arm.download_url(),
+        "https://api.github.com/repos/livekit/rust-sdks/releases/assets/419683228"
+    );
+    assert!(super::pins::for_triple("mac-arm64-debug").is_none());
 }

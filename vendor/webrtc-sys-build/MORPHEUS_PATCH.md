@@ -12,6 +12,11 @@ isolation patch still verifies the extracted static library independently.
 
 ## Changes
 
+- Fetch each pinned release asset through its fixed official GitHub asset API
+  identity with an unauthenticated octet-stream request. This avoids a failing
+  browser-download route without changing the SDK bytes or admitting a mirror.
+  The public legacy browser-URL helper remains available to existing callers;
+  the verified downloader uses the asset identity held alongside its size/hash.
 - Stream downloads over HTTPS with a bounded redirect count and timeout.
   Require the exact reviewed compressed size and SHA-256 before parsing ZIP
   contents. Pins cover the eleven release assets; unsupported profiles fail
@@ -61,3 +66,21 @@ Silicon, Intel Mac, Windows and Linux are **not yet verified**. The ordinary CI 
 includes this crate's unit tests. No source review or checksum alone establishes
 beta readiness, and version-only ZIP advisory matches must still be assessed
 against actual callers; do not suppress ZIP advisories globally.
+
+## Asset transport correction (source only)
+
+The Apple Silicon build at source `bd5f2fee6dd765ed968d8727cf6d2ebb5311875c`
+failed before archive verification with a rejected HTTP response. A bounded
+read-only probe found HTTP 504 on the existing browser route, while the official
+asset API for `419683228` delivered the exact reviewed 265,849,959-byte archive
+with unchanged SHA-256 `f9be49b9fee9cd1588da8a40c85bda21f5ea49c4ed82662dc889b1c919569a08`.
+The historical build log does not disclose whether its rejection was status or
+content length; the probe establishes the current route failure, not that
+missing historical detail.
+
+All eleven asset IDs are already recorded in the provenance manifest and were
+reconciled against official release metadata before being added to the code pins.
+HTTPS/redirect count, timeout, response status/length, streamed size/digest,
+extraction, cache receipt and cleanup rules are unchanged. No authentication
+header or token is added. The additional existing-module unit regression is
+prepared but unexecuted; no current platform acceptance is claimed for this edit.
