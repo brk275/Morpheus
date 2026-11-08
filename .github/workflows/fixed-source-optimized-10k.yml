@@ -1,0 +1,324 @@
+# TEMPORARY optimized live timeline acceptance. NEVER MERGE this workflow.
+# HELD pending stable native/call results, root review and a zero-overlap native slot.
+name: Real-room timeline acceptance
+run-name: Real encrypted 10K timeline 5e5da37c - both sync adapters
+on:
+  push:
+    branches: [codex/temp-optimized-10k-5e5da37c-20261107]
+permissions:
+  contents: read
+concurrency:
+  group: native-5e5da37c07b2aa06bc3655ae02571cac33a44c07-ubuntu-24.04
+  cancel-in-progress: false
+jobs:
+  contracts:
+    name: Real-room optimized timeline acceptance
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/temp-optimized-10k-5e5da37c-20261107' && github.repository == 'brk275/Morpheus' && github.repository_owner == 'brk275' && github.event.repository.private == false && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.login == 'brk275' && github.event.sender.id > 0 && github.event.sender.id == github.event.repository.owner.id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    defaults:
+      run:
+        working-directory: candidate
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 5e5da37c07b2aa06bc3655ae02571cac33a44c07
+          fetch-depth: 0
+          persist-credentials: false
+          path: candidate
+      - name: Check out fixed reviewed scanner inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 5e5da37c07b2aa06bc3655ae02571cac33a44c07
+          path: validation
+          persist-credentials: false
+      - name: Verify exact reviewed source
+        shell: bash
+        env:
+          FIXED_SOURCE: 5e5da37c07b2aa06bc3655ae02571cac33a44c07
+          FIXED_TREE: e9ecf72fdcd5e7a0c12fa23cd53823a2cf1b9110
+          WORKFLOW_HEAD: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/codex/temp-optimized-10k-5e5da37c-20261107
+          test "$WORKFLOW_REF" = brk275/Morpheus/.github/workflows/fixed-source-optimized-10k.yml@refs/heads/codex/temp-optimized-10k-5e5da37c-20261107
+          [[ "$WORKFLOW_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          test "$WORKFLOW_HEAD" = "$GITHUB_SHA"
+          test "$WORKFLOW_HEAD" != "$FIXED_SOURCE"
+          test "$(git rev-parse HEAD)" = "$FIXED_SOURCE"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$FIXED_TREE"
+          test "$(git -C ../validation rev-parse HEAD)" = "$FIXED_SOURCE"
+          test "$(git -C ../validation rev-parse 'HEAD^{tree}')" = "$FIXED_TREE"
+          printf 'Actual event: push; workflow head: %s; fixed source: %s; fixed tree: %s\n' "$WORKFLOW_HEAD" "$FIXED_SOURCE" "$FIXED_TREE"
+      - name: Scan source before executing reviewed native acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
+          mkdir "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/default.toml"
+          : > "$RUNNER_TEMP/empty.ignore"
+          echo "dcd5d9a2dfafaf50adb63f294eba982778b67dade562def4e0e32bf38941285c  $GITHUB_WORKSPACE/validation/scripts/scan_history.py" | sha256sum --check --status
+          echo "f4fb315687debe13e9e44dd4321196406592637b199f7d129a35b62586b052c3  $GITHUB_WORKSPACE/validation/scripts/public-fixtures.json" | sha256sum --check --status
+          python3 -I "$GITHUB_WORKSPACE/validation/scripts/scan_history.py" \
+            --candidate "$PWD" --scanner "$RUNNER_TEMP/gitleaks/gitleaks" \
+            --manifest "$GITHUB_WORKSPACE/validation/scripts/public-fixtures.json" \
+            --evidence "$RUNNER_TEMP/timeline-history-scan"
+      - name: Install native Linux build and isolated desktop dependencies
+        if: runner.os == 'Linux'
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          # Use only the official Ubuntu archive for this step; the hosted
+          # image's Azure mirror can stall otherwise bounded provisioning.
+          [[ "${ImageOS:-}" == ubuntu24 ]]
+          [[ "$(dpkg --print-architecture)" == amd64 ]]
+          [[ "${RUNNER_TEMP:-}" == /* && -d "$RUNNER_TEMP" ]]
+          test -r /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          # APT resolves the disabled sourceparts value below to /etc/apt/-.
+          test ! -d /etc/apt/-
+          apt_sources="$(mktemp --tmpdir="$RUNNER_TEMP" --suffix=.sources morpheus-apt-XXXXXXXXXX)"
+          trap 'rm -f -- "$apt_sources"' EXIT
+          cat > "$apt_sources" <<'MORPHEUS_UBUNTU_SOURCES'
+          Types: deb
+          URIs: https://archive.ubuntu.com/ubuntu
+          Suites: noble noble-updates noble-backports
+          Components: main restricted universe multiverse
+          Architectures: amd64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: https://security.ubuntu.com/ubuntu
+          Suites: noble-security
+          Components: main restricted universe multiverse
+          Architectures: amd64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          MORPHEUS_UBUNTU_SOURCES
+          chmod 0644 "$apt_sources"
+          # Keep both invocations noninteractive and bounded; no global
+          # source files or package verification settings are changed.
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o "Dir::Etc::sourcelist=$apt_sources" -o Dir::Etc::sourceparts=-)
+          sudo -n env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get "${apt_options[@]}" update < /dev/null
+          sudo -n env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get "${apt_options[@]}" install -y libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
+            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev \
+            libsystemd-dev systemd-dev libudev-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xauth \
+            dbus-x11 gnome-keyring libsecret-tools libgl1-mesa-dri fonts-noto-color-emoji < /dev/null
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: verified-sdk-archives-v1
+          save-if: false
+          workspaces: candidate
+      - name: Prepare the pinned owned native PipeWire client
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/build_linux_native.py --variant native \
+            --prefix "$RUNNER_TEMP/morpheus-native-pipewire-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --github-env
+      - name: Build the real optimized app with disclosed acceptance instrumentation
+        timeout-minutes: 90
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
+          MORPHEUS_TIMELINE_ACCEPTANCE_BUILD: "1"
+        run: cargo build --release --locked -p morpheus-app --features native-calls
+      - name: Verify the actual Linux app uses its owned native client
+        timeout-minutes: 2
+        shell: /usr/bin/python3 -I -B {0}
+        run: |
+          import hashlib, json, os, pathlib, re, selectors, signal, stat, subprocess, sys, tempfile, time
+          root = pathlib.Path.cwd().resolve(strict=True)
+          sys.path.insert(0, str(root / 'packaging/linux'))
+          sys.path.insert(0, str(root / 'scripts'))
+          import appimage_client as client
+
+          def interrupted(_signal, _frame):
+              raise RuntimeError('native link verification interrupted')
+          signal.signal(signal.SIGTERM, interrupted)
+          private = pathlib.Path(tempfile.mkdtemp(prefix='morpheus-native-link-', dir=os.environ['RUNNER_TEMP']))
+          home, temporary = private / 'home', private / 'tmp'
+          home.mkdir(mode=0o700)
+          temporary.mkdir(mode=0o700)
+          environment = {'PATH':'/usr/bin:/bin', 'HOME':str(home), 'TMPDIR':str(temporary), 'LANG':'C', 'LC_ALL':'C'}
+
+          def bounded(label, argv, limit=4096):
+              # Only fixed reviewed commands run here. Keep all output private,
+              # stop the owned group before reaping its leader, and bound bytes.
+              process = subprocess.Popen(argv, cwd=private, env=environment,
+                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                  start_new_session=True)
+              output = bytearray()
+              deadline = time.monotonic() + 20
+              selector = selectors.DefaultSelector()
+              try:
+                  selector.register(process.stdout, selectors.EVENT_READ)
+                  while True:
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0 or not selector.select(remaining):
+                          raise RuntimeError('native link command deadline')
+                      block = os.read(process.stdout.fileno(), min(8192, limit + 1 - len(output)))
+                      if not block:
+                          break
+                      output.extend(block)
+                      if len(output) > limit:
+                          raise RuntimeError('native link command output limit')
+                  # Observe completion without reaping, so group cleanup cannot
+                  # race PID reuse or turn a successful early close into SIGKILL.
+                  while os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None:
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0:
+                          raise RuntimeError('native link command exit deadline')
+                      time.sleep(min(0.01, remaining))
+              finally:
+                  try:
+                      os.killpg(process.pid, signal.SIGKILL)
+                  except ProcessLookupError:
+                      pass
+                  process.wait(timeout=5)
+                  selector.close()
+                  process.stdout.close()
+                  descriptor = os.open(private / (label + '.log'), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                  with os.fdopen(descriptor, 'wb') as target:
+                      target.write(output)
+              return process.returncode, bytes(output)
+
+          try:
+              client.require_build_platform()
+              assert os.environ.get('GITHUB_ACTIONS') == 'true'
+              assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+              assert os.environ.get('MORPHEUS_PIPEWIRE_CLIENT_VARIANT') == 'native'
+              receipt = pathlib.Path(os.environ['MORPHEUS_PIPEWIRE_CLIENT_RECEIPT'])
+              stage = client.private_directory(receipt.parent)
+              assert receipt.name == 'build-client.txt'
+              assert stage.is_relative_to(pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True))
+              library = stage / client.R.NATIVE_SONAME
+              hidden = stage / '.native-link-absence-check'
+              assert not hidden.exists() and not hidden.is_symlink()
+              identity = library.lstat()
+              assert stat.S_ISREG(identity.st_mode) and identity.st_uid == os.getuid()
+              assert identity.st_nlink == 1 and not identity.st_mode & 0o022
+              content = client.read_regular(library, client.R.MAX_LIBRARY)
+              client.R.elf_identity(content, library=True, expected_soname=client.R.NATIVE_SONAME)
+              original_hash = hashlib.sha256(content).hexdigest()
+              binary = root / 'target/release/morpheus-app'
+              details = binary.lstat()
+              assert stat.S_ISREG(details.st_mode) and not binary.is_symlink()
+              assert details.st_uid == os.getuid() and details.st_mode & 0o111
+              code, dynamic = bounded('readelf', [client.R.trusted_tool('readelf'), '--dynamic', str(binary)], 65536)
+              assert code == 0
+              needed = re.findall(rb'\(NEEDED\).*?\[([^\]\n]+)\]', dynamic)
+              assert needed.count(client.R.NATIVE_SONAME.encode()) == 1
+              assert client.SONAME.encode() not in needed and b'\x00' not in dynamic
+              paths = re.findall(rb'\((RPATH|RUNPATH)\).*?\[([^\]\n]*)\]', dynamic)
+              assert paths == [(b'RUNPATH', str(stage).encode())]
+              # The instrumented build refuses ordinary startup before updater
+              # dispatch. Its existing offline config help exits earlier, with
+              # no acceptance runfile, account, profile, vault or device access.
+              # This proves final-App loading only, not updater/cohort behavior.
+              command = [str(binary), 'config', 'help']
+              expected_help = b'Usage:\n  morpheus config validate [--json] [--file CONFIG.toml]\n  morpheus config schema [--json]\n\nvalidate  Check config.toml and the theme it selects. Exit status 0 when\n          valid, 1 when not, 2 for a usage error. Nothing is written.\n--file    Check another configuration file instead of the standard one; its\n          themes folder is the one beside it.\nschema    Print the field, color token and diagnostic reference.\n'
+              code, first = bounded('help-before', command)
+              assert code == 0 and first == expected_help
+              try:
+                  os.rename(library, hidden)
+                  code, refusal = bounded('help-missing-client', command)
+                  expected = (str(binary).encode() + b': error while loading shared libraries: '
+                      + client.R.NATIVE_SONAME.encode()
+                      + b': cannot open shared object file: No such file or directory\n')
+                  assert code == 127 and refusal == expected
+              finally:
+                  if hidden.exists() or hidden.is_symlink():
+                      moved = hidden.lstat()
+                      assert (moved.st_dev, moved.st_ino, moved.st_mode) == (identity.st_dev, identity.st_ino, identity.st_mode)
+                      assert hashlib.sha256(client.read_regular(hidden, client.R.MAX_LIBRARY)).hexdigest() == original_hash
+                      assert not library.exists() and not library.is_symlink()
+                      os.rename(hidden, library)
+              code, restored = bounded('help-restored', command)
+              assert code == 0 and restored == first == expected_help
+              assert not list(home.iterdir()) and not list(temporary.iterdir())
+              print('Native app client linkage: ' + json.dumps({'distinct_needed':True,
+                  'current_runpath':True, 'missing_client_refused':True, 'same_library_restored':True,
+                  'offline_help_only_no_profile':True}, sort_keys=True))
+          except Exception:
+              print('Native app client linkage failed; bounded output remains private on the ephemeral runner.')
+              raise SystemExit(1) from None
+      - name: Exercise real encrypted 10000-event room through both sync adapters
+        timeout-minutes: 140
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          xvfb-run -a -s '-screen 0 1440x900x24' dbus-run-session -- python3 -I -B - <<'PY'
+          import json, os, pathlib, subprocess, sys, tempfile, time
+          sys.path.insert(0, str(pathlib.Path('scripts').resolve(strict=True)))
+          import run_matrix_acceptance as fixture_host
+          import run_timeline_acceptance as timeline
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert os.environ.get('ImageOS') == 'ubuntu24'
+          assert timeline.guard(os.environ) is None
+          # Preserve the existing fixture ownership rule: prove no service,
+          # volume or network with these fixed names exists before taking it.
+          for command, names in (
+              (['docker','container','ls','--all','--format','{{.Names}}'], fixture_host.FIXTURE_CONTAINERS),
+              (['docker','volume','ls','--format','{{.Name}}'], fixture_host.FIXTURE_VOLUMES),
+              (['docker','network','ls','--format','{{.Name}}'], (fixture_host.FIXTURE_NETWORK,)),
+          ):
+              result = subprocess.run(command, capture_output=True, timeout=30, check=True)
+              assert len(result.stdout) <= 1024*1024
+              assert not set(result.stdout.decode().splitlines()).intersection(names)
+          root = pathlib.Path(tempfile.mkdtemp(prefix='morpheus-timeline-hosted-', dir=os.environ['RUNNER_TEMP']))
+          root.chmod(0o700)
+          host = fixture_host.Acceptance(root, os.environ['RUNNER_TEMP'] + '/gitleaks/gitleaks')
+          # This selected workload includes 18 minutes of rate-limited seeding
+          # and two 50-minute worst-case runs. No ordinary acceptance suite's
+          # budget or planned checks are changed by this temporary workflow.
+          host.deadline = time.monotonic() + 135*60
+          # Previously verified 03fe524 forwards only a scanned, closed failure
+          # record before raising; never echo exception strings or private logs.
+          failed = False
+          try:
+              host.start_keyring()
+              host.require_containment()
+              host.script('local_matrix_env', 'up')
+              fixture = fixture_host.fixture_from_output(str(root/'accounts.json'), root)
+              output = host.run('timeline_10k', [sys.executable, 'scripts/run_timeline_acceptance.py',
+                  '--fixture', str(fixture), '--work', str(root/'timeline-work')], seconds=130*60, pid_namespace=True)
+              prefix = 'MORPHEUS_TIMELINE_10K_SUMMARY '
+              records = [json.loads(line[len(prefix):]) for line in output.splitlines() if line.startswith(prefix)]
+              assert len(records) == 1
+              value = records[0]
+              assert set(value) == {'check','status','seed','runs'}
+              assert value['check'] == timeline.CHECK and value['status'] == 'passed'
+              assert value['seed'] == {'events':10000} and set(value['runs']) == set(timeline.ADAPTERS)
+              for adapter in timeline.ADAPTERS:
+                  assert timeline.valid_report(value['runs'][adapter], 'measure', adapter)
+              print(prefix + json.dumps(value, sort_keys=True), flush=True)
+          except BaseException:
+              failed = True
+              print('TIMELINE_10K_ACCEPTANCE_FAILED private_logs_retained_on_ephemeral_host_only', flush=True)
+          finally:
+              host.finalizing = True
+              try:
+                  host.script('local_matrix_env', 'destroy')
+                  host.verify_fixture_absence()
+              except BaseException:
+                  failed = True
+                  print('TIMELINE_10K_CLEANUP_FAILED', flush=True)
+          if failed:
+              raise SystemExit(1)
+          print('TIMELINE_10K_ACCEPTANCE_PASSED instrumented_linux_only', flush=True)
+          PY
