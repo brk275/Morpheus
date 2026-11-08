@@ -91,7 +91,10 @@ Its only differences from shipping are:
 - a generated profile root instead of the standard app directories;
 - an explicitly requested sync policy: the shipping `Auto` for sliding sync,
   or `ClassicOnly`, which forces the same classic `/sync` loop that `Auto`
-  falls back to.
+  falls back to;
+- two counts of all currently attached component roots, each after an ordinary
+  redraw outside recorded scroll timing. These provide an upper bound on
+  attached message delegates without asking Slint to create or update instances.
 
 The renderer is still the one Slint's default backend selects, with no
 backend or renderer override. The `AppWindow` and the `LiveUi` controller are
@@ -159,7 +162,7 @@ never IDs or text. The runner prints only a summary built from those reports.
 | `request_until_loading_cleared_ms` | Production load-older callback until its loading flag clears; rows may publish slightly later | Time to render the new rows |
 | `fixture_distinct_decrypted` | Direct count of distinct fixture events in the window's message model; undecryptable events never enter it | A delegate count |
 | `rss_kib` | `/proc/self/status` on Linux; `unavailable` elsewhere | Heap size, or RSS on macOS or Windows |
-| `delegates` | `unmeasured`: Slint exposes no public count of instantiated rows | Evidence for or against full instantiation |
+| `delegates.after_history_upper_bound`, `delegates.after_scroll_upper_bound` | Total currently attached physical component roots, including unrelated UI components; a conservative upper bound on attached message delegates | Exact message-row count, cumulative allocations, peak live instances, or objects retained outside the attached tree |
 
 The accessibility row counts in the offline record above remain a proxy.
 
@@ -174,14 +177,48 @@ The accessibility row counts in the offline record above remain a proxy.
   Installed-package performance needs its own path.
 - **Owner thresholds.** No pass or fail threshold is defined. The owner must
   set responsiveness thresholds from measured evidence.
-- **Unmeasured quantities.** Delegate instantiation, GPU time, presentation and
-  display refresh are not measured.
+- **Unmeasured quantities.** Exact message-delegate counts, peak live instances,
+  cumulative allocations, GPU time, presentation and display refresh are not
+  measured. The two attached component-root counts must satisfy
+  `0 < count < 10000` after the actual 10,000 fixture events have decrypted.
+  This proves a bound at those snapshots, not at every moment.
 - **Fixture variety.** Replies, reactions, edits, attachments and images are
   not in the fixture.
 - **Device key timing.** The exact-device wait only guards key distribution.
   The authoritative check is that all 10,000 events decrypt in each profile.
   An enrolled app that quits before publishing its device keys fails the seed
   at `enrolled_device_absent`; enrollment does not yet wait for that itself.
+
+### Attached delegate upper bounds
+
+The message repeater is a direct child of `ListView`; pinned Slint 1.18.1 selects
+viewport-based repetition. Each materialized message-row instance owns a distinct
+`ItemTreeRc`, reachable as a dynamic child from the window. Consequently the
+number of all attached physical component roots is an upper bound on attached
+message-row instances. A complete root count below 10,000 proves that all 10,000
+model messages are not simultaneously attached as delegates at that snapshot.
+It does not give an exact message-row count or prove a cumulative allocation bound.
+
+The instrumented driver takes two snapshots: after the actual decrypted full
+history has completed a layout/render, and after scrolling. Both require the
+room timeline page and the full model to remain active. The raw walk reads
+existing item-tree nodes, repeater ranges and weak child handles. It never uses
+element queries, `visit_descendants`, geometry, accessibility evaluation, debug
+metadata or instantiation/update functions. Missing children, duplicate physical
+owners, or bounded traversal failure refuses the measurement. Strong owners stay
+alive on the UI thread until the snapshot finishes. Every dynamic subtree is
+visited, including unrelated UI components; none are filtered by visibility.
+
+Two ordinary redraws occur outside the recorded scroll timing. Scroll capture is
+disabled before the second redraw, so it cannot fill a missed scroll observation
+or add scroll spans or intervals. The report discloses the added snapshots.
+Shipping compilation, UI, optimization and debug-info environment behavior are
+unchanged. No per-row callback or lifecycle hook is introduced.
+
+Source structure is not a runtime count. A fresh hosted run on the changed
+revision must supply these conservative counts for both adapters; earlier
+instrumented baselines cannot qualify the added instrumentation. A passing bound
+alone does not establish responsiveness or the full performance release gate.
 
 ### Seed run 39165425640: the `devices` stage
 

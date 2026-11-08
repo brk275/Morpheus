@@ -27,7 +27,9 @@
 //! rendered but before the back buffer is presented, so they are CPU-side
 //! frame-hook timings, never GPU time, presentation or display refresh.
 //! Values ending in `_observed` are first observed by an event-loop poll and
-//! are upper bounds. Delegate instantiation is not measured. See
+//! are upper bounds. All attached component roots are counted after history
+//! layout and scrolling: a conservative message-delegate upper bound, never an
+//! exact message-row count, cumulative allocation count or peak. See
 //! tests/TIMELINE_10K.md for the procedure and what remains open.
 #![cfg_attr(test, allow(dead_code))]
 
@@ -59,17 +61,19 @@ const RUN_ENV: &str = "MORPHEUS_TIMELINE_ACCEPTANCE";
 /// crates/morpheus-matrix/tests/timeline_10k_local.rs.
 const MARKER: &str = "tl10k-";
 const EVENTS: usize = 10_000;
-const DELTA_FROM_SHIPPING: [&str; 4] = [
+const DELTA_FROM_SHIPPING: [&str; 5] = [
     "acceptance_driver",
     "rendering_notifier",
     "generated_profile_root",
     "requested_sync_policy",
+    "delegate_upper_bound_snapshots",
 ];
-const NOT_MEASURED: [&str; 4] = [
+const NOT_MEASURED: [&str; 5] = [
     "gpu_time",
     "presentation",
     "display_refresh",
-    "delegate_instances",
+    "exact_delegate_instances",
+    "delegate_peak",
 ];
 /// Fixture labels from scripts/local_matrix_env.py.
 const MEASURED_ACCOUNT: &str = "a_second_device";
@@ -428,6 +432,75 @@ impl Run {
             switch,
             room,
         })
+    }
+}
+
+/// Count all attached physical component roots without creating instances.
+/// Each message-row repeater instance owns a distinct ItemTreeRc in pinned
+/// Slint 1.18.1. Counting every reachable component is therefore a conservative
+/// upper bound on attached message delegates, including unrelated UI components.
+/// Raw getters use existing ranges/instances; query/visit_descendants would
+/// first materialize trees. No IDs, metadata, geometry or bindings are queried.
+fn attached_component_root_upper_bound(window: &slint::Window) -> Result<usize, Refusal> {
+    use slint::private_unstable_api::re_exports::{
+        ItemRc, ItemTreeNode, ItemTreeRc, ItemTreeWeak, WindowInner,
+    };
+
+    const MAX_NODES: usize = 100_000;
+    const MAX_DEPTH: usize = 64;
+    let root = WindowInner::from_pub(window)
+        .try_component()
+        .ok_or("delegate_tree_missing")?;
+    let mut pending = vec![(root, 0usize)];
+    let mut owners = Vec::<ItemRc>::new();
+    let mut nodes = 0usize;
+    while let Some((tree, depth)) = pending.pop() {
+        if owners.len() >= EVENTS || depth > MAX_DEPTH {
+            return Err("delegate_tree_bound");
+        }
+        let owner = ItemRc::new_root(tree.clone());
+        // ItemRc equality compares the strong allocation owner and item index;
+        // keep those owners alive, without exposing addresses or raw pointers.
+        if owners.contains(&owner) {
+            return Err("delegate_tree_duplicate");
+        }
+        owners.push(owner);
+        checked_component_upper_bound(owners.len())?;
+        let tree_ref = ItemTreeRc::borrow_pin(&tree);
+        let item_tree = tree_ref.as_ref().get_item_tree();
+        nodes = nodes
+            .checked_add(item_tree.as_slice().len())
+            .ok_or("delegate_tree_bound")?;
+        if nodes > MAX_NODES {
+            return Err("delegate_tree_bound");
+        }
+        for node in item_tree.as_slice() {
+            if let ItemTreeNode::DynamicTree { index, .. } = node {
+                let range = tree_ref.as_ref().get_subtree_range(*index);
+                let count = range
+                    .end
+                    .checked_sub(range.start)
+                    .ok_or("delegate_tree_bound")?;
+                if count > EVENTS || pending.len().saturating_add(count) > EVENTS {
+                    return Err("delegate_tree_bound");
+                }
+                for index_in_model in range.start..range.end {
+                    let mut weak = ItemTreeWeak::default();
+                    tree_ref.as_ref().get_subtree(*index, index_in_model, &mut weak);
+                    let child = weak.upgrade().ok_or("delegate_tree_missing")?;
+                    pending.push((child, depth + 1));
+                }
+            }
+        }
+    }
+    checked_component_upper_bound(owners.len())
+}
+
+fn checked_component_upper_bound(roots: usize) -> Result<usize, Refusal> {
+    if roots == 0 || roots >= EVENTS {
+        Err("delegate_upper_bound")
+    } else {
+        Ok(roots)
     }
 }
 
@@ -1026,6 +1099,35 @@ impl Context {
         }
     }
 
+    async fn snapshot_delegates(&self, room: &str) -> Result<usize, Refusal> {
+        // Snapshot redraws must never enter the recorded scroll samples or
+        // turn a previously missed scroll attempt into a successful one.
+        if self.frames.borrow().recording {
+            return Err("delegate_snapshot");
+        }
+        if self.ui.get_page() != 0
+            || !self.showing(room)
+            || self.ui.get_messages().row_count() < EVENTS
+        {
+            return Err("timeline_not_visible");
+        }
+        self.enter("delegate_snapshot");
+        let before = self.frames.borrow().completed;
+        self.ui.window().request_redraw();
+        until(WAIT_LIMIT, POLL, "delegate_snapshot", || {
+            self.frames.borrow().completed > before
+        })
+        .await?;
+        self.rendering()?;
+        if self.ui.get_page() != 0
+            || !self.showing(room)
+            || self.ui.get_messages().row_count() < EVENTS
+        {
+            return Err("timeline_not_visible");
+        }
+        attached_component_root_upper_bound(self.ui.window())
+    }
+
     async fn open_room(&self, room: &str) -> Result<(u64, usize), Refusal> {
         let sent = Instant::now();
         self.ui.invoke_open_room(room.into());
@@ -1125,6 +1227,10 @@ impl Context {
         let after_history = self.rss_checkpoint();
         self.rendering()?;
 
+        // Outside timed scrolling: count attached component roots after
+        // layout of the decrypted 10K model, without requesting instances.
+        let delegates_after_history = self.snapshot_delegates(&room).await?;
+
         // In-process wheel events over the timeline at the window's real size.
         self.enter("scroll");
         if self.ui.get_page() != 0 {
@@ -1182,6 +1288,15 @@ impl Context {
         }
         let after_scroll = self.rss_checkpoint();
         self.rendering()?;
+        // Freeze the recorded scroll values before any snapshot redraw.
+        // Later normal frames cannot extend these recorded timing summaries.
+        let (scroll_spans, scroll_intervals) = {
+            let frames = self.frames.borrow();
+            (frames.spans_us.summary(), frames.intervals_us.summary())
+        };
+        // Some individual scroll attempts may have no render hook. Complete
+        // one ordinary redraw outside recorded timing before this snapshot.
+        let delegates_after_scroll = self.snapshot_delegates(&room).await?;
 
         // The production switch-account callback, away and back, then reopen.
         self.enter("switch_away");
@@ -1249,8 +1364,8 @@ impl Context {
                 "steps_with_render_hook": rendered_steps,
                 "idle_render_hook_frames_before": idle_frames,
                 "dispatch_to_render_hook_us": dispatch_to_hook.summary(),
-                "render_hook_span_us": frames.spans_us.summary(),
-                "render_hook_interval_us": frames.intervals_us.summary(),
+                "render_hook_span_us": scroll_spans,
+                "render_hook_interval_us": scroll_intervals,
             },
             "account_switch": {
                 "away_observed_ms": millis(away - sent),
@@ -1266,7 +1381,11 @@ impl Context {
                 "after_switch": after_switch,
                 "peak": peak,
             },
-            "delegates": {"instances": Value::Null, "method": "unmeasured"},
+            "delegates": {
+                "after_history_upper_bound": delegates_after_history,
+                "after_scroll_upper_bound": delegates_after_scroll,
+                "method": "attached_component_root_upper_bound",
+            },
             "poll_ms": millis(POLL),
             "not_measured": NOT_MEASURED,
         });
@@ -1385,6 +1504,15 @@ mod tests {
     }
 
     #[test]
+    fn component_upper_bound_must_be_positive_and_below_the_decrypted_fixture_size() {
+        assert_eq!(checked_component_upper_bound(0), Err("delegate_upper_bound"));
+        assert_eq!(checked_component_upper_bound(1), Ok(1));
+        assert_eq!(checked_component_upper_bound(EVENTS - 1), Ok(EVENTS - 1));
+        assert_eq!(checked_component_upper_bound(EVENTS), Err("delegate_upper_bound"));
+        assert_eq!(checked_component_upper_bound(usize::MAX), Err("delegate_upper_bound"));
+    }
+
+    #[test]
     fn percentiles_use_nearest_rank_within_a_bound() {
         let mut samples = Samples::default();
         assert_eq!(samples.summary(), Value::Null);
@@ -1424,6 +1552,15 @@ mod tests {
         assert_eq!(frames.spans_us.values.len(), 3);
         assert_eq!(frames.intervals_us.values.len(), 2);
         assert_eq!(frames.api, Some("native_opengl"));
+        // The ordinary snapshot redraw counts as a completed renderer frame,
+        // never as an extra recorded scroll span or interval.
+        frames.record(false);
+        frames.next_after = None;
+        frames.observe(RenderingState::BeforeRendering, &opengl);
+        frames.observe(RenderingState::AfterRendering, &opengl);
+        assert_eq!(frames.completed, 4);
+        assert_eq!(frames.spans_us.values.len(), 3);
+        assert_eq!(frames.intervals_us.values.len(), 2);
         frames.observe(RenderingState::AfterRendering, &opengl);
         assert_eq!(frames.failure, Some("unpaired_frame"));
 

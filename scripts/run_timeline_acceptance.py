@@ -78,10 +78,11 @@ profile_not_fresh login account_mismatch sync_not_running adapter_mismatch
 account_option_missing room_not_shown room_file_mode profile_not_enrolled restore
 pagination_bound pagination_not_started pagination_timeout pagination_error
 history_incomplete timeline_not_visible input_dispatch scroll_not_rendered
+delegate_snapshot delegate_tree_missing delegate_tree_bound delegate_tree_duplicate delegate_upper_bound
 switch_away switch_back device_record device_record_invalid
 """.split())
 STAGES = frozenset("""
-start watchdog first_render enroll_profile enroll_switch_account enroll_measured_account
+start watchdog first_render delegate_snapshot enroll_profile enroll_switch_account enroll_measured_account
 restore sync room_listed open_room pagination history_complete scroll switch_away
 switch_back reopen_room complete enroll_device_record fixture_account homeserver_not_loopback
 fixture_user_not_synthetic client login output_path output_in_checkout bob_device_ids
@@ -100,7 +101,8 @@ BUILD = {
     "shipping_acceptance": ("const", False),
     "delta_from_shipping": (
         "const",
-        ["acceptance_driver", "rendering_notifier", "generated_profile_root", "requested_sync_policy"],
+        ["acceptance_driver", "rendering_notifier", "generated_profile_root", "requested_sync_policy",
+         "delegate_upper_bound_snapshots"],
     ),
 }
 COMMON = {
@@ -169,9 +171,10 @@ MEASURE = COMMON | {
         "after_switch": "int?",
         "peak": "int?",
     },
-    "delegates": {"instances": ("const", None), "method": ("const", "unmeasured")},
+    "delegates": {"after_history_upper_bound": "int", "after_scroll_upper_bound": "int",
+                  "method": ("const", "attached_component_root_upper_bound")},
     "poll_ms": "int",
-    "not_measured": ("const", ["gpu_time", "presentation", "display_refresh", "delegate_instances"]),
+    "not_measured": ("const", ["gpu_time", "presentation", "display_refresh", "exact_delegate_instances", "delegate_peak"]),
 }
 SUMMARY_KEYS = {"count", "dropped", "p50", "p95", "max"}
 
@@ -270,6 +273,9 @@ def valid_report(report, mode: str, adapter: str) -> bool:
     if not closed(report, schema) or report["adapter"] != adapter:
         return False
     backend = report["observed_backend"] if mode == "enroll" else report["sync"]["observed_backend"]
+    if mode != "enroll" and any(not 0 < report["delegates"][name] < EVENTS
+                                for name in ("after_history_upper_bound", "after_scroll_upper_bound")):
+        return False
     return backend == BACKENDS[adapter]
 
 

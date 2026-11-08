@@ -38,7 +38,8 @@ def build():
         "variant": "instrumented_release",
         "shipping_acceptance": False,
         "delta_from_shipping": ["acceptance_driver", "rendering_notifier",
-                                "generated_profile_root", "requested_sync_policy"],
+                                "generated_profile_root", "requested_sync_policy",
+                                "delegate_upper_bound_snapshots"],
     }
 
 
@@ -74,9 +75,10 @@ def measure_report(adapter):
                            "reopen_first_rows_observed_ms": 200, "reopen_initial_rows": 10_000},
         "rss_kib": {"source": "proc_self_status", "after_startup": 150_000, "after_history": 210_000,
                     "after_scroll": 212_000, "after_switch": 220_000, "peak": 230_000},
-        "delegates": {"instances": None, "method": "unmeasured"},
+        "delegates": {"after_history_upper_bound": 60, "after_scroll_upper_bound": 70,
+                      "method": "attached_component_root_upper_bound"},
         "poll_ms": 5,
-        "not_measured": ["gpu_time", "presentation", "display_refresh", "delegate_instances"],
+        "not_measured": ["gpu_time", "presentation", "display_refresh", "exact_delegate_instances", "delegate_peak"],
     }
 
 
@@ -204,6 +206,19 @@ class ReportTests(unittest.TestCase):
         ):
             with self.subTest(change=change):
                 self.assertFalse(mutated(change))
+
+
+    def test_attached_component_upper_bounds_cannot_claim_missing_or_all_fixture_rows(self):
+        for checkpoint in ("after_history_upper_bound", "after_scroll_upper_bound"):
+            for invalid in (None, True, 0, 10_000, 10_001, -1):
+                report = measure_report("sliding")
+                report["delegates"][checkpoint] = invalid
+                with self.subTest(checkpoint=checkpoint, invalid=invalid):
+                    self.assertFalse(runner.valid_report(report, "measure", "sliding"))
+        for value in (1, 9_999):
+            report = measure_report("sliding")
+            report["delegates"].update(after_history_upper_bound=value, after_scroll_upper_bound=value)
+            self.assertTrue(runner.valid_report(report, "measure", "sliding"))
 
 
 class FlowTests(RunnerTest):
