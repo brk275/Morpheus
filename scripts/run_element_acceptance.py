@@ -23,7 +23,7 @@ import time
 import wave
 
 from fixture_paths import external_path, private_directory, write_private
-from element_peer_fixture import down, up
+from element_peer_fixture import PATCHED_SDK_KIND, down, up, up_patched_sdk
 from element_process_namespace import assert_contained
 
 REPO = Path(__file__).resolve().parent.parent
@@ -36,12 +36,14 @@ CHECKS = frozenset((
     "browser_group_roster", "browser_group_audio", "browser_screen", "browser_group_departure",
     "browser_key_rotation", "browser_post_rotation_screen", "browser_post_rotation_audio",
 ))
+PATCHED_SDK_CHECKS = (CHECKS - {"official_image"}) | {"patched_sdk_assets"}
 STAGES = frozenset((
     "configuration", "tool_install", "browser_install", "native_test_build", "media_fixture",
     "browser_launch", "browser_login", "browser_identity", "browser_room_sync", "native_join_wait",
     "browser_join", "browser_roster", "browser_receive_video", "browser_receive_audio", "native_media_wait", "browser_leave",
     "browser_group_roster", "browser_group_audio", "browser_receive_screen",
     "browser_group_departure", "browser_key_rotation",
+    "browser_sender_key_activation", "browser_post_rotation_screen", "browser_post_rotation_audio",
     "element_fixture_root", "element_configuration", "element_image_pull", "element_image_verify",
     "element_container_create", "element_container_start", "element_ready", "element_cleanup",
     "native_test", "log_scan", "complete",
@@ -58,12 +60,15 @@ STAGE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_STAGE ([a-z_]+)$", re.MULTILINE)
 FAILURE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_FAILURE ([a-z_]+)$", re.MULTILINE)
 
 
-def evidence(output: str, *, complete=False) -> dict[str, bool]:
+def evidence(output: str, *, complete=False, patched_sdk=False) -> dict[str, bool]:
+    required = PATCHED_SDK_CHECKS if patched_sdk else CHECKS
     result = {}
     for key, value in CHECK_PATTERN.findall(output):
-        if key in CHECKS:
+        if key in required:
             result[key] = result.get(key, True) and value == "true"
-    if complete and (set(result) != CHECKS or not all(result.values())
+    forbidden = "official_image" if patched_sdk else "patched_sdk_assets"
+    if complete and (set(result) != required or not all(result.values())
+                     or any(key == forbidden for key, _ in CHECK_PATTERN.findall(output))
                      or any(value in FAILURES for value in FAILURE_PATTERN.findall(output))):
         raise RuntimeError("evidence")
     return result
@@ -86,7 +91,71 @@ def native_stages(output: str) -> tuple[str, ...]:
     return tuple(result)
 
 
-def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
+
+NATIVE_KEY_FAILURES = frozenset((
+    "departure_receipt_wait_timeout", "departure_receipt_validation",
+    "departure_index_unchanged", "same_senders_key_adoption_timeout",
+    "browser_post_media_receipt_timeout",
+))
+NATIVE_KEY_FAILURE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_KEY_FAILURE "
+NATIVE_EXIT_PREFIX = "MORPHEUS_ELEMENT_NATIVE_EXIT "
+
+
+def native_key_failure(output: str) -> str | None:
+    """Classify only known sites in the immutable fixture, never copy panic text."""
+    checks = evidence(output)
+    if checks.get("native_group_departure") is not True:
+        return None
+    lines = output.splitlines()
+    sites = []
+    for index, line in enumerate(lines):
+        if len(line) > 512:
+            continue
+        match = re.fullmatch(
+            r"thread '[^'\r\n]{1,160}'(?: \([0-9]{1,20}\))? panicked at "
+            r"crates/morpheus-rtc/tests/element_call_peer\.rs:([0-9]{1,5}):[0-9]{1,5}:",
+            line,
+        )
+        if match:
+            if index + 1 >= len(lines) or len(lines[index + 1]) > 1024:
+                return None
+            sites.append((int(match[1]), lines[index + 1]))
+    if len(sites) != 1:
+        return None
+    site, message = sites[0]
+    rotated = checks.get("native_key_rotation") is True
+    if site == 133 and message == "Stock browser coordination timed out: Elapsed(())":
+        return "browser_post_media_receipt_timeout" if rotated else "departure_receipt_wait_timeout"
+    if rotated:
+        return None
+    validation = {
+        367: "Key receipt metadata missing:", 368: "Invalid private key receipt",
+        372: "Cannot open private key receipt:", 373: "Cannot inspect private key receipt:",
+        374: "Invalid opened key receipt", 381: "Cannot read private key receipt:",
+        382: "Key receipt exceeded bound", 384: "Invalid key receipt shape:",
+    }
+    if site in validation and (message == validation[site] or message.startswith(validation[site] + " ")):
+        return "departure_receipt_validation"
+    if site == 607 and message == "assertion `left != right` failed: Departure did not produce a new sender index":
+        return "departure_index_unchanged"
+    if site == 633 and message == "Actual same media senders did not adopt the departure key: Elapsed(())":
+        return "same_senders_key_adoption_timeout"
+    return None
+
+
+def native_exit_marker(status) -> str | None:
+    # This value is sampled by waitid(WNOWAIT) before owned teardown, not the
+    # SIGKILL result produced by close(). No PID or signal description is copied.
+    if type(status) is not int:
+        return None
+    if 0 <= status <= 255:
+        return NATIVE_EXIT_PREFIX + "code=" + str(status)
+    if -64 <= status < 0:
+        return NATIVE_EXIT_PREFIX + "signal=" + str(-status)
+    return None
+
+
+def diagnostics(output: str, *, include_native=True) -> dict[str, str | int]:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
     failures = [value for value in FAILURE_PATTERN.findall(output) if value in FAILURES]
@@ -94,8 +163,17 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
         result["stage"] = stages[-1]
     if failures:
         result["failure"] = failures[-1]
-    if include_native and (native := native_stages(output)):
-        result["native_stage"] = native[-1]
+    if include_native:
+        if native := native_stages(output):
+            result["native_stage"] = native[-1]
+        failures = re.findall(r"^MORPHEUS_ELEMENT_NATIVE_KEY_FAILURE ([a-z_]{1,64})$", output, re.MULTILINE)
+        if len(failures) == 1 and failures[0] in NATIVE_KEY_FAILURES:
+            result["native_key_failure"] = failures[0]
+        outcomes = re.findall(r"^MORPHEUS_ELEMENT_NATIVE_EXIT (code|signal)=([0-9]{1,3})$", output, re.MULTILINE)
+        if len(outcomes) == 1:
+            kind, value = outcomes[0]
+            if (kind == "code" and int(value) <= 255) or (kind == "signal" and 1 <= int(value) <= 64):
+                result["native_exit_" + kind] = int(value)
     return result
 
 
@@ -209,6 +287,8 @@ def wait_peers(native: Child, browser: Child, seconds=360):
         # Sample both terminal statuses even when both finish between polls.
         # A final browser.close error must not be hidden by earlier markers.
         native_status, browser_status = native.status(), browser.status()
+        if native_status is not None:
+            native.acceptance_status = native_status
         if native_status is not None and native_status != 0:
             raise RuntimeError("native_acceptance")
         if browser_status is not None and browser_status != 0:
@@ -381,11 +461,14 @@ class Runner:
                 native_output.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n"))
 
 
-def execute(root: Path, fixture: Path, gitleaks: str):
+def execute(root: Path, fixture: Path, gitleaks: str, *, patched_sdk_receipt=None, receipt_sha256=None):
     if sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_OS") != "Linux":
         raise RuntimeError("configuration")
     if "MORPHEUS_ELEMENT_DIAG_REFRESH" in os.environ:
         raise RuntimeError("configuration")
+    if (patched_sdk_receipt is None) != (receipt_sha256 is None):
+        raise RuntimeError("configuration")
+    patched_sdk = patched_sdk_receipt is not None
     assert_contained()
     fixture = external_path(fixture)
     if not fixture.is_file() or fixture.stat().st_mode & 0o077:
@@ -411,10 +494,22 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         built = runner.command(["cargo", "test", "--locked", "-p", "morpheus-rtc", "--features", "native-devices",
                                 "--test", "element_call_peer", "--no-run", "--message-format=json"], seconds=600)
         binary = native_executable(built)
-        peer = runner.service(lambda: up(root / "service"))
-        if peer.get("official_image_identity_verified") is not True:
-            raise RuntimeError("evidence")
-        write_private(runner.logs / "image.log", "MORPHEUS_ELEMENT_CHECK official_image=true\n", create=True)
+        if patched_sdk:
+            peer = runner.service(lambda: up_patched_sdk(root / "service", patched_sdk_receipt, receipt_sha256))
+            if (peer.get("kind") != PATCHED_SDK_KIND
+                    or peer.get("official_server_image_identity_verified") is not True
+                    or peer.get("official_image_identity_verified") is not False
+                    or peer.get("official_application_assets") is not False
+                    or peer.get("stock_interoperability") is not False
+                    or peer.get("patched_sdk_receipt_sha256") != receipt_sha256):
+                raise RuntimeError("evidence")
+            image_fact = "patched_sdk_assets"
+        else:
+            peer = runner.service(lambda: up(root / "service"))
+            if peer.get("official_image_identity_verified") is not True or "kind" in peer:
+                raise RuntimeError("evidence")
+            image_fact = "official_image"
+        write_private(runner.logs / "image.log", f"MORPHEUS_ELEMENT_CHECK {image_fact}=true\n", create=True)
         runner.mark("media_fixture")
         media_fixtures(root)
         extra = {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture), "MORPHEUS_ELEMENT_PEER_ROOT": str(root),
@@ -456,7 +551,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         if peers_complete and children_joined and not exact_native_pass(native_output):
             failure = "evidence"
         failure = failure or cleanup_failure
-        facts = evidence(output, complete=not failure)
+        facts = evidence(output, complete=not failure, patched_sdk=patched_sdk)
     except RuntimeError as error:
         failure = str(error)
         output, native_output, facts = "", "", {}
@@ -471,6 +566,11 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     if children_joined and cleanup_failure is None:
         for value in native_stages(native_output):
             print(NATIVE_STAGE_PREFIX + value, flush=True)
+        if failure and native_output and native is not None:
+            if marker := native_exit_marker(getattr(native, "acceptance_status", None)):
+                print(marker, flush=True)
+            if category := native_key_failure(native_output):
+                print(NATIVE_KEY_FAILURE_PREFIX + category, flush=True)
     # Cleanup is required but must not erase the last useful failure stage.
     diagnostic_output = output.replace("MORPHEUS_ELEMENT_STAGE element_cleanup\n", "")
     if found := diagnostics(diagnostic_output, include_native=False):
@@ -482,6 +582,8 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         print("MORPHEUS_ELEMENT_FAILURE " + failure, flush=True)
         raise RuntimeError(failure)
     runner.mark("complete")
+    if patched_sdk:
+        print("MORPHEUS_PATCHED_SDK_DIAGNOSTIC stock_interoperability=false", flush=True)
     return facts
 
 
@@ -490,6 +592,8 @@ def main():
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--fixture", required=True, type=Path)
     parser.add_argument("--gitleaks", required=True)
+    parser.add_argument("--patched-sdk-receipt", type=Path)
+    parser.add_argument("--patched-sdk-receipt-sha256")
     args = parser.parse_args()
     # The outer acceptance runner has a longer watchdog and also calls down.
     # A graceful cancellation still lets this process kill its owned groups.
@@ -499,7 +603,8 @@ def main():
     signal.signal(signal.SIGINT, interrupted)
     signal.signal(signal.SIGALRM, interrupted)
     signal.alarm(1_740)
-    execute(args.root, args.fixture, args.gitleaks)
+    execute(args.root, args.fixture, args.gitleaks,
+            patched_sdk_receipt=args.patched_sdk_receipt, receipt_sha256=args.patched_sdk_receipt_sha256)
 
 
 if __name__ == "__main__":

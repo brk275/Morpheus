@@ -50,6 +50,23 @@ class EvidenceTests(unittest.TestCase):
                 with self.subTest(group_fact=name), self.assertRaisesRegex(RuntimeError, "evidence"):
                     target.evidence(value, complete=True)
 
+    def test_patched_sdk_facts_cannot_qualify_unchanged_stock(self):
+        patched = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in target.PATCHED_SDK_CHECKS)
+        stock = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in target.CHECKS)
+        self.assertEqual(target.evidence(patched, complete=True, patched_sdk=True),
+                         dict.fromkeys(target.PATCHED_SDK_CHECKS, True))
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(patched, complete=True)
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(stock, complete=True, patched_sdk=True)
+        for mode in (False, True):
+            with self.assertRaisesRegex(RuntimeError, "evidence"):
+                target.evidence(stock + "\n" + patched, complete=True, patched_sdk=mode)
+        for name in target.CHECKS - {"official_image"}:
+            broken = patched.replace(f"MORPHEUS_ELEMENT_CHECK {name}=true", "")
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "evidence"):
+                target.evidence(broken, complete=True, patched_sdk=True)
+
     def test_exact_named_nonempty_test_result_is_required(self):
         result = f"test {target.TEST_NAME} ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"
         self.assertTrue(target.exact_native_pass(result))
@@ -80,9 +97,65 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(target.native_stages(output), ("invalid",))
                 self.assertEqual(target.diagnostics(output), {"native_stage": "invalid"})
 
+    def test_key_failure_classifies_only_exact_pinned_sites_without_copying_messages(self):
+        prefix = "MORPHEUS_ELEMENT_CHECK native_group_departure=true\n"
+        def panic(site, message):
+            return (prefix + "thread 'element_call_browser_peer_encrypted_media_and_departure' panicked at "
+                    f"crates/morpheus-rtc/tests/element_call_peer.rs:{site}:6:\n{message}\n")
+        cases = (
+            (133, "Stock browser coordination timed out: Elapsed(())", "departure_receipt_wait_timeout"),
+            (367, "Key receipt metadata missing: private-error", "departure_receipt_validation"),
+            (384, "Invalid key receipt shape: private-value", "departure_receipt_validation"),
+            (607, "assertion `left != right` failed: Departure did not produce a new sender index",
+             "departure_index_unchanged"),
+            (633, "Actual same media senders did not adopt the departure key: Elapsed(())",
+             "same_senders_key_adoption_timeout"),
+        )
+        for site, message, category in cases:
+            with self.subTest(site=site):
+                output = panic(site, message)
+                self.assertEqual(target.native_key_failure(output), category)
+                modern = output.replace("' panicked at", "' (123456) panicked at")
+                self.assertEqual(target.native_key_failure(modern), category)
+                self.assertIsNone(target.native_key_failure(
+                    output.replace("' panicked at", "' (" + "1" * 21 + ") panicked at")))
+                for broken in (output.replace(prefix, ""), output + output,
+                               output.replace("element_call_peer.rs:", "untrusted.rs:"),
+                               output.replace(f".rs:{site}:", ".rs:9999:")):
+                    self.assertIsNone(target.native_key_failure(broken))
+        self.assertIsNone(target.native_key_failure(panic(633, "private-error")))
+        self.assertIsNone(target.native_key_failure(panic(633, "x" * 1025)))
+        self.assertEqual(target.native_key_failure(
+            panic(133, "Stock browser coordination timed out: Elapsed(())")
+            + "MORPHEUS_ELEMENT_CHECK native_key_rotation=true\n"), "browser_post_media_receipt_timeout")
+        self.assertIsNone(target.native_key_failure(
+            panic(633, cases[-1][1]) + "MORPHEUS_ELEMENT_CHECK native_key_rotation=true\n"))
+        source = (target.REPO / "crates/morpheus-rtc/tests/element_call_peer.rs").read_text().splitlines()
+        for line, literal in ((133, "Stock browser coordination timed out"),
+                              (367, "Key receipt metadata missing"), (384, "Invalid key receipt shape"),
+                              (607, "assert_ne!("), (633, "Actual same media senders did not adopt the departure key")):
+            self.assertIn(literal, source[line - 1])
+
+    def test_native_outcomes_and_key_categories_are_closed_and_not_raw_error_text(self):
+        for status, expected in ((0, "code=0"), (101, "code=101"), (-9, "signal=9")):
+            marker = target.native_exit_marker(status)
+            self.assertEqual(marker, target.NATIVE_EXIT_PREFIX + expected)
+            kind, value = expected.split("=")
+            self.assertEqual(target.diagnostics(marker), {"native_exit_" + kind: int(value)})
+        for status in (True, None, "101", 256, -65):
+            self.assertIsNone(target.native_exit_marker(status))
+        category = "same_senders_key_adoption_timeout"
+        marker = target.NATIVE_KEY_FAILURE_PREFIX + category
+        self.assertEqual(target.diagnostics(marker), {"native_key_failure": category})
+        for output in (marker + " private", marker + "\n" + marker,
+                       target.NATIVE_KEY_FAILURE_PREFIX + "private", "MORPHEUS_ELEMENT_NATIVE_EXIT code=256",
+                       "MORPHEUS_ELEMENT_NATIVE_EXIT signal=0", "MORPHEUS_ELEMENT_NATIVE_EXIT signal=65"):
+            self.assertEqual(target.diagnostics(output), {})
+
     def test_native_failure_facts_follow_owned_cleanup_and_successful_scan(self):
-        for scanner_status, join_failure, service_failure in ((0, False, False), (1, False, False),
-                                                            (0, True, False), (0, False, True)):
+        for scanner_status, join_failure, service_failure, anchor_failure in (
+                (0, False, False, False), (1, False, False, False),
+                (0, True, False, False), (0, False, True, False), (0, False, False, True)):
             with self.subTest(scanner_status=scanner_status, join_failure=join_failure, service_failure=service_failure), \
                     tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -93,6 +166,9 @@ class EvidenceTests(unittest.TestCase):
                 runner = target.Runner(root, "scanner")
                 native = self.anchored_log(runner, "native.log", (
                     "opaque-fixture-panic\nMORPHEUS_ELEMENT_CHECK native_audio=true\n"
+                    "MORPHEUS_ELEMENT_CHECK native_group_departure=true\n"
+                    "thread 'fixture' panicked at crates/morpheus-rtc/tests/element_call_peer.rs:633:6:\n"
+                    "Actual same media senders did not adopt the departure key: Elapsed(())\n"
                     + target.NATIVE_STAGE_PREFIX + "microphone_cryptor\n"
                     + target.NATIVE_STAGE_PREFIX + "late_login\n").encode())
                 browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
@@ -118,6 +194,11 @@ class EvidenceTests(unittest.TestCase):
                 def snapshot():
                     events.append("read")
                     return original_snapshots()
+                original_release = runner.release_log_anchors
+                def release():
+                    original_release()
+                    if anchor_failure:
+                        raise RuntimeError("fixture_operation")
                 visible = io.StringIO()
                 with mock.patch.object(target.sys, "platform", "linux"), mock.patch.dict(os.environ, {
                     "GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux",
@@ -131,8 +212,9 @@ class EvidenceTests(unittest.TestCase):
                         mock.patch.object(target, "media_fixtures"), \
                         mock.patch.object(target.subprocess, "run", side_effect=scanned), \
                         mock.patch.object(runner, "log_snapshots", side_effect=snapshot), \
+                        mock.patch.object(runner, "release_log_anchors", side_effect=release), \
                         contextlib.redirect_stdout(visible), self.assertRaisesRegex(
-                            RuntimeError, "fixture_operation" if join_failure or service_failure else (
+                            RuntimeError, "fixture_operation" if join_failure or service_failure or anchor_failure else (
                                 "native_acceptance" if scanner_status == 0 else "log_scan")):
                     target.execute(root, fixture, "scanner")
                 self.assertEqual(events, ["native_join", "browser_join"] + ([] if join_failure or service_failure else ["read", "scan"]))
@@ -141,9 +223,14 @@ class EvidenceTests(unittest.TestCase):
                 output = visible.getvalue()
                 self.assertNotIn("opaque", output)
                 self.assertEqual(target.evidence(output),
-                                 {"native_audio": True, "official_image": True} if scanner_status == 0 and not join_failure and not service_failure else {})
+                                 {"native_audio": True, "native_group_departure": True, "official_image": True}
+                                 if scanner_status == 0 and not join_failure and not service_failure and not anchor_failure else {})
+                released = scanner_status == 0 and not join_failure and not service_failure and not anchor_failure
+                self.assertEqual(target.diagnostics(output).get("native_exit_code"), 1 if released else None)
+                self.assertEqual(target.diagnostics(output).get("native_key_failure"),
+                                 "same_senders_key_adoption_timeout" if released else None)
                 self.assertEqual(target.diagnostics(output).get("native_stage"),
-                                 "late_login" if scanner_status == 0 and not join_failure and not service_failure else None)
+                                 "late_login" if scanner_status == 0 and not join_failure and not service_failure and not anchor_failure else None)
 
     @staticmethod
     def anchored_log(runner, name, data):
@@ -343,6 +430,9 @@ class EvidenceTests(unittest.TestCase):
                         target.wait_peers(native, browser)
                 else:
                     target.wait_peers(native, browser)
+                self.assertEqual(native.acceptance_status, native_status)
+                native.process.returncode = -signal.SIGKILL
+                self.assertEqual(native.acceptance_status, native_status)
 
     def test_peers_finishing_between_polls_still_check_terminal_status(self):
         native, browser = mock.Mock(started=time.monotonic()), mock.Mock()

@@ -3,12 +3,15 @@
 import contextlib
 import importlib.util
 import io
+import hashlib
+import os
 import json
 from pathlib import Path
 import stat
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -279,6 +282,303 @@ class CliTests(unittest.TestCase):
             output.assert_called_once_with("MORPHEUS_ELEMENT_STAGE element_image_pull", file=sys.stderr, flush=True)
         with self.assertRaises(TypeError):
             peer.set_stage("http://secret.invalid/?token=private")
+
+
+class PatchedSDKAssetTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="morpheus-patched-assets-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.assets = self.root / "dist"
+        self.assets.mkdir(mode=0o700)
+        index = b'<html><script src="/assets/app.js"></script></html>'
+        (self.assets / "index.html").write_bytes(index)
+        (self.assets / "index.html").chmod(0o600)
+        self.data = {
+            "schema": 1, "kind": peer.PATCHED_SDK_KIND, "element_revision": peer.REVISION,
+            "sdk_revision": peer.SDK_REVISION, "sdk_patch_sha256": peer.SDK_PATCH_SHA256,
+            "sdk_production_files": dict(peer.SDK_PRODUCTION_FILES),
+            "stock_interoperability": False, "official_application_assets": False,
+            "assets": str(self.assets), "build_inputs_sha256": "a" * 64,
+            "inventory": {"index.html": {"bytes": len(index), "sha256": hashlib.sha256(index).hexdigest()}},
+        }
+        self.receipt = self.root / "receipt.json"
+
+    def save(self):
+        body = (json.dumps(self.data) + "\n").encode()
+        self.receipt.write_bytes(body)
+        self.receipt.chmod(0o600)
+        return hashlib.sha256(body).hexdigest()
+
+    def test_exact_diagnostic_assets_never_claim_stock_identity(self):
+        digest = self.save()
+        assets, data = peer.patched_sdk_assets(self.receipt, digest)
+        self.assertEqual(assets, self.assets)
+        self.assertIs(data["stock_interoperability"], False)
+        config = peer.nginx_configuration(18443, patched_sdk=True)
+        self.assertIn("root /patched-sdk-app;", config)
+        self.assertIn("location = /config.json { alias /fixture/config.json;", config)
+        self.assertNotIn("root /fixture;", config)
+        self.assertNotIn("root /app;", config)
+        with mock.patch.object(peer, "_up", return_value={}) as launch:
+            peer.up_patched_sdk(self.root / "service", self.receipt, digest)
+        self.assertEqual(launch.call_args.kwargs["patched"][0], self.assets)
+        with mock.patch.object(peer, "_up", return_value={}) as launch:
+            peer.up(self.root / "stock")
+        self.assertNotIn("patched", launch.call_args.kwargs)
+
+    def test_wrong_digest_or_source_or_stock_claim_fails_before_launch(self):
+        digest = self.save()
+        with self.assertRaises(peer.FixtureError):
+            peer.patched_sdk_assets(self.receipt, "b" * 64)
+        for name, value in (("element_revision", "0" * 40), ("sdk_revision", "0" * 40),
+                            ("sdk_production_files", {}), ("stock_interoperability", True),
+                            ("official_application_assets", True), ("schema", True)):
+            original = self.data[name]
+            self.data[name] = value
+            with self.subTest(name=name), mock.patch.object(peer, "_up") as launch:
+                with self.assertRaises(peer.FixtureError):
+                    peer.up_patched_sdk(self.root / "service", self.receipt, self.save())
+                launch.assert_not_called()
+            self.data[name] = original
+
+    def test_extra_changed_linked_or_deployment_assets_fail(self):
+        digest = self.save()
+        extra = self.assets / "extra.js"
+        extra.write_text("extra")
+        with self.assertRaises(peer.FixtureError):
+            peer.patched_sdk_assets(self.receipt, digest)
+        extra.unlink()
+        index = self.assets / "index.html"
+        original = index.read_bytes()
+        index.write_bytes(original + b"changed")
+        with self.assertRaises(peer.FixtureError):
+            peer.patched_sdk_assets(self.receipt, digest)
+        index.write_bytes(original)
+        external = self.root / "external.html"
+        index.rename(external)
+        index.symlink_to(external)
+        with self.assertRaises(peer.FixtureError):
+            peer.patched_sdk_assets(self.receipt, digest)
+        index.unlink()
+        os.link(external, index)
+        with self.assertRaises(peer.FixtureError):
+            peer.patched_sdk_assets(self.receipt, digest)
+        index.unlink()
+        external.rename(index)
+        (self.assets / "config.json").write_text("{}")
+        with self.assertRaises(peer.FixtureError):
+            peer.patched_sdk_assets(self.receipt, digest)
+
+    def test_duplicate_keys_and_mount_separator_paths_fail(self):
+        self.save()
+        body = self.receipt.read_bytes().rstrip()[:-1] + b', "schema": 1}\n'
+        self.receipt.write_bytes(body)
+        with self.assertRaises(peer.FixtureError):
+            peer.patched_sdk_assets(self.receipt, hashlib.sha256(body).hexdigest())
+        for value in (str(self.assets) + ",readonly=false", str(self.assets) + "\n", "bad\x00path"):
+            self.data["assets"] = value
+            with self.subTest(path=value), self.assertRaises(peer.FixtureError):
+                peer.patched_sdk_assets(self.receipt, self.save())
+        with self.assertRaises(peer.FixtureError):
+            peer.patched_sdk_assets(self.root / "receipt,readonly=false", "a" * 64)
+
+    def test_opened_metadata_must_match_before_any_read(self):
+        digest = self.save()
+        original = self.receipt.stat()
+        fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        for field in ("st_mode", "st_nlink", "st_size"):
+            values = {name: getattr(original, name) for name in fields}
+            values[field] += 1
+            with self.subTest(field=field), mock.patch.object(peer.os, "fstat", return_value=SimpleNamespace(**values)):
+                with self.assertRaises(peer.FixtureError):
+                    peer.patched_sdk_assets(self.receipt, digest)
+
+    def test_asset_file_and_inventory_bounds_are_enforced(self):
+        digest = self.save()
+        with mock.patch.object(peer, "MAX_ASSET_FILE_BYTES", 1), self.assertRaises(peer.FixtureError):
+            peer.patched_sdk_assets(self.receipt, digest)
+        with mock.patch.object(peer, "MAX_ASSET_TOTAL_BYTES", 1), self.assertRaises(peer.FixtureError):
+            peer.patched_sdk_assets(self.receipt, digest)
+        alias = self.root / "alias"
+        alias.symlink_to(self.assets, target_is_directory=True)
+        self.data["assets"] = str(alias)
+        with self.assertRaises(peer.FixtureError):
+            peer.patched_sdk_assets(self.receipt, self.save())
+
+
+class PatchedSDKBuilderSelectionTests(unittest.TestCase):
+    def setUp(self):
+        import build_patched_element_peer as builder
+        self.builder = builder
+        self.temp = tempfile.TemporaryDirectory(prefix="morpheus-builder-unit-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.store = self.root / "node_modules/.pnpm"
+        self.store.mkdir(parents=True)
+
+    def package(self, label, name, version):
+        path = self.store / label / "node_modules" / name
+        path.mkdir(parents=True)
+        (path / "package.json").write_text(json.dumps({"name": name, "version": version}))
+        return path
+
+    def test_actual_caller_dependency_wins_over_root_alias(self):
+        caller = self.package("caller", "vite", "8.2.4")
+        dependency = self.package("selected", "rolldown", "1.2.15")
+        (caller.parent / "rolldown").symlink_to(dependency, target_is_directory=True)
+        wrong = self.package("wrong", "rolldown", "0.0.0")
+        (self.root / "node_modules/rolldown").symlink_to(wrong, target_is_directory=True)
+        self.assertEqual(self.builder.resolved_package(self.root, "rolldown", "1.2.15", caller), dependency)
+        with self.assertRaises(RuntimeError):
+            self.builder.resolved_package(self.root, "rolldown", "1.2.15", self.root)
+
+    def test_member_guards_hash_identity_and_duplicate_resolution(self):
+        package = self.package("selected", "synthetic-tool", "1.0.0")
+        (self.root / "node_modules/synthetic-tool").symlink_to(package, target_is_directory=True)
+        member = package / "index.js"
+        member.write_bytes(b"synthetic-data-only")
+        fact = {"phase": "SDK_BABEL", "identity": "synthetic-tool@1.0.0", "relative_entry": "index.js",
+                "bytes": member.stat().st_size, "sha256": hashlib.sha256(member.read_bytes()).hexdigest()}
+        self.builder.installed_members(self.root, [fact])
+        with self.assertRaises(RuntimeError):
+            self.builder.installed_members(self.root, [fact, fact])
+        with self.assertRaises(RuntimeError):
+            self.builder.installed_members(self.root, [dict(fact, sha256="a" * 64)])
+        with self.assertRaises(RuntimeError):
+            self.builder.installed_members(self.root, [dict(fact, identity="synthetic-tool@2.0.0")])
+        member.unlink()
+        external = self.root / "outside.js"
+        external.write_bytes(b"synthetic-data-only")
+        member.symlink_to(external)
+        with self.assertRaises(RuntimeError):
+            self.builder.installed_members(self.root, [fact])
+
+    def test_complete_source_inventory_rejects_extra_files_directories_and_links(self):
+        source = self.root / "source"
+        source.mkdir()
+        item = source / "input.ts"
+        item.write_bytes(b"synthetic source")
+        facts = {"input.ts": {"mode": "100644", "bytes": item.stat().st_size,
+                              "sha256": hashlib.sha256(item.read_bytes()).hexdigest()}}
+        self.builder.unchanged_source(source, facts)
+        (source / "injected.ts").write_text("unexpected")
+        with self.assertRaises(RuntimeError):
+            self.builder.unchanged_source(source, facts)
+        (source / "injected.ts").unlink()
+        (source / "extra").mkdir()
+        with self.assertRaises(RuntimeError):
+            self.builder.unchanged_source(source, facts)
+        (source / "extra").rmdir()
+        (source / "lib").mkdir()
+        with self.assertRaises(RuntimeError):
+            self.builder.unchanged_source(source, facts)
+        self.builder.unchanged_source(source, facts, outputs=("lib",))
+        (source / "lib").rmdir()
+        (source / "node_modules").symlink_to(self.store, target_is_directory=True)
+        with self.assertRaises(RuntimeError):
+            self.builder.unchanged_source(source, facts)
+
+    def test_ancestor_config_stats_and_config_directory_links_fail_closed(self):
+        # Supply only owned synthetic ancestors, without touching machine config.
+        selected = SimpleNamespace(parents=(self.root,))
+        self.builder.no_ancestor_configuration(selected)
+        for name in ("browserslist-stats.json", ".svgrrc.js", "package.json", ".postcssrc.yaml"):
+            path = self.root / name
+            path.write_text("synthetic")
+            with self.subTest(name=name), self.assertRaises(RuntimeError):
+                self.builder.no_ancestor_configuration(selected)
+            path.unlink()
+        config = self.root / ".config"
+        config.symlink_to(self.store, target_is_directory=True)
+        with self.assertRaises(RuntimeError):
+            self.builder.no_ancestor_configuration(selected)
+        config.unlink()
+        config.mkdir()
+        (config / "svgrrc.ts").write_text("synthetic")
+        with self.assertRaises(RuntimeError):
+            self.builder.no_ancestor_configuration(selected)
+
+    def sourcemap_chain(self):
+        sdk, dist = self.root / "sdk", self.root / "dist"
+        sdk.mkdir()
+        dist.mkdir()
+        sources = {"src/matrixrtc/First.ts": b"first synthetic", "src/matrixrtc/Second.ts": b"second synthetic"}
+        generated = {}
+        for name, body in sources.items():
+            path = sdk / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+            emitted = "lib/" + name.removeprefix("src/").removesuffix(".ts") + ".js"
+            path = sdk / emitted
+            path.parent.mkdir(parents=True, exist_ok=True)
+            js = b"synthetic generated JS\n//# sourceMappingURL=" + path.name.encode() + b".map"
+            path.write_bytes(js)
+            (sdk / (emitted + ".map")).write_text(json.dumps({
+                "version": 3, "file": path.name, "sources": ["../../" + name],
+                "sourcesContent": [body.decode()], "mappings": "AAAA"}))
+            generated[emitted] = js
+        hashes = {name: hashlib.sha256(body).hexdigest() for name, body in sources.items()}
+        mapping = {"sources": ["../../node_modules/matrix-js-sdk/" + name for name in generated],
+                   "sourcesContent": [body.decode() for body in generated.values()]}
+        output = dist / "app.js.map"
+        output.write_text(json.dumps(mapping))
+        return sdk, dist, sources, generated, hashes, mapping, output
+
+    def test_sourcemap_requires_exact_both_selected_source_contents(self):
+        sdk, dist, sources, _, hashes, mapping, output = self.sourcemap_chain()
+        with mock.patch.object(self.builder, "SDK_PRODUCTION_FILES", hashes):
+            self.builder.selected_sdk_sources(dist, sdk)
+            mapping["sources"] = ["../../" + name for name in sources]
+            mapping["sourcesContent"] = [body.decode() for body in sources.values()]
+            output.write_text(json.dumps(mapping))
+            self.builder.selected_sdk_sources(dist, sdk)
+            mapping["sourcesContent"][0] = "old source"
+            output.write_text(json.dumps(mapping))
+            with self.assertRaises(RuntimeError):
+                self.builder.selected_sdk_sources(dist, sdk)
+
+    def test_generated_map_chain_rejects_old_missing_and_ambiguous_inputs(self):
+        sdk, dist, _, generated, hashes, mapping, output = self.sourcemap_chain()
+        original = json.dumps(mapping)
+        with mock.patch.object(self.builder, "SDK_PRODUCTION_FILES", hashes):
+            for mutation in ("old_js", "missing_one", "wrong_package", "ambiguous_path"):
+                changed = json.loads(original)
+                if mutation == "old_js":
+                    changed["sourcesContent"][0] = "old generated JS"
+                elif mutation == "missing_one":
+                    changed["sources"] = changed["sources"][1:]
+                    changed["sourcesContent"] = changed["sourcesContent"][1:]
+                elif mutation == "wrong_package":
+                    changed["sources"][0] = changed["sources"][0].replace("matrix-js-sdk", "another-sdk")
+                else:
+                    changed["sources"][0] = changed["sources"][0].replace("/lib/", "/other/../lib/")
+                output.write_text(json.dumps(changed))
+                with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                    self.builder.selected_sdk_sources(dist, sdk)
+            output.write_text(original)
+            selected = sdk / (next(iter(generated)) + ".map")
+            map_body = selected.read_text()
+            selected.unlink()
+            with self.assertRaises((RuntimeError, FileNotFoundError)):
+                self.builder.selected_sdk_sources(dist, sdk)
+            selected.write_text(map_body)
+            for mutation in ("old_ts", "wrong_path", "wrong_file"):
+                changed = json.loads(map_body)
+                if mutation == "old_ts":
+                    changed["sourcesContent"][0] = "old TS source"
+                elif mutation == "wrong_path":
+                    changed["sources"][0] = "../../src/matrixrtc/Other.ts"
+                else:
+                    changed["file"] = "Other.js"
+                selected.write_text(json.dumps(changed))
+                with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                    self.builder.selected_sdk_sources(dist, sdk)
+            selected.write_text(map_body)
+            js_path = sdk / next(iter(generated))
+            js_path.write_bytes(js_path.read_bytes().replace(b"sourceMappingURL=", b"wrongMapReference="))
+            with self.assertRaises(RuntimeError):
+                self.builder.selected_sdk_sources(dist, sdk)
 
 
 if __name__ == "__main__":

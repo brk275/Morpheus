@@ -525,8 +525,11 @@ async function main() {
     }), "Departure did not deliver a new exact-sender key");
     const afterLeave = await page.evaluate(() => window.__morpheusInteropKeys.last);
     writeKeyReceipt("new-key-observed.json", afterLeave);
+    mark("browser_sender_key_activation");
     await poll(() => existsSync(join(root, "screen-changed")), "Actual sender key activation did not finish");
+    mark("browser_post_rotation_screen");
     await observeScreen(true, 2);
+    mark("browser_post_rotation_audio");
     await observeAudio(owner, 1301, 2, true);
     check("browser_key_rotation");
     check("browser_post_rotation_screen");

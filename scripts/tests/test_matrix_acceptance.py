@@ -3766,5 +3766,69 @@ class ScopedContinuationTests(unittest.TestCase):
             self.assertEqual((Path(folder) / "outcomes.json").stat().st_mode & 0o777, 0o600)
 
 
+
+class PatchedSDKDiagnosticScopeTests(unittest.TestCase):
+    def test_failed_diagnostic_uses_the_same_closed_failure_classification(self):
+        module = acceptance_module
+        for reason in ("test_failed", "deadline", "evidence_incomplete"):
+            with self.subTest(reason=reason):
+                failure = module.CheckFailure(module.PATCHED_SDK_LABEL, reason)
+                self.assertEqual((failure.label, failure.reason), (module.PATCHED_SDK_LABEL, reason))
+                self.assertEqual(str(failure), f"Acceptance check failed: {module.PATCHED_SDK_LABEL} ({reason})")
+        for label, reason in (("unknown-diagnostic", "test_failed"),
+                              (module.PATCHED_SDK_LABEL, "unknown-reason")):
+            with self.subTest(label=label, reason=reason), self.assertRaisesRegex(
+                    RuntimeError, "Invalid acceptance failure classification"):
+                module.CheckFailure(label, reason)
+
+    def test_explicit_receipt_required_and_excluded_from_full_plan(self):
+        module = acceptance_module
+        self.assertNotIn(module.PATCHED_SDK_LABEL, module.PLANNED_CHECKS)
+        self.assertEqual(module.SUITES[module.PATCHED_SDK_SUITE], (module.PATCHED_SDK_LABEL,))
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaises(RuntimeError):
+                Acceptance(Path(folder), "scanner", suite=module.PATCHED_SDK_SUITE)
+            for suite in ("full", "element-interop"):
+                with self.subTest(suite=suite), self.assertRaises(RuntimeError):
+                    Acceptance(Path(folder), "scanner", suite=suite,
+                               patched_sdk_receipt=Path(folder) / "receipt.json",
+                               patched_sdk_receipt_sha256="a" * 64)
+
+    def test_non_hosted_context_never_reads_diagnostic_receipt(self):
+        with patch.object(sys, "argv", ["run_matrix_acceptance.py", "--gitleaks", "scanner",
+                                       "--suite", acceptance_module.PATCHED_SDK_SUITE,
+                                       "--patched-sdk-receipt", "/not-read.json",
+                                       "--patched-sdk-receipt-sha256", "a" * 64]), \
+             patch.dict(os.environ, {"GITHUB_ACTIONS": "false", "RUNNER_OS": "Linux"}), \
+             patch("element_peer_fixture.patched_sdk_assets") as read:
+            with self.assertRaisesRegex(RuntimeError, "ephemeral Linux"):
+                acceptance_module.main()
+        read.assert_not_called()
+
+    def test_patched_record_retains_all_assertions_and_cannot_be_stock(self):
+        module = acceptance_module
+        import run_element_acceptance as element
+        output = "\n".join(f"MORPHEUS_ELEMENT_CHECK {key}=true" for key in element.PATCHED_SDK_CHECKS)
+        marker = "\nMORPHEUS_PATCHED_SDK_DIAGNOSTIC stock_interoperability=false"
+        with tempfile.TemporaryDirectory() as folder:
+            diagnostic = Acceptance(Path(folder) / "diagnostic", "scanner", suite=module.PATCHED_SDK_SUITE,
+                                    patched_sdk_receipt=Path(folder) / "receipt.json",
+                                    patched_sdk_receipt_sha256="a" * 64)
+            def record(owner, label, value):
+                return owner.validated_record(label, value, test=False, ring_case=None,
+                                              oauth_checks=(), element_checks=True)
+            result = record(diagnostic, module.PATCHED_SDK_LABEL, output + marker)
+            self.assertFalse(result["stock_interoperability"])
+            self.assertFalse(result["official_application_assets"])
+            self.assertNotIn("element_checks", result)
+            self.assertEqual(set(result["patched_sdk_checks"]), element.PATCHED_SDK_CHECKS)
+            for value in (output, output + marker + marker,
+                          output.replace("native_group_roster=true", "native_group_roster=false") + marker):
+                with self.subTest(value=value), self.assertRaises(RuntimeError):
+                    record(diagnostic, module.PATCHED_SDK_LABEL, value)
+            stock = Acceptance(Path(folder) / "stock", "scanner", suite="element-interop")
+            with self.assertRaises(RuntimeError):
+                record(stock, module.ELEMENT_LABEL, output + marker)
+
 if __name__ == "__main__":
     unittest.main()
