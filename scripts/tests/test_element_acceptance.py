@@ -148,6 +148,33 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(target.native_stages(output), ("invalid",))
                 self.assertEqual(target.diagnostics(output), {"native_stage": "invalid"})
 
+    def test_group_event_probe_accepts_only_closed_coherent_classifications(self):
+        for fetched in ("decrypted", "missing_key", "unknown_index", "other_utd", "fetch_failed", "invalid", "timeout"):
+            for cache in ("present", "absent"):
+                line = target.GROUP_EVENT_PREFIX + f"origin=unique late_cache={cache} fetch={fetched}"
+                expected = {"origin": "unique", "late_cache": cache, "fetch": fetched}
+                self.assertEqual(target.group_event(line), expected)
+                self.assertEqual(target.group_event_marker(expected), line)
+                self.assertEqual(target.diagnostics(line), {"group_event": expected})
+                self.assertEqual(target.diagnostics(line, include_native=False), {})
+        for origin in ("missing", "ambiguous", "invalid"):
+            line = target.GROUP_EVENT_PREFIX + f"origin={origin} late_cache=not_checked fetch=not_attempted"
+            self.assertEqual(target.group_event(line), {"origin": origin, "late_cache": "not_checked", "fetch": "not_attempted"})
+        line = target.GROUP_EVENT_PREFIX + "origin=unique late_cache=invalid fetch=not_attempted"
+        self.assertEqual(target.group_event_marker(target.group_event(line)), line)
+        valid = target.GROUP_EVENT_PREFIX + "origin=unique late_cache=absent fetch=missing_key"
+        for malformed in (
+                valid + " private-event-id", valid + "\n" + valid,
+                valid.replace("unique", "private_user"), valid.replace("missing_key", "private_error"),
+                valid.replace("unique", "missing"), valid.replace("absent", "not_checked"),
+                valid.replace("absent", "invalid"), valid.replace("missing_key", "not_attempted"),
+                target.GROUP_EVENT_PREFIX + "x" * 193,
+                target.GROUP_EVENT_PREFIX + "invalid"):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(target.group_event(malformed), {"state": "invalid"})
+                self.assertEqual(target.group_event_marker(target.group_event(malformed)), target.GROUP_EVENT_PREFIX + "invalid")
+        self.assertEqual(target.group_event("ordinary private event"), {})
+
     def test_native_failure_facts_follow_owned_cleanup_and_successful_scan(self):
         for scanner_status, join_failure, service_failure, anchor_failure in (
                 (0, False, False, False), (1, False, False, False),
@@ -168,6 +195,7 @@ class EvidenceTests(unittest.TestCase):
                     + f"test {target.TEST_NAME} ... FAILED\n"
                     + target.GROUP_ROSTER_PREFIX + "original total=2 alice=1 bob=1 carol=0 local=1\n"
                     + target.GROUP_ROSTER_PREFIX + "late total=3 alice=1 bob=1 carol=1 local=1\n"
+                    + target.GROUP_EVENT_PREFIX + "origin=unique late_cache=absent fetch=missing_key\n"
                     + target.NATIVE_STAGE_PREFIX + "microphone_cryptor\n"
                     + target.NATIVE_STAGE_PREFIX + "late_login\n").encode())
                 browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
@@ -236,6 +264,9 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(target.diagnostics(output).get("group_rosters"), {
                     "original": {"total": 2, "alice": 1, "bob": 1, "carol": 0, "local": 1, "unknown": 0},
                     "late": {"total": 3, "alice": 1, "bob": 1, "carol": 1, "local": 1, "unknown": 0},
+                } if allowed else None)
+                self.assertEqual(target.diagnostics(output).get("group_event"), {
+                    "origin": "unique", "late_cache": "absent", "fetch": "missing_key",
                 } if allowed else None)
 
     @staticmethod
@@ -443,6 +474,61 @@ class EvidenceTests(unittest.TestCase):
         browser.status.side_effect = [None, 1]
         with mock.patch.object(target.time, "sleep"), self.assertRaisesRegex(RuntimeError, "browser_acceptance"):
             target.wait_peers(native, browser)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux owned failure marker")
+    def test_failure_marker_requires_owned_private_regular_complete_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = target.Child.file_identity(root.stat())[:-1]
+            marker = root / "roster-timeout-diagnostic"
+            self.assertFalse(target.roster_diagnostic_marker(root, identity))
+            marker.write_bytes(b"probe\n")
+            marker.chmod(0o600)
+            self.assertTrue(target.roster_diagnostic_marker(root, identity))
+            for payload, mode in ((b"private", 0o600), (b"probe\n", 0o644), (b"probe\n" * 100, 0o600)):
+                marker.write_bytes(payload)
+                marker.chmod(mode)
+                with self.assertRaisesRegex(RuntimeError, "fixture_operation"):
+                    target.roster_diagnostic_marker(root, identity)
+            marker.unlink()
+            other = root / "other"
+            other.write_bytes(b"probe\n")
+            other.chmod(0o600)
+            marker.symlink_to(other)
+            with self.assertRaisesRegex(RuntimeError, "fixture_operation"):
+                target.roster_diagnostic_marker(root, identity)
+            marker.unlink()
+            os.link(other, marker)
+            with self.assertRaisesRegex(RuntimeError, "fixture_operation"):
+                target.roster_diagnostic_marker(root, identity)
+            with self.assertRaisesRegex(RuntimeError, "fixture_operation"):
+                target.roster_diagnostic_marker(root, ())
+
+    def test_failure_only_collection_grace_never_permits_pass_or_extends_global_deadline(self):
+        for statuses, times, markers in (
+                (([None, 101], [1, 1]), [0, 1], [True, True]),
+                (([None, None], [1, 1]), [0, 7], [True, True]),
+                (([None, None], [1, 1]), [359, 360], [True, True]),
+                (([None, 0], [1, 0]), [0, 1], [True, False]),
+                (([0], [0]), [0], [True])):
+            native, browser = mock.Mock(started=0), mock.Mock()
+            native.status.side_effect, browser.status.side_effect = statuses
+            with self.subTest(statuses=statuses, times=times), \
+                    mock.patch.object(target, "roster_diagnostic_marker", side_effect=markers), \
+                    mock.patch.object(target.time, "monotonic", side_effect=times), \
+                    mock.patch.object(target.time, "sleep"), \
+                    self.assertRaisesRegex(RuntimeError, "native_acceptance"):
+                target.wait_peers(native, browser, diagnostic_root=(Path("unused"), ()))
+            self.assertEqual(native.status.call_count, browser.status.call_count)
+            self.assertEqual(native.status.call_count, len(times))
+        for marker in (False, RuntimeError("fixture_operation")):
+            native, browser = mock.Mock(started=0), mock.Mock()
+            native.status.return_value, browser.status.return_value = None, 1
+            with mock.patch.object(target, "roster_diagnostic_marker", side_effect=marker if isinstance(marker, Exception) else None,
+                                   return_value=marker), mock.patch.object(target.time, "sleep") as sleeper, \
+                    self.assertRaisesRegex(RuntimeError, "fixture_operation" if isinstance(marker, Exception) else "browser_acceptance"):
+                target.wait_peers(native, browser, diagnostic_root=(Path("unused"), ()))
+            sleeper.assert_not_called()
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux owned-group lifecycle")

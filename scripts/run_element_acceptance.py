@@ -53,6 +53,7 @@ NATIVE_TERMINAL_PREFIX = "MORPHEUS_ELEMENT_NATIVE_TERMINAL "
 NATIVE_FAILURE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_FAILURE "
 GROUP_ROSTER_PREFIX = "MORPHEUS_ELEMENT_GROUP_ROSTER "
 GROUP_ROLES = ("original", "late")
+GROUP_EVENT_PREFIX = "MORPHEUS_ELEMENT_GROUP_EVENT "
 ROSTER_TIMEOUT = re.compile(
     r"^thread '" + re.escape(TEST_NAME) + r"'(?: \([0-9]{1,10}\))? panicked at "
     r"crates/morpheus-rtc/tests/element_call_peer\.rs:[0-9]{1,6}:[0-9]{1,6}:\n"
@@ -197,6 +198,43 @@ def group_roster_markers(facts: dict) -> tuple[str, ...]:
     return tuple(result)
 
 
+def group_event(output: str) -> dict:
+    """One bounded classification; never copy event identities or raw errors."""
+    result = {}
+    cursor = count = 0
+    while (start := output.find(GROUP_EVENT_PREFIX.rstrip(), cursor)) >= 0:
+        cursor = start + len(GROUP_EVENT_PREFIX)
+        if start and output[start - 1] != "\n":
+            continue
+        count += 1
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        if count != 1 or end - start > 192:
+            return {"state": "invalid"}
+        match = re.fullmatch(
+            re.escape(GROUP_EVENT_PREFIX)
+            + r"origin=(unique|missing|ambiguous|invalid) late_cache=(present|absent|invalid|not_checked)"
+            + r" fetch=(decrypted|missing_key|unknown_index|other_utd|fetch_failed|invalid|not_attempted|timeout)",
+            output[start:end],
+        )
+        if match is None:
+            return {"state": "invalid"}
+        origin, cache, fetched = match.groups()
+        if ((origin != "unique" and (cache != "not_checked" or fetched != "not_attempted"))
+                or (origin == "unique" and (cache == "not_checked"
+                    or (cache == "invalid" and fetched != "not_attempted")
+                    or (cache != "invalid" and fetched == "not_attempted")))):
+            return {"state": "invalid"}
+        result = {"origin": origin, "late_cache": cache, "fetch": fetched}
+    return result
+
+
+def group_event_marker(fact: dict) -> str:
+    if fact.get("state") == "invalid":
+        return GROUP_EVENT_PREFIX + "invalid"
+    return GROUP_EVENT_PREFIX + " ".join(f"{key}={fact[key]}" for key in ("origin", "late_cache", "fetch"))
+
+
 def diagnostics(output: str, *, include_native=True) -> dict:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
@@ -211,6 +249,8 @@ def diagnostics(output: str, *, include_native=True) -> dict:
         result.update(native_terminal_diagnostics(output))
         if rosters := group_rosters(output):
             result["group_rosters"] = rosters
+        if event := group_event(output):
+            result["group_event"] = event
     return result
 
 
@@ -319,19 +359,66 @@ class Child:
             self.closed = True
 
 
-def wait_peers(native: Child, browser: Child, seconds=360):
+def roster_diagnostic_marker(root: Path, root_identity) -> bool:
+    """Read only the fixed failure signal in the owned private root."""
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if Child.file_identity(os.fstat(directory))[:-1] != root_identity:
+            raise RuntimeError("fixture_operation")
+        try:
+            fd = os.open("roster-timeout-diagnostic", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                         dir_fd=directory)
+        except FileNotFoundError:
+            return False
+        try:
+            before = os.fstat(fd)
+            stable = lambda info: (*Child.file_identity(info), info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                    or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1 or before.st_size != 6
+                    or os.read(fd, 7) != b"probe\n"
+                    or stable(os.fstat(fd)) != stable(before)
+                    or stable(os.stat("roster-timeout-diagnostic", dir_fd=directory, follow_symlinks=False)) != stable(before)):
+                raise RuntimeError("fixture_operation")
+            return True
+        finally:
+            os.close(fd)
+    except OSError:
+        raise RuntimeError("fixture_operation") from None
+    finally:
+        os.close(directory)
+
+
+def wait_peers(native: Child, browser: Child, seconds=360, *, diagnostic_root=None):
+    failure = None
+    grace_until = None
     while True:
         # Sample both terminal statuses even when both finish between polls.
         # A final browser.close error must not be hidden by earlier markers.
         native_status, browser_status = native.status(), browser.status()
+        now = time.monotonic()
+        marked = diagnostic_root is not None and roster_diagnostic_marker(*diagnostic_root)
+        if marked:
+            failure = failure or "native_acceptance"
         if native_status is not None and native_status != 0:
-            raise RuntimeError("native_acceptance")
+            raise RuntimeError(failure or "native_acceptance")
         if browser_status is not None and browser_status != 0:
-            raise RuntimeError("browser_acceptance")
+            failure = failure or "browser_acceptance"
+            if native_status is not None or not marked:
+                raise RuntimeError(failure)
+            # Collection after a proven failure only. Never extend the
+            # unchanged global deadline or erase either failed outcome.
+            if grace_until is None:
+                grace_until = min(now + 7, native.started + seconds)
+            if now >= grace_until:
+                raise RuntimeError(failure)
         if native_status == 0 and browser_status == 0:
+            if failure:
+                raise RuntimeError(failure)
             return
-        if time.monotonic() - native.started >= seconds:
-            raise RuntimeError("deadline")
+        if failure and native_status is not None:
+            raise RuntimeError(failure)
+        if now - native.started >= seconds:
+            raise RuntimeError(failure or "deadline")
         time.sleep(0.2)
 
 
@@ -549,7 +636,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
             time.sleep(0.2)
         runner.mark("native_test")
         native = runner.start([str(binary), "--exact", TEST_NAME, "--show-output", "--test-threads=1"], extra=extra)
-        wait_peers(native, browser)
+        wait_peers(native, browser, diagnostic_root=(runner.root, runner.root_identity))
         peers_complete = True
     except BaseException as error:
         failed_stage = runner.stage
@@ -605,6 +692,8 @@ def execute(root: Path, fixture: Path, gitleaks: str):
             if rosters := group_rosters(native_output):
                 for marker in group_roster_markers(rosters):
                     print(marker, flush=True)
+            if event := group_event(native_output):
+                print(group_event_marker(event), flush=True)
     # Cleanup is required but must not erase the last useful failure stage.
     diagnostic_output = output.replace("MORPHEUS_ELEMENT_STAGE element_cleanup\n", "")
     if found := diagnostics(diagnostic_output, include_native=False):

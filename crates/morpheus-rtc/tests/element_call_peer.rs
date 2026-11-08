@@ -401,6 +401,369 @@ fn exact_roster(rtc: &RtcService, room: &str, users: &[&str]) -> bool {
     actual == expected
 }
 
+struct GroupEventFacts {
+    origin: &'static str,
+    late_cache: &'static str,
+    fetch: &'static str,
+}
+
+impl GroupEventFacts {
+    fn unavailable(origin: &'static str) -> Self {
+        Self {
+            origin,
+            late_cache: "not_checked",
+            fetch: "not_attempted",
+        }
+    }
+
+    fn emit(&self) {
+        eprintln!(
+            "MORPHEUS_ELEMENT_GROUP_EVENT origin={} late_cache={} fetch={}",
+            self.origin, self.late_cache, self.fetch,
+        );
+    }
+}
+
+// Parse only one bounded, already SDK-decrypted event. The expected identities
+// remain private; the diagnostic emits only fixed classifications below.
+fn matches_group_event(raw: &str, room: &str, member: &morpheus_rtc::ParticipantInfo) -> bool {
+    if raw.len() > 64 * 1024 {
+        return false;
+    }
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let Some(device) = member.device_id.as_deref() else {
+        return false;
+    };
+    let content = &event["content"];
+    let stable_spelling = content.get("sticky_key");
+    let legacy_spelling = content.get("msc4354_sticky_key");
+    let carried_values = [stable_spelling, legacy_spelling];
+    let expected_member = Some(member.member_id.as_str());
+    let values_match = carried_values
+        .iter()
+        .flatten()
+        .all(|value| value.as_str() == expected_member);
+    let value_present = carried_values.iter().any(Option::is_some);
+    event["sender"].as_str() == Some(member.user_id.as_str())
+        && event
+            .get("room_id")
+            .is_none_or(|value| value.as_str() == Some(room))
+        && matches!(
+            event["type"].as_str(),
+            Some("m.rtc.member" | "org.matrix.msc4143.rtc.member")
+        )
+        && content["application"]["type"].as_str() == Some("m.call")
+        && content["slot_id"].as_str() == Some(ELEMENT_ROOM_SLOT_ID)
+        && content["member"]["id"].as_str() == Some(member.member_id.as_str())
+        && content["member"]["user_id"].as_str() == Some(member.user_id.as_str())
+        && content["member"]["device_id"].as_str() == Some(device)
+        // Sticky2025's observed raw join omits membership. The existing
+        // codec infers join only from an application and nonempty member id;
+        // an explicit null, leave or malformed value is never a join.
+        && !member.member_id.is_empty()
+        && content["member"]
+            .get("membership")
+            .is_none_or(|value| value.as_str() == Some("join"))
+        && values_match
+        && value_present
+}
+
+fn matches_group_envelope(raw: &str, room: &str, bob: &str) -> bool {
+    if raw.len() > 64 * 1024 {
+        return false;
+    }
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    event["sender"].as_str() == Some(bob)
+        && event["type"].as_str() == Some("m.room.encrypted")
+        && event
+            .get("room_id")
+            .is_none_or(|value| value.as_str() == Some(room))
+}
+
+#[test]
+fn group_event_probe_rejects_spoofed_membership_and_oversized_payloads() {
+    let member = morpheus_rtc::ParticipantInfo {
+        member_id: "fixture-member".into(),
+        user_id: "@fixture:example.invalid".into(),
+        device_id: Some("FIXTURE".into()),
+        is_local: false,
+        reachable: true,
+        streams: Vec::new(),
+        hand_raised_at_ms: None,
+        joined_at_ms: None,
+    };
+    let room = "!fixture:example.invalid";
+    let value = serde_json::json!({
+        "type": "m.rtc.member", "sender": member.user_id, "room_id": room,
+        "content": {
+            "application": {"type": "m.call"},
+            "slot_id": ELEMENT_ROOM_SLOT_ID, "msc4354_sticky_key": member.member_id,
+            "member": {"id": member.member_id, "user_id": member.user_id,
+                       "device_id": "FIXTURE", "membership": "join"},
+        },
+    });
+    assert!(matches_group_event(&value.to_string(), room, &member));
+    for path in ["sender", "room_id", "type"] {
+        let mut changed = value.clone();
+        changed[path] = serde_json::json!("mismatch");
+        assert!(!matches_group_event(&changed.to_string(), room, &member));
+    }
+    for path in ["id", "user_id", "device_id", "membership"] {
+        let mut changed = value.clone();
+        changed["content"]["member"][path] = serde_json::json!("mismatch");
+        assert!(!matches_group_event(&changed.to_string(), room, &member));
+    }
+    for path in ["slot_id", "msc4354_sticky_key", "sticky_key"] {
+        let mut changed = value.clone();
+        changed["content"][path] = serde_json::json!("mismatch");
+        assert!(!matches_group_event(&changed.to_string(), room, &member));
+    }
+    assert!(!matches_group_event(&"x".repeat(64 * 1024 + 1), room, &member));
+    // Observed raw wire shape from the pinned Sticky2025 codec's LEGACY_JOIN,
+    // with only its identities replaced by deterministic fixture values.
+    let legacy_content: serde_json::Value = serde_json::from_str(
+        r#"{
+        "application": { "type": "m.call", "m.call.intent": "video" },
+        "slot_id": "m.call#ROOM",
+        "rtc_transports": [
+            { "type": "livekit", "livekit_service_url": "https://mrtc.example.io" }
+        ],
+        "member": {
+            "device_id": "FIXTURE",
+            "user_id": "@fixture:example.invalid",
+            "id": "fixture-member"
+        },
+        "versions": [],
+        "msc4354_sticky_key": "fixture-member"
+    }"#,
+    )
+    .unwrap();
+    let legacy_member = member.clone();
+    let legacy = serde_json::json!({
+        "type": "org.matrix.msc4143.rtc.member", "sender": legacy_member.user_id,
+        "room_id": room, "content": legacy_content,
+    });
+    assert!(matches_group_event(&legacy.to_string(), room, &legacy_member));
+    for membership in [
+        serde_json::Value::Null,
+        serde_json::json!("leave"),
+        serde_json::json!(false),
+        serde_json::json!("malformed"),
+    ] {
+        let mut changed = legacy.clone();
+        changed["content"]["member"]["membership"] = membership;
+        assert!(!matches_group_event(
+            &changed.to_string(),
+            room,
+            &legacy_member,
+        ));
+    }
+    let mut changed = legacy.clone();
+    changed["content"]
+        .as_object_mut()
+        .unwrap()
+        .remove("application");
+    assert!(!matches_group_event(&changed.to_string(), room, &legacy_member));
+    let mut changed = legacy.clone();
+    changed["content"]["application"]["type"] = serde_json::json!("other");
+    assert!(!matches_group_event(&changed.to_string(), room, &legacy_member));
+    let encrypted = serde_json::json!({
+        "type": "m.room.encrypted", "sender": member.user_id, "room_id": room,
+    });
+    assert!(matches_group_envelope(&encrypted.to_string(), room, &member.user_id));
+    assert!(!matches_group_envelope(
+        &encrypted.to_string(),
+        "!other:example.invalid",
+        &member.user_id,
+    ));
+    assert!(!matches_group_envelope(
+        &encrypted.to_string(),
+        room,
+        "@other:example.invalid",
+    ));
+    assert!(!matches_group_envelope(&value.to_string(), room, &member.user_id));
+    assert!(!matches_group_envelope(
+        &"x".repeat(64 * 1024 + 1),
+        room,
+        &member.user_id,
+    ));
+}
+
+async fn group_event_probe(
+    rtc: &RtcService,
+    late: &RtcService,
+    room: &str,
+    bob: &str,
+) -> GroupEventFacts {
+    use matrix_sdk::{
+        config::RequestConfig,
+        deserialized_responses::{TimelineEventKind, UnableToDecryptReason},
+        ruma::api::client::room::get_room_event,
+    };
+    let Ok(room_id) = matrix_sdk::ruma::RoomId::parse(room) else {
+        return GroupEventFacts::unavailable("invalid");
+    };
+    let (Some(original_room), Some(late_room)) = (
+        rtc.client().get_room(&room_id),
+        late.client().get_room(&room_id),
+    ) else {
+        return GroupEventFacts::unavailable("invalid");
+    };
+    if original_room.state() != matrix_sdk::RoomState::Joined
+        || late_room.state() != matrix_sdk::RoomState::Joined
+    {
+        return GroupEventFacts::unavailable("invalid");
+    }
+    let Ok(members) = rtc.participants(room) else {
+        return GroupEventFacts::unavailable("invalid");
+    };
+    if members.len() > 64 {
+        return GroupEventFacts::unavailable("invalid");
+    }
+    let mut peers = members.iter().filter(|member| member.user_id == bob);
+    let Some(member) = peers.next() else {
+        return GroupEventFacts::unavailable("missing");
+    };
+    if peers.next().is_some() {
+        return GroupEventFacts::unavailable("ambiguous");
+    }
+    if member.is_local
+        || member.member_id.is_empty()
+        || member.member_id.len() > 255
+        || member.user_id.len() > 255
+        || !member
+            .device_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty() && id.len() <= 255)
+    {
+        return GroupEventFacts::unavailable("invalid");
+    }
+    let live = original_room.sticky_events().live();
+    if live.len() > 64 {
+        return GroupEventFacts::unavailable("invalid");
+    }
+    let mut entries = live.iter().filter(|entry| {
+        entry.key.sender.as_str() == bob
+            && entry.key.sticky_key == member.member_id
+            && matches!(
+                entry.key.event_type.to_string().as_str(),
+                "m.rtc.member" | "org.matrix.msc4143.rtc.member"
+            )
+    });
+    let Some(entry) = entries.next() else {
+        return GroupEventFacts::unavailable("missing");
+    };
+    if entries.next().is_some() {
+        return GroupEventFacts::unavailable("ambiguous");
+    }
+    let same_sender = |info: &matrix_sdk::deserialized_responses::EncryptionInfo| {
+        info.sender.as_str() == member.user_id
+            && info.sender_device.as_deref().map(|id| id.as_str()) == member.device_id.as_deref()
+    };
+    if entry.event_id.as_str().len() > 512
+        || !entry
+            .encryption_info()
+            .is_some_and(|info| same_sender(info.as_ref()))
+        || !matches_group_event(entry.raw().json().get(), room, member)
+    {
+        return GroupEventFacts::unavailable("invalid");
+    }
+    let event_id = entry.event_id.clone(); // Private lookup handle, never printed.
+    let mut facts = GroupEventFacts {
+        origin: "unique",
+        late_cache: "absent",
+        fetch: "not_attempted",
+    };
+    // This snapshot is taken before the GET. Absence does not mean the SDK
+    // never received an encrypted event; pending receipts are not public here.
+    let late_live = late_room.sticky_events().live();
+    if late_live.len() > 64 {
+        facts.late_cache = "invalid";
+        return facts;
+    }
+    let mut cached = late_live.iter().filter(|value| value.event_id == event_id);
+    if let Some(value) = cached.next() {
+        if cached.next().is_some()
+            || value.key.sender.as_str() != bob
+            || value.key.sticky_key != member.member_id
+            || !value
+                .encryption_info()
+                .is_some_and(|info| same_sender(info.as_ref()))
+            || !matches_group_event(value.raw().json().get(), room, member)
+        {
+            facts.late_cache = "invalid";
+            return facts;
+        }
+        facts.late_cache = "present";
+    }
+    // One authorized GET and the SDK's ordinary decryption policy only. It
+    // may queue ordinary key/backup requests; it never ingests a sticky event,
+    // republishes Bob, changes crypto settings or rescues the failed wait.
+    let fetched = timeout(Duration::from_secs(6), async {
+        let response = late
+            .client()
+            .send(get_room_event::v3::Request::new(room_id, event_id.clone()))
+            .with_request_config(
+                RequestConfig::new()
+                    .retry_limit(0)
+                    .timeout(Duration::from_secs(5))
+                    .max_response_bytes(64 * 1024),
+            )
+            .await
+            .map_err(|_| "fetch_failed")?;
+        if response
+            .event
+            .get_field::<String>("event_id")
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some(event_id.as_str())
+            || !matches_group_envelope(response.event.json().get(), room, bob)
+        {
+            return Err("invalid");
+        }
+        // The same public safe raw cast used by Room's normal event path;
+        // the SDK deserializes and authenticates it under default settings.
+        let event = late_room
+            .decrypt_event(response.event.cast_ref_unchecked(), None)
+            .await
+            .map_err(|_| "invalid")?;
+        Ok(event)
+    })
+    .await;
+    facts.fetch = match fetched {
+        Err(_) => "timeout",
+        Ok(Err(reason)) => reason,
+        Ok(Ok(event)) if event.kind.parse_event_id().as_ref() != Some(&event_id) => "invalid",
+        Ok(Ok(event)) => match &event.kind {
+            TimelineEventKind::Decrypted(_)
+                if event
+                    .kind
+                    .encryption_info()
+                    .is_some_and(|info| same_sender(info.as_ref()))
+                    && matches_group_event(event.raw().json().get(), room, member) =>
+            {
+                "decrypted"
+            }
+            TimelineEventKind::UnableToDecrypt { utd_info, .. }
+                if matches_group_envelope(event.raw().json().get(), room, bob) =>
+            {
+                match &utd_info.reason {
+                    UnableToDecryptReason::MissingMegolmSession { .. } => "missing_key",
+                    UnableToDecryptReason::UnknownMegolmMessageIndex => "unknown_index",
+                    _ => "other_utd",
+                }
+            }
+            _ => "invalid",
+        },
+    };
+    facts
+}
+
 async fn group_and_screen(
     rtc: &mut RtcService,
     root: &std::path::Path,
@@ -482,6 +845,13 @@ async fn group_and_screen(
     })
     .await;
     if converged.is_err() {
+        // Publish a complete private failure-only signal atomically. The
+        // parent may collect this diagnostic after a browser failure, but
+        // the signal can never extend an acceptance deadline or permit pass.
+        let pending = root.join("roster-timeout-diagnostic.pending");
+        write_marker(&pending, b"probe\n");
+        fs::rename(&pending, root.join("roster-timeout-diagnostic"))
+            .expect("Cannot publish private roster failure marker");
         // Sample each failed observation once, without exposing identities or
         // changing the exact three-member predicate or its deadline.
         for (role, service) in [("original", &*rtc), ("late", &late)] {
@@ -506,6 +876,7 @@ async fn group_and_screen(
                 Err(_) => eprintln!("MORPHEUS_ELEMENT_GROUP_ROSTER {role} unavailable"),
             }
         }
+        group_event_probe(rtc, &late, room, &bob.user_id).await.emit();
     }
     converged.expect("Three-member native rosters did not converge");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_group_roster=true");
