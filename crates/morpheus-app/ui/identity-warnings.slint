@@ -73,6 +73,8 @@ export component IdentityWarningRow inherits Rectangle {
     in property <color> hover-surface;
     in property <color> outline;
     in property <float> text-scale: 1;
+    // Opt-in cap for a finite scroll viewport; other rows keep their natural width.
+    in property <length> max-control-width: 0px;
     // This conversation still owns focus: the same live account, room and
     // page with no protected surface or other modal over it
     // (AppWindow.identity-warnings-allowed). Read when the details or the
@@ -114,12 +116,18 @@ export component IdentityWarningRow inherits Rectangle {
             accessible-live-region: polite;
         }
         details := TextAction {
+            max-control-width: root.max-control-width;
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
             text: "Details";
             accessible-label: "Show identity change details";
             activated => { IdentityWarnings.show-details(); }
         }
+        states [
+            capped when root.max-control-width > 0px: {
+                details.max-width: root.max-control-width;
+            }
+        ]
     }
 }
 

@@ -246,7 +246,9 @@ pub fn download_webrtc() -> Result<()> {
         .build()
         .map_err(|_| anyhow!("Cannot initialize native SDK download"))?;
     let response = client
-        .get(download_url())
+        .get(pin.download_url())
+        .header(reqwest::header::ACCEPT, "application/octet-stream")
+        .header(reqwest::header::USER_AGENT, "morpheus-native-sdk")
         .send()
         .map_err(|_| anyhow!("Native SDK download request failed"))?;
     if response.status() != StatusCode::OK

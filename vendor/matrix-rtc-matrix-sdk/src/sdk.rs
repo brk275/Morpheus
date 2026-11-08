@@ -48,6 +48,7 @@ use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 
+mod rtc_token;
 mod slot_write;
 
 // The sticky duration for `m.rtc.member` comes from the core
@@ -111,6 +112,10 @@ const RETRY_AFTER: Duration = Duration::from_secs(5);
 pub struct SdkMatrixBackend {
     client: Client,
     slot_write_admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    // Ephemeral SHA256 replay marker only: never retain the rejected token.
+    // Clones refuse replay until the SDK supplies a different access token.
+    rtc_expired_access: Arc<StdMutex<Option<rtc_token::RejectedAccess>>>,
+    rtc_token_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SdkMatrixBackend {
@@ -118,6 +123,8 @@ impl SdkMatrixBackend {
         Self {
             client,
             slot_write_admission: None,
+            rtc_expired_access: Arc::new(StdMutex::new(None)),
+            rtc_token_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -709,6 +716,19 @@ impl MatrixBackend for SdkMatrixBackend {
             matrix_server_name: response.matrix_server_name.to_string(),
             expires_in: response.expires_in.as_secs(),
         })
+    }
+
+    async fn livekit_token(
+        &self,
+        request: matrix_rtc_core::LiveKitTokenRequest,
+    ) -> Result<String, BackendError> {
+        rtc_token::get(
+            &self.client,
+            request,
+            &self.rtc_expired_access,
+            &self.rtc_token_gate,
+        )
+        .await
     }
 
     /// Through the SDK's discovery: cached, with a bounded request, and

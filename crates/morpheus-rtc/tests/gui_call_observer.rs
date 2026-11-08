@@ -177,15 +177,17 @@ async fn wait_for_gui_slot(client: &Client, room_id: &str) {
     let room_id = RoomId::parse(room_id).expect("Invalid encrypted fixture room ID");
     timeout(Duration::from_secs(120), async {
         loop {
-            let request = get_state_event_for_key::v3::Request::new(
-                room_id.clone(),
-                StateEventType::from("m.rtc.slot"),
-                "m.call#room".to_owned(),
-            );
-            match client.send(request).await {
-                Ok(_) => return,
-                Err(error) if error.client_api_error_kind() == Some(&ErrorKind::NotFound) => {}
-                Err(_) => panic!("Cannot query the GUI's MatrixRTC call slot"),
+            for event_type in ["m.rtc.slot", "org.matrix.msc4143.rtc.slot"] {
+                let request = get_state_event_for_key::v3::Request::new(
+                    room_id.clone(),
+                    StateEventType::from(event_type),
+                    "m.call#ROOM".to_owned(),
+                );
+                match client.send(request).await {
+                    Ok(_) => return,
+                    Err(error) if error.client_api_error_kind() == Some(&ErrorKind::NotFound) => {}
+                    Err(_) => panic!("Cannot query the GUI's MatrixRTC call slot"),
+                }
             }
             sleep(Duration::from_millis(300)).await;
         }
@@ -348,7 +350,7 @@ async fn run_observer() {
     let mut rtc = RtcService::new(client);
     let join = timeout(
         Duration::from_secs(60),
-        rtc.join(room_id, CallOptions::default()),
+        rtc.join_room(room_id, CallOptions::element_call_matrix_2_0()),
     )
     .await
     .expect("Bob's native RTC join timed out")

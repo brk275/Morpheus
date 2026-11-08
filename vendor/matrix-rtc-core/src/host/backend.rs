@@ -85,6 +85,20 @@ pub struct BackendError {
     pub message: String,
 }
 
+/// Homeserver-mediated RTC token request. The SFU locator and publishing server
+/// are request data only; the backend must use its own fixed account authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveKitTokenRequest {
+    pub url: String,
+    pub server_name: String,
+    pub room_id: String,
+    pub slot_id: String,
+    pub member_id: String,
+    /// Expected account/device, checked before reading the account token.
+    pub own_user_id: String,
+    pub own_device_id: String,
+}
+
 impl BackendError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
@@ -472,6 +486,12 @@ pub trait MatrixBackend: MaybeSend {
         Err(BackendError::not_implemented("openid_token"))
     }
 
+    /// Obtain a JWT through this account's authenticated homeserver. Never
+    /// forward an account Bearer token to the request's SFU or server name.
+    async fn livekit_token(&self, _request: LiveKitTokenRequest) -> Result<String, BackendError> {
+        Err(BackendError::not_implemented("livekit_token"))
+    }
+
     /// The homeserver's `rtc_transports` array, raw, from
     /// `GET /_matrix/client/v1/rtc/transports`; an empty array when the
     /// endpoint is missing.
@@ -632,6 +652,10 @@ pub struct MockBackend {
     pub relations_requests: std::sync::Mutex<Vec<(String, String, String, String)>>,
     /// What `relations` answers, by target event id; unknown ids answer empty.
     pub relations_answers: std::sync::Mutex<std::collections::HashMap<String, Vec<EventIn>>>,
+    /// What `openid_token` answers.
+    pub openid_response: std::sync::Mutex<Result<OpenIdToken, BackendError>>,
+    /// How many times `openid_token` was asked.
+    pub openid_requests: std::sync::atomic::AtomicUsize,
     /// What `rtc_transports` answers.
     pub transports: std::sync::Mutex<Result<Value, BackendError>>,
     /// How many times `rtc_transports` was asked.
@@ -660,6 +684,13 @@ impl Default for MockBackend {
             to_device_subscriptions: Default::default(),
             relations_requests: Default::default(),
             relations_answers: Default::default(),
+            openid_response: std::sync::Mutex::new(Ok(OpenIdToken {
+                access_token: "mock-openid-token".to_owned(),
+                token_type: "Bearer".to_owned(),
+                matrix_server_name: "example.org".to_owned(),
+                expires_in: 3600,
+            })),
+            openid_requests: Default::default(),
             transports: std::sync::Mutex::new(Ok(Value::Array(Vec::new()))),
             transports_requests: Default::default(),
             room_subscription_error: Default::default(),
@@ -921,12 +952,9 @@ impl MatrixBackend for MockBackend {
     }
 
     async fn openid_token(&self) -> Result<OpenIdToken, BackendError> {
-        Ok(OpenIdToken {
-            access_token: "mock-openid-token".to_owned(),
-            token_type: "Bearer".to_owned(),
-            matrix_server_name: "example.org".to_owned(),
-            expires_in: 3600,
-        })
+        self.openid_requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.openid_response.lock().unwrap().clone()
     }
 
     async fn rtc_transports(&self) -> Result<Value, BackendError> {

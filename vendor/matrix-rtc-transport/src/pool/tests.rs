@@ -26,6 +26,10 @@ struct TransportState {
     senders: StdMutex<HashMap<String, UnboundedSender<ConnectionEvent>>>,
     /// Connect attempts that fail before one succeeds.
     fail_attempts: AtomicU32,
+    /// A checked identity may be unavailable until its authority is current.
+    identity_blocked: AtomicBool,
+    identity_attempts: AtomicU32,
+    auth_failure: AtomicU32,
     applied: StdMutex<Vec<(String, MediaStreamKind, ResolvedConstraints)>>,
     /// Observe entry into the next actual trait future, before its first await.
     first_poll: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -49,11 +53,15 @@ impl MediaTransport for FakeTransport {
     fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
         match transport {
             RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
-            RtcTransport::Unsupported(_) => None,
+            RtcTransport::LiveKitCsApi(_) | RtcTransport::Unsupported(_) => None,
         }
     }
 
     fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
+        self.0.identity_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.0.identity_blocked.load(Ordering::SeqCst) {
+            return None;
+        }
         Some(format!("id-{}", member.member_id))
     }
 
@@ -63,6 +71,11 @@ impl MediaTransport for FakeTransport {
             .lock()
             .unwrap()
             .push(connection_key.to_owned());
+        match self.0.auth_failure.load(Ordering::SeqCst) {
+            1 => return Err(TransportError::SignInRequired),
+            2 => return Err(TransportError::AuthExpired),
+            _ => {}
+        }
         if self.0.fail_attempts.load(Ordering::SeqCst) > 0 {
             self.0.fail_attempts.fetch_sub(1, Ordering::SeqCst);
             return Err(TransportError::Connect("fake failure".into()));
@@ -231,6 +244,210 @@ fn track_added(identity: &str, kind: MediaStreamKind) -> ConnectionEvent {
         kind,
         track: Arc::new(FakeTrack(kind)),
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_identity_on_another_publishers_transport_cannot_supply_media_or_state() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    fx.drain().await;
+    own.send(track_added("id-bob", MediaStreamKind::Microphone))
+        .unwrap();
+    own.send(ConnectionEvent::TrackMuted {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Microphone,
+    })
+    .unwrap();
+    own.send(ConnectionEvent::TrackUnmuted {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Microphone,
+    })
+    .unwrap();
+    own.send(ConnectionEvent::ActiveSpeakers {
+        speakers: vec![crate::SpeakingParticipant {
+            identity: "id-bob".into(),
+            level: 1.0,
+        }],
+    })
+    .unwrap();
+    own.send(ConnectionEvent::EncryptionStateChanged {
+        identity: "id-bob".into(),
+        state: FrameEncryptionState::Ok,
+    })
+    .unwrap();
+    let events = fx.drain().await;
+    assert!(events.iter().all(
+        |event| matches!(event, PoolEvent::ActiveSpeakers { speakers } if speakers.is_empty())
+    ));
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Microphone)
+            .is_none()
+    );
+    let peer = fx.sender(PEER_FOCUS);
+    peer.send(track_added("id-bob", MediaStreamKind::Microphone))
+        .unwrap();
+    assert!(fx.drain().await.contains(&PoolEvent::StreamAdded {
+        member_id: "bob".into(),
+        kind: MediaStreamKind::Microphone
+    }));
+    own.send(ConnectionEvent::TrackRemoved {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Microphone,
+    })
+    .unwrap();
+    fx.drain().await;
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Microphone)
+            .is_some()
+    );
+    fx.pool.close();
+}
+
+#[tokio::test(start_paused = true)]
+async fn early_receivers_are_replayed_only_on_the_attested_transport() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    own.send(track_added("id-bob", MediaStreamKind::Camera))
+        .unwrap();
+    assert!(fx.drain().await.is_empty());
+    let events = fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    assert!(!events.iter().any(
+        |event| matches!(event, PoolEvent::StreamAdded { member_id, .. } if member_id == "bob")
+    ));
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Camera)
+            .is_none()
+    );
+    fx.drain().await;
+    fx.sender(PEER_FOCUS)
+        .send(track_added("id-bob", MediaStreamKind::Camera))
+        .unwrap();
+    assert!(fx.drain().await.contains(&PoolEvent::StreamAdded {
+        member_id: "bob".into(),
+        kind: MediaStreamKind::Camera
+    }));
+    fx.pool.close();
+}
+
+#[tokio::test]
+async fn a_refused_same_connection_epoch_cannot_retain_or_repair_previous_attribution() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    let mut bob = member_on("bob", OWN_FOCUS);
+    bob.membership_ts = Some(1);
+    fx.pool.apply_snapshot(std::slice::from_ref(&bob));
+    own.send(track_added("id-bob", MediaStreamKind::Microphone))
+        .unwrap();
+    fx.drain().await;
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Microphone)
+            .is_some()
+    );
+    fx.state.identity_blocked.store(true, Ordering::SeqCst);
+    bob.membership_ts = Some(2);
+    let changed = fx.pool.apply_snapshot(std::slice::from_ref(&bob));
+    assert!(changed.contains(&PoolEvent::StreamRemoved {
+        member_id: "bob".into(),
+        kind: MediaStreamKind::Microphone
+    }));
+    assert!(!fx.pool.member_identities.contains_key("bob"));
+    own.send(track_added("id-bob", MediaStreamKind::Microphone))
+        .unwrap();
+    own.send(ConnectionEvent::TrackMuted {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Microphone,
+    })
+    .unwrap();
+    assert!(fx.drain().await.is_empty());
+    let lease = Arc::new(AtomicBool::new(true));
+    assert!(
+        fx.pool
+            .member_key_imported("id-bob".into(), "bob".into(), 7, lease)
+            .is_empty()
+    );
+    assert!(!fx.pool.member_identities.contains_key("bob"));
+    fx.state.identity_blocked.store(false, Ordering::SeqCst);
+    let repaired = fx.pool.apply_snapshot(std::slice::from_ref(&bob));
+    assert!(
+        !repaired
+            .iter()
+            .any(|event| matches!(event, PoolEvent::StreamAdded { .. }))
+    );
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Microphone)
+            .is_none()
+    );
+    own.send(track_added("id-bob", MediaStreamKind::Microphone))
+        .unwrap();
+    assert!(fx.drain().await.contains(&PoolEvent::StreamAdded {
+        member_id: "bob".into(),
+        kind: MediaStreamKind::Microphone
+    }));
+    fx.pool.close();
+}
+
+#[tokio::test(start_paused = true)]
+async fn account_authorization_failures_are_typed_and_do_not_schedule_peer_retries() {
+    for (failure, expected) in [
+        (1, PoolEvent::AuthenticationRequired),
+        (2, PoolEvent::AuthenticationExpired),
+    ] {
+        let mut fx = Fixture::new();
+        fx.state.auth_failure.store(failure, Ordering::SeqCst);
+        fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+        assert_eq!(fx.drain().await, vec![expected]);
+        assert_eq!(fx.connects(PEER_FOCUS), 1);
+        tokio::time::sleep(BACKOFF_MAX * 2).await;
+        assert!(fx.drain().await.is_empty());
+        assert_eq!(fx.connects(PEER_FOCUS), 1);
+        fx.pool.close();
+    }
+}
+
+#[tokio::test]
+async fn a_parked_receiver_does_not_reappear_under_a_new_membership_timestamp() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    let mut bob = member_on("bob", OWN_FOCUS);
+    bob.membership_ts = Some(1);
+    fx.pool.apply_snapshot(std::slice::from_ref(&bob));
+    let old: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
+    let weak = Arc::downgrade(&old);
+    own.send(ConnectionEvent::TrackAdded {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Camera,
+        track: old,
+    })
+    .unwrap();
+    fx.drain().await;
+    fx.pool.apply_snapshot(&[]);
+    assert!(weak.upgrade().is_some());
+    bob.membership_ts = Some(2);
+    let events = fx.pool.apply_snapshot(&[bob]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PoolEvent::StreamAdded { .. }))
+    );
+    assert!(weak.upgrade().is_none());
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Camera)
+            .is_none()
+    );
+    fx.pool.close();
 }
 
 #[tokio::test]
@@ -870,6 +1087,103 @@ async fn first_poll_panic_remains_failed_but_later_real_intent_can_settle() {
 /// The SFU need not repeat TrackAdded when only Matrix membership lapsed.
 #[tokio::test(start_paused = true)]
 async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
+    // Exercise the checked-mapper miss in this existing required regression.
+    // The actor may hold a previous observation while core authority changes;
+    // neither that observation nor this pool may create an identity itself.
+    {
+        let mut fx = Fixture::new();
+        let old = fx.adopt();
+        let bob = member_on("bob", OWN_FOCUS);
+        fx.state.identity_blocked.store(true, Ordering::SeqCst);
+        assert!(
+            fx.pool
+                .apply_snapshot(std::slice::from_ref(&bob))
+                .is_empty()
+        );
+        let old_track: Arc<dyn RemoteTrackHandle> =
+            Arc::new(FakeTrack(MediaStreamKind::Microphone));
+        let old_weak = Arc::downgrade(&old_track);
+        old.send(ConnectionEvent::TrackAdded {
+            identity: "id-bob".into(),
+            kind: MediaStreamKind::Microphone,
+            track: old_track,
+        })
+        .unwrap();
+        assert!(fx.drain().await.is_empty());
+        // Retrying a refused identity cannot expose any pending track.
+        assert!(
+            fx.pool
+                .apply_snapshot(std::slice::from_ref(&bob))
+                .is_empty()
+        );
+        assert!(fx.pool.known_members.contains("bob"));
+        assert!(!fx.pool.member_identities.contains_key("bob"));
+        let tracks = fx.pool.remote_tracks();
+        assert!(tracks.get("bob", MediaStreamKind::Microphone).is_none());
+
+        fx.pool.apply_snapshot(&[]);
+        assert!(!fx.pool.known_members.contains("bob"));
+        let current = fx.adopt();
+        assert!(old_weak.upgrade().is_none());
+        // A delayed event from the replaced connection cannot refill pending
+        // media even when the same member later becomes attributable again.
+        let late_track: Arc<dyn RemoteTrackHandle> =
+            Arc::new(FakeTrack(MediaStreamKind::Microphone));
+        let late_weak = Arc::downgrade(&late_track);
+        old.send(ConnectionEvent::TrackAdded {
+            identity: "id-bob".into(),
+            kind: MediaStreamKind::Microphone,
+            track: late_track,
+        })
+        .unwrap();
+        assert!(fx.drain().await.is_empty());
+        assert!(late_weak.upgrade().is_none());
+
+        // The member returns under the same ID while its checked mapper still
+        // refuses. Only a fresh handle on the current connection may survive.
+        assert!(
+            fx.pool
+                .apply_snapshot(std::slice::from_ref(&bob))
+                .is_empty()
+        );
+        let fresh: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Microphone));
+        current
+            .send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".into(),
+                kind: MediaStreamKind::Microphone,
+                track: fresh.clone(),
+            })
+            .unwrap();
+        assert!(fx.drain().await.is_empty());
+        assert!(tracks.get("bob", MediaStreamKind::Microphone).is_none());
+        fx.state.identity_blocked.store(false, Ordering::SeqCst);
+        assert_eq!(
+            fx.pool.apply_snapshot(std::slice::from_ref(&bob)),
+            vec![PoolEvent::StreamAdded {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Microphone,
+            }]
+        );
+        assert!(Arc::ptr_eq(
+            &tracks.get("bob", MediaStreamKind::Microphone).unwrap(),
+            &fresh,
+        ));
+        let attempts = fx.state.identity_attempts.load(Ordering::SeqCst);
+        // An existing accepted mapping must not be retargeted on every update.
+        fx.state.identity_blocked.store(true, Ordering::SeqCst);
+        assert!(
+            fx.pool
+                .apply_snapshot(std::slice::from_ref(&bob))
+                .is_empty()
+        );
+        assert_eq!(fx.state.identity_attempts.load(Ordering::SeqCst), attempts);
+        fx.pool.apply_snapshot(&[]);
+        assert!(!fx.pool.known_members.contains("bob"));
+        assert!(!fx.pool.member_identities.contains_key("bob"));
+        assert!(fx.pool.apply_snapshot(&[bob]).is_empty());
+        assert!(tracks.get("bob", MediaStreamKind::Microphone).is_none());
+        fx.pool.close();
+    }
     let mut fx = Fixture::new();
     fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
     fx.drain().await;
@@ -1257,6 +1571,9 @@ async fn an_active_idle_retired_focus_cannot_be_parked_after_a_lapse() {
     fx.drain().await;
     // The same member moves focus without a TrackRemoved from the old source.
     fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    // Changing the attested publication retires the old receiver immediately,
+    // rather than retaining it until the old focus's idle grace expires.
+    assert!(weak.upgrade().is_none());
     tokio::time::sleep(IDLE_GRACE * 2).await;
     fx.drain().await;
     assert!(
@@ -1267,7 +1584,7 @@ async fn an_active_idle_retired_focus_cannot_be_parked_after_a_lapse() {
             .iter()
             .any(|key| key == PEER_FOCUS)
     );
-    assert!(weak.upgrade().is_some());
+    assert!(weak.upgrade().is_none());
     fx.pool.apply_snapshot(&[]);
     assert!(weak.upgrade().is_none());
     fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
@@ -1280,4 +1597,40 @@ async fn an_active_idle_retired_focus_cannot_be_parked_after_a_lapse() {
             .is_none()
     );
     fx.pool.close();
+}
+
+#[tokio::test]
+async fn member_key_notifications_cannot_cross_a_retired_generation() {
+    let mut fx = Fixture::new();
+    let old = Arc::new(AtomicBool::new(true));
+    let current = Arc::new(AtomicBool::new(true));
+    assert!(
+        fx.pool
+            .member_key_imported("id-bob".into(), "old".into(), 1, Arc::clone(&old))
+            .is_empty()
+    );
+    old.store(false, Ordering::Release);
+    assert!(
+        fx.pool
+            .member_key_imported("id-bob".into(), "bob".into(), 2, Arc::clone(&current))
+            .is_empty()
+    );
+    let events = fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    assert!(events.contains(&PoolEvent::KeyImported {
+        member_id: "bob".into(),
+        identity: "id-bob".into(),
+        key_index: 2,
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PoolEvent::KeyImported { key_index: 1, .. }))
+    );
+    assert!(fx.pool.member_pending_keys.is_empty());
+    assert!(
+        fx.pool
+            .member_key_imported("id-bob".into(), "old".into(), 3, old)
+            .is_empty()
+    );
+    assert!(fx.pool.member_pending_keys.is_empty());
 }

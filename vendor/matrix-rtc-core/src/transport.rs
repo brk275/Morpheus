@@ -16,6 +16,9 @@ use std::collections::BTreeMap;
 pub enum RtcTransport {
     /// LiveKit SFU transport as defined in MSC4195.
     LiveKit(LiveKitTransport),
+    /// MSC4195 homeserver-mediated authorization for an SFU locator. This URL
+    /// receives media connections only, never an account or OpenID token.
+    LiveKitCsApi(LiveKitCsApiTransport),
     /// An unsupported or unknown transport type.
     /// Holds the raw transport data for forward compatibility.
     Unsupported(UnsupportedTransport),
@@ -26,6 +29,26 @@ pub enum RtcTransport {
 pub struct LiveKitTransport {
     /// URL of the service that issues JWT tokens for connecting to the LiveKit SFU.
     pub livekit_service_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveKitCsApiTransport {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+}
+
+impl RtcTransport {
+    pub fn is_livekit(&self) -> bool {
+        matches!(self, Self::LiveKit(_) | Self::LiveKitCsApi(_))
+    }
+
+    pub fn livekit_service_url(&self) -> Option<&str> {
+        match self {
+            Self::LiveKit(service) => Some(&service.livekit_service_url),
+            _ => None,
+        }
+    }
 }
 
 /// An unsupported transport type, storing raw data for forward compatibility.
@@ -87,15 +110,42 @@ impl RawRtcTransport {
     pub fn into_typed(self) -> RtcTransport {
         match self.transport_type.as_str() {
             "livekit" => {
-                let url = self
-                    .extra_fields
-                    .get("livekit_service_url")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                if let Some(url) = url {
+                let locator = self.extra_fields.get("url");
+                let service = self.extra_fields.get("livekit_service_url");
+                let server = self.extra_fields.get("server_name");
+                // A present malformed field is not an absent field. In
+                // particular, never reinterpret a malformed CSAPI descriptor
+                // as an OpenID credential destination.
+                if locator.is_some_and(|v| v.as_str().is_none_or(str::is_empty))
+                    || service.is_some_and(|v| v.as_str().is_none_or(str::is_empty))
+                    || server.is_some_and(|v| {
+                        v.as_str().is_none_or(|s| {
+                            s.is_empty()
+                                || s.len() > 1024
+                                || s.chars().any(|c| {
+                                    c.is_control()
+                                        || c.is_whitespace()
+                                        || matches!(c, '/' | '\\' | '?' | '#' | '@')
+                                })
+                        })
+                    })
+                {
+                    return RtcTransport::Unsupported(UnsupportedTransport {
+                        transport_type: self.transport_type,
+                        extra_fields: self.extra_fields,
+                    });
+                }
+                // Both standard fields select the legacy OpenID publisher
+                // contract, matching current Element Call. A locator-only
+                // descriptor selects homeserver mediation, never direct POST.
+                if let Some(url) = service.and_then(|v| v.as_str()) {
                     RtcTransport::LiveKit(LiveKitTransport {
-                        livekit_service_url: url,
+                        livekit_service_url: url.to_owned(),
+                    })
+                } else if let Some(url) = locator.and_then(|v| v.as_str()) {
+                    RtcTransport::LiveKitCsApi(LiveKitCsApiTransport {
+                        url: url.to_owned(),
+                        server_name: server.and_then(|v| v.as_str()).map(str::to_owned),
                     })
                 } else {
                     // LiveKit transport without required field -> unsupported
@@ -109,6 +159,72 @@ impl RawRtcTransport {
                 transport_type: self.transport_type,
                 extra_fields: self.extra_fields,
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn malformed_locators_never_become_openid_services() {
+        for value in [
+            json!({"type": "livekit", "url": null, "livekit_service_url": "https://auth.example.org"}),
+            json!({"type": "livekit", "url": "", "livekit_service_url": "https://auth.example.org"}),
+            json!({"type": "livekit", "url": "wss://sfu.example.org", "livekit_service_url": null}),
+        ] {
+            let raw: RawRtcTransport = serde_json::from_value(value).unwrap();
+            assert!(matches!(raw.into_typed(), RtcTransport::Unsupported(_)));
+        }
+        let raw: RawRtcTransport = serde_json::from_value(json!({
+            "type": "livekit", "livekit_service_url": "https://auth.example.org"
+        }))
+        .unwrap();
+        assert_eq!(
+            raw.into_typed(),
+            RtcTransport::LiveKit(LiveKitTransport {
+                livekit_service_url: "https://auth.example.org".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn standard_locator_and_service_keep_distinct_contracts() {
+        let raw: RawRtcTransport = serde_json::from_value(json!({
+            "type": "livekit", "url": "wss://sfu.example.org"
+        }))
+        .unwrap();
+        assert_eq!(
+            raw.into_typed(),
+            RtcTransport::LiveKitCsApi(LiveKitCsApiTransport {
+                url: "wss://sfu.example.org".into(),
+                server_name: None
+            })
+        );
+        let raw: RawRtcTransport = serde_json::from_value(json!({
+            "type": "livekit", "url": "wss://sfu.example.org", "livekit_service_url": "https://auth.example.org"
+        })).unwrap();
+        assert!(matches!(raw.into_typed(), RtcTransport::LiveKit(_)));
+        let raw: RawRtcTransport = serde_json::from_value(json!({
+            "type": "livekit", "url": "wss://sfu.example.org", "server_name": "operator.example.org:8448"
+        })).unwrap();
+        let typed = raw.into_typed();
+        assert_eq!(
+            crate::own_membership::transport_to_json(&typed)["server_name"],
+            "operator.example.org:8448"
+        );
+        for server in [
+            json!(null),
+            json!(false),
+            json!("https://operator.example.org"),
+        ] {
+            let raw: RawRtcTransport = serde_json::from_value(
+                json!({"type":"livekit", "url":"wss://sfu.example.org", "server_name":server}),
+            )
+            .unwrap();
+            assert!(matches!(raw.into_typed(), RtcTransport::Unsupported(_)));
         }
     }
 }

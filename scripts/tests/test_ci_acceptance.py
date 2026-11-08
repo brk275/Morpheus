@@ -322,6 +322,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
                 wayland = "true" if runner=="Linux" and route in ("all","wayland") else "false"
                 selected = {"model-tests":route in ("all","models"), "desktop-tests":route in ("all","desktop","desktop-video"),
                             "device-tests":route in ("all","devices"), "vendor-tests":route in ("all","vendor"),
+                            "rtc-library-tests":route in ("all","vendor"),
                             "video-source-tests":route in ("all","vendor","desktop-video"),
                             "sdk-receipt-tests":route in ("all","sdk"),
                             "windows-capture-tests":runner=="Windows" and route in ("all","devices"),
@@ -330,6 +331,10 @@ class NativeRouteWorkflowTests(unittest.TestCase):
                 outcomes.update({name:{"outcome":"skipped"} for name in ("preview-capture","preview-upload")})
                 self.assertIsNone(validate(route,runner,wayland,outcomes))
                 for name, yes in selected.items():
+                    missing = outcomes.copy()
+                    del missing[name]
+                    with self.subTest(route=route, runner=runner, step=name, missing=True):
+                        self.assertIsNotNone(validate(route, runner, wayland, missing))
                     for bad in (None,"failure","cancelled","neutral","skipped" if yes else "success"):
                         changed=outcomes | {name:{"outcome":bad}}
                         with self.subTest(route=route,runner=runner,step=name,bad=bad):
@@ -355,7 +360,8 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         # the same matrix-wide scope with its Windows-only capture also skipped.
         for runner in ("Windows", "macOS"):
             outcomes = {name: {"outcome": "success"} for name in (
-                "model-tests", "desktop-tests", "device-tests", "vendor-tests", "video-source-tests", "sdk-receipt-tests")}
+                "model-tests", "desktop-tests", "device-tests", "vendor-tests", "rtc-library-tests",
+                "video-source-tests", "sdk-receipt-tests")}
             outcomes.update({name: {"outcome": "skipped"} for name in (
                 "wayland-tests", "matrix-tests", "preview-capture", "preview-upload")})
             outcomes["windows-capture-tests"] = {"outcome": "success" if runner == "Windows" else "skipped"}
@@ -382,6 +388,42 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertEqual(ast.dump(projection.args[0]), ast.dump(calls[0].args[0]))
         self.assertEqual(ast.dump(projection.args[1]), ast.dump(calls[0].args[1]))
         self.assertEqual(ast.unparse(projection.args[2]), "os.environ.get('WAYLAND_SELECTED')")
+
+    def test_rtc_libraries_run_on_every_selected_platform_and_gate_the_actual_outcome(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        start = "      - name: Test call authentication and media ownership libraries\n"
+        self.assertEqual(source.count(start), 1)
+        step = source.split(start, 1)[1].split("      - name:", 1)[0]
+        self.assertIn("        id: rtc-library-tests\n", step)
+        self.assertIn("        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor')\n", step)
+        self.assertNotIn("runner.os", step)
+        self.assertIn("        timeout-minutes: 20\n", step)
+        self.assertIn("        continue-on-error: true\n", step)
+        self.assertIn('          SLINT_EMIT_DEBUG_INFO: "1"\n', step)
+        command = (
+            "cargo test --locked --no-fail-fast -p morpheus-rtc -p matrix-rtc-core "
+            "-p matrix-rtc-call -p matrix-rtc-call-sdk -p matrix-rtc-transport "
+            "-p matrix-rtc-matrix-sdk -p matrix-rtc-livekit "
+            "--features morpheus-rtc/native-rtc,morpheus-rtc/native-devices --lib"
+        )
+        self.assertIn("        run: " + command + "\n", step)
+        compile_start = "      - name: Compile focused call libraries before regression deadline\n"
+        self.assertEqual(source.count(compile_start), 1)
+        compile_step = source.split(compile_start, 1)[1].split(start, 1)[0]
+        self.assertIn("        if: needs.scope.outputs.check_route == 'vendor'\n", compile_step)
+        self.assertIn('          SLINT_EMIT_DEBUG_INFO: "1"\n', compile_step)
+        self.assertIn("        run: " + command + " --no-run\n", compile_step)
+        self.assertNotIn("continue-on-error:", compile_step)
+        self.assertNotIn("timeout-minutes:", compile_step)
+        self.assertLess(source.index(compile_start), source.index(start))
+        self.assertIn("RTC_LIBRARY_OUTCOME: ${{ steps.rtc-library-tests.outcome }}", source)
+        self.assertIn('("rtc-library-tests", "RTC_LIBRARY_OUTCOME")', source)
+
+    def test_native_compile_budget_covers_cold_mac_graphs_without_changing_windows(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        compile_job = source.split("  compile:\n", 1)[1].split("    strategy:\n", 1)[0]
+        self.assertIn("    timeout-minutes: ${{ (matrix.os == 'macos-15' || matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}\n", compile_job)
+        self.assertNotIn("windows-2025", compile_job)
 
     def test_native_video_step_selects_exact_synthetic_cases_and_is_required(self):
         source = WORKFLOW.read_text(encoding="utf-8")
@@ -525,18 +567,42 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertNotIn("workflow_run:",source)
         self.assertNotIn("secrets.",source)
 
+    def test_focused_vendor_prebuild_matches_existing_first_native_targets(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        start = "      - name: Compile focused vendor app prerequisites before regressions\n"
+        end = "      - name: Test vendored security fixes\n"
+        self.assertEqual(source.count(start), 1)
+        step = source.split(start, 1)[1].split(end, 1)[0]
+        self.assertIn("        if: needs.scope.outputs.check_route == 'vendor'\n", step)
+        self.assertNotIn("continue-on-error:", step)
+        self.assertNotIn("timeout-minutes:", step)
+        self.assertNotIn("SLINT_EMIT_DEBUG_INFO", step)
+        command = "cargo test --locked -p morpheus-app --features native-calls"
+        self.assertIn("        run: " + command
+                      + " --test rtc_retained_events --test gl_config_preference --no-run\n", step)
+        vendor = source.split(end, 1)[1].split("      - name: Test synthetic native video source ownership\n", 1)[0]
+        self.assertNotIn("SLINT_EMIT_DEBUG_INFO", vendor)
+        for target in ("rtc_retained_events", "gl_config_preference"):
+            self.assertIn(command + " --test " + target + " -- --list", vendor)
+        # Only ARM joins the already150-minute Linux/Intel job cap; Windows90
+        # and every existing per-test/fixture deadline are unchanged.
+        self.assertIn("timeout-minutes: ${{ (matrix.os == 'macos-15' || matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}", source)
+        self.assertLess(source.index("      - name: Prepare the pinned owned native PipeWire client\n"), source.index(start))
+        self.assertLess(source.index(start), source.index(end))
+
     def test_focused_timeline_prebuild_matches_actual_app_target_before_fixture_deadlines(self):
         source = WORKFLOW.read_text(encoding="utf-8")
         start = "      - name: Compile focused app timeline test before live fixture deadlines\n"
         end = "      - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC\n"
         self.assertEqual(source.count(start), 1)
         step = source.split(start, 1)[1].split(end, 1)[0]
-        condition = "        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads')\n"
+        condition = "        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'matrix') && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads')\n"
         self.assertIn(condition, step)
         self.assertIn('          SLINT_EMIT_DEBUG_INFO: "1"\n', step)
         self.assertNotIn("continue-on-error:", step)
         self.assertNotIn("timeout-minutes:", step)
         self.assertLess(source.index("      - name: Prepare the pinned owned native PipeWire client\n"), source.index(start))
+        self.assertLess(source.index("      - name: Test vendored security fixes\n"), source.index(start))
         self.assertLess(source.index(start), source.index(end))
         # Compare the real coordinator command/profile as source DATA. A future
         # target/feature/metadata mismatch must fail this existing helper gate.

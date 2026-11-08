@@ -12,6 +12,7 @@ members = [
     "vendor/livekit-api",
     "vendor/matrix-rtc-livekit",
     "vendor/matrix-rtc-call-sdk",
+    "vendor/matrix-rtc-call",
     "vendor/matrix-rtc-matrix-sdk",
     "vendor/matrix-rtc-transport",
     "vendor/matrix-rtc-core",
@@ -71,6 +72,8 @@ nokhwa = { path = "vendor/nokhwa" }
 nokhwa-bindings-macos = { path = "vendor/nokhwa-bindings-macos" }
 
 [patch."https://github.com/element-hq/matrix-rust-rtc"]
+# Preserve standard typed service/CSAPI publication through the locked call carrier.
+matrix-rtc-call = { path = "vendor/matrix-rtc-call" }
 # Preserve original stable slot authority before one canonical slot write.
 matrix-rtc-matrix-sdk = { path = "vendor/matrix-rtc-matrix-sdk" }
 # Retain the original bounded attachment stream for the first facade subscriber.

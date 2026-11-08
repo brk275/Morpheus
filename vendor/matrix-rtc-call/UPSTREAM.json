@@ -1,0 +1,134 @@
+{
+  "repository": "https://github.com/element-hq/matrix-rust-rtc",
+  "revision": "53880ef1ef66b62df555ce71ccd1d6c85b813596",
+  "crate_path": "crates/matrix-rtc-call",
+  "version": "0.5.0-rc.2",
+  "source": "Existing locked git dependency; local path mirror for the typed publication seam.",
+  "license": "AGPL-3.0-only OR LicenseRef-Element-Commercial",
+  "license_files": [
+    "LICENSE",
+    "LICENSE-COMMERCIAL"
+  ],
+  "original_manifest": "Cargo.toml.upstream",
+  "original_workspace_manifest": "Cargo.workspace.toml.upstream",
+  "original_files": [
+    {
+      "upstream_path": "Cargo.toml",
+      "vendored_path": "Cargo.workspace.toml.upstream",
+      "git_blob": "6976519628a110ec17b905339acc00a32b8ee4db",
+      "sha256": "65d9cb6174aceab08b531f49736750e65870918cf6a6d9a1363d23b8d2dfd4a3",
+      "bytes": 5416,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "LICENSE",
+      "vendored_path": "LICENSE",
+      "git_blob": "be3f7b28e564e7dd05eaf59d64adba1a4065ac0e",
+      "sha256": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0",
+      "bytes": 34523,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "LICENSE-COMMERCIAL",
+      "vendored_path": "LICENSE-COMMERCIAL",
+      "git_blob": "39041ce02de05e9c7bb044a6ea31c9a64fcf1405",
+      "sha256": "8f4b65d16f5ae2810f08a57430d2672e82bd06ddd1762f68dafdeb9f1f151896",
+      "bytes": 256,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "crates/matrix-rtc-call/Cargo.toml",
+      "vendored_path": "Cargo.toml",
+      "git_blob": "ad17d288f7ffcfd7a797498b90ba592c42ff8e1d",
+      "sha256": "01bd8497ff2c1f1d0f3e441133246a279b8227ca2ad4271961f80c046f8d2f3c",
+      "bytes": 1548,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "crates/matrix-rtc-call/README.md",
+      "vendored_path": "README.md",
+      "git_blob": "ca89a3a002df031c7eb142ee5cb9d6cdd31a300b",
+      "sha256": "40bd4410abdec9b6bcf4ea6f9cb2ea4eea25eaceeb6bdce104f421625a191b28",
+      "bytes": 5217,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "crates/matrix-rtc-call/src/client.rs",
+      "vendored_path": "src/client.rs",
+      "git_blob": "e58d566bca344411780f8771cdb03a15bcc70ce3",
+      "sha256": "d94f9bf839f79dacc4d308a955f9f26d4c889284471dbbfa9d4ff8365bd2f38b",
+      "bytes": 28444,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "crates/matrix-rtc-call/src/client/tests.rs",
+      "vendored_path": "src/client/tests.rs",
+      "git_blob": "80f3bd15955cfa6a43d69081c51c8934839b6c47",
+      "sha256": "2d7f70bd45e70e81fe853cd13b9d5fa30fdaf42758e204afcb030e0b535ac5c0",
+      "bytes": 23442,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "crates/matrix-rtc-call/src/feeder_tests.rs",
+      "vendored_path": "src/feeder_tests.rs",
+      "git_blob": "9df783cc4fde362517b3b2e35b5ac685b958fdaa",
+      "sha256": "51c9a5d1e4028fb6ee8454aae83ec497126c8d73cd60ca970cb0e56246e78ad0",
+      "bytes": 5254,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "crates/matrix-rtc-call/src/lib.rs",
+      "vendored_path": "src/lib.rs",
+      "git_blob": "2235d91b96ef235c4f98178798eda8982c102f33",
+      "sha256": "bc5bd7c5fa9173c6c3fcff1e0f2f002fe414789dd14bf2adf2312e2eee59ec76",
+      "bytes": 2024,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "crates/matrix-rtc-call/src/notification.rs",
+      "vendored_path": "src/notification.rs",
+      "git_blob": "850061f071f05622ba8e33d681f368c9d6454ac8",
+      "sha256": "6cd344ce9d458039835ba28ef7c541708783af984f8534e92e42f23b594278d1",
+      "bytes": 16693,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "crates/matrix-rtc-call/src/reactions.rs",
+      "vendored_path": "src/reactions.rs",
+      "git_blob": "f1723228d284d4019e8ebc51dafe16bb8ffd4532",
+      "sha256": "1ebf99e5f7d1c1918e968cb925b152eb3883300203092297166c028ecfb862fa",
+      "bytes": 37043,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "crates/matrix-rtc-call/src/room_state.rs",
+      "vendored_path": "src/room_state.rs",
+      "git_blob": "025eb910a7e16752a2d346970abe46da7040de21",
+      "sha256": "cdbff2c2f84e88e3d658886375060246405b095d94de3a4d3275690008d66e53",
+      "bytes": 23125,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "crates/matrix-rtc-call/src/room_state/tests.rs",
+      "vendored_path": "src/room_state/tests.rs",
+      "git_blob": "ce2ca4c7f8cefa2ab2081f77a7c9f4ec62e79d21",
+      "sha256": "014151e2c7167a44a29eec33a5743ca4e6183c1976c76a103d5dd93741f94d8c",
+      "bytes": 28380,
+      "mode": "100644"
+    },
+    {
+      "upstream_path": "crates/matrix-rtc-call/src/transports.rs",
+      "vendored_path": "src/transports.rs",
+      "git_blob": "454f633b0c4b15439d2bbe33d1b5b4cfe11e0df7",
+      "sha256": "fc4cad057edf1a35f45fda55967274cbde2203f9da7f9359799a5bc3708ede8f",
+      "bytes": 6221,
+      "mode": "100644"
+    }
+  ],
+  "changes": [
+    "Cargo.toml: replace inherited workspace package/dependency declarations with identical upstream values; no added dependency or build hook.",
+    "src/transports.rs: accept explicit typed LiveKit publication and preserve advertised legacy service or CS API locator without casting one authority to another.",
+    "src/client/tests.rs: add actor publication/admission/leave regression using existing mock backend."
+  ],
+  "source_execution_admitted": false
+}

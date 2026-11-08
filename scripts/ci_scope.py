@@ -184,7 +184,7 @@ MANUAL_CHECKS = frozenset({"all", "models", "desktop", "desktop-video", "devices
 # Exact existing suites from run_matrix_acceptance.py; no new test composition.
 MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-reads",
                            "timeline-failures", "media-only", "app-timeline",
-                           "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop"})
+                           "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "rtc-media", "element-interop"})
 
 
 # Exact reviewed development inputs only. Desktop still compiles and tests all
@@ -254,8 +254,37 @@ AUTOMATIC_CONTROL_INPUTS = frozenset((
     "scripts/ci_scope.py", "scripts/tests/test_ci_scope.py",
     ".github/workflows/ci.yml", "scripts/tests/test_ci_acceptance.py",
 ))
-REVIEWED_CONTROL_WORKFLOW_SHA256 = "50be2e2a563e5b61e97e2b294499707ee9b194e2d508901bdcf9866d304dfd1f"
-REVIEWED_CONTROL_WORKFLOW_BYTES = 65948
+REVIEWED_CONTROL_WORKFLOW_SHA256 = "0b88b9dd7c6b764b35695a59d17e54575c4b5836d688ac8224cdd45f0f1d0cd3"
+REVIEWED_CONTROL_WORKFLOW_BYTES = 68406
+
+
+# The shared archive downloader is exercised by the existing four-platform
+# vendor route. These exact Linux transport callers are also checked by the
+# always-on helper suite; AppImage installation remains explicit Linux QA.
+# No prefix/manifest/lock exception: mixed or unknown native inputs stay full.
+TRANSPORT_NATIVE_INPUTS = frozenset((
+    "vendor/webrtc-sys-build/src/lib.rs",
+    "vendor/webrtc-sys-build/src/pins.rs",
+    "vendor/webrtc-sys-build/src/archive_tests.rs",
+))
+TRANSPORT_INPUTS = TRANSPORT_NATIVE_INPUTS | frozenset((
+    "vendor/webrtc-sys-build/MORPHEUS_PATCH.md",
+    "vendor/webrtc-sys-build/MORPHEUS_PROVENANCE.json",
+    "scripts/build_linux_native.py",
+    "packaging/linux/appimage_process.py",
+    "packaging/linux/package_appimage.py",
+    "scripts/tests/test_appimage_process.py",
+))
+
+
+def reviewed_transport_only(paths, event, event_name, force_all=False):
+    if (force_all or not paths or any(type(path) is not str for path in paths)
+            or not set(paths) <= TRANSPORT_INPUTS | AUTOMATIC_CONTROL_INPUTS
+            or not set(paths) & TRANSPORT_NATIVE_INPUTS or type(event) is not dict):
+        return False
+    # Match every workflow byte, not merely the path of its scanner edits.
+    # This selects tests only; it never imports a passing run or reuses results.
+    return reviewed_workflow_layout(event, event_name)
 
 
 def reviewed_control_only(paths, event, event_name, force_all=False):
@@ -649,6 +678,8 @@ def event_selection(event, event_name):
         paths, force_all = changed_paths(event, event_name)
         selected = classify(paths, force_all)
         route = automatic_route(paths, force_all)
+        if route == "all" and reviewed_transport_only(paths, event, event_name, force_all):
+            route = "vendor"
         if route == "all" and reviewed_control_only(paths, event, event_name, force_all):
             route = "helpers"
         if qualified_apply_main_reuse(paths, event, event_name, force_all):

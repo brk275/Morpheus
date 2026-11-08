@@ -38,7 +38,8 @@ def build():
         "variant": "instrumented_release",
         "shipping_acceptance": False,
         "delta_from_shipping": ["acceptance_driver", "rendering_notifier",
-                                "generated_profile_root", "requested_sync_policy"],
+                                "generated_profile_root", "requested_sync_policy",
+                                "delegate_upper_bound_snapshots", "timeline_anchor_motion_samples"],
     }
 
 
@@ -68,15 +69,21 @@ def measure_report(adapter):
                     "fixture_distinct_decrypted": 10_000, "count_method": "direct_window_model"},
         "scroll": {"steps": 240, "delta_logical_px": 480.0, "steps_accepted": 238,
                    "steps_with_render_hook": 238, "idle_render_hook_frames_before": 0,
-                   "dispatch_to_render_hook_us": summary(4_000), "render_hook_span_us": summary(3_000),
+                   "steps_with_anchor_motion": 120, "steps_with_anchor_row_change": 110,
+                   "anchor_index_min": 10, "anchor_index_max": 900,
+                   "motion_method": "shipping_top_row_at_first_render_hook",
+                   "dispatch_to_motion_render_hook_us": {**summary(4_000), "count": 120},
+                   "dispatch_to_render_hook_us": {**summary(4_000), "count": 238},
+                   "render_hook_span_us": summary(3_000),
                    "render_hook_interval_us": summary(16_000)},
         "account_switch": {"away_observed_ms": 800, "back_observed_ms": 700,
                            "reopen_first_rows_observed_ms": 200, "reopen_initial_rows": 10_000},
         "rss_kib": {"source": "proc_self_status", "after_startup": 150_000, "after_history": 210_000,
                     "after_scroll": 212_000, "after_switch": 220_000, "peak": 230_000},
-        "delegates": {"instances": None, "method": "unmeasured"},
+        "delegates": {"after_history_upper_bound": 60, "after_scroll_upper_bound": 70,
+                      "method": "attached_component_root_upper_bound"},
         "poll_ms": 5,
-        "not_measured": ["gpu_time", "presentation", "display_refresh", "delegate_instances"],
+        "not_measured": ["gpu_time", "presentation", "display_refresh", "exact_delegate_instances", "delegate_peak"],
     }
 
 
@@ -204,6 +211,44 @@ class ReportTests(unittest.TestCase):
         ):
             with self.subTest(change=change):
                 self.assertFalse(mutated(change))
+
+
+    def test_scroll_requires_real_row_traversal_with_closed_motion_counts(self):
+        for change in (
+            {"steps_with_anchor_motion": 0},
+            {"steps_accepted": 0},
+            {"steps_accepted": 241},
+            {"steps": 241},
+            {"steps_with_anchor_row_change": 0},
+            {"steps_with_anchor_row_change": 121},
+            {"steps_with_anchor_motion": 239},
+            {"anchor_index_max": 10},
+            {"anchor_index_max": 10_000},
+            {"anchor_index_min": -1},
+            {"motion_method": "accepted_input"},
+            {"dispatch_to_motion_render_hook_us": None},
+            {"dispatch_to_render_hook_us": None},
+            {"dispatch_to_render_hook_us": summary(4_000)},
+            {"dispatch_to_motion_render_hook_us": {**summary(40_000), "count": 120}},
+            {"dispatch_to_motion_render_hook_us": summary(4_000)},
+            {"dispatch_to_motion_render_hook_us": {**summary(4_000), "count": 120, "dropped": 1}},
+        ):
+            report = measure_report("sliding")
+            report["scroll"].update(change)
+            with self.subTest(change=change):
+                self.assertFalse(runner.valid_report(report, "measure", "sliding"))
+
+    def test_attached_component_upper_bounds_cannot_claim_missing_or_all_fixture_rows(self):
+        for checkpoint in ("after_history_upper_bound", "after_scroll_upper_bound"):
+            for invalid in (None, True, 0, 10_000, 10_001, -1):
+                report = measure_report("sliding")
+                report["delegates"][checkpoint] = invalid
+                with self.subTest(checkpoint=checkpoint, invalid=invalid):
+                    self.assertFalse(runner.valid_report(report, "measure", "sliding"))
+        for value in (1, 9_999):
+            report = measure_report("sliding")
+            report["delegates"].update(after_history_upper_bound=value, after_scroll_upper_bound=value)
+            self.assertTrue(runner.valid_report(report, "measure", "sliding"))
 
 
 class FlowTests(RunnerTest):

@@ -45,8 +45,8 @@ use morpheus_matrix::{
 };
 pub use morpheus_rtc::CallInfo;
 use morpheus_rtc::{
-    AudioControls, AudioDeviceSelection, AudioResume, AudioState, CallOptions, LocalRtcSupport,
-    MediaError, ReconnectBackoff, ReconnectPolicy, ReconnectWindow, RtcCallEnd,
+    AudioControls, AudioDeviceSelection, AudioResume, AudioState, CallOptions, LiveKitDescriptor,
+    LocalRtcSupport, MediaError, ReconnectBackoff, ReconnectPolicy, ReconnectWindow, RtcCallEnd,
     RtcConnectionSignal, RtcError, RtcService, TransportSupport, local_device_support,
     local_support,
 };
@@ -69,7 +69,7 @@ use crate::{
     outgoing_ring::{InvitationOutcome, OutgoingRing},
     updater::{CallLease as UpdateCallLease, UpdateActivity, UpdateError},
     video_render::{RosterUpdate, StageRequest, VideoUpdate, run_remote_video},
-    voice_spaces::VoiceSpaces,
+    voice_spaces::{RoomCallProfile, VoiceSpaces},
 };
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -91,10 +91,11 @@ pub enum AudioCallCapability {
     SignInRequired,
     StickySyncRequired(SyncStatus),
     NoLiveKitTransport,
-    TransportReady { livekit_service_url: String },
+    TransportReady { transport: LiveKitDescriptor },
 }
 
-/// Choose one MatrixRTC format before joining; no runtime protocol fallback.
+/// Choose one MatrixRTC membership format before joining. Authentication is
+/// selected separately from the account's advertised transport, never this mode.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CallJoinMode {
     #[default]
@@ -118,9 +119,9 @@ pub struct InvitationUpdate {
 }
 
 impl CallJoinMode {
-    fn options(self) -> CallOptions {
+    pub(crate) fn options(self) -> CallOptions {
         match self {
-            Self::Standard => CallOptions::default(),
+            Self::Standard => CallOptions::element_call_matrix_2_0(),
             Self::ElementCallMatrix2 => CallOptions::element_call_matrix_2_0(),
             Self::ElementCallRoomState => CallOptions::room_state_compatibility(),
         }
@@ -237,6 +238,7 @@ pub enum CallControllerError {
     AlreadyBusy,
     Cancelled,
     AccountChanged,
+    CallProfileChanged,
     StaleCall,
     IncomingOfferUnavailable,
     RoomNotLoaded,
@@ -261,6 +263,9 @@ impl fmt::Display for CallControllerError {
             Self::AlreadyBusy => write!(formatter, "a call is already starting or active"),
             Self::Cancelled => write!(formatter, "call start was cancelled"),
             Self::AccountChanged => write!(formatter, "the active Matrix account changed"),
+            Self::CallProfileChanged => {
+                write!(formatter, "call settings changed; start the call again")
+            }
             Self::StaleCall => write!(formatter, "that call is no longer active"),
             Self::IncomingOfferUnavailable => {
                 write!(formatter, "that incoming call is no longer available")
@@ -1424,17 +1429,16 @@ impl CallController {
         self.shared.status.borrow().clone()
     }
 
-    /// Safe for a settings or call-entry screen: this contacts the homeserver
-    /// but does not open a media device, publish a membership, or write a slot.
-    pub async fn probe_audio(&self) -> Result<AudioCallCapability, CallControllerError> {
+    // Local readiness only; actions resolve their transport once in the RTC adapter.
+    async fn audio_account(&self) -> Result<AccountInfo, AudioCallCapability> {
         if local_support() != LocalRtcSupport::NativeFrames {
-            return Ok(AudioCallCapability::NativeRtcNotBuilt);
+            return Err(AudioCallCapability::NativeRtcNotBuilt);
         }
         if !local_device_support().audio {
-            return Ok(AudioCallCapability::AudioBackendNotBuilt);
+            return Err(AudioCallCapability::AudioBackendNotBuilt);
         }
         let Some(account) = self.manager.active_account().await else {
-            return Ok(AudioCallCapability::SignInRequired);
+            return Err(AudioCallCapability::SignInRequired);
         };
         let sync = self.manager.subscribe_sync_status().borrow().clone();
         if !matches!(
@@ -1443,8 +1447,17 @@ impl CallController {
                 backend: SyncBackend::SlidingSticky
             }
         ) {
-            return Ok(AudioCallCapability::StickySyncRequired(sync));
+            return Err(AudioCallCapability::StickySyncRequired(sync));
         }
+        Ok(account)
+    }
+
+    /// Read-only settings probe; it opens no media device and writes no membership or slot.
+    pub async fn probe_audio(&self) -> Result<AudioCallCapability, CallControllerError> {
+        let account = match self.audio_account().await {
+            Ok(account) => account,
+            Err(unavailable) => return Ok(unavailable),
+        };
         let client = self.manager.active_client().await?;
         self.ensure_account(&account.id).await?;
         let rtc = RtcService::new(client);
@@ -1453,9 +1466,9 @@ impl CallController {
             .map_err(|_| CallControllerError::TimedOut("discovering MatrixRTC transport"))??;
         self.ensure_account(&account.id).await?;
         Ok(match transport {
-            TransportSupport::LiveKit { service_url } => AudioCallCapability::TransportReady {
-                livekit_service_url: service_url,
-            },
+            TransportSupport::LiveKit { transport } => {
+                AudioCallCapability::TransportReady { transport }
+            }
             TransportSupport::NoLiveKitTransport => AudioCallCapability::NoLiveKitTransport,
         })
     }
@@ -1468,7 +1481,14 @@ impl CallController {
         selection: AccountSelection,
         room_id: &str,
         mode: CallJoinMode,
+        profile: RoomCallProfile,
+        voice_spaces: Arc<VoiceSpaces>,
     ) -> Result<(), CallControllerError> {
+        if voice_spaces.room_call_profile(selection.account_id(), room_id) != Some(profile)
+            || CallJoinMode::from(profile.mode()) != mode
+        {
+            return Err(CallControllerError::CallProfileChanged);
+        }
         if !selection.is_current() {
             return Err(CallControllerError::AccountChanged);
         }
@@ -1489,7 +1509,7 @@ impl CallController {
         let (result_tx, result_rx) = oneshot::channel();
         tokio::spawn(async move {
             let result = controller
-                .open_slot_reserved(&selection, &room_id, mode)
+                .open_slot_reserved(&selection, &room_id, mode, profile, voice_spaces)
                 .await;
             let cleanup = shared.finish_open_slot(token).await;
             done.send_replace(true);
@@ -1507,7 +1527,14 @@ impl CallController {
         selection: &AccountSelection,
         room_id: &str,
         mode: CallJoinMode,
+        profile: RoomCallProfile,
+        voice_spaces: Arc<VoiceSpaces>,
     ) -> Result<(), CallControllerError> {
+        if voice_spaces.room_call_profile(selection.account_id(), room_id) != Some(profile)
+            || CallJoinMode::from(profile.mode()) != mode
+        {
+            return Err(CallControllerError::CallProfileChanged);
+        }
         if !selection.is_current() {
             return Err(CallControllerError::AccountChanged);
         }
@@ -1540,15 +1567,18 @@ impl CallController {
             return Err(CallControllerError::UnknownEncryptionState);
         }
         self.ensure_account(&account_id).await?;
-        let slot_id = CallOptions::default().slot_id;
         let original_selection = selection.clone();
+        let profile_admission = voice_spaces.room_call_admission(
+            expected_account_id.to_owned(),
+            room_id.to_owned(),
+            profile,
+        );
         let admit: Arc<dyn Fn() -> bool + Send + Sync> =
-            Arc::new(move || original_selection.is_current());
+            Arc::new(move || original_selection.is_current() && profile_admission());
         timeout(
             JOIN_TIMEOUT,
-            rtc.open_outgoing_slot(
+            rtc.open_outgoing_room(
                 room_id,
-                &slot_id,
                 encryption.is_encrypted(),
                 mode.options().interop_mode,
                 admit,
@@ -1556,6 +1586,9 @@ impl CallController {
         )
         .await
         .map_err(|_| CallControllerError::TimedOut("opening MatrixRTC call slot"))??;
+        if voice_spaces.room_call_profile(selection.account_id(), room_id) != Some(profile) {
+            return Err(CallControllerError::CallProfileChanged);
+        }
         if !selection.is_current() {
             return Err(CallControllerError::AccountChanged);
         }
@@ -1569,14 +1602,21 @@ impl CallController {
         selection: AccountSelection,
         room_id: &str,
         mode: CallJoinMode,
+        profile: RoomCallProfile,
         audio_devices: AudioDeviceSelection,
         intent: CallStartIntent,
         voice_spaces: Arc<VoiceSpaces>,
     ) -> Result<CallInfo, CallControllerError> {
+        if voice_spaces.room_call_profile(selection.account_id(), room_id) != Some(profile)
+            || CallJoinMode::from(profile.mode()) != mode
+        {
+            return Err(CallControllerError::CallProfileChanged);
+        }
         self.start_audio_owned(
             selection,
             room_id,
             mode.options(),
+            profile,
             audio_devices,
             intent,
             voice_spaces,
@@ -1605,6 +1645,7 @@ impl CallController {
                 target.selection().clone(),
                 target.room_id(),
                 target.options().clone(),
+                target.profile(),
                 audio_devices,
                 CallStartIntent::Quiet,
                 voice_spaces,
@@ -1622,6 +1663,7 @@ impl CallController {
         selection: AccountSelection,
         room_id: &str,
         options: CallOptions,
+        profile: RoomCallProfile,
         audio_devices: AudioDeviceSelection,
         intent: CallStartIntent,
         voice_spaces: Arc<VoiceSpaces>,
@@ -1707,6 +1749,7 @@ impl CallController {
             account,
             room_id: room_id.to_owned(),
             options,
+            profile,
             audio_devices,
             token,
             presentation: token,
@@ -1975,15 +2018,10 @@ impl CallController {
     }
 
     async fn ready_account_id(&self) -> Result<String, CallControllerError> {
-        match self.probe_audio().await? {
-            AudioCallCapability::TransportReady { .. } => self
-                .manager
-                .active_account()
-                .await
-                .map(|account| account.id)
-                .ok_or(CallControllerError::AccountChanged),
-            unavailable => Err(CallControllerError::Unavailable(unavailable)),
-        }
+        self.audio_account()
+            .await
+            .map(|account| account.id)
+            .map_err(CallControllerError::Unavailable)
     }
 
     async fn ensure_account(&self, account_id: &str) -> Result<(), CallControllerError> {
@@ -2031,6 +2069,23 @@ fn accepted_cancelled(
         }
     }
 }
+async fn room_profile_changed(
+    spaces: &VoiceSpaces,
+    account_id: &str,
+    room_id: &str,
+    profile: RoomCallProfile,
+) {
+    let mut changes = spaces.subscribe_incoming_policy();
+    loop {
+        if spaces.room_call_profile(account_id, room_id) != Some(profile) {
+            return;
+        }
+        if changes.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn established_cancelled(guard: Option<&EstablishedGuard>) {
     match guard {
         Some(guard) => guard.cancelled().await,
@@ -2090,6 +2145,13 @@ enum SessionEnd {
 fn session_end(end: RtcCallEnd) -> SessionEnd {
     match end {
         RtcCallEnd::SlotClosed => SessionEnd::Ended("the room call was closed"),
+        RtcCallEnd::AuthenticationRequired => SessionEnd::Ended("Sign in again before calling"),
+        RtcCallEnd::AuthenticationExpired => SessionEnd::Ended(
+            "The account session is awaiting refresh; try calling after it reconnects.",
+        ),
+        RtcCallEnd::IdentityRejected => {
+            SessionEnd::Ended("call identities could not be uniquely verified")
+        }
         // No local Leave was requested, so the membership ended without us,
         // e.g. its delayed leave fired while this device was offline.
         RtcCallEnd::Left => SessionEnd::Rejoin(RejoinCause::MembershipEnded),
@@ -2227,6 +2289,7 @@ struct CallWorker {
     account: AccountInfo,
     room_id: String,
     options: CallOptions,
+    profile: RoomCallProfile,
     audio_devices: AudioDeviceSelection,
     token: u64,
     presentation: u64,
@@ -2243,6 +2306,12 @@ struct CallWorker {
 }
 
 impl CallWorker {
+    fn profile_current(&self) -> bool {
+        self.voice_spaces
+            .room_call_profile(&self.account_id, &self.room_id)
+            == Some(self.profile)
+    }
+
     async fn run(mut self) {
         // The existing call reservation has already revoked every prior
         // attachment lease. Do not open any native call media until its actual
@@ -2826,6 +2895,9 @@ impl CallWorker {
     }
 
     async fn setup(&mut self) -> Result<(RtcService, CallInfo), CallControllerError> {
+        if !self.profile_current() {
+            return Err(CallControllerError::CallProfileChanged);
+        }
         if !self.selection.is_current() {
             return Err(CallControllerError::AccountChanged);
         }
@@ -2838,11 +2910,10 @@ impl CallWorker {
             _ = &mut self.cancel => return Err(CallControllerError::Cancelled),
             _ = self.selection.revoked() => return Err(CallControllerError::AccountChanged),
             _ = accepted_cancelled(self.accepted.as_ref()) => return Err(CallControllerError::IncomingOfferUnavailable),
-            result = controller.probe_audio() => result?,
+            result = controller.ready_account_id() => result?,
         };
-        match probe {
-            AudioCallCapability::TransportReady { .. } => {}
-            unavailable => return Err(CallControllerError::Unavailable(unavailable)),
+        if probe != self.account_id {
+            return Err(CallControllerError::AccountChanged);
         }
         tokio::select! {
             biased;
@@ -2903,9 +2974,18 @@ impl CallWorker {
             let stop_admission = Arc::clone(&self.capture_stop);
             let admit = || selection_admission.is_current() && !stop_admission.requested();
             let options = self.options.clone();
+            let profiles = self.voice_spaces.clone();
+            let profile = self.profile;
+            let profile_account = self.account_id.clone();
+            let profile_room = self.room_id.clone();
+            let original_admit = admit;
+            let admit = || {
+                original_admit()
+                    && profiles.room_call_profile(&profile_account, &profile_room) == Some(profile)
+            };
             let join = timeout(JOIN_TIMEOUT, async {
                 if outgoing {
-                    rtc.join_outgoing(&room_id, options, &admit).await
+                    rtc.join_outgoing_room(&room_id, options, &admit).await
                 } else {
                     rtc.join(&room_id, options).await
                 }
@@ -2919,6 +2999,7 @@ impl CallWorker {
                     _ = cancel => {},
                     _ = selection.revoked() => {},
                     _ = offer_cancelled => {},
+                    _ = room_profile_changed(&profiles, &profile_account, &profile_room, profile) => {},
                 }
             };
             settle_owned_join(join, cancelled, || {
@@ -2961,6 +3042,11 @@ impl CallWorker {
                 .then_some(())
                 .ok_or(CallControllerError::AccountChanged)
         });
+        let account_check = account_check.and_then(|()| {
+            self.profile_current()
+                .then_some(())
+                .ok_or(CallControllerError::CallProfileChanged)
+        });
         if let Err(error) = account_check {
             leave_with_timeout(&mut rtc, &room_id)
                 .await
@@ -2989,6 +3075,8 @@ impl CallWorker {
                 }
             }
         }
+        // Rejoin uses this exact admitted concrete slot, never room intent again.
+        self.options.slot_id = info.slot_id.clone();
         Ok((rtc, info))
     }
 
@@ -3278,6 +3366,11 @@ impl CallWorker {
         outgoing: &mut LocalVideoSession,
         remaining: Duration,
     ) -> Result<CallInfo, JoinAttemptError> {
+        if !self.profile_current() {
+            return Err(JoinAttemptError::Stopped(RejoinEnd::Stopped(Err(
+                CallControllerError::CallProfileChanged,
+            ))));
+        }
         let room_id = self.room_id.clone();
         let (joined, cancelled) = {
             let join = timeout(
@@ -3286,12 +3379,18 @@ impl CallWorker {
             );
             let cancel = &mut self.cancel;
             let selection = &self.selection;
+            let profiles = self.voice_spaces.clone();
+            let profile = self.profile;
+            let account_id = self.account_id.clone();
+            let profile_lost = room_profile_changed(&profiles, &account_id, &room_id, profile);
+            tokio::pin!(profile_lost);
             let cancelled = async {
                 loop {
                     tokio::select! {
                         biased;
                         _ = &mut *cancel => break,
                         _ = selection.revoked() => break,
+                        _ = &mut profile_lost => break,
                         event = outgoing.next_event() => {
                             outgoing.handle_detached_event(event).await;
                         }
@@ -3327,6 +3426,11 @@ impl CallWorker {
         let account = ensure_account(&self.manager, &self.account_id).await;
         if account.is_err() || !self.selection.is_current() {
             let changed = Err(CallControllerError::AccountChanged);
+            let end = leave_after(rtc, &self.room_id, changed).await;
+            return Err(JoinAttemptError::Stopped(end));
+        }
+        if !self.profile_current() {
+            let changed = Err(CallControllerError::CallProfileChanged);
             let end = leave_after(rtc, &self.room_id, changed).await;
             return Err(JoinAttemptError::Stopped(end));
         }
@@ -3778,6 +3882,32 @@ async fn ensure_account(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sign_in_required_is_terminal_without_rejoin() {
+        assert!(matches!(
+            session_end(RtcCallEnd::AuthenticationRequired),
+            SessionEnd::Ended("Sign in again before calling")
+        ));
+    }
+
+    #[test]
+    fn expired_auth_waits_for_account_refresh_without_rejoin() {
+        assert!(matches!(
+            session_end(RtcCallEnd::AuthenticationExpired),
+            SessionEnd::Ended(
+                "The account session is awaiting refresh; try calling after it reconnects."
+            )
+        ));
+    }
+
+    #[test]
+    fn identity_contract_refusal_is_terminal_without_rejoin() {
+        assert!(matches!(
+            session_end(RtcCallEnd::IdentityRejected),
+            SessionEnd::Ended(_)
+        ));
+    }
+
     use super::*;
     #[tokio::test]
     async fn attachment_audio_authority_ends_before_a_queued_or_opening_call_and_never_revives() {
@@ -4310,20 +4440,24 @@ mod tests {
     }
 
     #[test]
-    fn call_modes_keep_current_slot_and_legacy_room_state_separate() {
+    fn app_modes_keep_stock_encrypted_calls_and_legacy_room_state_separate() {
         use morpheus_rtc::InteropMode;
 
         let standard = CallJoinMode::Standard.options();
-        assert_eq!(standard.interop_mode, InteropMode::Current);
+        assert_eq!(standard.interop_mode, InteropMode::Sticky2025);
         assert_eq!(standard.slot_id, "m.call#room");
+        assert_eq!(standard.auth_dialect, None);
+        assert_eq!(standard, CallOptions::element_call_matrix_2_0());
 
         let sticky =
             CallJoinMode::from(morpheus_config::RoomCallMode::ElementCallMatrix2).options();
         assert_eq!(sticky, CallOptions::element_call_matrix_2_0());
         assert_eq!(sticky.interop_mode, InteropMode::Sticky2025);
+        assert_eq!(sticky.auth_dialect, None);
 
         let legacy = CallJoinMode::ElementCallRoomState.options();
         assert_eq!(legacy.interop_mode, InteropMode::RoomState);
+        assert_eq!(legacy.auth_dialect, None);
         assert_eq!(legacy.slot_id, "m.call#room");
     }
 

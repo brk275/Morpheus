@@ -45,6 +45,19 @@ async fn settle(ui: &AppWindow) {
     i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
 }
 
+// A cold Settings page owns one post-mount focus handoff; a FIFO settle alone
+// need not consume its timer. Observe completion without forcing focus.
+async fn finish_settings_reveal(ui: &AppWindow) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ui.get_settings_reveal_pending() {
+            settle(ui).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the mounted Settings page consumes its one focus request");
+}
+
 /// Check the actual property against an independently queried installed face.
 /// The testing backend keeps the real system-font collection; no rendering or
 /// fixed-width glyph-metric assertion is implied by matching a family identity.
@@ -814,8 +827,80 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
         ui.get_appearance_ui_font_input().as_str(),
         defaults.appearance.font_family
     );
+    assert!(!ui.get_appearance_fonts_dirty());
+    // A real edit marks the atomic font form. Invalid external TOML refuses
+    // both Apply and Reset without erasing that edit or replacing the file.
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Interface font family"));
+    ui.set_appearance_ui_font_input("  ".into());
+    key(ui, Key::End);
+    type_text(ui, "serif  ");
+    ui.set_appearance_message_font_input(" monospace ".into());
+    ui.set_appearance_composer_font_input("".into());
+    ui.set_appearance_mono_font_input(" monospace ".into());
+    assert!(ui.get_appearance_fonts_dirty());
+    let font_draft = ui.get_appearance_ui_font_input();
+    let broken_fonts = "[appearance\nfont_family = \"serif\"\n";
+    std::fs::write(config_path, broken_fonts).unwrap();
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), broken_fonts);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(ui.get_appearance_ui_font_input(), font_draft);
+    tab_to_control(
+        ui,
+        "Use the default interface, message and monospaced fonts",
+    );
+    key(ui, Key::Space);
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), broken_fonts);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(ui.get_appearance_ui_font_input(), font_draft);
+    store.save(&reset).unwrap();
+    apply_config(ui, &reset, None);
+    assert_eq!(ui.get_appearance_ui_font_input(), font_draft);
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(ui.get_appearance_ui_font_input(), "serif");
+    assert_eq!(ui.get_appearance_message_font_input(), "monospace");
+    assert_eq!(ui.get_appearance_composer_font_input(), "");
+    assert_eq!(ui.get_appearance_mono_font_input(), "monospace");
+    assert_eq!(store.load().unwrap().appearance.font_family, "serif");
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    key(ui, Key::End);
+    type_text(ui, " draft");
+    assert!(ui.get_appearance_fonts_dirty());
+    tab_to_control(
+        ui,
+        "Use the default interface, message and monospaced fonts",
+    );
+    key(ui, Key::Space);
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(
+        ui.get_appearance_ui_font_input(),
+        defaults.appearance.font_family
+    );
+    assert_eq!(ui.get_appearance_message_font_input(), "");
+    assert_eq!(ui.get_appearance_composer_font_input(), "");
+    assert_eq!(ui.get_appearance_mono_font_input(), "monospace");
+    let reset_draft = store.load().unwrap();
+    assert_eq!(
+        reset_draft.appearance.font_family,
+        defaults.appearance.font_family
+    );
+    assert_eq!(reset_draft.typography.message_font_family, None);
+    assert_eq!(reset_draft.typography.composer_font_family, None);
+    assert_eq!(reset_draft.typography.monospace_font_family, "monospace");
+    assert_eq!(
+        reset_draft.typography.message_size, 17,
+        "font reset keeps other preferences"
+    );
     store.save(&defaults).unwrap();
     apply_config(ui, &defaults, None);
+    // Restore the original motion control before its unchanged refusal check.
+    tab_to_control(ui, "Reduce motion, off");
     let invalid = "[appearance\nreduce_motion = true\n";
     std::fs::write(config_path, invalid).unwrap();
     key(ui, Key::Space);
@@ -1710,342 +1795,384 @@ async fn assert_seek_policy_and_thread_keeper(
 
     phase.set(97);
 
-    // The open thread: 60 mixed replies under a short root.
+    assert_thread_virtual_read_reporting(ui).await;
+
+    // The open thread is a real virtual list: its root/history context is
+    // virtual item zero; only mounted replies project their rich text.
     ui.invoke_show_thread_panel();
     let root = message_item(&rich_fixture(30_000));
     ui.set_thread_root_id("$fixture-30000:example.org".into());
     ui.set_thread_root_sender(root.sender);
     ui.set_thread_root_rich_body(root.rich_body);
     ui.set_thread_root_rich_accessible_body(root.rich_accessible_body);
-    let mut replies: Vec<_> = (30_001..30_061)
+    let old_draft = ui.get_thread_composer_text();
+    ui.set_thread_composer_text("A retained thread draft".into());
+    let mut replies: Vec<_> = (30_001..30_401)
         .map(|i| Arc::new(rich_fixture(i)))
         .collect();
+    Arc::make_mut(&mut replies[320]).sender = "@quinn:example.org".into();
     ui.set_thread_messages(update_shared(ModelRc::default(), replies.clone()));
     keep_thread_for_test(live);
     settle(ui).await;
+    assert_eq!(
+        control_bounds(ui, "REPLIES · 400").len(),
+        1,
+        "root context scrolls with the replies"
+    );
+    assert!(
+        control_bounds(ui, &replies[320].body).is_empty(),
+        "a far reply has no mounted subtree"
+    );
     let thread = |event: &str| seek_for_test(ui, live, Pane::Thread, event, None, None);
-    assert!(thread("$fixture-30030:example.org"));
-    assert!(thread_seek_stopped(ui).await, "the reply is placed");
-    settle(ui).await;
-    // The reader's anchor: a reply above 30,030 across the pane's top.
-    let reader = || {
-        let index = usize::try_from(ui.get_thread_anchor_index()).expect("an anchor");
-        let reply = rich_fixture(30_001 + index);
-        let event = format!("$fixture-{}:example.org", 30_001 + index);
-        assert_eq!(ui.get_thread_anchor_event().as_str(), event);
-        (index, control_bounds(ui, &reply.body))
-    };
-    let (index, held) = reader();
-    assert!((1..29).contains(&index), "below the first reply: {index}");
-    assert_eq!(held.len(), 1, "the anchor reply is laid out once");
-    let at = |index: usize| control_bounds(ui, &rich_fixture(30_001 + index).body);
-    // The first reply (always above the reader) becomes `lines` lines long.
-    // Hard line breaks, as Matrix sends them, so its growth never depends
-    // on word wrapping in the window's current width, fonts or styling.
-    let grow = |replies: &mut Vec<Arc<morpheus_matrix::MessageInfo>>, lines: usize| {
-        let more = vec!["It grew one line longer."; lines - 1].join("\n");
-        let row = Arc::make_mut(&mut replies[0]);
-        row.body = format!("Edited first reply.\n{more}");
-        row.rich_markdown = Some(row.body.replace('\n', "  \n"));
-        row.rich_accessible = Some(row.body.clone());
-        ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
-    };
-    // A text's laid-out height, from its real generated geometry. Every
-    // change above the reader below must really change the layout there:
-    // a place kept across no change would prove nothing.
-    let height_of = |label: &str| {
-        let bounds = control_bounds(ui, label);
-        assert_eq!(bounds.len(), 1, "laid out once: {label}");
-        bounds[0].bottom - bounds[0].top
-    };
-
-    // A reply above the reader grows: the anchor reply stays where it was.
-    let shorter = height_of(&replies[0].body);
-    grow(&mut replies, 6);
-    settle(ui).await;
-    let grown = height_of(&replies[0].body) - shorter;
-    assert!(grown > 1.0, "the first reply grew: {grown}");
-    let kept = at(index);
+    assert!(thread("$fixture-30321:example.org"));
     assert!(
-        (kept[0].top - held[0].top).abs() <= 1.0,
-        "{held:?} {kept:?}"
+        thread_seek_stopped(ui).await,
+        "the virtual reply is approached and placed"
     );
-
-    // The root above every reply reflows, from one line to four: it stays
-    // there too.
-    let root_label = rich_fixture(30_000).body;
-    let short_root = height_of(&root_label);
-    let longer = message_item(&rich_fixture(30_107));
-    ui.set_thread_root_rich_body(longer.rich_body);
     settle(ui).await;
-    let grown = height_of(&root_label) - short_root;
-    assert!(grown > 1.0, "the root grew: {grown}");
-    let kept = at(index);
-    assert!(
-        (kept[0].top - held[0].top).abs() <= 1.0,
-        "{held:?} {kept:?}"
+    assert_eq!(
+        control_bounds(ui, &replies[320].body).len(),
+        1,
+        "the actual requested reply is mounted"
     );
-
-    // The person scrolls: the anchor follows them, and the keeper then
-    // keeps the new place rather than pulling the old one back.
-    // An anchor can be mostly clipped, so its text center is not a valid
-    // wheel target. Aim inside the actual viewport containing that reply.
-    let target = control_with_label(ui, &rich_fixture(30_001 + index).body);
-    let mut viewports = Vec::new();
-    for node in geometry_nodes(ui) {
-        if node
-            .downcast::<slint::private_unstable_api::re_exports::Flickable>()
-            .is_none()
-        {
-            continue;
-        }
-        let contains_target = node
-            .visit_descendants(|item| {
-                if item == &target {
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            })
-            .is_some();
-        if contains_target {
-            viewports.push(item_bounds(&node));
-        }
-    }
-    assert_eq!(viewports.len(), 1, "one actual thread scroll viewport");
-    let viewport = viewports[0];
-    assert!(inside_window(ui, viewport), "{viewport:?}");
-    let position = slint::LogicalPosition::new(
-        (viewport.left + viewport.right) / 2.0,
-        (viewport.top + viewport.bottom) / 2.0,
+    assert!(
+        control_bounds(ui, &replies[0].body).is_empty(),
+        "the first reply is released outside the virtual range"
+    );
+    assert!(
+        control_bounds(ui, "REPLIES · 400").is_empty(),
+        "offscreen header is virtual too"
     );
     assert_eq!(
-        ui.window()
-            .dispatch_event_with_result(WindowEvent::PointerScrolled {
-                position,
-                delta_x: 0.0,
-                delta_y: -120.0,
-            })
-            .unwrap(),
-        slint::platform::WindowEventDispatchResult::Accepted,
-        "the wheel was accepted inside the thread viewport: {viewport:?}"
-    );
-    settle(ui).await;
-    let (moved, scrolled) = reader();
-    let followed = moved != index || (scrolled[0].top - kept[0].top).abs() > 1.0;
-    assert!(
-        followed,
-        "the anchor followed the scroll: viewport={viewport:?}, anchor={index}/{moved}, before={kept:?}, after={scrolled:?}"
-    );
-    let shorter = height_of(&replies[0].body);
-    grow(&mut replies, 9);
-    settle(ui).await;
-    let grown = height_of(&replies[0].body) - shorter;
-    assert!(grown > 1.0, "the first reply grew: {grown}");
-    let kept = at(moved);
-    assert!(
-        (kept[0].top - scrolled[0].top).abs() <= 1.0,
-        "{scrolled:?} {kept:?}"
+        ui.get_thread_composer_text().as_str(),
+        "A retained thread draft"
     );
 
-    // Behind a protected surface the keeper moves nothing: the reply moves
-    // with the layout, by exactly the growth above it, and its place is
-    // taken again.
+    // Same-count edits must update the source row through tracked indexing,
+    // not wait for another model-length change. Old text must disappear.
+    let old_body = replies[320].body.clone();
+    let edited = Arc::make_mut(&mut replies[320]);
+    edited.body = "An edited visible virtual reply".into();
+    edited.rich_markdown = Some(edited.body.clone());
+    edited.rich_accessible = Some(edited.body.clone());
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    settle(ui).await;
+    assert!(control_bounds(ui, &old_body).is_empty());
+    assert_eq!(control_bounds(ui, &replies[320].body).len(), 1);
+
+    // Appending must preserve the real focused control, not recreate every
+    // mounted delegate by replacing an integer-count model.
+    let seen = "Seen in this thread: who has read up to this reply from quinn";
+    request_bridge_focus(ui, seen);
+    let focused_reply = control_with_label(ui, seen);
+    replies.push(Arc::new(rich_fixture(30_401)));
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    settle(ui).await;
+    assert!(
+        focused_control_has_label(ui, seen),
+        "append retains actual focus"
+    );
+    assert!(
+        control_with_label(ui, seen) == focused_reply,
+        "append retains the same action instance"
+    );
+    assert_eq!(
+        ui.get_thread_composer_text().as_str(),
+        "A retained thread draft"
+    );
+
+    // Prepending changes the target index. The existing production anchor-seek
+    // admission resolves by event again, using a reply index (no header offset).
+    let held_event = ui.get_thread_anchor_event();
+    let held_offset = ui.get_thread_anchor_offset();
+    let held_index = usize::try_from(ui.get_thread_anchor_index()).unwrap();
+    let held_text = replies[held_index].body.clone();
+    let held = control_bounds(ui, &held_text);
+    assert_eq!(held.len(), 1);
+    let mut prepended: Vec<_> = (29_990..29_995)
+        .map(|i| Arc::new(rich_fixture(i)))
+        .collect();
+    prepended.extend(replies);
+    replies = prepended;
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    keep_thread_for_test(live);
+    assert!(seek_for_test(
+        ui,
+        live,
+        Pane::Thread,
+        held_event.as_str(),
+        Some(held_offset),
+        None
+    ));
+    assert_eq!(
+        ui.get_thread_seek_index(),
+        i32::try_from(held_index + 5).unwrap()
+    );
+    assert!(
+        thread_seek_stopped(ui).await,
+        "the shifted reply is resolved and kept"
+    );
+    settle(ui).await;
+    let kept = control_bounds(ui, &held_text);
+    assert_eq!(kept.len(), 1);
+    assert!(
+        (kept[0].top - held[0].top).abs() <= 1.0,
+        "prepend preserves reading position: {held:?} {kept:?}"
+    );
+
+    // Reflow a mounted row, not an offscreen reply. The actual text height
+    // changes; ListView may intrinsically retain its first drawn row. Custom
+    // keeper authority is checked separately rather than crediting that layout
+    // behavior to a client move.
+    let mounted_event = ui.get_thread_anchor_event();
+    let mounted_index = replies
+        .iter()
+        .position(|reply| reply.event_id.as_deref() == Some(mounted_event.as_str()))
+        .unwrap();
+    let row_bounds = |label: &str| {
+        let item = control_with_label(ui, label);
+        // StyledText is a native item inside the mounted conditional reply
+        // tree; physical root zero is that reply's own Rectangle.
+        let row = slint::private_unstable_api::re_exports::ItemRc::new(item.item_tree().clone(), 0);
+        let bounds = item_bounds(&row);
+        assert!(bounds.bottom - bounds.top >= item_bounds(&item).bottom - item_bounds(&item).top);
+        bounds
+    };
+    let grow_mounted = |rows: &mut Vec<Arc<morpheus_matrix::MessageInfo>>, lines: usize| {
+        let row = Arc::make_mut(&mut rows[mounted_index]);
+        row.body = vec!["A mounted reply reflows."; lines].join("\n");
+        row.rich_markdown = Some(row.body.replace('\n', "  \n"));
+        row.rich_accessible = Some(row.body.clone());
+        let body = row.body.clone();
+        ui.set_thread_messages(update_shared(ui.get_thread_messages(), rows.clone()));
+        body
+    };
+    let before = row_bounds(&replies[mounted_index].body);
+    let text = control_bounds(ui, &replies[mounted_index].body)[0];
+    keep_thread_for_test(live);
+    assert!(
+        ui.invoke_viewport_anchor_admit(),
+        "the current keeper is admitted"
+    );
+    let body = grow_mounted(&mut replies, 32);
+    settle(ui).await;
+    let grown = control_bounds(ui, &body)[0];
+    assert!(
+        grown.bottom - grown.top > text.bottom - text.top + 1.0,
+        "mounted text really grew"
+    );
+    let after = row_bounds(&body);
+    assert!(
+        (after.top - before.top).abs() <= 1.0,
+        "the actual anchored row stays in place"
+    );
+
+    // A header that is currently virtual performs no hidden layout work when
+    // its root text changes, and cannot disturb the mounted reader.
+    let root_body = "A reflowed thread root\nWith a second line\nAnd a third line\nStill in the same scroll context";
+    ui.set_thread_root_rich_body(StyledText::from_plain_text(root_body));
+    ui.set_thread_root_rich_accessible_body(root_body.into());
+    settle(ui).await;
+    assert!(
+        control_bounds(ui, root_body).is_empty(),
+        "the offscreen root stays virtual"
+    );
+    assert!((row_bounds(&body).top - after.top).abs() <= 1.0);
+
     ui.set_member_confirm_open(true);
     settle(ui).await;
-    let shorter = height_of(&replies[0].body);
-    // Where the first two replies' texts start, for the diagnostic below.
-    let (first_before, second_before) = (control_bounds(ui, &replies[0].body), at(1));
-    grow(&mut replies, 12);
-    settle(ui).await;
-    let grown = height_of(&replies[0].body) - shorter;
-    assert!(grown > 1.0, "the first reply grew: {grown}");
-    let after = at(moved);
-    if after[0].top <= kept[0].top + 1.0 || (after[0].top - kept[0].top - grown).abs() > 1.0 {
-        // The one bounded diagnostic of this point, for a hosted log:
-        // numbers and booleans only. The first reply's top moving is
-        // scrolling; the second reply not moving below the first is the
-        // layout; Rust admitting the keeper here is the keeper.
-        let top = |bounds: &[Bounds]| bounds.first().map_or(f32::NAN, |b| b.top);
-        let (first_now, second_now) = (control_bounds(ui, &replies[0].body), at(1));
-        let bottom = first_now.first().map_or(f32::NAN, |b| b.bottom);
-        eprintln!(
-            concat!(
-                "MORPHEUS_THREAD_KEEPER_BLOCKED grown={:.1} first={:.1}/{:.1}",
-                " first_bottom={:.1} second={:.1}/{:.1} reader={:.1}/{:.1}",
-                " modal={} allowed={} admit={} anchor={} offset={:.1} seek={}"
-            ),
-            grown,
-            top(&first_before),
-            top(&first_now),
-            bottom,
-            top(&second_before),
-            top(&second_now),
-            kept[0].top,
-            after[0].top,
-            ui.get_member_confirm_open(),
-            ui.get_viewport_seek_allowed(),
-            ui.invoke_viewport_anchor_admit(),
-            ui.get_thread_anchor_index(),
-            ui.get_thread_anchor_offset(),
-            ui.get_thread_seek_id()
-        );
-    }
-    assert!(after[0].top > kept[0].top + 1.0, "moved with the layout");
-    let shift = after[0].top - kept[0].top;
     assert!(
-        (shift - grown).abs() <= 1.0,
-        "by that growth: {shift} {grown}"
+        !ui.invoke_viewport_anchor_admit(),
+        "a modal withdraws the custom keeper"
     );
+    let body = grow_mounted(&mut replies, 40);
+    settle(ui).await;
+    assert!(!ui.invoke_viewport_anchor_admit());
+    assert_eq!(
+        ui.get_thread_seek_id(),
+        0,
+        "no seek is started by protected reflow"
+    );
+    let protected = row_bounds(&body);
     ui.set_member_confirm_open(false);
-    settle(ui).await;
-
-    // Nothing moves late once it closes: the keeper ended when the surface
-    // came up and stays stopped until the thread's next publication binds
-    // it again. The reply across the top takes the anchor again, and the
-    // next layout change above it is still not corrected.
-    for _ in 0..2 {
+    for _ in 0..3 {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
         settle(ui).await;
     }
-    let closed = at(moved);
     assert!(
-        (closed[0].top - after[0].top).abs() <= 1.0,
-        "no late move: {after:?} {closed:?}"
+        !ui.invoke_viewport_anchor_admit(),
+        "closing a modal never resumes the old keeper"
     );
     assert!(
-        ui.get_thread_anchor_index() >= 0,
-        "the anchor is taken again"
+        (row_bounds(&body).top - protected.top).abs() <= 1.0,
+        "no late client movement after close"
     );
-    let shorter = height_of(&replies[0].body);
-    grow(&mut replies, 13);
+    let _body = grow_mounted(&mut replies, 48);
     settle(ui).await;
-    let grown = height_of(&replies[0].body) - shorter;
-    assert!(grown > 1.0, "the first reply grew: {grown}");
-    let later = at(moved);
-    let shift = later[0].top - closed[0].top;
     assert!(
-        (shift - grown).abs() <= 1.0,
-        "not corrected: {shift} {grown}"
+        !ui.invoke_viewport_anchor_admit(),
+        "another layout cannot renew withdrawn authority"
     );
+    assert_eq!(ui.get_thread_seek_id(), 0);
 
-    // A brief protected entry (opened and closed before any change handler
-    // runs) also stops the thread keeper, at once, until the thread's next
-    // publication binds it again: the next layout change is not corrected.
+    // A protected entry that opens and closes in the same turn withdraws at
+    // the entry itself; deferred UI change handlers cannot revive the keeper.
     keep_thread_for_test(live);
-    for _ in 0..2 {
-        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
-        settle(ui).await;
-    }
-    let (index, before) = reader();
+    assert!(ui.invoke_viewport_anchor_admit());
     crate::matrix_links::clear(ui);
     ui.set_account_menu_open(true);
     ui.set_account_menu_open(false);
-    grow(&mut replies, 14);
+    assert!(
+        !ui.invoke_viewport_anchor_admit(),
+        "brief entry withdraws synchronously"
+    );
+    let _body = grow_mounted(&mut replies, 56);
     settle(ui).await;
-    let after = at(index);
-    assert!(after[0].top > before[0].top + 1.0, "the keeper was stopped");
+    assert!(!ui.invoke_viewport_anchor_admit());
+    assert_eq!(ui.get_thread_seek_id(), 0);
 
-    // An older link's stale cleanup leaves the keeper bound: after a hidden
-    // link A's timer and read's completion, once a newer open moved A's
-    // navigation, the next layout change is still corrected.
+    // Cleanup from an older link is not a new entry and cannot revoke a
+    // keeper belonging to the newer navigation/publication.
     keep_thread_for_test(live);
-    for _ in 0..2 {
-        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
-        settle(ui).await;
-    }
-    let (index, before) = reader();
     let was_live = live.is_live.swap(true, Ordering::AcqRel);
     let clicked = live.current_navigation_epoch();
     live.invalidate_navigation();
     crate::matrix_links::tests::end_stale_reads(ui, live, clicked);
     live.is_live.store(was_live, Ordering::Release);
-    let shorter = height_of(&replies[0].body);
-    grow(&mut replies, 15);
-    settle(ui).await;
-    let grown = height_of(&replies[0].body) - shorter;
-    assert!(grown > 1.0, "the first reply grew: {grown}");
-    let after = at(index);
     assert!(
-        (after[0].top - before[0].top).abs() <= 1.0,
-        "{before:?} {after:?}"
+        ui.invoke_viewport_anchor_admit(),
+        "stale cleanup preserves the newer keeper"
     );
+    let before = row_bounds(&replies[mounted_index].body);
+    let body = grow_mounted(&mut replies, 64);
+    settle(ui).await;
+    assert!(ui.invoke_viewport_anchor_admit());
+    assert!((row_bounds(&body).top - before.top).abs() <= 1.0);
+
+    // Protected surfaces and security generation changes still retire seeks
+    // before the virtual list can approach another reply, with no late resume.
+    ui.set_member_confirm_open(true);
+    settle(ui).await;
+    assert!(thread("$fixture-29990:example.org"));
+    assert_eq!(
+        ui.get_thread_seek_id(),
+        0,
+        "no move behind a protected surface"
+    );
+    assert!(control_bounds(ui, &replies[0].body).is_empty());
+    ui.set_member_confirm_open(false);
+    settle(ui).await;
+    assert!(thread("$fixture-29990:example.org"));
+    let step = live.security_gate.try_account_access().expect("idle gate");
+    assert!(
+        thread_seek_stopped(ui).await,
+        "security transition retires the virtual seek"
+    );
+    drop(step);
+    assert_eq!(ui.get_thread_seek_id(), 0, "no late resume");
 
     phase.set(98);
-
-    // The thread's scrollbar wheel moves the replies without reporting as
-    // scrolled. A seek waiting for its reply sees that scrolling and ends
-    // without moving anything once the reply arrives. The bar is the
-    // pane's last 14 px, beyond the 12 px padding of the replies' layout,
-    // whose full width the REPLIES heading takes.
-    let heading = control_bounds(ui, "REPLIES · 60");
-    assert_eq!(heading.len(), 1, "the replies heading");
-    assert!(thread("$fixture-30061:example.org"));
+    // A missing reply waits without a speculative MAX index move. The person's
+    // scrollbar movement wins before that reply arrives; publication must not
+    // pull them to the late target.
+    assert!(thread("$fixture-30321:example.org"));
+    assert!(thread_seek_stopped(ui).await);
     settle(ui).await;
-    assert_ne!(ui.get_thread_seek_id(), 0, "waiting for its reply");
-    let before = at(moved);
-    let bar = slint::LogicalPosition::new(
-        heading[0].right + 5.0,
-        (before[0].top + before[0].bottom) / 2.0,
-    );
-    ui.window().dispatch_event(WindowEvent::PointerScrolled {
-        position: bar,
-        delta_x: 0.0,
-        delta_y: -120.0,
-    });
-    settle(ui).await;
-    let wheeled = at(moved);
-    assert!((wheeled[0].top - before[0].top).abs() > 1.0, "moved");
-    // Not reported as scrolled: only the seek's own check can end it.
-    assert_ne!(ui.get_thread_seek_id(), 0, "the bar's wheel is silent");
-    replies.push(Arc::new(rich_fixture(30_061)));
-    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
-    // Force the matching row's actual conditional holders and geometry. Its
-    // init/layout must not end and destroy its own seek holder synchronously.
-    assert_eq!(control_bounds(ui, &replies.last().unwrap().body).len(), 1);
-    assert_ne!(ui.get_thread_seek_id(), 0, "placement waits for its frame");
-    assert!(thread_seek_stopped(ui).await, "the seek ended");
-    let after = at(moved);
-    assert!((after[0].top - wheeled[0].top).abs() <= 1.0, "kept");
-
-    // The same with a pane created only after its seek began: a reveal set
-    // before the thread's pane exists, which its own init then joins. The
-    // pane goes away, and the panel is shown again with a seek for a missing
-    // reply, both before any settle.
-    ui.set_thread_root_id("".into());
-    settle(ui).await;
-    assert!(control_bounds(ui, "REPLIES · 61").is_empty(), "no pane");
-    ui.invoke_show_thread_panel();
-    ui.set_thread_root_id("$fixture-30000:example.org".into());
-    assert!(thread("$fixture-30062:example.org"));
-    assert_ne!(ui.get_thread_seek_id(), 0, "before the pane exists");
-    settle(ui).await;
-    let heading = control_bounds(ui, "REPLIES · 61");
-    assert_eq!(heading.len(), 1, "the new pane is laid out");
-    let bar = slint::LogicalPosition::new(
-        heading[0].right + 5.0,
-        (heading[0].top + heading[0].bottom) / 2.0,
-    );
-    ui.window().dispatch_event(WindowEvent::PointerScrolled {
-        position: bar,
-        delta_x: 0.0,
-        delta_y: -120.0,
-    });
-    settle(ui).await;
-    let wheeled = control_bounds(ui, "REPLIES · 61");
-    assert!((wheeled[0].top - heading[0].top).abs() > 1.0, "moved");
-    assert_ne!(ui.get_thread_seek_id(), 0, "the bar's wheel is silent");
-    replies.push(Arc::new(rich_fixture(30_062)));
-    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
-    assert_eq!(control_bounds(ui, &replies.last().unwrap().body).len(), 1);
+    let current_event = ui.get_thread_anchor_event();
+    let current_offset = ui.get_thread_anchor_offset();
+    let current_index = usize::try_from(ui.get_thread_anchor_index()).unwrap();
+    let current_text = replies[current_index].body.clone();
+    let target = control_with_label(ui, &current_text);
+    let mut viewports = Vec::new();
+    for node in geometry_nodes(ui) {
+        if node
+            .downcast::<slint::private_unstable_api::re_exports::Flickable>()
+            .is_some()
+            && node
+                .visit_descendants(|item| {
+                    if item == &target {
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    }
+                })
+                .is_some()
+        {
+            viewports.push(item_bounds(&node));
+        }
+    }
+    assert_eq!(viewports.len(), 1);
+    let viewport = viewports[0];
+    assert!(inside_window(ui, viewport));
+    assert!(thread("$fixture-30402:example.org"));
     assert_ne!(
         ui.get_thread_seek_id(),
         0,
-        "the recreated pane defers placement"
+        "waiting for a not-yet-loaded reply"
     );
-    assert!(thread_seek_stopped(ui).await, "the seek ended");
-    let after = control_bounds(ui, "REPLIES · 62");
-    assert!((after[0].top - wheeled[0].top).abs() <= 1.0, "kept");
+    let position =
+        slint::LogicalPosition::new(viewport.right - 3.0, (viewport.top + viewport.bottom) / 2.0);
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position,
+        delta_x: 0.0,
+        delta_y: -120.0,
+    });
+    settle(ui).await;
+    let scrolled_event = ui.get_thread_anchor_event();
+    let scrolled_offset = ui.get_thread_anchor_offset();
+    assert!(
+        scrolled_event != current_event || (scrolled_offset - current_offset).abs() > 1.0,
+        "the actual scrollbar moved"
+    );
+    replies.push(Arc::new(rich_fixture(30_402)));
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    assert!(
+        thread_seek_stopped(ui).await,
+        "the person's scrolling ends the waiting seek"
+    );
+    settle(ui).await;
+    assert_eq!(
+        ui.get_thread_anchor_event(),
+        scrolled_event,
+        "late reply cannot take the viewport"
+    );
+    assert!((ui.get_thread_anchor_offset() - scrolled_offset).abs() <= 1.0);
+    assert!(
+        control_bounds(ui, &replies.last().unwrap().body).is_empty(),
+        "late target stays virtual"
+    );
+    // A list mounted after its seek began still detects the person's first
+    // scroll. Its old window anchor belongs to the previous list, not this one.
+    ui.set_thread_root_id("".into());
+    settle(ui).await;
+    ui.set_thread_root_id("$fixture-30000:example.org".into());
+    assert!(thread("$fixture-30403:example.org"));
+    assert_ne!(ui.get_thread_seek_id(), 0, "the pane has not mounted yet");
+    settle(ui).await;
+    assert_eq!(
+        control_bounds(ui, &format!("REPLIES · {}", replies.len())).len(),
+        1
+    );
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position,
+        delta_x: 0.0,
+        delta_y: -480.0,
+    });
+    settle(ui).await;
+    let recreated_event = ui.get_thread_anchor_event();
+    let recreated_offset = ui.get_thread_anchor_offset();
+    replies.push(Arc::new(rich_fixture(30_403)));
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    assert!(thread_seek_stopped(ui).await);
+    settle(ui).await;
+    assert_eq!(
+        ui.get_thread_anchor_event(),
+        recreated_event,
+        "late placement cannot move a recreated pane"
+    );
+    assert!((ui.get_thread_anchor_offset() - recreated_offset).abs() <= 1.0);
+    assert!(control_bounds(ui, &replies.last().unwrap().body).is_empty());
+    ui.set_thread_composer_text(old_draft);
 
     ui.set_thread_messages(ModelRc::new(VecModel::<MessageItem>::default()));
     ui.set_thread_root_id("".into());
@@ -2057,6 +2184,265 @@ async fn assert_seek_policy_and_thread_keeper(
     ui.set_show_side_panel(old_side);
     ui.set_live_session(old_live);
     settle(ui).await;
+}
+
+/// The existing generated-UI phase owns a separate stand-in window here so
+/// capturing read reports never replaces the main fixture's installed owner.
+async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
+    use crate::timeline_model::{tests::rich_fixture, update_shared};
+    use std::{
+        cell::{Cell, RefCell},
+        ops::ControlFlow,
+        rc::Rc,
+    };
+
+    let ui = AppWindow::new().unwrap();
+    crate::timeline_model::register_thread_rows(&ui);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_show_sign_in(false);
+    ui.set_live_session(true);
+    ui.set_page(0);
+    ui.set_active_account_local_id("thread-read-fixture".into());
+    ui.set_active_room_id("!thread-read:example.org".into());
+    ui.set_thread_root_id("$thread-read-root:example.org".into());
+    ui.set_thread_root_sender("quinn".into());
+    ui.set_thread_root_rich_body(slint::StyledText::from_plain_text(
+        "A scrollable thread root",
+    ));
+    ui.set_thread_root_rich_accessible_body("A scrollable thread root".into());
+    ui.invoke_show_thread_panel();
+    let reports = Rc::new(RefCell::new(Vec::<(bool, String)>::new()));
+    let observed = reports.clone();
+    ui.global::<crate::RoomActivity>()
+        .on_read_view(move |thread, event| {
+            observed.borrow_mut().push((thread, event.to_string()));
+        });
+    let contexts = Rc::new(Cell::new(0));
+    let observed = contexts.clone();
+    ui.global::<crate::RoomActivity>()
+        .on_context_changed(move || {
+            observed.set(observed.get() + 1);
+        });
+    let mut rows: Vec<_> = (31_000..31_400)
+        .map(|i| Arc::new(rich_fixture(i)))
+        .collect();
+    let first = rows[0].body.clone();
+    let last = rows.last().unwrap().event_id.as_ref().unwrap().clone();
+    ui.set_thread_messages(update_shared(ModelRc::default(), rows.clone()));
+    ui.show().unwrap();
+    ui.window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
+    settle(&ui).await;
+    for _ in 0..4 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+    }
+    assert!(control_bounds(&ui, &rows.last().unwrap().body).is_empty());
+    assert!(
+        reports.borrow().iter().all(|(_, event)| event.is_empty()),
+        "a virtual tail cannot mark the last reply read"
+    );
+    let target = control_with_label(&ui, &first);
+    let viewports: Vec<_> = geometry_nodes(&ui)
+        .into_iter()
+        .filter(|node| {
+            node.downcast::<slint::private_unstable_api::re_exports::Flickable>()
+                .is_some()
+                && node
+                    .visit_descendants(|item| {
+                        if item == &target {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    })
+                    .is_some()
+        })
+        .map(|node| item_bounds(&node))
+        .collect();
+    assert_eq!(viewports.len(), 1);
+    let viewport = viewports[0];
+    let position = slint::LogicalPosition::new(
+        (viewport.left + viewport.right) / 2.0,
+        (viewport.top + viewport.bottom) / 2.0,
+    );
+    let wheel = |delta| {
+        ui.window().dispatch_event(WindowEvent::PointerScrolled {
+            position,
+            delta_x: 0.0,
+            delta_y: delta,
+        });
+    };
+    wheel(-1_000_000.0);
+    // A timer may report the tail before the same tick updates the virtual
+    // layout. Wait for current mounted geometry and current read authority;
+    // an earlier positive report cannot prove that the tail remains visible.
+    let latest_tail_report = || {
+        reports
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(thread, _)| *thread)
+            .is_some_and(|(_, event)| event == &last)
+    };
+    for _ in 0..40 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+        let tail_mounted = control_bounds(&ui, &rows.last().unwrap().body).len() == 1;
+        if tail_mounted && latest_tail_report() {
+            break;
+        }
+    }
+    assert_eq!(
+        control_bounds(&ui, &rows.last().unwrap().body).len(),
+        1,
+        "the actual tail is mounted"
+    );
+    assert!(
+        latest_tail_report(),
+        "only the laid-out visible tail reports progress"
+    );
+
+    let at = reports.borrow().len();
+    wheel(1_000_000.0);
+    settle(&ui).await;
+    assert!(
+        control_bounds(&ui, &rows.last().unwrap().body).is_empty(),
+        "scrolling releases the tail"
+    );
+    assert!(
+        reports.borrow()[at..]
+            .iter()
+            .any(|(thread, event)| *thread && event.is_empty()),
+        "scroll-away revokes before the tail disappears"
+    );
+    for _ in 0..4 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+    }
+    assert!(
+        reports.borrow()[at..]
+            .iter()
+            .all(|(_, event)| event.is_empty()),
+        "an unmounted tail cannot rearm"
+    );
+
+    wheel(-1_000_000.0);
+    for _ in 0..40 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+        if reports
+            .borrow()
+            .last()
+            .is_some_and(|(thread, event)| *thread && event == &last)
+        {
+            break;
+        }
+    }
+    assert!(
+        reports
+            .borrow()
+            .last()
+            .is_some_and(|(_, event)| event == &last)
+    );
+    let at = reports.borrow().len();
+    rows.push(Arc::new(rich_fixture(31_400)));
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), rows.clone()));
+    settle(&ui).await;
+    assert!(
+        reports.borrow()[at..]
+            .first()
+            .is_some_and(|(thread, event)| *thread && event.is_empty()),
+        "append revokes the previous last-row authority first"
+    );
+    assert!(
+        reports.borrow()[at..]
+            .iter()
+            .all(|(_, event)| event != &last)
+    );
+
+    // Replace the model with the same row count: no extent/count delta is
+    // allowed to keep the old read authority alive. Its header token is read
+    // without mounting a header or touching any MessageItem.
+    let at = reports.borrow().len();
+    let reset: Vec<_> = (32_000..32_401)
+        .map(|i| Arc::new(rich_fixture(i)))
+        .collect();
+    ui.set_thread_messages(update_shared(ModelRc::default(), reset));
+    settle(&ui).await;
+    assert!(
+        reports.borrow()[at..]
+            .first()
+            .is_some_and(|(thread, event)| *thread && event.is_empty()),
+        "same-count model replacement revokes first"
+    );
+    let at = reports.borrow().len();
+    // A real same-model reset also invalidates the scalar generation even
+    // when the count is unchanged (the existing source's bulk reset path).
+    let reset: Vec<_> = (33_000..33_401)
+        .map(|i| Arc::new(rich_fixture(i)))
+        .collect();
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), reset));
+    settle(&ui).await;
+    assert!(
+        reports.borrow()[at..]
+            .first()
+            .is_some_and(|(thread, event)| *thread && event.is_empty()),
+        "same-count source reset revokes first"
+    );
+
+    wheel(-1_000_000.0);
+    for _ in 0..40 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+        if reports
+            .borrow()
+            .last()
+            .is_some_and(|(_, event)| !event.is_empty())
+        {
+            break;
+        }
+    }
+    assert!(
+        reports
+            .borrow()
+            .last()
+            .is_some_and(|(_, event)| !event.is_empty())
+    );
+    let at = reports.borrow().len();
+    ui.set_member_confirm_open(true);
+    settle(&ui).await;
+    assert!(
+        reports.borrow()[at..]
+            .first()
+            .is_some_and(|(_, event)| event.is_empty()),
+        "protected entry revokes the bridge"
+    );
+    for _ in 0..4 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(&ui).await;
+    }
+    assert!(
+        reports.borrow()[at..]
+            .iter()
+            .all(|(_, event)| event.is_empty()),
+        "a protected tail never rearms"
+    );
+    ui.set_member_confirm_open(false);
+    settle(&ui).await;
+    let before = contexts.get();
+    ui.set_show_side_panel(false);
+    settle(&ui).await;
+    assert!(
+        contexts.get() > before,
+        "unmounting the pane sends the existing owner context withdrawal"
+    );
+    ui.set_live_session(false);
+    ui.hide().unwrap();
+    settle(&ui).await;
+    main_ui
+        .window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
 }
 
 /// Run the window until its thread seek ended, bounded at 60 passes of 16 ms.
@@ -3030,6 +3416,56 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     // Preserve the original local drop order, and identify whether releasing
     // this Arc returns; this is not a receipt for every runtime descendant.
     drop(_entered);
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_release");
+    drop(runtime);
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_released");
+}
+
+// Run this exact ignored case in its own process: Slint's testing backend is
+// process-global. The default account UI case above keeps every transition;
+// a live timeline deadline must not also pay for that separate offline suite.
+#[test]
+#[ignore = "requires disposable Matrix accounts and an isolated fixture vault"]
+fn live_slint_timeline_controller() {
+    run_live_controller_ui(false);
+}
+
+#[test]
+#[ignore = "requires disposable Matrix accounts and an isolated fixture vault"]
+fn live_slint_people_controller() {
+    run_live_controller_ui(true);
+}
+
+fn run_live_controller_ui(people: bool) {
+    assert!(
+        std::env::var_os("MORPHEUS_MATRIX_TEST_ACCOUNTS").is_some(),
+        "live controller acceptance requires a disposable fixture"
+    );
+    i_slint_backend_testing::init_integration_test_with_mock_time();
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    let entered = runtime.enter();
+    let runtime_handle = runtime.handle().clone();
+    slint::spawn_local(async move {
+        if people {
+            eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_entered");
+            crate::people_directory::live_tests::run_if_configured(runtime_handle).await;
+            eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_returned");
+        } else {
+            crate::live::timeline_controller_tests::run_if_configured(runtime_handle).await;
+        }
+        slint::quit_event_loop().unwrap();
+        eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL quit_requested");
+    })
+    .unwrap();
+    slint::run_event_loop_until_quit().unwrap();
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL loop_returned");
+    drop(entered);
     eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_release");
     drop(runtime);
     eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_released");
@@ -5175,6 +5611,45 @@ async fn assert_seen_by_modal_guard(ui: &AppWindow) {
     ui.set_messages(ModelRc::new(VecModel::from(vec![row])));
     settle(ui).await;
     let opener = "Seen by: who has read up to this message from Robin";
+    // A quiet action keeps its actual button, geometry and AT focus target
+    // while its unused glyph is absent. Reveal by pointer and by bridge focus.
+    ui.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(0.0, 0.0),
+    });
+    ui.invoke_focus_composer(false);
+    settle(ui).await;
+    let (quiet_bounds, quiet) = drawn_icon(ui, opener);
+    assert!(quiet.commands.is_empty() && quiet.texts.is_empty());
+    ui.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(
+            (quiet_bounds.left + quiet_bounds.right) / 2.0,
+            (quiet_bounds.top + quiet_bounds.bottom) / 2.0,
+        ),
+    });
+    settle(ui).await;
+    let (hover_bounds, hovered) = drawn_icon(ui, opener);
+    assert_eq!(
+        hover_bounds, quiet_bounds,
+        "glyph reveal must not move the action"
+    );
+    // Seen-by uses the existing unmapped "✓✓" text fallback, not a path.
+    assert!(hovered.commands.is_empty());
+    assert_eq!(hovered.texts, vec!["✓✓".to_owned()]);
+    ui.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(0.0, 0.0),
+    });
+    settle(ui).await;
+    let hidden = drawn_icon(ui, opener).1;
+    assert!(hidden.commands.is_empty() && hidden.texts.is_empty());
+    request_bridge_focus(ui, opener);
+    settle(ui).await;
+    let (focus_bounds, focused) = drawn_icon(ui, opener);
+    assert_eq!(
+        focus_bounds, quiet_bounds,
+        "keyboard reveal keeps the same target"
+    );
+    assert!(focused.commands.is_empty());
+    assert_eq!(focused.texts, vec!["✓✓".to_owned()]);
     let close = "Close read receipts";
     let press = |text: &str| ui.invoke_dispatch_shortcut(text.into(), true, false, true, false);
     control_with_label(ui, opener).accessible_action(&AccessibilityAction::Default);
@@ -5196,6 +5671,19 @@ async fn assert_seen_by_modal_guard(ui: &AppWindow) {
         focused_control_has_label(ui, opener),
         "focus did not return to the action that opened Seen by"
     );
+    let returned = drawn_icon(ui, opener).1;
+    assert!(returned.commands.is_empty());
+    assert_eq!(returned.texts, vec!["✓✓".to_owned()]);
+    key(ui, Key::Space);
+    settle(ui).await;
+    assert!(
+        activity.get_seen_open(),
+        "the revealed action still accepts Space"
+    );
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!activity.get_seen_open());
+    assert!(focused_control_has_label(ui, opener));
     // Shortcuts run again once it is closed (the details panel, twice).
     assert!(press("d"));
     assert!(press("d"));
@@ -5769,6 +6257,39 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     settle(ui).await;
     assert!(!ui.get_style_profile_items().row_data(0).unwrap().current);
     ui.invoke_style_profile_chosen(item.key.clone());
+    // A typed four-field form remains local while a profile changes the look.
+    assert!(
+        !ui.get_appearance_fonts_dirty(),
+        "projection is not a user edit"
+    );
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Interface font family"));
+    ui.set_appearance_ui_font_input("Draft interface".into());
+    key(ui, Key::End);
+    type_text(ui, " typed");
+    ui.set_appearance_message_font_input("Draft messages".into());
+    ui.set_appearance_composer_font_input("Draft composer".into());
+    ui.set_appearance_mono_font_input("Draft monospace".into());
+    assert!(ui.get_appearance_fonts_dirty());
+    let font_drafts = (
+        ui.get_appearance_ui_font_input(),
+        ui.get_appearance_message_font_input(),
+        ui.get_appearance_composer_font_input(),
+        ui.get_appearance_mono_font_input(),
+    );
+    let assert_font_drafts = |ui: &AppWindow| {
+        assert!(ui.get_appearance_fonts_dirty());
+        assert_eq!(
+            (
+                ui.get_appearance_ui_font_input(),
+                ui.get_appearance_message_font_input(),
+                ui.get_appearance_composer_font_input(),
+                ui.get_appearance_mono_font_input(),
+            ),
+            font_drafts
+        );
+    };
     let preview = |ui: &AppWindow| {
         ui.invoke_style_profile_preview();
         assert!(ui.get_style_preview_active());
@@ -5778,10 +6299,13 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     settle(ui).await;
     assert_eq!(ui.get_message_font_size(), 15);
     assert_eq!(store.load().unwrap(), larger, "a preview saves nothing");
+    assert_font_drafts(ui);
     ui.invoke_style_profile_cancel_preview();
     settle(ui).await;
     assert!(!ui.get_style_preview_active());
     assert_eq!(ui.get_message_font_size(), 20);
+    assert_font_drafts(ui);
+    assert_eq!(store.load().unwrap(), larger, "cancel saves no font draft");
 
     // A save that would change the look is refused and ends the preview.
     preview(ui);
@@ -5879,6 +6403,12 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     assert!(!ui.get_style_preview_active());
     assert_eq!(ui.get_message_font_size(), 15);
     assert!(ui.get_style_profile_items().row_data(0).unwrap().current);
+    assert_font_drafts(ui);
+    assert_eq!(
+        applied.appearance.font_family,
+        config.appearance.font_family
+    );
+    assert_ne!(applied.appearance.font_family, font_drafts.0.as_str());
 
     // An invalid settings file is never overwritten by Apply.
     let broken = "schema_version = 1\n[typography]\nmessage_size = 999\n";
@@ -5901,6 +6431,8 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     assert_eq!(store.load().unwrap(), applied);
     assert_eq!(ui.get_style_profile_items().row_count(), 0);
 
+    // End only this synthetic window form before the next unrelated scenario.
+    ui.set_appearance_fonts_dirty(false);
     ui.set_page(0);
     apply_config(ui, &Config::default(), None);
     settle(ui).await;
@@ -6613,6 +7145,7 @@ async fn exercise_account_ui(
     let manager =
         Arc::new(morpheus_matrix::AccountManager::open(directory.path().join("profile")).unwrap());
     let ui = AppWindow::new().unwrap();
+    crate::timeline_model::register_thread_rows(&ui);
     assert_live_font_projections(&ui);
     ui.set_show_sign_in(false);
     ui.window().set_size(slint::PhysicalSize::new(1280, 900));
@@ -9198,7 +9731,11 @@ fn assert_record_scroll_range(ui: &AppWindow, labels: &[&str], threaded: bool) {
         root.visit_descendants(|item| {
             if let Some(flickable) = item.downcast::<Flickable>() {
                 let contains = item.visit_descendants(|child| {
-                    if child == &target { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+                    if child == &target {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
                 }).is_some();
                 if contains {
                     ancestors += 1;
@@ -10087,6 +10624,100 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
         "the strip must not push the composer out of the lower part of the window: {:?}",
         composer[0]
     );
+    // At the supported minimum, simultaneous global notices get their own
+    // bounded viewport instead of pushing the conversation/composer offscreen.
+    // Every record stays present; ordinary Tab reveals notice/attachment actions.
+    // Three attachment rows share the same finite canvas with eight saved sends;
+    // these are in-memory rows and no action is activated or file accessed.
+    let before_size = ui.window().size();
+    let before_studio_notice = ui.get_studio_notice();
+    let before_profile_notice = ui.get_style_profile_notice();
+    let before_studio_pending = ui.get_studio_pending();
+    let before_studio_conflicts = ui.get_studio_conflicts();
+    let before_attachments = ui.get_attachment_items();
+    let before_ready_count = ui.get_attachment_ready_count();
+    let before_attachment_status = ui.get_attachment_status();
+    let before_recovery_serial = ui.get_timeline_recovery_serial();
+    ui.set_studio_notice("Synthetic appearance result remains available".into());
+    ui.set_style_profile_notice("Synthetic style profile result remains available".into());
+    ui.set_studio_pending(1);
+    ui.set_studio_conflicts(0);
+    ui.set_timeline_recovery_serial(101);
+    ui.set_attachment_items(ModelRc::new(VecModel::from(
+        (1..=3)
+            .map(|id| crate::AttachmentItem {
+                id,
+                name: format!("synthetic bounded file {id}").into(),
+                detail: "1 KiB".into(),
+                status: "Ready".into(),
+                progress: -1.0,
+                can_remove: true,
+                can_move_up: id > 1,
+                can_move_down: id < 3,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_attachment_ready_count(3);
+    ui.set_attachment_status("Three synthetic ready attachments".into());
+    let rail = if ui.get_navigation_mode() == 0 {
+        ui.get_rail_width_px()
+    } else {
+        0
+    };
+    let minimum_width = (rail + ui.get_room_list_width() + ui.get_details_width() + 360).max(940);
+    ui.window()
+        .set_size(slint::PhysicalSize::new(minimum_width as u32, 620));
+    settle(ui).await;
+    assert_eq!(ui.get_composer_pending_items().row_count(), 8);
+    let compact_composer = control_bounds(ui, &composer_label);
+    let conversation = control_bounds(ui, "Messages in this room");
+    assert_eq!((compact_composer.len(), conversation.len()), (1, 1));
+    assert!(inside_window(ui, compact_composer[0]));
+    assert!(inside_window(ui, conversation[0]));
+    assert!(conversation[0].bottom - conversation[0].top >= 49.5);
+    for label in [
+        "Discard the unsaved appearance changes and restore your saved look",
+        "Save the appearance changes to the settings file",
+        "Dismiss the appearance notice",
+        "Dismiss the style profile notice",
+        "Open Security and recovery settings for this account",
+    ] {
+        tab_to_control(ui, label);
+        let action = button_bounds(ui, label);
+        assert_eq!(action.len(), 1);
+        assert!(inside_window(ui, action[0]), "{label}: {:?}", action[0]);
+        assert!(inside_window(ui, control_bounds(ui, &composer_label)[0]));
+    }
+    for label in [
+        "Send 3 ready attachments",
+        "Remove synthetic bounded file 1",
+        "Send synthetic bounded file 1 later",
+        "Send synthetic bounded file 2 earlier",
+        "Send synthetic bounded file 2 later",
+        "Remove synthetic bounded file 2",
+        "Send synthetic bounded file 3 earlier",
+        "Remove synthetic bounded file 3",
+    ] {
+        tab_to_control(ui, label);
+        let action = button_bounds(ui, label);
+        assert_eq!(action.len(), 1);
+        assert!(inside_window(ui, action[0]), "{label}: {:?}", action[0]);
+        assert!(inside_window(ui, control_bounds(ui, &composer_label)[0]));
+    }
+    assert_eq!(ui.get_attachment_items().row_count(), 3);
+    assert_eq!(ui.get_composer_pending_items().row_count(), 8);
+    ui.set_attachment_items(before_attachments);
+    ui.set_attachment_ready_count(before_ready_count);
+    ui.set_attachment_status(before_attachment_status);
+    ui.set_timeline_recovery_serial(before_recovery_serial);
+    ui.set_studio_notice(before_studio_notice);
+    ui.set_style_profile_notice(before_profile_notice);
+    ui.set_studio_pending(before_studio_pending);
+    ui.set_studio_conflicts(before_studio_conflicts);
+    ui.window().set_size(before_size);
+    settle(ui).await;
+
     // Focus walks every control of all eight records down to the composer
     // input; each strip control is scrolled fully into view on both axes
     // when it receives focus, so the deepest record is reachable by keyboard
@@ -13107,6 +13738,7 @@ async fn assert_inline_audio_card_layout() {
     const EVENT: &str = "$audio-layout:example.org";
     const STATUS: &str = "Playing in memory. This synthetic status wraps in a narrow pane without covering any playback action.";
     let ui = AppWindow::new().unwrap();
+    crate::timeline_model::register_thread_rows(&ui);
     ui.window().set_size(slint::PhysicalSize::new(1280, 900));
     ui.set_show_sign_in(false);
     ui.set_page(0);
@@ -14247,6 +14879,195 @@ async fn assert_font_browser(ui: &AppWindow, directory: &std::path::Path) {
     // Following the inherited font removes only that role's own value.
     ui.invoke_font_browser_inherit();
     assert_eq!(store.load().unwrap().typography.message_font_family, None);
+    ui.invoke_font_browser_close();
+    assert!(!ui.get_font_browser_open());
+    settle(ui).await;
+
+    // A browser choice replaces only its role in a dirty form. Applying
+    // that real form must keep the chosen family and the other three edits.
+    crate::appearance::install_callbacks(ui, &store);
+    let font_inputs = |ui: &AppWindow| {
+        [
+            ui.get_appearance_ui_font_input(),
+            ui.get_appearance_message_font_input(),
+            ui.get_appearance_composer_font_input(),
+            ui.get_appearance_mono_font_input(),
+        ]
+    };
+    for (role, family) in [
+        (0, "Literata"),
+        (1, "JetBrains Mono"),
+        (2, "Literata"),
+        (3, "JetBrains Mono"),
+    ] {
+        assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+        settle(ui).await;
+        finish_settings_reveal(ui).await;
+        assert!(focused_control_has_label(ui, "Interface font family"));
+        ui.set_appearance_ui_font_input("Draft interface".into());
+        key(ui, Key::End);
+        type_text(ui, " typed");
+        ui.set_appearance_message_font_input("Draft messages".into());
+        ui.set_appearance_composer_font_input("Draft composer".into());
+        ui.set_appearance_mono_font_input("Draft monospace".into());
+        assert!(ui.get_appearance_fonts_dirty());
+        let mut expected = font_inputs(ui);
+        // Use the production navigation boundary even when leaving and
+        // returning in one event: it retires the mounted Settings handoff.
+        ui.invoke_navigate_page(0);
+        assert!(!ui.get_settings_controls_mounted());
+        // A direct browser save normalizes the selected role only.
+        ui.invoke_font_browser_show(role);
+        ui.invoke_font_browser_use(format!(" {family} ").into());
+        expected[role as usize] = family.into();
+        assert_eq!(font_inputs(ui), expected);
+        assert!(ui.get_appearance_fonts_dirty());
+        let accepted = store.load().unwrap();
+        let accepted_names = [
+            accepted.appearance.font_family.as_str(),
+            accepted
+                .typography
+                .message_font_family
+                .as_deref()
+                .unwrap_or(""),
+            accepted
+                .typography
+                .composer_font_family
+                .as_deref()
+                .unwrap_or(""),
+            accepted.typography.monospace_font_family.as_str(),
+        ];
+        assert_eq!(accepted_names[role as usize], family);
+        ui.invoke_font_browser_close();
+        assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+        settle(ui).await;
+        finish_settings_reveal(ui).await;
+        tab_to_control(ui, "Apply fonts");
+        key(ui, Key::Space);
+        settle(ui).await;
+        assert!(!ui.get_appearance_fonts_dirty());
+        assert_eq!(font_inputs(ui), expected);
+        // Settings stages the form; its Apply commits the exact combined look.
+        ui.invoke_studio_apply();
+        let applied_fonts = store.load().unwrap();
+        assert_eq!(applied_fonts.appearance.font_family, expected[0].as_str());
+        assert_eq!(
+            applied_fonts.typography.message_font_family.as_deref(),
+            Some(expected[1].as_str())
+        );
+        assert_eq!(
+            applied_fonts.typography.composer_font_family.as_deref(),
+            Some(expected[2].as_str())
+        );
+        assert_eq!(
+            applied_fonts.typography.monospace_font_family,
+            expected[3].as_str()
+        );
+    }
+    // A Settings browser choice is staged: synchronize its returned value,
+    // including inheritance, while preserving other drafts and the disk file.
+    ui.set_appearance_fonts_dirty(true);
+    ui.set_appearance_ui_font_input("Staged interface draft".into());
+    ui.set_appearance_message_font_input("Staged message draft".into());
+    ui.set_appearance_composer_font_input("Staged composer draft".into());
+    ui.set_appearance_mono_font_input("Staged monospace draft".into());
+    let mut inherited_inputs = font_inputs(ui);
+    inherited_inputs[1] = "".into();
+    let before_staged = std::fs::read(store.path()).unwrap();
+    ui.invoke_font_browser_show(1);
+    ui.invoke_font_browser_inherit();
+    assert_eq!(font_inputs(ui), inherited_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert!(ui.get_studio_pending() > 0);
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_staged);
+    ui.invoke_font_browser_close();
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    settle(ui).await;
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(font_inputs(ui), inherited_inputs);
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_staged);
+    ui.invoke_studio_apply();
+    let inherited = store.load().unwrap();
+    assert_eq!(
+        inherited.appearance.font_family,
+        inherited_inputs[0].as_str()
+    );
+    assert_eq!(inherited.typography.message_font_family, None);
+    assert_eq!(
+        inherited.typography.composer_font_family.as_deref(),
+        Some(inherited_inputs[2].as_str())
+    );
+    assert_eq!(
+        inherited.typography.monospace_font_family,
+        inherited_inputs[3].as_str()
+    );
+
+    // Use remains enabled for the current family, as does already-inherited
+    // selection. Both are valid choices even when no file write is needed.
+    ui.set_appearance_fonts_dirty(true);
+    ui.set_appearance_ui_font_input("Unapplied interface".into());
+    ui.set_appearance_message_font_input("Unapplied messages".into());
+    ui.set_appearance_composer_font_input("Unapplied composer".into());
+    ui.set_appearance_mono_font_input("Unapplied monospace".into());
+    let mut no_op_inputs = font_inputs(ui);
+    let before_no_op = std::fs::read(store.path()).unwrap();
+    ui.invoke_navigate_page(0);
+    assert!(!ui.get_settings_controls_mounted());
+    ui.invoke_font_browser_show(0);
+    ui.invoke_font_browser_use(inherited.appearance.font_family.as_str().into());
+    no_op_inputs[0] = inherited.appearance.font_family.as_str().into();
+    assert_eq!(font_inputs(ui), no_op_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_no_op);
+    ui.invoke_font_browser_show(1);
+    ui.invoke_font_browser_inherit();
+    no_op_inputs[1] = "".into();
+    assert_eq!(font_inputs(ui), no_op_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_no_op);
+    ui.invoke_font_browser_close();
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    finish_settings_reveal(ui).await;
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    settle(ui).await;
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(font_inputs(ui), no_op_inputs);
+    ui.invoke_studio_apply();
+    let no_op_applied = store.load().unwrap();
+    assert_eq!(
+        no_op_applied.appearance.font_family,
+        inherited.appearance.font_family
+    );
+    assert_eq!(no_op_applied.typography.message_font_family, None);
+    assert_eq!(
+        no_op_applied.typography.composer_font_family.as_deref(),
+        Some(no_op_inputs[2].as_str())
+    );
+    assert_eq!(
+        no_op_applied.typography.monospace_font_family,
+        no_op_inputs[3].as_str()
+    );
+
+    // Failed reads never synchronize a choice or overwrite the dirty form/file.
+    ui.set_appearance_fonts_dirty(true);
+    ui.set_appearance_message_font_input("Unapplied messages".into());
+    let refused_inputs = font_inputs(ui);
+    ui.set_page(0);
+    ui.invoke_font_browser_show(1);
+    let broken = "[appearance\nfont_family = \"broken\"\n";
+    std::fs::write(store.path(), broken).unwrap();
+    ui.invoke_font_browser_use("Literata".into());
+    assert_eq!(font_inputs(ui), refused_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), broken);
+    ui.invoke_font_browser_close();
+    ui.set_appearance_fonts_dirty(false);
+    store.save(&initial).unwrap();
+    ui.set_config_error("".into());
+    apply_config(ui, &initial, None);
 
     // A family typed by hand that is not installed is kept as typed and
     // shown as not found.
@@ -16358,17 +17179,6 @@ async fn assert_media_viewer_keyboard(ui: &AppWindow) {
 async fn assert_animation_autoplay_setting(ui: &AppWindow) {
     use std::{cell::Cell, rc::Rc};
 
-    async fn finish_reveal(ui: &AppWindow) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while ui.get_settings_reveal_pending() {
-                settle(ui).await;
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the mounted Settings page consumes its one focus request");
-    }
-
     const ROW: &str = "Play animated images automatically when opened";
     let page = ui.get_page();
     let requested = Rc::new(Cell::new(None));
@@ -16383,7 +17193,7 @@ async fn assert_animation_autoplay_setting(ui: &AppWindow) {
     settle(ui).await;
     // A cold Settings page delivers its pending request after mounting. Wait
     // for that handoff, then require the same real control focus as a hot page.
-    finish_reveal(ui).await;
+    finish_settings_reveal(ui).await;
     assert!(focused_control_has_label(
         ui,
         "Allow image previews in encrypted rooms"
@@ -16428,7 +17238,7 @@ async fn assert_animation_autoplay_setting(ui: &AppWindow) {
     ));
     assert!(ui.get_settings_reveal_pending());
     settle(ui).await;
-    finish_reveal(ui).await;
+    finish_settings_reveal(ui).await;
     assert!(focused_control_has_label(ui, ROW));
     assert!(requested.take().is_none());
 
@@ -16438,7 +17248,22 @@ async fn assert_animation_autoplay_setting(ui: &AppWindow) {
     assert!(crate::settings_search::reveal(ui, "media.image_previews"));
     assert!(ui.get_settings_reveal_pending());
     settle(ui).await;
-    finish_reveal(ui).await;
+    finish_settings_reveal(ui).await;
+    assert!(focused_control_has_label(
+        ui,
+        "Allow image previews in encrypted rooms"
+    ));
+    assert!(requested.take().is_none());
+
+    // A stale mounted flag from the old subtree cannot make a cold page
+    // skip its handoff. Only the current page can own live focus trackers.
+    ui.invoke_navigate_page(0);
+    settle(ui).await;
+    ui.set_settings_controls_mounted(true);
+    assert!(crate::settings_search::reveal(ui, "media.image_previews"));
+    assert!(ui.get_settings_reveal_pending());
+    settle(ui).await;
+    finish_settings_reveal(ui).await;
     assert!(focused_control_has_label(
         ui,
         "Allow image previews in encrypted rooms"

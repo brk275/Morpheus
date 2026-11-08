@@ -2,9 +2,8 @@
 //! busy.
 //!
 //! Like the live timeline controller scenario, this never creates a Slint
-//! backend: the single real-window harness in the account access UI tests
-//! calls `run_if_configured` on its event loop (mock time) after its own
-//! scenarios. Without MORPHEUS_MATRIX_TEST_ACCOUNTS (the disposable local
+//! backend: the exact ignored live People harness in the account access UI
+//! tests calls `run_if_configured` on its own event loop (mock time). Without MORPHEUS_MATRIX_TEST_ACCOUNTS (the disposable local
 //! fixture from `scripts/local_matrix_env.py`) it returns at once. With it,
 //! the fixture's `a_primary` account signs in on a fresh profile, and the
 //! production callbacks drive a real generated window registered through

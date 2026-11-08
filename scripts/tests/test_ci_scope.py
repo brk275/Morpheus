@@ -373,7 +373,7 @@ class ScopeTests(unittest.TestCase):
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
                                          "timeline-failures", "media-only", "app-timeline",
-                                         "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop"})
+                                         "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "rtc-media", "element-interop"})
         source = ast.parse((Path(__file__).resolve().parents[1]/"run_matrix_acceptance.py").read_text())
         suites = [node.value for node in source.body if isinstance(node,ast.Assign)
                   and any(isinstance(target,ast.Name) and target.id=="SUITES" for target in node.targets)]
@@ -490,6 +490,62 @@ class ScopeTests(unittest.TestCase):
         self.assertTrue(event_selection({}, "workflow_dispatch")["wayland"])
 
     @patch("scripts.ci_scope.changed_paths")
+    @patch("scripts.ci_scope.subprocess.run")
+    def test_reviewed_transport_batch_selects_vendor_four_only_with_exact_workflow(self, run, changed):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_bytes()
+        self.assertEqual(len(workflow), ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES)
+        self.assertEqual(hashlib.sha256(workflow).hexdigest(), ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256)
+        native = {"vendor/webrtc-sys-build/src/lib.rs", "vendor/webrtc-sys-build/src/pins.rs",
+                  "vendor/webrtc-sys-build/src/archive_tests.rs"}
+        transport = native | {"vendor/webrtc-sys-build/MORPHEUS_PATCH.md",
+                              "vendor/webrtc-sys-build/MORPHEUS_PROVENANCE.json",
+                              "scripts/build_linux_native.py", "packaging/linux/appimage_process.py",
+                              "packaging/linux/package_appimage.py", "scripts/tests/test_appimage_process.py"}
+        self.assertEqual(ci_scope.TRANSPORT_NATIVE_INPUTS, native)
+        self.assertEqual(ci_scope.TRANSPORT_INPUTS, transport)
+        paths = sorted(transport | {"scripts/ci_scope.py", "scripts/tests/test_ci_scope.py",
+                                    ".github/workflows/ci.yml", "scripts/tests/test_ci_acceptance.py"})
+        for name, event in (("push", {"after": "a" * 40}),
+                            ("pull_request", {"pull_request": {"head": {"sha": "a" * 40}}})):
+            changed.return_value = (paths, False)
+            run.side_effect = [SimpleNamespace(stdout=str(len(workflow)).encode() + b"\n"),
+                               SimpleNamespace(stdout=workflow)]
+            selected = event_selection(event, name)
+            self.assertEqual(selected, {
+                "native": True, "native_matrix": {"os": list(PLATFORMS)},
+                "config": False, "wayland": False, "manual": False,
+                "manual_platform": "all", "check_route": "vendor", "matrix_suite": "full",
+            })
+            self.assertEqual(run.call_count % 2, 0)
+            for call in run.call_args_list[-2:]:
+                self.assertIn("core.hooksPath=/dev/null", call.args[0])
+                self.assertIn("core.fsmonitor=false", call.args[0])
+                self.assertEqual(call.kwargs["timeout"], 10)
+                self.assertNotIn("shell", call.kwargs)
+            # Same-size changed workflow is not the reviewed runner/test layout.
+            run.side_effect = [SimpleNamespace(stdout=str(len(workflow)).encode() + b"\n"),
+                               SimpleNamespace(stdout=b"x" * len(workflow))]
+            self.assertEqual(event_selection(event, name)["check_route"], "all")
+        for extra in ("Cargo.lock", "Cargo.toml", "vendor/webrtc-sys-build/Cargo.toml",
+                      "vendor/webrtc-sys/build.rs", "vendor/webrtc-sys-build/src/unknown.rs",
+                      "crates/morpheus-app/ui/app-window.slint", "scripts/run_matrix_acceptance.py",
+                      ".github/workflows/unknown.yml"):
+            run.reset_mock()
+            changed.return_value = (paths + [extra], False)
+            self.assertEqual(event_selection({}, "push")["check_route"], "all", extra)
+            run.assert_not_called()
+        for raw in ("./vendor/webrtc-sys-build/src/lib.rs", None):
+            self.assertFalse(ci_scope.reviewed_transport_only([raw], {"after": "a" * 40}, "push"))
+        run.reset_mock()
+        self.assertFalse(ci_scope.reviewed_transport_only(paths, {"after": "a" * 40}, "push", True))
+        self.assertFalse(ci_scope.reviewed_transport_only(paths, {}, "workflow_dispatch"))
+        run.assert_not_called()
+        self.assertEqual(event_selection({}, "workflow_dispatch")["check_route"], "all")
+        # Packaging-only inputs do not gain four native jobs from this exception.
+        self.assertFalse(ci_scope.reviewed_transport_only(
+            ["packaging/linux/package_appimage.py", "scripts/tests/test_appimage_process.py"], {}, "push"))
+
+    @patch("scripts.ci_scope.changed_paths")
     def test_exact_automatic_appearance_and_producer_batches_select_existing_routes(self, changed):
         app = set((
                 'crates/morpheus-app/src/account_access_ui_tests.rs',
@@ -595,9 +651,9 @@ class ScopeTests(unittest.TestCase):
         # comparisons with owned fixture bytes under test-only pins, so a
         # future different workflow can safely fall back all without requiring
         # its execution layout to be admitted by this exemption.
-        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 65948)
+        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 68406)
         self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
-                         "50be2e2a563e5b61e97e2b294499707ee9b194e2d508901bdcf9866d304dfd1f")
+                         "0b88b9dd7c6b764b35695a59d17e54575c4b5836d688ac8224cdd45f0f1d0cd3")
         import hashlib
         with patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_BYTES", len(workflow)), \
                 patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_SHA256", hashlib.sha256(workflow).hexdigest()):

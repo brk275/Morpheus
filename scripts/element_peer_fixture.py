@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the immutable official Element Call RC for local Linux acceptance.
+"""Serve the immutable official Element Call release for local Linux acceptance.
 
 Only stock application assets are served. Deployment JSON and nginx binding are
 configured outside the checkout. This helper never accepts account credentials.
@@ -29,12 +29,12 @@ import urllib.request
 from fixture_paths import external_path, private_directory, write_private
 
 
-VERSION = "v0.28.0-rc.1"
-REVISION = "9b3c3569ecefbb79cf527ea24e3756ba50553a8f"
-SDK_REVISION = "fa4772a4ddd335a5a8bfbf8bb21df49b70f7a999"
+VERSION = "v0.28.2"
+REVISION = "b4dd44bd78c1296fb8c28519bfc41cb488d636fd"
+SDK_REVISION = "3f05dc4d104a3dfc753c5e3549a18c74fab4b076"
 IMAGE_REPOSITORY = "ghcr.io/element-hq/element-call"
 # Published multi-platform manifest, verified by registry HTTP and OCI labels.
-IMAGE_DIGEST = "sha256:6d83fe15c425e1139edafdffe2b2073256608dcafdc554da5bf840de496891fe"
+IMAGE_DIGEST = "sha256:c61fc9e4e04f75690c693d4556d01c09a2b9246f3fc8d35222d3aac36ba29906"
 IMAGE = f"{IMAGE_REPOSITORY}:{VERSION}@{IMAGE_DIGEST}"
 OWNER_LABEL = "io.github.brk275.morpheus.element-peer-fixture"
 STATE_FILE = "element-peer-owner.json"
