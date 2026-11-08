@@ -487,7 +487,9 @@ fn attached_component_root_upper_bound(window: &slint::Window) -> Result<usize, 
                 }
                 for index_in_model in range.start..range.end {
                     let mut weak = ItemTreeWeak::default();
-                    tree_ref.as_ref().get_subtree(*index, index_in_model, &mut weak);
+                    tree_ref
+                        .as_ref()
+                        .get_subtree(*index, index_in_model, &mut weak);
                     let child = weak.upgrade().ok_or("delegate_tree_missing")?;
                     pending.push((child, depth + 1));
                 }
@@ -1608,11 +1610,20 @@ mod tests {
 
     #[test]
     fn component_upper_bound_must_be_positive_and_below_the_decrypted_fixture_size() {
-        assert_eq!(checked_component_upper_bound(0), Err("delegate_upper_bound"));
+        assert_eq!(
+            checked_component_upper_bound(0),
+            Err("delegate_upper_bound")
+        );
         assert_eq!(checked_component_upper_bound(1), Ok(1));
         assert_eq!(checked_component_upper_bound(EVENTS - 1), Ok(EVENTS - 1));
-        assert_eq!(checked_component_upper_bound(EVENTS), Err("delegate_upper_bound"));
-        assert_eq!(checked_component_upper_bound(usize::MAX), Err("delegate_upper_bound"));
+        assert_eq!(
+            checked_component_upper_bound(EVENTS),
+            Err("delegate_upper_bound")
+        );
+        assert_eq!(
+            checked_component_upper_bound(usize::MAX),
+            Err("delegate_upper_bound")
+        );
     }
 
     #[test]
@@ -1664,7 +1675,10 @@ mod tests {
                 ..before
             },
         ] {
-            assert_eq!(invalid.checked(EVENTS).unwrap_err(), "scroll_anchor_invalid");
+            assert_eq!(
+                invalid.checked(EVENTS).unwrap_err(),
+                "scroll_anchor_invalid"
+            );
         }
     }
 

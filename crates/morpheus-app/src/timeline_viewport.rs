@@ -739,15 +739,18 @@ fn published(
         let (top, before) = match pane {
             Pane::Room => {
                 ui.set_timeline_seek_index(i32::try_from(index).unwrap_or(i32::MAX));
-                (ui.get_timeline_anchor_event(), ui.get_timeline_anchor_index())
+                (
+                    ui.get_timeline_anchor_event(),
+                    ui.get_timeline_anchor_index(),
+                )
             }
             Pane::Thread => {
                 ui.set_thread_seek_index(i32::try_from(index).unwrap_or(i32::MAX));
                 (ui.get_thread_anchor_event(), ui.get_thread_anchor_index())
             }
         };
-        let top_moved = usize::try_from(before)
-            .is_ok_and(|at| !timeline_model::has_event_at(rows, at, &top));
+        let top_moved =
+            usize::try_from(before).is_ok_and(|at| !timeline_model::has_event_at(rows, at, &top));
         if moved || top_moved {
             rows_changed(ui, pane);
         }

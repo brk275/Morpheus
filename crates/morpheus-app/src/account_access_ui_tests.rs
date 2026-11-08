@@ -1825,7 +1825,10 @@ async fn assert_seek_policy_and_thread_keeper(
     );
     let thread = |event: &str| seek_for_test(ui, live, Pane::Thread, event, None, None);
     assert!(thread("$fixture-30321:example.org"));
-    assert!(thread_seek_stopped(ui).await, "the virtual reply is approached and placed");
+    assert!(
+        thread_seek_stopped(ui).await,
+        "the virtual reply is approached and placed"
+    );
     settle(ui).await;
     assert_eq!(
         control_bounds(ui, &replies[320].body).len(),
@@ -1836,8 +1839,14 @@ async fn assert_seek_policy_and_thread_keeper(
         control_bounds(ui, &replies[0].body).is_empty(),
         "the first reply is released outside the virtual range"
     );
-    assert!(control_bounds(ui, "REPLIES · 400").is_empty(), "offscreen header is virtual too");
-    assert_eq!(ui.get_thread_composer_text().as_str(), "A retained thread draft");
+    assert!(
+        control_bounds(ui, "REPLIES · 400").is_empty(),
+        "offscreen header is virtual too"
+    );
+    assert_eq!(
+        ui.get_thread_composer_text().as_str(),
+        "A retained thread draft"
+    );
 
     // Same-count edits must update the source row through tracked indexing,
     // not wait for another model-length change. Old text must disappear.
@@ -1859,12 +1868,18 @@ async fn assert_seek_policy_and_thread_keeper(
     replies.push(Arc::new(rich_fixture(30_401)));
     ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
     settle(ui).await;
-    assert!(focused_control_has_label(ui, seen), "append retains actual focus");
+    assert!(
+        focused_control_has_label(ui, seen),
+        "append retains actual focus"
+    );
     assert!(
         control_with_label(ui, seen) == focused_reply,
         "append retains the same action instance"
     );
-    assert_eq!(ui.get_thread_composer_text().as_str(), "A retained thread draft");
+    assert_eq!(
+        ui.get_thread_composer_text().as_str(),
+        "A retained thread draft"
+    );
 
     // Prepending changes the target index. The existing production anchor-seek
     // admission resolves by event again, using a reply index (no header offset).
@@ -1889,8 +1904,14 @@ async fn assert_seek_policy_and_thread_keeper(
         Some(held_offset),
         None
     ));
-    assert_eq!(ui.get_thread_seek_index(), i32::try_from(held_index + 5).unwrap());
-    assert!(thread_seek_stopped(ui).await, "the shifted reply is resolved and kept");
+    assert_eq!(
+        ui.get_thread_seek_index(),
+        i32::try_from(held_index + 5).unwrap()
+    );
+    assert!(
+        thread_seek_stopped(ui).await,
+        "the shifted reply is resolved and kept"
+    );
     settle(ui).await;
     let kept = control_bounds(ui, &held_text);
     assert_eq!(kept.len(), 1);
@@ -1929,13 +1950,22 @@ async fn assert_seek_policy_and_thread_keeper(
     let before = row_bounds(&replies[mounted_index].body);
     let text = control_bounds(ui, &replies[mounted_index].body)[0];
     keep_thread_for_test(live);
-    assert!(ui.invoke_viewport_anchor_admit(), "the current keeper is admitted");
+    assert!(
+        ui.invoke_viewport_anchor_admit(),
+        "the current keeper is admitted"
+    );
     let body = grow_mounted(&mut replies, 32);
     settle(ui).await;
     let grown = control_bounds(ui, &body)[0];
-    assert!(grown.bottom - grown.top > text.bottom - text.top + 1.0, "mounted text really grew");
+    assert!(
+        grown.bottom - grown.top > text.bottom - text.top + 1.0,
+        "mounted text really grew"
+    );
     let after = row_bounds(&body);
-    assert!((after.top - before.top).abs() <= 1.0, "the actual anchored row stays in place");
+    assert!(
+        (after.top - before.top).abs() <= 1.0,
+        "the actual anchored row stays in place"
+    );
 
     // A header that is currently virtual performs no hidden layout work when
     // its root text changes, and cannot disturb the mounted reader.
@@ -1943,30 +1973,46 @@ async fn assert_seek_policy_and_thread_keeper(
     ui.set_thread_root_rich_body(StyledText::from_plain_text(root_body));
     ui.set_thread_root_rich_accessible_body(root_body.into());
     settle(ui).await;
-    assert!(control_bounds(ui, root_body).is_empty(), "the offscreen root stays virtual");
+    assert!(
+        control_bounds(ui, root_body).is_empty(),
+        "the offscreen root stays virtual"
+    );
     assert!((row_bounds(&body).top - after.top).abs() <= 1.0);
 
     ui.set_member_confirm_open(true);
     settle(ui).await;
-    assert!(!ui.invoke_viewport_anchor_admit(), "a modal withdraws the custom keeper");
+    assert!(
+        !ui.invoke_viewport_anchor_admit(),
+        "a modal withdraws the custom keeper"
+    );
     let body = grow_mounted(&mut replies, 40);
     settle(ui).await;
     assert!(!ui.invoke_viewport_anchor_admit());
-    assert_eq!(ui.get_thread_seek_id(), 0, "no seek is started by protected reflow");
+    assert_eq!(
+        ui.get_thread_seek_id(),
+        0,
+        "no seek is started by protected reflow"
+    );
     let protected = row_bounds(&body);
     ui.set_member_confirm_open(false);
     for _ in 0..3 {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
         settle(ui).await;
     }
-    assert!(!ui.invoke_viewport_anchor_admit(), "closing a modal never resumes the old keeper");
+    assert!(
+        !ui.invoke_viewport_anchor_admit(),
+        "closing a modal never resumes the old keeper"
+    );
     assert!(
         (row_bounds(&body).top - protected.top).abs() <= 1.0,
         "no late client movement after close"
     );
     let _body = grow_mounted(&mut replies, 48);
     settle(ui).await;
-    assert!(!ui.invoke_viewport_anchor_admit(), "another layout cannot renew withdrawn authority");
+    assert!(
+        !ui.invoke_viewport_anchor_admit(),
+        "another layout cannot renew withdrawn authority"
+    );
     assert_eq!(ui.get_thread_seek_id(), 0);
 
     // A protected entry that opens and closes in the same turn withdraws at
@@ -1976,7 +2022,10 @@ async fn assert_seek_policy_and_thread_keeper(
     crate::matrix_links::clear(ui);
     ui.set_account_menu_open(true);
     ui.set_account_menu_open(false);
-    assert!(!ui.invoke_viewport_anchor_admit(), "brief entry withdraws synchronously");
+    assert!(
+        !ui.invoke_viewport_anchor_admit(),
+        "brief entry withdraws synchronously"
+    );
     let _body = grow_mounted(&mut replies, 56);
     settle(ui).await;
     assert!(!ui.invoke_viewport_anchor_admit());
@@ -1990,7 +2039,10 @@ async fn assert_seek_policy_and_thread_keeper(
     live.invalidate_navigation();
     crate::matrix_links::tests::end_stale_reads(ui, live, clicked);
     live.is_live.store(was_live, Ordering::Release);
-    assert!(ui.invoke_viewport_anchor_admit(), "stale cleanup preserves the newer keeper");
+    assert!(
+        ui.invoke_viewport_anchor_admit(),
+        "stale cleanup preserves the newer keeper"
+    );
     let before = row_bounds(&replies[mounted_index].body);
     let body = grow_mounted(&mut replies, 64);
     settle(ui).await;
@@ -2002,13 +2054,20 @@ async fn assert_seek_policy_and_thread_keeper(
     ui.set_member_confirm_open(true);
     settle(ui).await;
     assert!(thread("$fixture-29990:example.org"));
-    assert_eq!(ui.get_thread_seek_id(), 0, "no move behind a protected surface");
+    assert_eq!(
+        ui.get_thread_seek_id(),
+        0,
+        "no move behind a protected surface"
+    );
     assert!(control_bounds(ui, &replies[0].body).is_empty());
     ui.set_member_confirm_open(false);
     settle(ui).await;
     assert!(thread("$fixture-29990:example.org"));
     let step = live.security_gate.try_account_access().expect("idle gate");
-    assert!(thread_seek_stopped(ui).await, "security transition retires the virtual seek");
+    assert!(
+        thread_seek_stopped(ui).await,
+        "security transition retires the virtual seek"
+    );
     drop(step);
     assert_eq!(ui.get_thread_seek_id(), 0, "no late resume");
 
@@ -2046,11 +2105,13 @@ async fn assert_seek_policy_and_thread_keeper(
     let viewport = viewports[0];
     assert!(inside_window(ui, viewport));
     assert!(thread("$fixture-30402:example.org"));
-    assert_ne!(ui.get_thread_seek_id(), 0, "waiting for a not-yet-loaded reply");
-    let position = slint::LogicalPosition::new(
-        viewport.right - 3.0,
-        (viewport.top + viewport.bottom) / 2.0,
+    assert_ne!(
+        ui.get_thread_seek_id(),
+        0,
+        "waiting for a not-yet-loaded reply"
     );
+    let position =
+        slint::LogicalPosition::new(viewport.right - 3.0, (viewport.top + viewport.bottom) / 2.0);
     ui.window().dispatch_event(WindowEvent::PointerScrolled {
         position,
         delta_x: 0.0,
@@ -2065,9 +2126,16 @@ async fn assert_seek_policy_and_thread_keeper(
     );
     replies.push(Arc::new(rich_fixture(30_402)));
     ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
-    assert!(thread_seek_stopped(ui).await, "the person's scrolling ends the waiting seek");
+    assert!(
+        thread_seek_stopped(ui).await,
+        "the person's scrolling ends the waiting seek"
+    );
     settle(ui).await;
-    assert_eq!(ui.get_thread_anchor_event(), scrolled_event, "late reply cannot take the viewport");
+    assert_eq!(
+        ui.get_thread_anchor_event(),
+        scrolled_event,
+        "late reply cannot take the viewport"
+    );
     assert!((ui.get_thread_anchor_offset() - scrolled_offset).abs() <= 1.0);
     assert!(
         control_bounds(ui, &replies.last().unwrap().body).is_empty(),
@@ -2081,7 +2149,10 @@ async fn assert_seek_policy_and_thread_keeper(
     assert!(thread("$fixture-30403:example.org"));
     assert_ne!(ui.get_thread_seek_id(), 0, "the pane has not mounted yet");
     settle(ui).await;
-    assert_eq!(control_bounds(ui, &format!("REPLIES · {}", replies.len())).len(), 1);
+    assert_eq!(
+        control_bounds(ui, &format!("REPLIES · {}", replies.len())).len(),
+        1
+    );
     ui.window().dispatch_event(WindowEvent::PointerScrolled {
         position,
         delta_x: 0.0,
@@ -2135,17 +2206,20 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
     ui.set_active_room_id("!thread-read:example.org".into());
     ui.set_thread_root_id("$thread-read-root:example.org".into());
     ui.set_thread_root_sender("quinn".into());
-    ui.set_thread_root_rich_body(slint::StyledText::from_plain_text("A scrollable thread root"));
+    ui.set_thread_root_rich_body(slint::StyledText::from_plain_text(
+        "A scrollable thread root",
+    ));
     ui.set_thread_root_rich_accessible_body("A scrollable thread root".into());
     ui.invoke_show_thread_panel();
     let reports = Rc::new(RefCell::new(Vec::<(bool, String)>::new()));
     let observed = reports.clone();
-    ui.global::<RoomActivity>().on_read_view(move |thread, event| {
-        observed.borrow_mut().push((thread, event.to_string()));
-    });
+    ui.global::<crate::RoomActivity>()
+        .on_read_view(move |thread, event| {
+            observed.borrow_mut().push((thread, event.to_string()));
+        });
     let contexts = Rc::new(Cell::new(0));
     let observed = contexts.clone();
-    ui.global::<RoomActivity>().on_context_changed(move || {
+    ui.global::<crate::RoomActivity>().on_context_changed(move || {
         observed.set(observed.get() + 1);
     });
     let mut rows: Vec<_> = (31_000..31_400)
@@ -2241,7 +2315,9 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
         settle(&ui).await;
     }
     assert!(
-        reports.borrow()[at..].iter().all(|(_, event)| event.is_empty()),
+        reports.borrow()[at..]
+            .iter()
+            .all(|(_, event)| event.is_empty()),
         "an unmounted tail cannot rearm"
     );
 
@@ -2273,7 +2349,11 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
             .is_some_and(|(thread, event)| *thread && event.is_empty()),
         "append revokes the previous last-row authority first"
     );
-    assert!(reports.borrow()[at..].iter().all(|(_, event)| event != &last));
+    assert!(
+        reports.borrow()[at..]
+            .iter()
+            .all(|(_, event)| event != &last)
+    );
 
     // Replace the model with the same row count: no extent/count delta is
     // allowed to keep the old read authority alive. Its header token is read
@@ -2337,7 +2417,9 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
         settle(&ui).await;
     }
     assert!(
-        reports.borrow()[at..].iter().all(|(_, event)| event.is_empty()),
+        reports.borrow()[at..]
+            .iter()
+            .all(|(_, event)| event.is_empty()),
         "a protected tail never rearms"
     );
     ui.set_member_confirm_open(false);
