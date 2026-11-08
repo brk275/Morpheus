@@ -70,6 +70,18 @@ class ProofTests(unittest.TestCase):
         commands = set(re.findall(r'command\(&root, "([a-z_]+)"\)', source))
         self.assertEqual(commands, {"static", "changed", "stopped", "reopened", "changed_again", "source_lost", "left"})
 
+    def test_receiving_peer_matches_standard_room_profile_and_canonical_wire_slot(self):
+        peer = (ROOT / "packaging/linux/appimage_peer.rs").read_text()
+        body = peer.split("async fn receives_actual_installed_appimage_screen()", 1)[1]
+        # Literal Current/default uses a different auth/slot contract and is
+        # deliberately rejected by the advertised legacy room service.
+        self.assertRegex(body, r'(?m)^\s*rtc\.open_slot\(room, "m\.call#ROOM", true\)')
+        self.assertRegex(body, r'(?m)^\s*rtc\.join_room\(room, CallOptions::element_call_matrix_2_0\(\)\)')
+        self.assertNotRegex(body, r'(?m)^\s*rtc\.join\(')
+        self.assertNotIn("CallOptions::default()", body)
+        app = (ROOT / "crates/morpheus-app/src/calls.rs").read_text()
+        self.assertRegex(app, r"Self::Standard\s*=>\s*CallOptions::element_call_matrix_2_0\(\)")
+
     def test_private_fact_cannot_be_overwritten_or_fabricated_by_other_value(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

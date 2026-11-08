@@ -412,10 +412,12 @@ async fn receives_actual_installed_appimage_screen() {
     let client = manager.active_client().await.expect("Peer client missing");
     bootstrap_test_identity(&client, bob).await;
     let mut rtc = RtcService::new(client.clone());
-    rtc.open_slot(room, "m.call#room", true)
+    // Match the ordinary app's Standard profile and the fixture's advertised
+    // legacy room service; literal Current/custom-slot joins remain distinct.
+    rtc.open_slot(room, "m.call#ROOM", true)
         .await
         .expect("Cannot open fixture slot");
-    rtc.join(room, CallOptions::default())
+    rtc.join_room(room, CallOptions::element_call_matrix_2_0())
         .await
         .expect("Peer join failed");
     fact(&root, "peer_ready");

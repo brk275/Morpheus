@@ -137,6 +137,54 @@ class PackageSmokeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "Symphonia-NOTICE"):
                     package_smoke.check_resources(installed)
 
+    def test_macos_install_uses_canonical_temp_root_without_resolving_bundle_resources(self):
+        alias = Path("/synthetic/alias-temp/owned")
+        canonical = Path("/synthetic/canonical-temp/owned")
+        mount = canonical / "mounted"
+        source = mount / "Morpheus.app"
+        installed = canonical / "Applications/Morpheus.app"
+        contents = installed / "Contents"
+        executable = contents / "MacOS/morpheus-app"
+        package = Path("/synthetic/dist/Morpheus.dmg")
+        dist = package.parent
+        info = {"CFBundleIdentifier": "io.github.brk275.morpheus", "CFBundleExecutable": "morpheus-app",
+                "CFBundleShortVersionString": "0.1.0", "NSMicrophoneUsageDescription": "fixture",
+                "NSCameraUsageDescription": "fixture", "NSScreenCaptureUsageDescription": "fixture"}
+        temporary = MagicMock()
+        temporary.__enter__.return_value = str(alias)
+        def resolve(path, **kwargs):
+            self.assertEqual(path, alias)
+            self.assertEqual(kwargs, {"strict": True})
+            return canonical
+        with patch.object(package_smoke.tempfile, "TemporaryDirectory", return_value=temporary) as allocate, \
+                patch.object(Path, "resolve", autospec=True, side_effect=resolve) as resolved, \
+                patch.object(Path, "mkdir", autospec=True), \
+                patch.object(Path, "open", autospec=True), \
+                patch.object(Path, "exists", return_value=False), \
+                patch.object(package_smoke, "artifact", return_value=package), \
+                patch.object(package_smoke.plistlib, "load", return_value=info), \
+                patch.object(package_smoke, "package_version", return_value="0.1.0"), \
+                patch.object(package_smoke, "output", return_value="arm64"), \
+                patch.object(package_smoke, "check_resources") as resources, \
+                patch.object(package_smoke, "macos_installed_launches") as launch, \
+                patch.object(package_smoke.shutil, "rmtree") as remove, \
+                patch.object(package_smoke, "run") as run, \
+                patch.object(package_smoke, "record"):
+            package_smoke.macos_smoke(dist, "arm64")
+        allocate.assert_called_once_with(prefix="morpheus-package-")
+        resolved.assert_called_once_with(alias, strict=True)
+        resources.assert_called_once_with(contents / "Resources", dist)
+        launch.assert_called_once_with(executable, canonical)
+        remove.assert_called_once_with(installed)
+        self.assertEqual(run.call_args_list, [
+            call(["hdiutil", "verify", str(package)], stdout=subprocess.DEVNULL),
+            call(["hdiutil", "attach", "-readonly", "-nobrowse", "-noautoopen", "-mountpoint", str(mount), str(package)],
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL),
+            call(["ditto", str(source), str(installed)]),
+            call(["hdiutil", "detach", str(mount)], stdout=subprocess.DEVNULL),
+        ])
+        temporary.__exit__.assert_called_once()
+
     def test_windows_install_uses_one_canonical_owned_temp_root_for_all_operations(self):
         alias = Path("/synthetic/SHORT~1/owned")
         canonical = Path("/synthetic/Long User/owned")

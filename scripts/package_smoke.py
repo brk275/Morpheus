@@ -407,7 +407,7 @@ def macos_smoke(dist, expected_arch):
     package = artifact(dist, ".dmg")
     run(["hdiutil", "verify", str(package)], stdout=subprocess.DEVNULL)
     with tempfile.TemporaryDirectory(prefix="morpheus-package-") as temp:
-        work = Path(temp)
+        work = Path(temp).resolve(strict=True)
         mount = work / "mounted"
         mount.mkdir()
         run(["hdiutil", "attach", "-readonly", "-nobrowse", "-noautoopen", "-mountpoint", str(mount), str(package)],
