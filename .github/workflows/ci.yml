@@ -77,8 +77,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --header 'Accept: application/octet-stream' --max-filesize 8230402 \
+            --connect-timeout 30 --max-time 120 \
+            https://api.github.com/repos/gitleaks/gitleaks/releases/assets/378332058 \
             --output "$archive"
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
           mkdir "$RUNNER_TEMP/gitleaks"
@@ -162,8 +164,9 @@ jobs:
     concurrency:
       group: native-${{ github.sha }}-${{ matrix.os }}
       cancel-in-progress: false
-    # Linux and Intel cold native graphs need compile room; test deadlines stay fixed.
-    timeout-minutes: ${{ (matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}
+    # Cold native graphs on both Mac architectures and Linux need compile room;
+    # Windows and every existing test deadline retain their prior bounds.
+    timeout-minutes: ${{ (matrix.os == 'macos-15' || matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
@@ -489,6 +492,12 @@ jobs:
         continue-on-error: true
         timeout-minutes: 15
         run: python3 scripts/run_wayland_acceptance.py
+      - name: Compile focused vendor app prerequisites before regressions
+        if: needs.scope.outputs.check_route == 'vendor'
+        # The vendor route starts cold; full checks already compiled the app.
+        # These are exactly the first existing vendor test targets/features.
+        # Compile only here, under the job bound, without running tests twice.
+        run: cargo test --locked -p morpheus-app --features native-calls --test rtc_retained_events --test gl_config_preference --no-run
       - name: Test vendored security fixes
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor')
         id: vendor-tests
@@ -761,8 +770,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --header 'Accept: application/octet-stream' --max-filesize 8230402 \
+            --connect-timeout 30 --max-time 120 \
+            https://api.github.com/repos/gitleaks/gitleaks/releases/assets/378332058 \
             --output "$archive"
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
           mkdir -p "$RUNNER_TEMP/gitleaks"

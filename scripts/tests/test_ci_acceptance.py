@@ -525,6 +525,29 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertNotIn("workflow_run:",source)
         self.assertNotIn("secrets.",source)
 
+    def test_focused_vendor_prebuild_matches_existing_first_native_targets(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        start = "      - name: Compile focused vendor app prerequisites before regressions\n"
+        end = "      - name: Test vendored security fixes\n"
+        self.assertEqual(source.count(start), 1)
+        step = source.split(start, 1)[1].split(end, 1)[0]
+        self.assertIn("        if: needs.scope.outputs.check_route == 'vendor'\n", step)
+        self.assertNotIn("continue-on-error:", step)
+        self.assertNotIn("timeout-minutes:", step)
+        self.assertNotIn("SLINT_EMIT_DEBUG_INFO", step)
+        command = "cargo test --locked -p morpheus-app --features native-calls"
+        self.assertIn("        run: " + command
+                      + " --test rtc_retained_events --test gl_config_preference --no-run\n", step)
+        vendor = source.split(end, 1)[1].split("      - name: Test synthetic native video source ownership\n", 1)[0]
+        self.assertNotIn("SLINT_EMIT_DEBUG_INFO", vendor)
+        for target in ("rtc_retained_events", "gl_config_preference"):
+            self.assertIn(command + " --test " + target + " -- --list", vendor)
+        # Only ARM joins the already150-minute Linux/Intel job cap; Windows90
+        # and every existing per-test/fixture deadline are unchanged.
+        self.assertIn("timeout-minutes: ${{ (matrix.os == 'macos-15' || matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}", source)
+        self.assertLess(source.index("      - name: Prepare the pinned owned native PipeWire client\n"), source.index(start))
+        self.assertLess(source.index(start), source.index(end))
+
     def test_focused_timeline_prebuild_matches_actual_app_target_before_fixture_deadlines(self):
         source = WORKFLOW.read_text(encoding="utf-8")
         start = "      - name: Compile focused app timeline test before live fixture deadlines\n"
