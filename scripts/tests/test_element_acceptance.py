@@ -66,6 +66,43 @@ class EvidenceTests(unittest.TestCase):
         )))
         self.assertEqual(result, {"stage": "browser_roster", "failure": "browser_acceptance"})
 
+    def test_terminal_diagnostics_preserve_exit_versus_signal_without_private_text(self):
+        for status, expected in ((0, {"native_exit_code": 0}), (101, {"native_exit_code": 101}),
+                                 (255, {"native_exit_code": 255}), (-6, {"native_signal": 6}),
+                                 (-9, {"native_signal": 9}), (-64, {"native_signal": 64})):
+            with self.subTest(status=status):
+                marker = target.terminal_marker(status)
+                self.assertEqual(target.diagnostics(marker), expected)
+                self.assertEqual(target.diagnostics(marker, include_native=False), {})
+        for status in (None, True, False, 256, -65, "101"):
+            with self.subTest(status=status):
+                self.assertIsNone(target.terminal_marker(status))
+        for suffix in ("exit=256", "exit=-1", "signal=0", "signal=65", "exit=01", "signal=6 private",
+                       "secret=private", "exit=" + "1" * 97):
+            self.assertEqual(target.diagnostics(target.NATIVE_TERMINAL_PREFIX + suffix),
+                             {"native_terminal": "invalid"})
+        self.assertEqual(target.diagnostics(target.terminal_marker(101) + "\n" + target.terminal_marker(-9)),
+                         {"native_terminal": "invalid"})
+        self.assertEqual(target.diagnostics(target.NATIVE_FAILURE_PREFIX + "private"),
+                         {"native_failure": "invalid"})
+
+    def test_only_exact_known_scanned_roster_panic_gets_a_fixed_classification(self):
+        header = (f"thread '{target.TEST_NAME}' (1234) panicked at "
+                  "crates/morpheus-rtc/tests/element_call_peer.rs:484:6:\n")
+        message = "Three-member native rosters did not converge: Elapsed(())"
+        result = f"\ntest {target.TEST_NAME} ... FAILED\n"
+        self.assertTrue(target.known_roster_timeout(header + message + result))
+        for value in (message, header + message, header + message + " private" + result,
+                      header.replace(target.TEST_NAME, "other") + message + result,
+                      header.replace("element_call_peer.rs", "other.rs") + message + result,
+                      header + "private panic" + result):
+            with self.subTest(value=value):
+                self.assertFalse(target.known_roster_timeout(value))
+        self.assertEqual(target.diagnostics(target.NATIVE_FAILURE_PREFIX + "group_roster_timeout"),
+                         {"native_failure": "group_roster_timeout"})
+        self.assertEqual(target.diagnostics(target.NATIVE_FAILURE_PREFIX + "group_roster_timeout",
+                                           include_native=False), {})
+
     def test_native_group_stages_are_closed_ordered_and_bounded(self):
         lines = [target.NATIVE_STAGE_PREFIX + value for value in target.NATIVE_STAGES]
         for count in range(1, len(lines) + 1):
@@ -81,9 +118,11 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(target.diagnostics(output), {"native_stage": "invalid"})
 
     def test_native_failure_facts_follow_owned_cleanup_and_successful_scan(self):
-        for scanner_status, join_failure, service_failure in ((0, False, False), (1, False, False),
-                                                            (0, True, False), (0, False, True)):
-            with self.subTest(scanner_status=scanner_status, join_failure=join_failure, service_failure=service_failure), \
+        for scanner_status, join_failure, service_failure, anchor_failure in (
+                (0, False, False, False), (1, False, False, False),
+                (0, True, False, False), (0, False, True, False), (0, False, False, True)):
+            with self.subTest(scanner_status=scanner_status, join_failure=join_failure,
+                              service_failure=service_failure, anchor_failure=anchor_failure), \
                     tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 fixture = root / "fixture.json"
@@ -93,11 +132,14 @@ class EvidenceTests(unittest.TestCase):
                 runner = target.Runner(root, "scanner")
                 native = self.anchored_log(runner, "native.log", (
                     "opaque-fixture-panic\nMORPHEUS_ELEMENT_CHECK native_audio=true\n"
+                    + f"thread '{target.TEST_NAME}' (1234) panicked at crates/morpheus-rtc/tests/element_call_peer.rs:484:6:\n"
+                    + "Three-member native rosters did not converge: Elapsed(())\n"
+                    + f"test {target.TEST_NAME} ... FAILED\n"
                     + target.NATIVE_STAGE_PREFIX + "microphone_cryptor\n"
                     + target.NATIVE_STAGE_PREFIX + "late_login\n").encode())
                 browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
                 native.joined = browser.joined = False
-                native.status = mock.Mock(return_value=1)
+                native.status = mock.Mock(return_value=101)
                 browser.status = mock.Mock(return_value=None)
                 events = []
                 def native_join():
@@ -105,6 +147,8 @@ class EvidenceTests(unittest.TestCase):
                     if join_failure:
                         raise RuntimeError("fixture_operation")
                     native.joined = True
+                    # Cleanup's own kill must not replace the natural exit fact.
+                    native.status.return_value = -9
                 def browser_join():
                     events.append("browser_join")
                     browser.joined = True
@@ -115,6 +159,11 @@ class EvidenceTests(unittest.TestCase):
                     events.append("scan")
                     return subprocess.CompletedProcess([], scanner_status)
                 original_snapshots = runner.log_snapshots
+                original_release = runner.release_log_anchors
+                def release():
+                    original_release()
+                    if anchor_failure:
+                        raise RuntimeError("fixture_operation")
                 def snapshot():
                     events.append("read")
                     return original_snapshots()
@@ -131,8 +180,9 @@ class EvidenceTests(unittest.TestCase):
                         mock.patch.object(target, "media_fixtures"), \
                         mock.patch.object(target.subprocess, "run", side_effect=scanned), \
                         mock.patch.object(runner, "log_snapshots", side_effect=snapshot), \
+                        mock.patch.object(runner, "release_log_anchors", side_effect=release), \
                         contextlib.redirect_stdout(visible), self.assertRaisesRegex(
-                            RuntimeError, "fixture_operation" if join_failure or service_failure else (
+                            RuntimeError, "fixture_operation" if join_failure or service_failure or anchor_failure else (
                                 "native_acceptance" if scanner_status == 0 else "log_scan")):
                     target.execute(root, fixture, "scanner")
                 self.assertEqual(events, ["native_join", "browser_join"] + ([] if join_failure or service_failure else ["read", "scan"]))
@@ -141,9 +191,15 @@ class EvidenceTests(unittest.TestCase):
                 output = visible.getvalue()
                 self.assertNotIn("opaque", output)
                 self.assertEqual(target.evidence(output),
-                                 {"native_audio": True, "official_image": True} if scanner_status == 0 and not join_failure and not service_failure else {})
+                                 {"native_audio": True, "official_image": True} if scanner_status == 0 and not join_failure and not service_failure and not anchor_failure else {})
                 self.assertEqual(target.diagnostics(output).get("native_stage"),
-                                 "late_login" if scanner_status == 0 and not join_failure and not service_failure else None)
+                                 "late_login" if scanner_status == 0 and not join_failure and not service_failure and not anchor_failure else None)
+                allowed = scanner_status == 0 and not join_failure and not service_failure and not anchor_failure
+                self.assertEqual(target.diagnostics(output).get("native_exit_code"), 101 if allowed else None)
+                self.assertNotIn("native_signal", target.diagnostics(output))
+                self.assertEqual(target.diagnostics(output).get("native_failure"),
+                                 "group_roster_timeout" if allowed else None)
+                self.assertNotIn("Three-member native rosters", output)
 
     @staticmethod
     def anchored_log(runner, name, data):

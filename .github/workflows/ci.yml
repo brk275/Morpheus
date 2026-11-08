@@ -756,6 +756,11 @@ jobs:
               cargo test --locked -p matrix-sdk --features testing,e2e-encryption --lib "$key_case" -- --exact
             done
           fi
+      - name: Compile focused Element native test before live fixture deadlines
+        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite == 'element-interop'
+        # Match the Element runner's exact native target before fixture clocks.
+        # Its 600-second build check and all runtime assertions stay unchanged.
+        run: cargo test --locked -p morpheus-rtc --features native-devices --test element_call_peer --no-run --message-format=json
       - name: Compile focused app timeline test before live fixture deadlines
         if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'matrix') && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads')
         # Same target/features and Slint metadata as Acceptance.app_timeline.

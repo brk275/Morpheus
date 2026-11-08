@@ -49,6 +49,13 @@ STAGES = frozenset((
 FAILURES = frozenset(("fixture_operation", "browser_acceptance", "native_acceptance", "deadline", "evidence", "log_scan"))
 NATIVE_STAGES = ("microphone_cryptor", "late_login", "late_sync", "late_bootstrap", "late_join", "group_roster")
 NATIVE_STAGE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_STAGE "
+NATIVE_TERMINAL_PREFIX = "MORPHEUS_ELEMENT_NATIVE_TERMINAL "
+NATIVE_FAILURE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_FAILURE "
+ROSTER_TIMEOUT = re.compile(
+    r"^thread '" + re.escape(TEST_NAME) + r"'(?: \([0-9]{1,10}\))? panicked at "
+    r"crates/morpheus-rtc/tests/element_call_peer\.rs:[0-9]{1,6}:[0-9]{1,6}:\n"
+    r"Three-member native rosters did not converge: Elapsed\(\(\)\)$", re.MULTILINE)
+
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILES = 128
 MAX_LOG_ENTRIES = 65_536
@@ -86,7 +93,55 @@ def native_stages(output: str) -> tuple[str, ...]:
     return tuple(result)
 
 
-def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
+def terminal_marker(status: int | None) -> str | None:
+    """Only a natural terminal observation made before owned cleanup."""
+    if type(status) is not int:
+        return None
+    if 0 <= status <= 255:
+        return NATIVE_TERMINAL_PREFIX + f"exit={status}"
+    if -64 <= status < 0:
+        return NATIVE_TERMINAL_PREFIX + f"signal={-status}"
+    return None
+
+
+def known_roster_timeout(output: str) -> bool:
+    """Recognize one exact known panic; never return any private panic text."""
+    return (ROSTER_TIMEOUT.search(output) is not None
+            and re.search(r"^test " + re.escape(TEST_NAME) + r" \.\.\. FAILED$", output, re.MULTILINE) is not None)
+
+
+def native_terminal_diagnostics(output: str) -> dict[str, str | int]:
+    result = {}
+    for prefix in (NATIVE_TERMINAL_PREFIX, NATIVE_FAILURE_PREFIX):
+        cursor = count = 0
+        while (start := output.find(prefix.rstrip(), cursor)) >= 0:
+            cursor = start + len(prefix)
+            if start and output[start - 1] != "\n":
+                continue
+            count += 1
+            end = output.find("\n", start)
+            end = len(output) if end < 0 else end
+            kind = "native_terminal" if prefix == NATIVE_TERMINAL_PREFIX else "native_failure"
+            if count != 1 or end - start > 96:
+                return {kind: "invalid"}
+            line = output[start:end]
+            if prefix == NATIVE_FAILURE_PREFIX:
+                if line != prefix + "group_roster_timeout":
+                    return {kind: "invalid"}
+                result[kind] = "group_roster_timeout"
+            else:
+                match = re.fullmatch(re.escape(prefix) + r"(exit|signal)=([0-9]{1,3})", line)
+                if match is None:
+                    return {kind: "invalid"}
+                name, digits = match.groups()
+                value = int(digits)
+                if str(value) != digits or not (0 <= value <= 255 if name == "exit" else 1 <= value <= 64):
+                    return {kind: "invalid"}
+                result["native_exit_code" if name == "exit" else "native_signal"] = value
+    return result
+
+
+def diagnostics(output: str, *, include_native=True) -> dict[str, str | int]:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
     failures = [value for value in FAILURE_PATTERN.findall(output) if value in FAILURES]
@@ -94,8 +149,10 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
         result["stage"] = stages[-1]
     if failures:
         result["failure"] = failures[-1]
-    if include_native and (native := native_stages(output)):
-        result["native_stage"] = native[-1]
+    if include_native:
+        if native := native_stages(output):
+            result["native_stage"] = native[-1]
+        result.update(native_terminal_diagnostics(output))
     return result
 
 
@@ -398,6 +455,8 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     peers_complete = False
     children_joined = False
     cleanup_failure = None
+    native_terminal = None
+    logs_scanned = False
     try:
         runner.mark("tool_install")
         tool = private_directory(root / "tool")
@@ -438,6 +497,13 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         failed_stage = runner.stage
         failure = str(error) if isinstance(error, RuntimeError) and str(error) in FAILURES else "fixture_operation"
     finally:
+        # Observe the still-owned unreaped leader before cleanup sends SIGKILL.
+        # A running process (None) must never be reported as killed by itself.
+        if native is not None:
+            try:
+                native_terminal = native.status()
+            except BaseException:
+                cleanup_failure = "fixture_operation"
         try:
             runner.close()
             children_joined = True
@@ -451,6 +517,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         if not children_joined or cleanup_failure is not None:
             raise RuntimeError("fixture_operation")
         output, native_output = runner.scan(native)
+        logs_scanned = True
         # This is the exact native log snapshot included in the successful
         # scan, inspected only after owned group teardown and actual waits.
         if peers_complete and children_joined and not exact_native_pass(native_output):
@@ -465,12 +532,18 @@ def execute(root: Path, fixture: Path, gitleaks: str):
             runner.release_log_anchors()
         except BaseException:
             failure = "fixture_operation"
+            logs_scanned = False
             output, native_output, facts = "", "", {}
     for key, value in sorted(facts.items()):
         print(f"MORPHEUS_ELEMENT_CHECK {key}={str(value).lower()}", flush=True)
     if children_joined and cleanup_failure is None:
         for value in native_stages(native_output):
             print(NATIVE_STAGE_PREFIX + value, flush=True)
+        if logs_scanned:
+            if marker := terminal_marker(native_terminal):
+                print(marker, flush=True)
+            if known_roster_timeout(native_output):
+                print(NATIVE_FAILURE_PREFIX + "group_roster_timeout", flush=True)
     # Cleanup is required but must not erase the last useful failure stage.
     diagnostic_output = output.replace("MORPHEUS_ELEMENT_STAGE element_cleanup\n", "")
     if found := diagnostics(diagnostic_output, include_native=False):

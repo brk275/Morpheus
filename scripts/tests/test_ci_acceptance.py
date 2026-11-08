@@ -600,5 +600,32 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertIs(ast.literal_eval(keywords["pid_namespace"]), True)
 
 
+    def test_focused_element_prebuild_matches_actual_native_target_before_fixture_deadlines(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        start = "      - name: Compile focused Element native test before live fixture deadlines\n"
+        end = "      - name: Compile focused app timeline test before live fixture deadlines\n"
+        self.assertEqual(source.count(start), 1)
+        step = source.split(start, 1)[1].split(end, 1)[0]
+        self.assertIn("        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite == 'element-interop'\n", step)
+        self.assertNotIn("continue-on-error:", step)
+        self.assertNotIn("timeout-minutes:", step)
+        self.assertNotIn("SLINT_EMIT_DEBUG_INFO", step)
+        self.assertLess(source.index("      - name: Prepare the pinned owned native PipeWire client\n"), source.index(start))
+        self.assertLess(source.index(start), source.index(end))
+        self.assertLess(source.index(start), source.index("      - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC\n"))
+        # Read the actual runner command as data; no candidate import or fixture.
+        element = ast.parse((WORKFLOW.parents[2] / "scripts/run_element_acceptance.py").read_text())
+        execute = next(node for node in element.body if isinstance(node, ast.FunctionDef) and node.name == "execute")
+        command = next(node for node in ast.walk(execute) if isinstance(node, ast.Call)
+                       and isinstance(node.func, ast.Attribute) and node.func.attr == "command"
+                       and node.args and isinstance(node.args[0], ast.List)
+                       and isinstance(node.args[0].elts[0], ast.Constant) and node.args[0].elts[0].value == "cargo")
+        arguments = ast.literal_eval(command.args[0])
+        self.assertEqual(arguments, ["cargo", "test", "--locked", "-p", "morpheus-rtc", "--features", "native-devices",
+                                     "--test", "element_call_peer", "--no-run", "--message-format=json"])
+        self.assertIn("        run: " + " ".join(arguments) + "\n", step)
+        self.assertEqual(ast.literal_eval(next(keyword.value for keyword in command.keywords if keyword.arg == "seconds")), 600)
+
+
 if __name__ == "__main__":
     unittest.main()
