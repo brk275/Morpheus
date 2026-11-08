@@ -2274,14 +2274,22 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
         });
     };
     wheel(-1_000_000.0);
+    // A timer may report the tail before the same tick updates the virtual
+    // layout. Wait for current mounted geometry and current read authority;
+    // an earlier positive report cannot prove that the tail remains visible.
+    let latest_tail_report = || {
+        reports
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(thread, _)| *thread)
+            .is_some_and(|(_, event)| event == &last)
+    };
     for _ in 0..40 {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
         settle(&ui).await;
-        if reports
-            .borrow()
-            .iter()
-            .any(|(thread, event)| *thread && event == &last)
-        {
+        let tail_mounted = control_bounds(&ui, &rows.last().unwrap().body).len() == 1;
+        if tail_mounted && latest_tail_report() {
             break;
         }
     }
@@ -2291,10 +2299,7 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
         "the actual tail is mounted"
     );
     assert!(
-        reports
-            .borrow()
-            .iter()
-            .any(|(thread, event)| *thread && event == &last),
+        latest_tail_report(),
         "only the laid-out visible tail reports progress"
     );
 
