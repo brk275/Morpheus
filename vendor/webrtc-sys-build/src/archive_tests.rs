@@ -188,3 +188,26 @@ fn reviewed_asset_download_uses_the_fixed_official_api_identity() {
     );
     assert!(super::pins::for_triple("mac-arm64-debug").is_none());
 }
+
+#[test]
+fn windows_cache_leaf_uses_exact_immutable_asset_without_duplicate_nesting() {
+    assert_eq!(
+        super::prebuilt_relative_path("win-x64-release"),
+        PathBuf::from("w-419683258")
+    );
+    assert_eq!(
+        super::prebuilt_relative_path("win-arm64-release"),
+        PathBuf::from("w-419683250")
+    );
+    for triple in [
+        "mac-arm64-release",
+        "mac-x64-release",
+        "linux-x64-release",
+        "win-x64-debug",
+    ] {
+        assert_eq!(
+            super::prebuilt_relative_path(triple),
+            PathBuf::from(format!("livekit/{triple}-webrtc-51ef663/{triple}"))
+        );
+    }
+}

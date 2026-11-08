@@ -188,6 +188,21 @@ PACKAGER_ERROR_MARKERS = {
     "target_environment": b"Unable to determine target-environment",
     "invalid_icons": b"Could not find a valid icon",
     "download_hash": b"Hash mismatch of downloaded file",
+    # CLI errors are distinct from packaging errors; each phrase is fixed in
+    # the authenticated 0.11.8 CLI source, never captured exception text.
+    "cli_metadata": b"Failed to read cargo metadata:",
+    "cli_config": b"Failed to parse config",
+    "cli_manifest": b"Failed to parse Cargo.toml:",
+    "cli_package_json": b"Failed to parse package.json:",
+    "cli_workspace_config": b"Failed to deserialize config from `package.metadata.packager` in Cargo.toml:",
+    "cli_no_config": b"Couldn't detect a valid configuration file or all configurations are disabled! Nothing to do here.",
+    # Transparent std::io errors otherwise have no crate-specific prefix.
+    # Publish only these fixed numeric OS classes, never the private path.
+    "filesystem_missing": b"(os error 2)",
+    "filesystem_denied": b"(os error 13)",
+    "filesystem_not_directory": b"(os error 20)",
+    "filesystem_readonly": b"(os error 30)",
+    "filesystem_no_space": b"(os error 28)",
 }
 # Restrict shell tracing matches to the exact commands/arguments in the pinned
 # generated script. Unknown lines are ignored, never echoed or called. Paths
@@ -244,6 +259,10 @@ def package_failure_markers(root, *, scan_passed):
                 or not 0 <= info.st_size <= 8 * 1024 * 1024):
             raise ValueError("Unsafe private package command log")
         data = read_regular(path, 8 * 1024 * 1024)
+        # Only normalize bounded SGR color escapes AFTER the complete raw logs
+        # passed the independent default scan. No terminal text is published.
+        # Do not interpret OSC/control strings or alter the raw scan input.
+        data = re.sub(rb"\x1b\[[0-9;]{0,64}m", b"", data)
         errors.update(token for token, literal in PACKAGER_ERROR_MARKERS.items() if literal in data)
         # The entire file is already bounded. Avoid unbounded line/regex work
         # for arbitrary server data or a single captured compiler-output line.

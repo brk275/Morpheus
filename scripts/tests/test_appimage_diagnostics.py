@@ -290,6 +290,28 @@ class ProgressTests(unittest.TestCase):
                 self.assertTrue(set(facts["package_failure_markers"]["error_markers"]) <= set(D.PACKAGER_ERROR_MARKERS))
                 self.assertNotIn("synthetic-not-published", json.dumps(facts))
 
+    def test_packager_colored_cli_failure_preserves_scan_gate_and_private_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            secret = b"synthetic-private-config-path"
+            self.package_failure_fixture(root, stderr=(
+                b"\x1b[31mFailed to parse\x1b[0m config: " + secret + b"\n"
+                b"I/O Error (" + secret + b"): Permission denied (os error 13)\n"
+                b"\x1b[33m+ cp /bounded/cache/AppRun-x86_64 AppRun\x1b[0m\n"))
+            self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed",
+                                             outer_reason="namespace_exit"),
+                             {"diagnostics": "withheld", "passed": False})
+            facts = D.public_failure(root, scan_passed=True, outer_cleanup="passed",
+                                     outer_reason="namespace_exit")
+            self.assertEqual(facts["package_failure_markers"], {
+                "status": "scanned_private_pair",
+                "error_markers": ["cli_config", "filesystem_denied", "io"],
+                "script_markers": ["copy_apprun"]})
+            self.assertFalse(facts["passed"])
+            self.assertEqual(facts["failure"]["reason"], "command_exit")
+            self.assertNotIn(secret.decode(), json.dumps(facts))
+            self.assertNotIn("/bounded/", json.dumps(facts))
+
     def test_packager_missing_logs_are_unavailable_and_unsafe_or_ambiguous_logs_withhold(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

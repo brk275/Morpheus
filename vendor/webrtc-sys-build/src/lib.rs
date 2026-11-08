@@ -95,12 +95,21 @@ pub fn custom_dir() -> Option<path::PathBuf> {
 /// This also has the benefit of not re-downloading the binaries for each crate
 pub fn prebuilt_dir() -> path::PathBuf {
     let target_dir = scratch::path(SCRATH_PATH);
-    path::Path::new(&target_dir).join(format!(
-        "livekit/{}-{}/{}",
-        webrtc_triple(),
-        WEBRTC_TAG,
-        webrtc_triple()
-    ))
+    path::Path::new(&target_dir).join(prebuilt_relative_path(&webrtc_triple()))
+}
+
+fn prebuilt_relative_path(triple: &str) -> PathBuf {
+    // MSVC's header search can reject ordinary paths at MAX_PATH even when
+    // Rust extracted the same verified files successfully. Keep the Windows
+    // cache leaf compact under the existing owned scratch directory. The
+    // immutable asset ID selects the same architecture/profile/release pin;
+    // download admission and the full SHA256 receipt remain mandatory.
+    if triple.starts_with("win-") {
+        if let Some(pin) = pins::for_triple(triple) {
+            return PathBuf::from(format!("w-{}", pin.asset_id));
+        }
+    }
+    PathBuf::from(format!("livekit/{triple}-{WEBRTC_TAG}/{triple}"))
 }
 
 pub fn download_url() -> String {
