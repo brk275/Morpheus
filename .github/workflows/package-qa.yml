@@ -647,6 +647,11 @@ jobs:
             --native-source-bundle "$env:MORPHEUS_NATIVE_SOURCE_BUNDLE" --native-source-receipt "$env:MORPHEUS_NATIVE_SOURCE_RECEIPT" `
             --gitleaks-sha256 "17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c" --execute-on-free-hosted-runner
           if ($LASTEXITCODE -ne 0) { throw 'Synthetic installed Windows update acceptance failed' }
+      - name: Check Windows archive units before packaging
+        if: runner.os == 'Windows' && needs.scope.outputs.native_updates != 'true'
+        shell: bash
+        working-directory: ${{ format('{0}/fetch-source', env.MORPHEUS_NATIVE_SOURCE_ROOT) }}
+        run: cargo test --locked -p webrtc-sys-build --lib
       - name: Build unsigned QA package
         if: runner.os != 'Linux' && needs.scope.outputs.native_updates != 'true'
         shell: bash

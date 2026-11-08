@@ -283,11 +283,7 @@ fn encrypted_history_recovers_on_fresh_alice_device() {
                 return Err("Old Alice selection does not match the signed-in account");
             }
             let enabled = old
-                .enable_recovery_selected(
-                    &old_selection,
-                    &|| old_selection.is_current(),
-                    &|_| {},
-                )
+                .enable_recovery_selected(&old_selection, &|| old_selection.is_current(), &|_| {})
                 .await
                 .map_err(|_| "Selected recovery setup failed")?;
             if enabled.confirmation != SetupConfirmation::Confirmed {
@@ -388,7 +384,9 @@ fn encrypted_history_recovers_on_fresh_alice_device() {
             // No recovery key or live old device survives this boundary. Stop
             // and drop the actual manager, retaining only its private profile
             // and OS vault entry, then reopen those exact persistent inputs.
-            let retiring = fresh_slot.take().ok_or("Fresh account manager disappeared")?;
+            let retiring = fresh_slot
+                .take()
+                .ok_or("Fresh account manager disappeared")?;
             retiring.stop().await;
             if fresh_selection.is_current() {
                 return Err("Stopped manager retained its account selection");

@@ -2285,12 +2285,19 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
             .find(|(thread, _)| *thread)
             .is_some_and(|(_, event)| event == &last)
     };
-    for _ in 0..40 {
+    for frame in 1..=40 {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
         settle(&ui).await;
         let tail_mounted = control_bounds(&ui, &rows.last().unwrap().body).len() == 1;
         if tail_mounted && latest_tail_report() {
             break;
+        }
+        // A wheel delta is clamped to the list's current estimated extent,
+        // not a request to reveal its last row. After the first 180 ms wheel
+        // animation and its measurements, scroll once more against the newly
+        // measured extent. Keep the original forty-frame observation bound.
+        if frame == 12 {
+            wheel(-1_000_000.0);
         }
     }
     assert_eq!(
@@ -2328,7 +2335,7 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
     );
 
     wheel(-1_000_000.0);
-    for _ in 0..40 {
+    for frame in 1..=40 {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
         settle(&ui).await;
         if reports
@@ -2337,6 +2344,11 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
             .is_some_and(|(thread, event)| *thread && event == &last)
         {
             break;
+        }
+        // Repeat the real wheel after its 180 ms animation has measured the
+        // virtual extent; keep this original forty-frame observation bound.
+        if frame == 12 {
+            wheel(-1_000_000.0);
         }
     }
     assert!(
@@ -2392,7 +2404,7 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
     );
 
     wheel(-1_000_000.0);
-    for _ in 0..40 {
+    for frame in 1..=40 {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
         settle(&ui).await;
         if reports
@@ -2401,6 +2413,11 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
             .is_some_and(|(_, event)| !event.is_empty())
         {
             break;
+        }
+        // Repeat the real wheel after its 180 ms animation has measured the
+        // virtual extent; keep this original forty-frame observation bound.
+        if frame == 12 {
+            wheel(-1_000_000.0);
         }
     }
     assert!(
