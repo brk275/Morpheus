@@ -303,10 +303,12 @@ def run_case(runner, root, artifact, appdir, peer_binary, backend, fixture, envi
         phase("keyring")
         keyring = owner.start("keyring", [executable("gnome-keyring-daemon"), "--foreground", "--unlock", "--components=secrets"], env,
                               stdin=secrets.token_urlsafe(32).encode() + b"\n")
-        phase("display")
+        phase("display_start")
         sway = owner.start("sway", [executable("sway"), "--config", str(root / "config/sway.conf")], env)
         runtime = root / "runtime"
+        phase("display_wayland_wait")
         env["WAYLAND_DISPLAY"] = owner.wait_for(lambda: next((p.name for p in runtime.glob("wayland-*") if p.is_socket()), None), watch=[bus, sway])
+        phase("display_ipc_wait")
         env["SWAYSOCK"] = str(owner.wait_for(lambda: next(runtime.glob("sway-ipc.*.sock"), None), watch=[bus, sway]))
         def run(stage, argv, seconds=15, limit=65536):
             return runner.run(stage, [executable(argv[0]), *argv[1:]], cwd=ROOT, env=env, timeout=seconds, output_limit=limit)

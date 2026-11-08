@@ -644,6 +644,48 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
         verify.assert_not_called()
         cleanup.assert_called_once()
 
+    def test_installed_capture_socket_budget_accepts_short_root_not_old_provider_layout(self):
+        with mock.patch.object(P.os, "getuid", return_value=1001):
+            P.require_capture_socket_budget(Path("/home/runner/work/_temp/m-ai-12345678"))
+            with self.assertRaises(P.PackageFailure) as error:
+                P.require_capture_socket_budget(Path("/home/runner/work/_temp/morpheus-appimage-capture-12345678"))
+        self.assertEqual(error.exception.reason, "configuration")
+
+    def test_installed_capture_socket_budget_counts_bytes_and_reserves_pid_growth(self):
+        # The fixed Sway suffix is55 bytes at this UID and widest positive pid_t.
+        # Linux accepts107 pathname bytes plus NUL, but not108 pathname bytes.
+        with mock.patch.object(P.os, "getuid", return_value=1001):
+            P.require_capture_socket_budget(Path("/" + "a" * 51))
+            for root in (Path("/" + "a" * 52), Path("/" + "é" * 26)):
+                with self.subTest(root_length=len(str(root))), self.assertRaises(P.PackageFailure) as error:
+                    P.require_capture_socket_budget(root)
+                self.assertEqual(error.exception.reason, "configuration")
+
+    def test_socket_budget_rejection_precedes_namespace_probe_and_native_build(self):
+        import source_bundle_qa as Q
+        with tempfile.TemporaryDirectory() as directory:
+            case = Path(directory)
+            with mock.patch.object(P, "public_hosted_environment"), \
+                    mock.patch.object(P, "controlled_environment", return_value={}), \
+                    mock.patch.object(Q, "guard_native"), \
+                    mock.patch.object(P, "expected_revision", return_value="a" * 40), \
+                    mock.patch.object(P, "verify_checkout"), \
+                    mock.patch.object(P, "command_tools", return_value={}), \
+                    mock.patch.object(P, "owned_tool", return_value="/reviewed/scanner"), \
+                    mock.patch.object(P, "require_capture_socket_budget", side_effect=P.PackageFailure("configuration")) as budget, \
+                    mock.patch.object(P.containment, "containment_check") as containment, \
+                    mock.patch.object(P, "contained") as native, \
+                    mock.patch.object(P.tempfile, "TemporaryDirectory") as temporary, \
+                    self.assertRaises(P.PackageFailure) as error:
+                temporary.return_value.__enter__.return_value = str(case)
+                temporary.return_value.__exit__.return_value = False
+                P.main(["--gitleaks", "/reviewed/scanner"])
+            self.assertEqual(error.exception.reason, "configuration")
+            budget.assert_called_once_with(case.resolve())
+            containment.assert_not_called()
+            native.assert_not_called()
+            temporary.assert_called_once_with(prefix="m-ai-", dir=P.os.environ.get("RUNNER_TEMP"))
+
     def test_readiness_cannot_be_enabled_by_environment(self):
         self.assertTrue(P.INSTALLED_CAPTURE_READY)  # Source review only.
         with mock.patch.object(P, "INSTALLED_CAPTURE_READY", False), \

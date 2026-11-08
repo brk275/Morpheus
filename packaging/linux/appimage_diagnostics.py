@@ -38,7 +38,7 @@ COMMANDS = frozenset((
     "capture-rtc-down", "capture-backend-configure", "capture-backend-compile", "cleanup-rtc", "cleanup-env", "cleanup-inventory"))
 WRAPPER = frozenset(("namespace", "startup", "build", "capture", "source", "complete"))
 MODES = frozenset(("none", "ordinary", "eager_bindings"))
-PHASES = frozenset(("none", "setup", "bus", "keyring", "display", "portal", "peer", "launch", "identity", "login", "join",
+PHASES = frozenset(("none", "setup", "bus", "keyring", "display", "display_start", "display_wayland_wait", "display_ipc_wait", "portal", "peer", "launch", "identity", "login", "join",
                     "static_frame", "changed_frame", "screen_stopped", "reopened_frame", "changed_after_reopen", "source_loss",
                     "app_left", "app_close", "bindings", "complete"))
 PEER_FACTS = frozenset(("unavailable_audio_verified", "peer_ready", "exact_sender_joined", "static_frame", "changed_frame",

@@ -59,6 +59,17 @@ def require_readiness():
         raise PackageFailure("not_ready")
 
 
+def require_capture_socket_budget(root):
+    # Sway 1.9 constructs this pathname before honoring SWAYSOCK and aborts
+    # when it does not fit Linux sockaddr_un.sun_path (108 including NUL).
+    # Reserve the widest positive signed pid_t, independent of the long build's
+    # later PID allocation. Keep both fresh sessions inside the same owned root.
+    for case in ("ordinary", "bindings"):
+        ipc = root / case / "session/runtime" / f"sway-ipc.{os.getuid()}.2147483647.sock"
+        if len(os.fsencode(ipc)) >= 108:
+            raise PackageFailure("configuration")
+
+
 def public_hosted_environment(environment):
     expected = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
                 "RUNNER_OS": "Linux", "GITHUB_REPOSITORY": "brk275/Morpheus",
@@ -865,9 +876,10 @@ def main(argv=None):
     scanner = owned_tool(args.gitleaks)
     output = qa_output_path(args.qa_output) if args.qa_output else None
     data = None
-    with tempfile.TemporaryDirectory(prefix="morpheus-appimage-capture-", dir=os.environ.get("RUNNER_TEMP")) as directory:
+    with tempfile.TemporaryDirectory(prefix="m-ai-", dir=os.environ.get("RUNNER_TEMP")) as directory:
         root = Path(directory).resolve()
         root.chmod(0o700)
+        require_capture_socket_budget(root)
         containment.containment_check(root / "containment-probe")
         receipt = contained(root, scanner, tools, environment)
         if output is not None:

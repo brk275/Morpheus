@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 from scripts.package import package_config, preflight_deb_authors, linux_appimage, macos_update_formats
 from scripts import prepare_macos_update as mac_update
-from scripts import prepare_windows_update, native_notices
+from scripts import prepare_windows_update, native_notices, macos_package_tools
 
 
 def fixture_notices(root, platform, version):
@@ -41,6 +41,121 @@ def fixture_notices(root, platform, version):
              "distribution_ready": False, "license_compliance_verified": False,
              "unresolved_release_requirements": list(native_notices.OPEN)}
     return {native_notices.TEXT: text, native_notices.INVENTORY: json.dumps(value, sort_keys=True).encode()}
+
+
+class MacPackagerToolsTests(unittest.TestCase):
+    def test_nonhosted_prepare_rejects_before_any_filesystem_inspection(self):
+        with mock.patch.object(macos_package_tools.sys, "platform", "linux"), \
+                mock.patch.object(Path, "lstat") as inspected:
+            with self.assertRaises(ValueError):
+                macos_package_tools.prepare({})
+            inspected.assert_not_called()
+
+    def test_existing_manual_mac_selection_modes_and_native_update_refusal(self):
+        revision = "a" * 40
+        environment = {"GITHUB_ACTIONS": "true", "CI": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+                       "RUNNER_OS": "macOS", "GITHUB_REPOSITORY": "brk275/Morpheus",
+                       "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "workflow_dispatch",
+                       "GITHUB_ACTOR": "brk275", "GITHUB_TRIGGERING_ACTOR": "brk275",
+                       "MORPHEUS_PACKAGE_SOURCE_REVISION": revision, "GITHUB_SHA": revision,
+                       "RUNNER_TEMP": "/synthetic", "GITHUB_EVENT_PATH": "/synthetic/event.json"}
+        event = {"repository": {"full_name": "brk275/Morpheus", "private": False, "owner": {"id": 1}},
+                 "sender": {"id": 1}, "inputs": {"source_revision": revision, "platform": "macos",
+                 "linux_formats": "both", "native_updates": "false", "appimage_updates": "false",
+                 "appimage_capture": "false", "source_bundle": "false"}}
+        def metadata(*args, **kwargs):
+            return json.dumps(event).encode(), (1, 1)
+        with mock.patch.object(macos_package_tools.sys, "platform", "darwin"), \
+                mock.patch.object(macos_package_tools.os, "getuid", return_value=501, create=True), \
+                mock.patch.object(macos_package_tools, "directory"), \
+                mock.patch.object(macos_package_tools, "regular", side_effect=metadata):
+            macos_package_tools.hosted_guard(environment)
+            event["inputs"].update(platform="all", source_revision="", linux_formats="appimage", appimage_updates="true")
+            macos_package_tools.hosted_guard(environment)
+            event["inputs"].update(native_updates="true")
+            with self.assertRaises(ValueError):
+                macos_package_tools.hosted_guard(environment)
+
+    def test_closed_json_rejects_duplicate_keys(self):
+        with self.assertRaises(ValueError):
+            macos_package_tools.unique_json(b'{"schema":1,"schema":1}')
+
+    @unittest.skipIf(os.name == "nt", "Darwin/POSIX file identity contract")
+    def test_script_identity_reader_rejects_symlinks_hardlinks_and_writable_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "script"
+            script.write_bytes(b"")
+            script.chmod(0o600)
+            with self.assertRaises(ValueError):
+                macos_package_tools.regular(script, 8)
+            self.assertEqual(macos_package_tools.regular(script, 8, allow_empty=True)[0], b"")
+            script.write_bytes(b"reviewed")
+            self.assertEqual(macos_package_tools.regular(script, 8)[0], b"reviewed")
+            link = root / "link"
+            link.symlink_to(script)
+            with self.assertRaises(ValueError):
+                macos_package_tools.regular(link, 8)
+            os.link(script, root / "hardlink")
+            with self.assertRaises(ValueError):
+                macos_package_tools.regular(script, 8)
+            (root / "hardlink").unlink()
+            script.chmod(0o622)
+            with self.assertRaises(ValueError):
+                macos_package_tools.regular(script, 8)
+
+    def test_existing_dmg_tool_tree_refuses_before_download_or_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            root = home / "Library/Caches/.cargo-packager/DMG"
+            root.mkdir(parents=True)
+            old = root / "unreviewed"
+            old.write_bytes(b"preserve")
+            with mock.patch.object(macos_package_tools, "hosted_guard"), \
+                    mock.patch.object(macos_package_tools, "pins", return_value={}), \
+                    mock.patch.object(macos_package_tools, "fresh_mount"), \
+                    mock.patch.object(macos_package_tools, "directory", return_value=(1, 1)), \
+                    mock.patch.object(macos_package_tools, "download") as download:
+                with self.assertRaises(ValueError):
+                    macos_package_tools.prepare({"HOME": str(home)})
+                download.assert_not_called()
+            self.assertEqual(old.read_bytes(), b"preserve")
+            self.assertEqual({p.name for p in root.iterdir()}, {"unreviewed"})
+
+    @unittest.skipIf(os.name == "nt", "Darwin/POSIX bounded transfer contract")
+    def test_download_refuses_wrong_bytes_with_closed_bounded_command(self):
+        for body in (b"wrong", b"x" * (macos_package_tools.SCRIPT_BYTES + 1)):
+            def transfer(command, **kwargs):
+                kwargs["stdout"].write(body)
+            def metadata(path):
+                kind = stat.S_IFREG if path.name == "curl" else stat.S_IFDIR
+                return SimpleNamespace(st_mode=kind | 0o755, st_uid=0)
+            with mock.patch.object(Path, "lstat", autospec=True, side_effect=metadata), \
+                    mock.patch.object(macos_package_tools.subprocess, "run", side_effect=transfer) as run:
+                with self.assertRaises(ValueError):
+                    macos_package_tools.download()
+                command = run.call_args.args[0]
+                self.assertEqual(command[0], "/usr/bin/curl")
+                self.assertEqual(command[-1], macos_package_tools.URL)
+                for option, value in [("--proxy", ""), ("--noproxy", "*"),
+                                      ("--proto", "=https"), ("--proto-redir", "=https"),
+                                      ("--max-redirs", "0"), ("--max-time", "30"),
+                                      ("--max-filesize", str(macos_package_tools.SCRIPT_BYTES))]:
+                    self.assertEqual(command[command.index(option) + 1], value)
+                self.assertNotIn("--location", command)
+                self.assertEqual(run.call_args.kwargs["timeout"], 35)
+                self.assertEqual(run.call_args.kwargs["env"], {"PATH": "/usr/bin:/bin", "LANG": "C"})
+                import resource
+                with mock.patch.object(resource, "setrlimit") as limit:
+                    run.call_args.kwargs["preexec_fn"]()
+                    limit.assert_called_once_with(resource.RLIMIT_FSIZE,
+                                                  (macos_package_tools.SCRIPT_BYTES + 1,) * 2)
+
+    def test_existing_volume_is_never_detached(self):
+        with mock.patch.object(macos_package_tools.os.path, "lexists", return_value=True) as exists:
+            with self.assertRaises(ValueError):
+                macos_package_tools.fresh_mount()
+            exists.assert_called_once_with("/Volumes/Morpheus")
 
 
 class PackageConfigTests(unittest.TestCase):

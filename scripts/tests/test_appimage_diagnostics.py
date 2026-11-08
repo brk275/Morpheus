@@ -47,6 +47,26 @@ class ProgressTests(unittest.TestCase):
             visible = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="source_missing")
             self.assertEqual(visible["failure"]["reason"], "source_missing")
 
+    def test_display_subphases_are_closed_latched_and_scan_gated(self):
+        for phase in ("display_start", "display_wayland_wait", "display_ipc_wait"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                progress = D.Progress(root)
+                progress.wrapper("capture")
+                progress.capture("ordinary", phase)
+                progress.failed(RuntimeError("private path and service body"))
+                progress.command("capture-inventory")
+                progress.cleanup(True)
+                self.assertTrue(D.valid_record(progress.value))
+                self.assertEqual(set(progress.value), D.FIELDS)
+                self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                                 {"diagnostics": "withheld", "passed": False})
+                visible = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                self.assertEqual(visible["failure"]["capture_phase"], phase)
+                self.assertEqual(visible["failure"]["command_stage"], "none")
+                self.assertEqual(visible["command_stage"], "capture-inventory")
+                self.assertNotIn("private", json.dumps(visible))
+
     def test_first_failure_position_survives_later_commands_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

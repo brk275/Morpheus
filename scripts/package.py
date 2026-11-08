@@ -159,9 +159,20 @@ def native_package(config, args):
             prepared = dict(config)
             prepared["resources"] = list(config["resources"]) + [
                 {"src": str(directory / name), "target": name} for name in notices.NAMES]
-            subprocess.run(["cargo", "packager", "--release", "--config", json.dumps(prepared), "--formats", formats],
-                           check=True, cwd=ROOT)
-            prepare_macos_payload(config, output, contents)
+            import contextlib
+            tools = contextlib.nullcontext()
+            if "dmg" in formats.split(","):
+                if __package__:
+                    from . import macos_package_tools
+                else:
+                    import macos_package_tools
+                # The separate installed-update driver invokes Packager directly
+                # under its own HOME. App-only packaging needs no DMG helper.
+                tools = macos_package_tools.ordinary_tools()
+            with tools:
+                subprocess.run(["cargo", "packager", "--release", "--config", json.dumps(prepared), "--formats", formats],
+                               check=True, cwd=ROOT)
+                prepare_macos_payload(config, output, contents)
         # Keep exact generated comparison data beside private QA artifacts, never upload.
         for name in notices.NAMES:
             with (output / name).open("xb") as stream:

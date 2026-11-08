@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "packager_version": "0.11.8",
+  "script": {
+    "url": "https://raw.githubusercontent.com/create-dmg/create-dmg/28867ba3563ddef62f55dcf130677103b4296c42/create-dmg",
+    "bytes": 16911,
+    "sha256": "d4be62531a0d4d4524d34fe0599b4ebdddd6f664931b4e0832536d1f0fd92b26"
+  },
+  "support": {
+    "template.applescript": {
+      "sha256": "13727c7930c50be639a1eb191e893f1ebc72c270268d4611391b41410a3e862a",
+      "bytes": 1828
+    },
+    "eula-resources-template.xml": {
+      "sha256": "7d61d948ba7f118306d61107fead78f04e3338585e2ec729abb65d5d2e21012d",
+      "bytes": 2376
+    }
+  }
+}
