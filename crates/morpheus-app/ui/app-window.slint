@@ -678,14 +678,17 @@ component IconAction inherits Rectangle {
     // Disabled, then selected, then the caller's ink.
     property <color> glyph-ink: !root.enabled && StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color
         : root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
-    if root.icon-id == "" : Text {
+    // Quiet row actions retain their focus, hit target and accessibility
+    // owner while hidden. Build only the glyph when it can actually be seen;
+    // its fixed-size control geometry never depends on these children.
+    if root.opacity > 0 && root.icon-id == "" : Text {
         text: root.icon;
         color: root.glyph-ink;
         font-size: root.icon == "Md" ? root.glyph-size * 13 / 18 : root.glyph-size;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
-    if root.icon-id != "" : MorpheusIcon {
+    if root.opacity > 0 && root.icon-id != "" : MorpheusIcon {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         width: root.glyph-size;

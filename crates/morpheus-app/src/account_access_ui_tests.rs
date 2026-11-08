@@ -5310,6 +5310,45 @@ async fn assert_seen_by_modal_guard(ui: &AppWindow) {
     ui.set_messages(ModelRc::new(VecModel::from(vec![row])));
     settle(ui).await;
     let opener = "Seen by: who has read up to this message from Robin";
+    // A quiet action keeps its actual button, geometry and AT focus target
+    // while its unused glyph is absent. Reveal by pointer and by bridge focus.
+    ui.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(0.0, 0.0),
+    });
+    ui.invoke_focus_composer(false);
+    settle(ui).await;
+    let (quiet_bounds, quiet) = drawn_icon(ui, opener);
+    assert!(quiet.commands.is_empty() && quiet.texts.is_empty());
+    ui.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(
+            (quiet_bounds.left + quiet_bounds.right) / 2.0,
+            (quiet_bounds.top + quiet_bounds.bottom) / 2.0,
+        ),
+    });
+    settle(ui).await;
+    let (hover_bounds, hovered) = drawn_icon(ui, opener);
+    assert_eq!(
+        hover_bounds, quiet_bounds,
+        "glyph reveal must not move the action"
+    );
+    // Seen-by uses the existing unmapped "✓✓" text fallback, not a path.
+    assert!(hovered.commands.is_empty());
+    assert_eq!(hovered.texts, vec!["✓✓".to_owned()]);
+    ui.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(0.0, 0.0),
+    });
+    settle(ui).await;
+    let hidden = drawn_icon(ui, opener).1;
+    assert!(hidden.commands.is_empty() && hidden.texts.is_empty());
+    request_bridge_focus(ui, opener);
+    settle(ui).await;
+    let (focus_bounds, focused) = drawn_icon(ui, opener);
+    assert_eq!(
+        focus_bounds, quiet_bounds,
+        "keyboard reveal keeps the same target"
+    );
+    assert!(focused.commands.is_empty());
+    assert_eq!(focused.texts, vec!["✓✓".to_owned()]);
     let close = "Close read receipts";
     let press = |text: &str| ui.invoke_dispatch_shortcut(text.into(), true, false, true, false);
     control_with_label(ui, opener).accessible_action(&AccessibilityAction::Default);
@@ -5331,6 +5370,19 @@ async fn assert_seen_by_modal_guard(ui: &AppWindow) {
         focused_control_has_label(ui, opener),
         "focus did not return to the action that opened Seen by"
     );
+    let returned = drawn_icon(ui, opener).1;
+    assert!(returned.commands.is_empty());
+    assert_eq!(returned.texts, vec!["✓✓".to_owned()]);
+    key(ui, Key::Space);
+    settle(ui).await;
+    assert!(
+        activity.get_seen_open(),
+        "the revealed action still accepts Space"
+    );
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!activity.get_seen_open());
+    assert!(focused_control_has_label(ui, opener));
     // Shortcuts run again once it is closed (the details panel, twice).
     assert!(press("d"));
     assert!(press("d"));
