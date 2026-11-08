@@ -44,8 +44,9 @@ pub use encryption::{
 pub use error::{CommandError, JoinError, LeaveError};
 pub use host::application::ApplicationIntake;
 pub use host::backend::{
-    BackendError, EventEncryption, EventIn, MatrixBackend, OpenIdToken, RoomSink, RoomSubjects,
-    Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient, ToDeviceSink,
+    BackendError, EventEncryption, EventIn, LiveKitTokenRequest, MatrixBackend, OpenIdToken,
+    RoomSink, RoomSubjects, Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient,
+    ToDeviceSink,
 };
 pub use host::event::{
     EventConversionError, EventOrigin, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
@@ -70,7 +71,8 @@ pub use slot::{
     SLOT_EVENT_TYPE, SlotEncryption, SlotState, SlotStatus,
 };
 pub use transport::{
-    LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport,
+    LiveKitCsApiTransport, LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport,
+    UnsupportedTransport,
 };
 pub use wire::wire_event_type;
 
@@ -78,6 +80,13 @@ pub use wire::wire_event_type;
 #[cfg(feature = "testing")]
 pub mod testing {
     pub use crate::host::backend::{MockBackend, MockRoomSubscription, MockToDeviceSubscription};
+
+    /// Public deterministic media-key fixture: bytes 0 through 15, padded base64.
+    pub fn sequential_test_media_key() -> String {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        STANDARD.encode([0_u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+    }
 }
 
 #[cfg(test)]
@@ -1035,7 +1044,9 @@ mod tests {
                             "https://example.com/livekit/jwt"
                         );
                     }
-                    RtcTransport::Unsupported(_) => panic!("Expected LiveKit transport"),
+                    RtcTransport::LiveKitCsApi(_) | RtcTransport::Unsupported(_) => {
+                        panic!("Expected LiveKit transport")
+                    }
                 }
             }
             RtcMembershipEvent::Left(_) => panic!("Expected Joined membership"),
@@ -1090,7 +1101,9 @@ mod tests {
                         assert_eq!(unsupported.transport_type, "unknown_transport");
                         assert!(unsupported.extra_fields.contains_key("custom_field"));
                     }
-                    RtcTransport::LiveKit(_) => panic!("Expected Unsupported transport"),
+                    RtcTransport::LiveKit(_) | RtcTransport::LiveKitCsApi(_) => {
+                        panic!("Expected Unsupported transport")
+                    }
                 }
             }
             RtcMembershipEvent::Left(_) => panic!("Expected Joined membership"),

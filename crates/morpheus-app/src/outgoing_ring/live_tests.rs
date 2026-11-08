@@ -19,6 +19,7 @@ use matrix_sdk::{
         api::client::{room::get_room_event, uiaa},
     },
 };
+use morpheus_config::RoomCallMode;
 use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
 use morpheus_rtc::{
     CallOptions, ObserverError, PassiveCallObserver, RtcStreamKind,
@@ -28,6 +29,7 @@ use morpheus_rtc::{
 };
 use serde::Deserialize;
 
+use crate::calls::CallJoinMode;
 use crate::incoming_ring::{AdmissionFailure, IncomingOffer, ledger::OfferLedger};
 use crate::voice_spaces::VoiceSpaces;
 
@@ -280,6 +282,7 @@ struct Case {
     fixture: Fixture,
     profile: tempfile::TempDir,
     mode: InteropMode,
+    room_mode: RoomCallMode,
     dm: bool,
     room_id: OwnedRoomId,
 }
@@ -326,11 +329,13 @@ impl Case {
         }
         let room_id =
             RoomId::parse(fixture.rooms.get("encrypted_room").ok_or(())?).map_err(|_| ())?;
-        let mode = match std::env::var("MORPHEUS_RING_TEST_MODE").as_deref() {
-            Ok("current") => InteropMode::Current,
-            Ok("sticky-2025") => InteropMode::Sticky2025,
+        let room_mode = match std::env::var("MORPHEUS_RING_TEST_MODE").as_deref() {
+            Ok("standard") => RoomCallMode::Standard,
+            Ok("sticky-2025") => RoomCallMode::ElementCallMatrix2,
             _ => return Err(()),
         };
+        let mode = CallJoinMode::from(room_mode).options().interop_mode;
+        require(mode == InteropMode::Sticky2025)?;
         let dm = match std::env::var("MORPHEUS_RING_TEST_TARGET").as_deref() {
             Ok("dm") => true,
             Ok("room") => false,
@@ -344,6 +349,7 @@ impl Case {
             fixture,
             profile,
             mode,
+            room_mode,
             dm,
             room_id,
         })
@@ -396,11 +402,7 @@ impl Session {
             )
             .await
             .map_err(|_| ())?;
-        let slot_selection = if case.mode == InteropMode::Sticky2025 {
-            Some(self.alice.account_selection(&alice.id).ok_or(())?)
-        } else {
-            None
-        };
+        let slot_selection = self.alice.account_selection(&alice.id).ok_or(())?;
         let bob = self
             .bob
             .add_password_account(
@@ -460,35 +462,48 @@ impl Session {
         phase(&mut self.stage, Stage::Join);
         self.rtc = Some(RtcService::new(alice_client.clone()));
         let rtc = self.rtc.as_mut().ok_or(())?;
-        if case.mode == InteropMode::Sticky2025 {
-            let original_selection = slot_selection.as_ref().ok_or(())?.clone();
-            let admit: Arc<dyn Fn() -> bool + Send + Sync> =
-                Arc::new(move || original_selection.is_current());
-            rtc.open_outgoing_slot(
+        let original_selection = slot_selection.clone();
+        let admit: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || original_selection.is_current());
+        // Experimental Current remains a literal historical API; shipping room
+        // intent must reject it before publishing a slot or joining membership.
+        let historical = CallOptions {
+            auth_dialect: Some(morpheus_rtc::LiveKitAuthDialect::DirectDraft),
+            ..CallOptions::default()
+        };
+        require(matches!(
+            rtc.join_outgoing_room(case.room_id.as_str(), historical, admit.as_ref())
+                .await,
+            Err(morpheus_rtc::RtcError::Discovery(message))
+                if message == "room-wide calls require a supported room profile; use a literal join for explicit draft or custom slots"
+        ))?;
+        require(rtc.call(case.room_id.as_str()).is_none())?;
+        require(matches!(
+            rtc.open_outgoing_room(
                 case.room_id.as_str(),
-                "m.call#room",
                 true,
-                case.mode,
+                InteropMode::Current,
                 Arc::clone(&admit),
             )
+            .await,
+            Err(morpheus_rtc::RtcError::Discovery(message))
+                if message == "room-wide calls require a supported room profile; use a literal join for explicit draft or custom slots"
+        ))?;
+        fact("experimental_current_room_entry_rejected");
+        rtc.open_outgoing_room(case.room_id.as_str(), true, case.mode, Arc::clone(&admit))
             .await
             .map_err(|_| ())?;
-            original_sticky_slot_without_lower(&alice_client, &case.room_id, admit.as_ref())
-                .await?;
-        } else {
-            rtc.open_slot(case.room_id.as_str(), "m.call#room", true)
-                .await
-                .map_err(|_| ())?;
-        }
-        let options = match case.mode {
-            InteropMode::Current => CallOptions::default(),
-            InteropMode::Sticky2025 => CallOptions::element_call_matrix_2_0(),
-            InteropMode::RoomState => return Err(()),
-        };
-        let info = time::timeout(PHASE_LIMIT, rtc.join(case.room_id.as_str(), options))
-            .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
+        original_sticky_slot_without_lower(&alice_client, &case.room_id, admit.as_ref()).await?;
+        let options = CallJoinMode::from(case.room_mode).options();
+        require(options.interop_mode == InteropMode::Sticky2025 && options.auth_dialect.is_none())?;
+        fact("shipping_sticky_profile");
+        let info = time::timeout(
+            PHASE_LIMIT,
+            rtc.join_outgoing_room(case.room_id.as_str(), options, admit.as_ref()),
+        )
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())?;
         require(
             rtc.participants(case.room_id.as_str())
                 .map_err(|_| ())?

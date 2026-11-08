@@ -78,10 +78,12 @@ profile_not_fresh login account_mismatch sync_not_running adapter_mismatch
 account_option_missing room_not_shown room_file_mode profile_not_enrolled restore
 pagination_bound pagination_not_started pagination_timeout pagination_error
 history_incomplete timeline_not_visible input_dispatch scroll_not_rendered
+scroll_anchor_invalid scroll_anchor_unavailable scroll_anchor_context scroll_not_moved
+delegate_snapshot delegate_tree_missing delegate_tree_bound delegate_tree_duplicate delegate_upper_bound
 switch_away switch_back device_record device_record_invalid
 """.split())
 STAGES = frozenset("""
-start watchdog first_render enroll_profile enroll_switch_account enroll_measured_account
+start watchdog first_render delegate_snapshot enroll_profile enroll_switch_account enroll_measured_account
 restore sync room_listed open_room pagination history_complete scroll switch_away
 switch_back reopen_room complete enroll_device_record fixture_account homeserver_not_loopback
 fixture_user_not_synthetic client login output_path output_in_checkout bob_device_ids
@@ -100,7 +102,8 @@ BUILD = {
     "shipping_acceptance": ("const", False),
     "delta_from_shipping": (
         "const",
-        ["acceptance_driver", "rendering_notifier", "generated_profile_root", "requested_sync_policy"],
+        ["acceptance_driver", "rendering_notifier", "generated_profile_root", "requested_sync_policy",
+         "delegate_upper_bound_snapshots", "timeline_anchor_motion_samples"],
     ),
 }
 COMMON = {
@@ -150,6 +153,12 @@ MEASURE = COMMON | {
         "delta_logical_px": "number",
         "steps_accepted": "int",
         "steps_with_render_hook": "int",
+        "steps_with_anchor_motion": "int",
+        "steps_with_anchor_row_change": "int",
+        "anchor_index_min": "int",
+        "anchor_index_max": "int",
+        "motion_method": ("const", "shipping_top_row_at_first_render_hook"),
+        "dispatch_to_motion_render_hook_us": "summary",
         "idle_render_hook_frames_before": "int",
         "dispatch_to_render_hook_us": "summary",
         "render_hook_span_us": "summary",
@@ -169,9 +178,10 @@ MEASURE = COMMON | {
         "after_switch": "int?",
         "peak": "int?",
     },
-    "delegates": {"instances": ("const", None), "method": ("const", "unmeasured")},
+    "delegates": {"after_history_upper_bound": "int", "after_scroll_upper_bound": "int",
+                  "method": ("const", "attached_component_root_upper_bound")},
     "poll_ms": "int",
-    "not_measured": ("const", ["gpu_time", "presentation", "display_refresh", "delegate_instances"]),
+    "not_measured": ("const", ["gpu_time", "presentation", "display_refresh", "exact_delegate_instances", "delegate_peak"]),
 }
 SUMMARY_KEYS = {"count", "dropped", "p50", "p95", "max"}
 
@@ -270,6 +280,23 @@ def valid_report(report, mode: str, adapter: str) -> bool:
     if not closed(report, schema) or report["adapter"] != adapter:
         return False
     backend = report["observed_backend"] if mode == "enroll" else report["sync"]["observed_backend"]
+    if mode != "enroll" and any(not 0 < report["delegates"][name] < EVENTS
+                                for name in ("after_history_upper_bound", "after_scroll_upper_bound")):
+        return False
+    if mode != "enroll":
+        scroll = report["scroll"]
+        motion = scroll["dispatch_to_motion_render_hook_us"]
+        all_steps = scroll["dispatch_to_render_hook_us"]
+        if not (scroll["steps"] == 240
+                and 0 < scroll["steps_with_anchor_row_change"] <= scroll["steps_with_anchor_motion"]
+                <= scroll["steps_with_render_hook"] <= scroll["steps"]
+                and 0 < scroll["steps_accepted"] <= scroll["steps"]
+                and scroll["anchor_index_min"] < scroll["anchor_index_max"] < report["history"]["model_rows"]
+                and motion is not None and motion["count"] == scroll["steps_with_anchor_motion"]
+                and motion["dropped"] == 0
+                and all_steps is not None and all_steps["count"] == scroll["steps_with_render_hook"]
+                and all_steps["dropped"] == 0 and motion["max"] <= all_steps["max"]):
+            return False
     return backend == BACKENDS[adapter]
 
 

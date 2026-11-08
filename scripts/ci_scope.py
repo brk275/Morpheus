@@ -183,7 +183,7 @@ MANUAL_CHECKS = frozenset({"all", "models", "desktop", "desktop-video", "devices
 # Exact existing suites from run_matrix_acceptance.py; no new test composition.
 MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-reads",
                            "timeline-failures", "media-only", "app-timeline",
-                           "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop"})
+                           "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "rtc-media", "element-interop"})
 
 
 # Exact reviewed development inputs only. Desktop still compiles and tests all
@@ -253,8 +253,8 @@ AUTOMATIC_CONTROL_INPUTS = frozenset((
     "scripts/ci_scope.py", "scripts/tests/test_ci_scope.py",
     ".github/workflows/ci.yml", "scripts/tests/test_ci_acceptance.py",
 ))
-REVIEWED_CONTROL_WORKFLOW_SHA256 = "011bef57a8bd8e0f04cc4ff4eb0707605be234461bd8aa83ca1a83ebeebe3da9"
-REVIEWED_CONTROL_WORKFLOW_BYTES = 66839
+REVIEWED_CONTROL_WORKFLOW_SHA256 = "0b88b9dd7c6b764b35695a59d17e54575c4b5836d688ac8224cdd45f0f1d0cd3"
+REVIEWED_CONTROL_WORKFLOW_BYTES = 68406
 
 
 # The shared archive downloader is exercised by the existing four-platform

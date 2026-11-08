@@ -10,7 +10,8 @@
 //! screen, in the direction of the reported top row. Once drawn, the row
 //! places itself from its own laid-out position and height, after every
 //! layout of it (before that frame is drawn) and at least every 16 ms. The
-//! thread's replies are all laid out, so a reply only ever places itself.
+//! thread uses the same virtual-list protocol, with its scrollable context
+//! header at virtual index zero and reply indices kept zero-based.
 //!
 //! A seek is bound to what its row was shown under: the account selection,
 //! the visible account and room, the navigation it belongs to, and the
@@ -34,10 +35,9 @@
 //! under the same feed and view and that row moved (rows were inserted or
 //! removed above it, such as by Load earlier), an anchor seek puts its top
 //! back where it was drawn. In the conversation, height changes need no seek:
-//! the ListView keeps its first drawn row in place. The thread's replies are a
-//! plain layout, so there a keeper puts the anchor reply back at its measured
-//! offset whenever the layout above it changes, under the same policy and the
-//! thread's latest publication; only scrolling takes the anchor again.
+//! the ListView keeps its first drawn row in place. The thread's virtual list
+//! does the same; its keeper also fences corrections for a mounted row's
+//! local layout changes under the latest publication and security policy.
 //! Nothing here follows new messages to the bottom; the conversation never
 //! did.
 
@@ -277,6 +277,7 @@ fn with<R>(f: impl FnOnce(&mut Seeks) -> R) -> R {
 /// Answer app-window.slint's admissions, ends and withdrawals for this
 /// window's live UI (called once, from message_search::register).
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>) {
+    crate::timeline_model::register_thread_rows(ui);
     let weak = ui.as_weak();
     let admit_live = live.clone();
     ui.on_viewport_seek_admit(move |id| {
@@ -348,7 +349,9 @@ pub(crate) fn reveal(ui: &AppWindow, live: &Arc<LiveUi>, request: Reveal) -> boo
                 return false;
             }
             let generation = live.thread_request_generation();
-            (View::Thread { root, generation }, 0)
+            let index = timeline_model::index_of_event(&ui.get_thread_messages(), &event_id)
+                .unwrap_or(usize::MAX);
+            (View::Thread { root, generation }, index)
         }
     };
     let scope = Scope {
@@ -402,7 +405,8 @@ pub(crate) fn seek_for_test(
             };
             index
         }
-        Pane::Thread => 0,
+        Pane::Thread => timeline_model::index_of_event(&ui.get_thread_messages(), event_id)
+            .unwrap_or(usize::MAX),
     };
     let security = security_generation(&live.security_gate);
     let owner_admits = owner.as_ref().is_none_or(|owner| (owner.admits)(ui, live));
@@ -454,6 +458,7 @@ fn start(ui: &AppWindow, live: Option<&Arc<LiveUi>>, seek: Seek, placement: Plac
         }
         Pane::Thread => {
             ui.set_thread_seek_event(event.as_str().into());
+            ui.set_thread_seek_index(i32::try_from(index).unwrap_or(i32::MAX));
             ui.set_thread_seek_reveal(reveal);
             ui.set_thread_seek_offset(offset);
             ui.set_thread_seek_id(id);
@@ -488,16 +493,22 @@ fn admit(ui: &AppWindow, live: &LiveUi, id: i32) -> bool {
         clear(ui, seek.pane, id);
         return false;
     }
-    if seek.pane == Pane::Room {
-        let rows = ui.get_messages();
+    {
+        let rows = match seek.pane {
+            Pane::Room => ui.get_messages(),
+            Pane::Thread => ui.get_thread_messages(),
+        };
         if !timeline_model::has_event_at(&rows, seek.index, &seek.event_id) {
             let Some(index) = timeline_model::index_of_event(&rows, &seek.event_id) else {
                 finish(ui, Some(live), seek, Ended::Unavailable);
                 return false;
             };
             seek.index = index;
-            ui.set_timeline_seek_index(i32::try_from(index).unwrap_or(i32::MAX));
-            rows_changed(ui);
+            match seek.pane {
+                Pane::Room => ui.set_timeline_seek_index(i32::try_from(index).unwrap_or(i32::MAX)),
+                Pane::Thread => ui.set_thread_seek_index(i32::try_from(index).unwrap_or(i32::MAX)),
+            }
+            rows_changed(ui, seek.pane);
         }
     }
     if !seek.spend_move() {
@@ -532,8 +543,11 @@ fn keeper_admitted(ui: &AppWindow, live: &LiveUi) -> bool {
 
 /// The running conversation seek's row moved because rows changed under it:
 /// the list's next top row is that seek's own, not the person's scrolling.
-fn rows_changed(ui: &AppWindow) {
-    ui.set_timeline_seek_rows(ui.get_timeline_seek_rows().wrapping_add(1));
+fn rows_changed(ui: &AppWindow, pane: Pane) {
+    match pane {
+        Pane::Room => ui.set_timeline_seek_rows(ui.get_timeline_seek_rows().wrapping_add(1)),
+        Pane::Thread => ui.set_thread_seek_rows(ui.get_thread_seek_rows().wrapping_add(1)),
+    }
 }
 
 /// Stop the window's seek of `pane` if it is still seek `id`.
@@ -713,8 +727,7 @@ fn published(
     let running = with(|seeks| {
         let seek = seeks.slot(pane).as_mut()?;
         let mut moved = false;
-        if pane == Pane::Room
-            && !timeline_model::has_event_at(rows, seek.index, &seek.event_id)
+        if !timeline_model::has_event_at(rows, seek.index, &seek.event_id)
             && let Some(index) = timeline_model::index_of_event(rows, &seek.event_id)
         {
             seek.index = index;
@@ -723,16 +736,23 @@ fn published(
         Some((seek.index, moved))
     });
     if let Some((index, moved)) = running {
-        if pane == Pane::Room {
-            ui.set_timeline_seek_index(i32::try_from(index).unwrap_or(i32::MAX));
-            // Rows changed above the reader's top row too: the list then
-            // draws another top row, which is this seek's, not the person's.
-            let top = ui.get_timeline_anchor_event();
-            let top_moved = usize::try_from(ui.get_timeline_anchor_index())
-                .is_ok_and(|at| !timeline_model::has_event_at(rows, at, &top));
-            if moved || top_moved {
-                rows_changed(ui);
+        let (top, before) = match pane {
+            Pane::Room => {
+                ui.set_timeline_seek_index(i32::try_from(index).unwrap_or(i32::MAX));
+                (
+                    ui.get_timeline_anchor_event(),
+                    ui.get_timeline_anchor_index(),
+                )
             }
+            Pane::Thread => {
+                ui.set_thread_seek_index(i32::try_from(index).unwrap_or(i32::MAX));
+                (ui.get_thread_anchor_event(), ui.get_thread_anchor_index())
+            }
+        };
+        let top_moved =
+            usize::try_from(before).is_ok_and(|at| !timeline_model::has_event_at(rows, at, &top));
+        if moved || top_moved {
+            rows_changed(ui, pane);
         }
         return;
     }

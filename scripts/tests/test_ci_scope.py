@@ -372,7 +372,7 @@ class ScopeTests(unittest.TestCase):
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
                                          "timeline-failures", "media-only", "app-timeline",
-                                         "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop"})
+                                         "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "rtc-media", "element-interop"})
         source = ast.parse((Path(__file__).resolve().parents[1]/"run_matrix_acceptance.py").read_text())
         suites = [node.value for node in source.body if isinstance(node,ast.Assign)
                   and any(isinstance(target,ast.Name) and target.id=="SUITES" for target in node.targets)]
@@ -650,9 +650,9 @@ class ScopeTests(unittest.TestCase):
         # comparisons with owned fixture bytes under test-only pins, so a
         # future different workflow can safely fall back all without requiring
         # its execution layout to be admitted by this exemption.
-        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 66839)
+        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 68406)
         self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
-                         "011bef57a8bd8e0f04cc4ff4eb0707605be234461bd8aa83ca1a83ebeebe3da9")
+                         "0b88b9dd7c6b764b35695a59d17e54575c4b5836d688ac8224cdd45f0f1d0cd3")
         import hashlib
         with patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_BYTES", len(workflow)), \
                 patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_SHA256", hashlib.sha256(workflow).hexdigest()):

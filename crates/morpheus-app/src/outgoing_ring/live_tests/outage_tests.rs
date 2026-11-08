@@ -1,4 +1,4 @@
-//! Current-only real SFU outage acceptance inside the existing owned fixture.
+//! Standard Sticky2025 SFU outage acceptance inside the owned legacy OpenID fixture.
 //! The app controller recovers automatically; fixture peers explicitly rejoin.
 
 use std::{
@@ -353,11 +353,18 @@ impl Peer {
         }
         let rtc = self.rtc.as_mut().ok_or(())?;
         self.info = Some(
-            time::timeout(PHASE_LIMIT, rtc.join(room.as_str(), CallOptions::default()))
-                .await
-                .map_err(|_| ())?
-                .map_err(|_| ())?,
+            time::timeout(
+                PHASE_LIMIT,
+                rtc.join_room(room.as_str(), CallOptions::element_call_matrix_2_0()),
+            )
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?,
         );
+        let account = self.account.as_ref().ok_or(())?;
+        require(self.info.as_ref().is_some_and(|info| {
+            info.local_identity == format!("{}:{}", account.user_id, account.device_id)
+        }))?;
         self.publication = Some(
             rtc.publish_camera(room.as_str(), 320, 180, false)
                 .await
@@ -620,12 +627,18 @@ impl OutageSession {
         let mut keys = self.calls.subscribe_recovery_keys();
         let mut status = self.calls.subscribe_status();
         let mut video = self.calls.subscribe_video();
+        let profile = preferences
+            .room_call_profile(&account.id, case.room.as_str())
+            .ok_or(())?;
+        require(profile.mode() == morpheus_config::RoomCallMode::Standard)?;
         stage("join");
         self.calls
             .open_slot(
                 selection.clone(),
                 case.room.as_str(),
                 CallJoinMode::Standard,
+                profile,
+                preferences.clone(),
             )
             .await
             .map_err(|_| ())?;
@@ -635,6 +648,7 @@ impl OutageSession {
                 selection.clone(),
                 case.room.as_str(),
                 CallJoinMode::Standard,
+                profile,
                 AudioDeviceSelection {
                     microphone: Some(alsa_playback::INPUT_ID.to_owned()),
                     speaker: Some(alsa_playback::OUTPUT_ID.to_owned()),
@@ -644,6 +658,10 @@ impl OutageSession {
             )
             .await
             .map_err(|_| ())?;
+        // This loopback fixture advertises only the standard legacy OpenID
+        // service. Its publisher identity is stable per authenticated device;
+        // a new membership and imported key ownership must still be fresh.
+        require(original.local_identity == format!("{}:{}", account.user_id, account.device_id))?;
         let stable_call = self.calls.call_token();
         let before_generation = self.calls.video_token();
         require(stable_call != 0 && before_generation != 0 && selection.is_current())?;
@@ -733,7 +751,9 @@ impl OutageSession {
         require(
             rejoined.room_id == original.room_id
                 && rejoined.slot_id == original.slot_id
-                && rejoined.local_identity != original.local_identity
+                && rejoined.membership_id != original.membership_id
+                && rejoined.local_identity == original.local_identity
+                && rejoined.local_identity == format!("{}:{}", account.user_id, account.device_id)
                 && self.calls.call_token() == stable_call
                 && selection.is_current(),
         )?;
@@ -747,13 +767,17 @@ impl OutageSession {
                 let new = self.peers[index].info.as_ref().ok_or(())?;
                 require(
                     new.membership_id != old.membership_id
-                        && new.local_identity != old.local_identity,
+                        && new.local_identity == old.local_identity
+                        && !new.local_identity.is_empty(),
                 )?;
             }
         }
         self.key_receipts(case, owner, &rejoined, &mut keys).await?;
+        fact("legacy_publisher_identity_stable");
+        // This existing fact is the freshly imported (member_id, identity)
+        // ownership tuple; the standard legacy backend identity stays stable.
         fact("fresh_key_identities");
-        // Memberships, native identities and real key-event metadata are now
+        // Fresh membership/identity tuples and real key-event metadata are now
         // bound. Install a new sink epoch before either new tone publication.
         stage("recovered_checkpoint");
         let after_audio = self.playback.checkpoint(Tone::After).map_err(|_| ())?;
@@ -786,9 +810,9 @@ impl OutageSession {
         require(selection.is_current() && self.calls.call_token() == stable_call)?;
         fact("no_extra_notification");
         fact(if case.dm {
-            "current_dm"
+            "standard_dm"
         } else {
-            "current_three_participant_room"
+            "standard_three_participant_room"
         });
         Ok(())
     }
@@ -1397,8 +1421,8 @@ async fn history_notifications(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Requires the explicit owned Current-only SFU outage Matrix acceptance route"]
-async fn current_call_recovers_from_owned_sfu_restart() {
+#[ignore = "Requires the explicit owned Standard Sticky2025 SFU outage Matrix acceptance route"]
+async fn standard_call_recovers_from_owned_sfu_restart() {
     stage("fixture");
     let opened = OutageCase::read()
         .and_then(|case| OutageSession::open(&case).map(|session| (case, session)));

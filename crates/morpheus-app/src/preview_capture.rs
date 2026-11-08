@@ -99,6 +99,7 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     // Never overwrite existing screenshots or follow an existing output link.
     fs::create_dir(&output)?;
     let ui = AppWindow::new()?;
+    crate::timeline_model::register_thread_rows(&ui);
     let mut nocturne = Config::default();
     nocturne.apply_style_preset(BuiltInStylePreset::Nocturne);
     let nocturne_theme = BuiltInStylePreset::Nocturne.theme()?;

@@ -61,6 +61,33 @@ class TimelineFailureForwardingTests(unittest.TestCase):
 
 
 class FocusedSuiteTests(unittest.TestCase):
+    def test_rtc_media_requires_all_three_existing_cases_without_claiming_full_acceptance(self):
+        labels = acceptance_module.RTC_LABELS
+        self.assertEqual(acceptance_module.SUITES["rtc-media"], labels)
+        self.assertEqual(acceptance_module.SUITES["full"], acceptance_module.PLANNED_CHECKS)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="rtc-media")
+            for missing in labels:
+                runner.results = [{"check": label, "passed": 1, "seconds": 1}
+                                  for label in labels if label != missing]
+                with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                    runner.finish_checks()
+            runner.results = [{"check": label, "passed": 1, "seconds": 1} for label in labels]
+            runner.finish_checks()
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "rtc-media")
+            self.assertEqual(report["not_run"], {})
+            self.assertNotIn(acceptance_module.ELEMENT_LABEL, {item["check"] for item in report["passed"]})
+            text = summary.read_text()
+            self.assertIn("three existing synthetic encrypted native cases", text)
+            self.assertIn("No stock Element", text)
+            self.assertIn("not full acceptance", text)
+            self.assertNotIn("Full suite:", text)
+
     def test_element_interop_requires_its_only_case_and_cannot_claim_full_acceptance(self):
         label = acceptance_module.ELEMENT_LABEL
         self.assertEqual(acceptance_module.SUITES["element-interop"], (label,))
@@ -113,13 +140,16 @@ class FocusedSuiteTests(unittest.TestCase):
             self.assertNotIn("Full suite:", summary.read_text())
 
     def test_app_timeline_completion_and_summary_cannot_claim_other_checks(self):
-        self.assertEqual(acceptance_module.SUITES["app-timeline"], ("app-live-timeline",))
+        self.assertEqual(acceptance_module.SUITES["app-timeline"], ("app-live-timeline", "app-live-people"))
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             runner = Acceptance(root, "scanner", suite="app-timeline")
             with self.assertRaises(RuntimeError):
                 runner.finish_checks()
             runner.results = [{"check": "app-live-timeline", "passed": 1, "seconds": 1}]
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+            runner.results.append({"check": "app-live-people", "passed": 1, "seconds": 1})
             runner.finish_checks()
             full = Acceptance(root, "scanner")
             full.results = list(runner.results)
@@ -132,8 +162,8 @@ class FocusedSuiteTests(unittest.TestCase):
             self.assertEqual(report["suite"], "app-timeline")
             self.assertEqual(report["not_run"], {})
             text = summary.read_text()
-            self.assertIn("Only app-live-timeline ran", text)
-            self.assertIn("member publication and cleanup", text)
+            self.assertIn("Only app-live-timeline and app-live-people ran", text)
+            self.assertIn("member publication, busy creation and cleanup", text)
             self.assertIn("No draft recovery, moderation, OAuth or RTC checks", text)
             self.assertIn("not full acceptance", text)
             self.assertNotIn("Full suite:", text)
@@ -178,7 +208,7 @@ class FocusedSuiteTests(unittest.TestCase):
 
     def test_timeline_read_completion_requires_all_selected_checks_and_reports_partial_scope(self):
         expected = ("live_local", "formatted_local", "media_local", "moderation_local",
-                    "search_local", "search_local-classic", "recovery_local", "unsupported_transport_local", "app-live-timeline")
+                    "search_local", "search_local-classic", "recovery_local", "unsupported_transport_local", "app-live-timeline", "app-live-people")
         self.assertEqual(acceptance_module.TIMELINE_READ_CHECKS, expected)
         self.assertEqual(acceptance_module.SUITES["full"], acceptance_module.PLANNED_CHECKS)
         with tempfile.TemporaryDirectory() as folder:
@@ -548,14 +578,38 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             fixture = root / "fixture.json"
             with patch.object(runner, "run") as run:
                 runner.app_timeline(fixture)
-            args, options = run.call_args
+            self.assertEqual(run.call_count, 2)
+            args, options = run.call_args_list[0]
             self.assertEqual(args[0], acceptance_module.APP_TIMELINE_LABEL)
             self.assertEqual(args[1], ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
                                       "--bin", "morpheus-app", acceptance_module.APP_TIMELINE_CASE,
-                                      "--", "--exact", "--nocapture", "--test-threads=1"])
+                                      "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"])
             self.assertEqual(options, {"extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture),
                                                 "SLINT_EMIT_DEBUG_INFO": "1"},
                                        "seconds": 480, "test": True, "pid_namespace": True})
+            people_args, people_options = run.call_args_list[1]
+            self.assertEqual(people_args[0], acceptance_module.APP_PEOPLE_LABEL)
+            self.assertEqual(people_args[1], args[1][:9] + [acceptance_module.APP_PEOPLE_CASE,
+                             "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"])
+            self.assertEqual(people_options, options)
+
+    def test_people_completion_rejects_missing_duplicate_false_and_unknown_records(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "scanner", suite="app-timeline")
+            marker = "MORPHEUS_LIVE_PEOPLE_CHECK busy_creation=true"
+            summary = "test result: ok. 1 passed; 0 failed; 0 ignored;"
+            arguments = {"ring_case": None, "oauth_checks": None, "element_checks": None}
+            record = runner.validated_record(acceptance_module.APP_PEOPLE_LABEL,
+                                             marker + "\n" + summary, test=True, **arguments)
+            self.assertEqual(record["app_people_checks"], {"busy_creation": True})
+            for records in ("", marker + "\n" + marker, marker.replace("true", "false"),
+                            marker.replace("busy_creation", "unknown"), marker + " private"):
+                with self.subTest(records=records), self.assertRaises(RuntimeError):
+                    runner.validated_record(acceptance_module.APP_PEOPLE_LABEL,
+                                            records + "\n" + summary, test=True, **arguments)
+            with self.assertRaises(RuntimeError):
+                runner.validated_record(acceptance_module.APP_PEOPLE_LABEL,
+                                        marker + "\n" + summary, test=False, **arguments)
 
     def test_live_ui_case_remains_required_in_full_and_timeline_profiles(self):
         for suite in ("full", "timeline-reads"):
@@ -648,7 +702,7 @@ class FinalizationTests(unittest.TestCase):
         runner.verify_fixture_absence.side_effect = absence_error
 
         def script(name, command):
-            if command == "down" and name in cleanup_errors:
+            if command in ("down", "destroy") and name in cleanup_errors:
                 raise cleanup_errors[name]
             return "private-fixture"
 
@@ -667,11 +721,25 @@ class FinalizationTests(unittest.TestCase):
 
     def assert_both_cleanups(self, runner):
         self.assertEqual(
-            [item.args for item in runner.script.call_args_list if item.args[1] == "down"],
-            [("local_matrix_rtc", "down"), ("local_matrix_env", "down")],
+            [item.args for item in runner.script.call_args_list if item.args[1] in ("down", "destroy")],
+            [("local_matrix_rtc", "down"), ("local_matrix_env", "destroy")],
         )
         runner.verify_fixture_absence.assert_called_once_with()
         self.assertEqual(runner.mock_calls[-1][0], "verify_fixture_absence")
+
+    def test_destroy_uses_the_same_reserved_cleanup_budget_as_down(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with patch.object(runner, "run") as run:
+                for name, command in (("local_matrix_rtc", "down"), ("local_matrix_env", "destroy")):
+                    runner.script(name, command)
+                    run.assert_called_with(f"{name}-{command}",
+                                           [sys.executable, f"scripts/{name}.py", command],
+                                           seconds=120, cleanup=True)
+                runner.script("local_matrix_env", "up")
+                run.assert_called_with("local_matrix_env-up",
+                                       [sys.executable, "scripts/local_matrix_env.py", "up"],
+                                       seconds=300, cleanup=False)
 
     def test_successful_body_and_cleanup_return_success(self):
         with self.mocked_main() as (runner, visible):
@@ -693,6 +761,45 @@ class FinalizationTests(unittest.TestCase):
         runner.rtc_cases.assert_not_called()
         runner.element_case.assert_not_called()
         self.assert_both_cleanups(runner)
+
+    def test_rtc_media_runs_only_existing_native_cases_and_preserves_cleanup_on_failure(self):
+        for failure_at in (None, "rtc_cases", "finish_checks"):
+            with self.subTest(failure_at=failure_at), self.mocked_main() as (runner, _):
+                failure = RuntimeError("fixed incomplete native RTC result")
+                if failure_at:
+                    getattr(runner, failure_at).side_effect = failure
+                with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                               "--suite", "rtc-media"]):
+                    if failure_at:
+                        with self.assertRaises(RuntimeError) as caught:
+                            acceptance_module.main()
+                        self.assertIs(caught.exception, failure)
+                    else:
+                        self.assertIsNone(acceptance_module.main())
+                runner.group.assert_called_once()
+                self.assertEqual(runner.group.call_args.args[0], acceptance_module.RTC_LABELS)
+                runner.rtc_cases.assert_called_once_with()
+                if failure_at == "rtc_cases":
+                    runner.finish_checks.assert_not_called()
+                else:
+                    runner.finish_checks.assert_called_once_with()
+                self.assertEqual([call.args for call in runner.script.call_args_list], [
+                    ("local_matrix_env", "up"), ("local_matrix_rtc", "up"),
+                    ("local_matrix_rtc", "probe"), ("local_matrix_rtc", "down"),
+                    ("local_matrix_env", "destroy"),
+                ])
+                runner.start_keyring.assert_called_once_with()
+                runner.require_containment.assert_called_once_with()
+                runner.test.assert_not_called()
+                runner.app_timeline.assert_not_called()
+                runner.app_recovery.assert_not_called()
+                runner.oauth_cases.assert_not_called()
+                runner.outgoing_ring_cases.assert_not_called()
+                runner.element_case.assert_not_called()
+                runner.rtc_recovery_cases.assert_not_called()
+                runner.draft_recovery_cases.assert_not_called()
+                runner.timeline_read_cases.assert_not_called()
+                self.assert_both_cleanups(runner)
 
     def test_element_interop_runs_only_the_existing_case_and_preserves_cleanup_on_failure(self):
         for failure_at in (None, "element_case", "finish_checks"):
@@ -718,7 +825,7 @@ class FinalizationTests(unittest.TestCase):
                 self.assertEqual([call.args for call in runner.script.call_args_list], [
                     ("local_matrix_env", "up"), ("local_matrix_rtc", "up"),
                     ("local_matrix_rtc", "probe"), ("local_matrix_rtc", "down"),
-                    ("local_matrix_env", "down"),
+                    ("local_matrix_env", "destroy"),
                 ])
                 runner.start_keyring.assert_called_once_with()
                 runner.require_containment.assert_called_once_with()
@@ -752,7 +859,7 @@ class FinalizationTests(unittest.TestCase):
                 runner.require_containment.assert_called_once_with()
                 self.assertEqual(acceptance_module.SUITES["oauth-only"], acceptance_module.OAUTH_LABELS)
                 self.assertEqual([call.args for call in runner.script.call_args_list],
-                                 [("local_matrix_rtc", "down"), ("local_matrix_env", "down")])
+                                 [("local_matrix_rtc", "down"), ("local_matrix_env", "destroy")])
                 runner.test.assert_not_called()
                 runner.app_timeline.assert_not_called()
                 runner.app_recovery.assert_not_called()
@@ -1045,31 +1152,34 @@ class FixtureAbsenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             runner = Acceptance(Path(folder), "unused-scanner")
             visible = io.StringIO()
-            with (patch.object(runner, "run", side_effect=["private-unrelated-container\n", "private-unrelated-network\n"]) as run,
+            with (patch.object(runner, "run", side_effect=["private-unrelated-container\n", "private-unrelated-volume\n", "private-unrelated-network\n"]) as run,
                   contextlib.redirect_stdout(visible), contextlib.redirect_stderr(visible)):
                 runner.verify_fixture_absence()
         self.assertEqual(visible.getvalue(), "")
         self.assertEqual([item.args[1] for item in run.call_args_list], [
             ["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
+            ["docker", "volume", "ls", "--format", "{{.Name}}"],
             ["docker", "network", "ls", "--format", "{{.Name}}"],
         ])
         self.assertTrue(all(item.kwargs == {"seconds": 30, "cleanup": True} for item in run.call_args_list))
 
-    def test_every_owned_container_or_network_remaining_rejects_cleanup(self):
-        cases = [(name + "\n", "") for name in acceptance_module.FIXTURE_CONTAINERS]
-        cases.append(("", acceptance_module.FIXTURE_NETWORK + "\n"))
+    def test_every_owned_container_volume_or_network_remaining_rejects_cleanup(self):
+        cases = [(name + "\n", "", "") for name in acceptance_module.FIXTURE_CONTAINERS]
+        cases.extend(("", name + "\n", "") for name in acceptance_module.FIXTURE_VOLUMES)
+        cases.append(("", "", acceptance_module.FIXTURE_NETWORK + "\n"))
         for outputs in cases:
             with self.subTest(outputs=outputs), tempfile.TemporaryDirectory() as folder:
                 runner = Acceptance(Path(folder), "unused-scanner")
                 with patch.object(runner, "run", side_effect=outputs) as run:
                     with self.assertRaisesRegex(RuntimeError, "resources remain"):
                         runner.verify_fixture_absence()
-                self.assertEqual(run.call_count, 2)
+                self.assertEqual(run.call_count, 3)
 
-    def test_failed_inventory_cannot_be_treated_as_empty_and_both_queries_are_attempted(self):
-        for outputs in ((RuntimeError("private daemon output"), ""),
-                        ("", OSError("private Docker socket")),
-                        (RuntimeError("private daemon output"), OSError("private Docker socket"))):
+    def test_failed_inventory_cannot_be_treated_as_empty_and_all_queries_are_attempted(self):
+        failure_types = (RuntimeError, OSError, RuntimeError)
+        for failed in range(1, 8):
+            outputs = tuple(failure_types[index]("private inventory failure") if failed & (1 << index) else ""
+                            for index in range(3))
             with self.subTest(failed_queries=sum(isinstance(item, BaseException) for item in outputs)), tempfile.TemporaryDirectory() as folder:
                 runner = Acceptance(Path(folder), "unused-scanner")
                 visible = io.StringIO()
@@ -1077,7 +1187,7 @@ class FixtureAbsenceTests(unittest.TestCase):
                       contextlib.redirect_stdout(visible), contextlib.redirect_stderr(visible),
                       self.assertRaisesRegex(RuntimeError, "absence could not be verified") as caught):
                     runner.verify_fixture_absence()
-                self.assertEqual(run.call_count, 2)
+                self.assertEqual(run.call_count, 3)
                 self.assertNotIn("private", visible.getvalue() + str(caught.exception))
 
 
@@ -1854,7 +1964,7 @@ class LiveEvidenceTests(unittest.TestCase):
                     self.assertTrue(indexes)
                     self.assertTrue(all(i < rtc_up for i in indexes))
                 self.assertEqual(calls[-4:], [call.summary(), call.script("local_matrix_rtc", "down"),
-                                             call.script("local_matrix_env", "down"), call.verify_fixture_absence()])
+                                             call.script("local_matrix_env", "destroy"), call.verify_fixture_absence()])
                 if failed:
                     runner.outgoing_ring_cases.assert_not_called()
                     runner.rtc_cases.assert_not_called()
@@ -2489,7 +2599,17 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
             output = self.output(target)
             expected = acceptance_module.OUTAGE_CHECKS | {acceptance_module.OUTAGE_TARGET[target]}
             self.assertEqual(set(acceptance_module.outage_evidence(output, target)), expected)
-            self.assertTrue({"native_audio_before", "native_audio_after"}.issubset(expected))
+            self.assertTrue({"native_audio_before", "native_audio_after",
+                             "legacy_publisher_identity_stable"}.issubset(expected))
+            with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+                runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+                record = runner.validated_record(f"rtc-recovery-standard-{target}", output,
+                    test=False, ring_case=None, oauth_checks=(), element_checks=False, outage_target=target)
+            self.assertEqual(record["call_mode"], "standard")
+            self.assertEqual(record["interop_mode"], "sticky-2025")
+            self.assertEqual(record["identity_contract"], "legacy_openid_publisher_user_device")
+            self.assertIs(record["backend_identity_rotated"], False)
+            self.assertEqual(record["key_evidence"], "native_key_import_for_fresh_membership_identity_tuple")
             invalid = ["", output.replace(acceptance_module.OUTAGE_TEST, "other::case"),
                        output.replace("1 passed", "0 passed"), output.replace("0 ignored", "1 ignored"),
                        output + "MORPHEUS_RTC_OUTAGE_RESULT passed=true\n",
@@ -2646,7 +2766,7 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
                 self.assertTrue(executed.kwargs["pid_namespace"])
             self.assertEqual(run.call_args_list[prerequisite_count - 1].args[1][-3:], [acceptance_module.OUTAGE_TEST, "--list", "--exact"])
             for invocation, target, fixture in zip(run.call_args_list[prerequisite_count:], ("dm", "room"), fixtures, strict=True):
-                self.assertEqual(invocation.args[0], f"rtc-recovery-current-{target}")
+                self.assertEqual(invocation.args[0], f"rtc-recovery-standard-{target}")
                 self.assertEqual(invocation.args[1][-5:], [acceptance_module.OUTAGE_TEST, "--ignored", "--exact", "--nocapture", "--test-threads=2"])
                 self.assertTrue(invocation.kwargs["pid_namespace"])
                 self.assertEqual(invocation.kwargs["seconds"], 540)
@@ -2694,10 +2814,10 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
             runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
             with self.assertRaises(RuntimeError):
-                runner.validated_record("rtc-recovery-current-dm", self.output(),
+                runner.validated_record("rtc-recovery-standard-dm", self.output(),
                     test=False, ring_case=None, oauth_checks=(), element_checks=False)
             with patch.object(acceptance_module.subprocess, "Popen") as spawn, self.assertRaises(RuntimeError):
-                runner.run("rtc-recovery-current-dm", ["no-execution"])
+                runner.run("rtc-recovery-standard-dm", ["no-execution"])
             spawn.assert_not_called()
 
     def test_failed_outage_does_not_retry_shared_sfu_in_the_next_case(self):
@@ -2709,8 +2829,8 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
                     patch.object(acceptance_module, "RecoveryTestBinary", return_value=self.binary()):
                 runner.rtc_recovery_cases()
             group.assert_called_once()
-            self.assertEqual(group.call_args.args[0], ("rtc-recovery-current-dm",))
-            self.assertEqual(runner.not_run, {"rtc-recovery-current-room": "dependency_failed"})
+            self.assertEqual(group.call_args.args[0], ("rtc-recovery-standard-dm",))
+            self.assertEqual(runner.not_run, {"rtc-recovery-standard-room": "dependency_failed"})
             with self.assertRaises(RuntimeError):
                 runner.finish_checks()
 
@@ -2773,10 +2893,10 @@ class OutgoingRingTests(unittest.TestCase):
         self.assertIn('\\nMORPHEUS_RING_ADMISSION result={result}', source)
         self.assertEqual(source.count('.map_err(admission_failure)?'), 2)
 
-    def output(self, ring_case=("current", "dm")):
+    def output(self, ring_case=("standard", "dm")):
         facts = "\n".join(f"MORPHEUS_RING_CHECK {name}=true" for name in sorted(acceptance_module.RING_CHECKS))
         incoming = set(acceptance_module.INCOMING_CHECKS)
-        if ring_case == ("current", "dm"):
+        if ring_case == ("standard", "dm"):
             incoming.add(acceptance_module.INCOMING_REPLAY_CHECK)
         actor = "\n".join(f"MORPHEUS_INCOMING_CHECK {name}=true" for name in sorted(incoming))
         return (f"test {acceptance_module.RING_TEST} ... ok\n{facts}\n{actor}\n"
@@ -2785,7 +2905,7 @@ class OutgoingRingTests(unittest.TestCase):
 
     def test_exact_named_test_and_every_fixed_fact_are_required(self):
         complete = self.output()
-        self.assertEqual(acceptance_module.ring_passed_tests(complete, ("current", "dm")), 1)
+        self.assertEqual(acceptance_module.ring_passed_tests(complete, ("standard", "dm")), 1)
         invalid = ["", complete.replace(acceptance_module.RING_TEST, "other::test"),
                    complete.replace(" ... ok", " ... ignored"),
                    complete.replace("0 ignored", "1 ignored"),
@@ -2805,7 +2925,7 @@ class OutgoingRingTests(unittest.TestCase):
                             complete + f"MORPHEUS_RING_CHECK {name}=false\n"))
         for index, output in enumerate(invalid):
             with self.subTest(case=index), self.assertRaises(RuntimeError):
-                acceptance_module.ring_passed_tests(output, ("current", "dm"))
+                acceptance_module.ring_passed_tests(output, ("standard", "dm"))
 
     def test_evidence_allows_only_exact_fixed_booleans_and_preserves_false(self):
         output = "\n".join((
@@ -2871,7 +2991,7 @@ class OutgoingRingTests(unittest.TestCase):
                 })
                 for output in (marker + self.output(), self.output() + marker):
                     with self.assertRaises(RuntimeError):
-                        acceptance_module.ring_passed_tests(output, ("current", "dm"))
+                        acceptance_module.ring_passed_tests(output, ("standard", "dm"))
 
     def test_admission_diagnostics_reject_suffixes_unknown_payloads_and_prefixed_lines(self):
         valid = "MORPHEUS_RING_ADMISSION result=policy"
@@ -2913,7 +3033,7 @@ class OutgoingRingTests(unittest.TestCase):
                 "--bin", "morpheus-app", "--no-run",
             ]))
             self.assertEqual(compile.kwargs, {"extra": {"SLINT_EMIT_DEBUG_INFO": "1"}})
-            cases = [(mode, target) for mode in ("current", "sticky-2025") for target in ("dm", "room")]
+            cases = [(mode, target) for mode in ("standard", "sticky-2025") for target in ("dm", "room")]
             for invocation, fixture, case in zip(run.call_args_list[1:], fixtures, cases, strict=True):
                 mode, target = case
                 self.assertEqual(invocation.args[0], f"outgoing-ring-{mode}-{target}")
@@ -2973,12 +3093,12 @@ class OutgoingRingTests(unittest.TestCase):
             runner = Acceptance(Path(folder), "unused-scanner")
             output = self.output() + "private-token-and-room-id\n"
             with self.mocked_run(runner, output) as (visible, _, scanner):
-                runner.run("outgoing-ring-current-dm", ["mock-app-test"], ring_case=("current", "dm"))
+                runner.run("outgoing-ring-standard-dm", ["mock-app-test"], ring_case=("standard", "dm"))
             scanner.assert_called_once()
             self.assertNotIn("private-token", visible.getvalue())
             self.assertEqual(runner.results[0]["passed"], 1)
             self.assertEqual(runner.results[0]["ring_checks"], dict.fromkeys(acceptance_module.RING_CHECKS, True))
-            self.assertEqual((runner.results[0]["ring_mode"], runner.results[0]["ring_target"]), ("current", "dm"))
+            self.assertEqual((runner.results[0]["ring_mode"], runner.results[0]["ring_target"]), ("standard", "dm"))
             log = next(runner.logs.glob("*.log"))
             self.assertEqual(log.stat().st_mode & 0o777, 0o600)
             self.assertEqual(log.read_text(), output)
@@ -2992,7 +3112,7 @@ class OutgoingRingTests(unittest.TestCase):
                 runner = Acceptance(Path(folder), "unused-scanner")
                 with (self.mocked_run(runner, output, returncode=code, scanner_code=scan) as (visible, _, _),
                       self.assertRaises(RuntimeError)):
-                    runner.run("outgoing-ring-current-dm", ["mock-app-test"], ring_case=("current", "dm"))
+                    runner.run("outgoing-ring-standard-dm", ["mock-app-test"], ring_case=("standard", "dm"))
                 self.assertEqual(runner.results, [])
                 self.assertNotIn("private-server", visible.getvalue())
                 self.assertNotIn('"status": "passed"', visible.getvalue())
@@ -3016,7 +3136,7 @@ class OutgoingRingTests(unittest.TestCase):
             with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
                 runner.summary()
                 self.assertNotIn("Invitation rows verify", summary.read_text())
-                runner.results.append({"check": "outgoing-ring-current-dm", "passed": 1, "seconds": 10,
+                runner.results.append({"check": "outgoing-ring-standard-dm", "passed": 1, "seconds": 10,
                                        "ring_checks": dict.fromkeys(acceptance_module.RING_CHECKS, True)})
                 runner.summary()
             text = summary.read_text()
@@ -3026,7 +3146,7 @@ class OutgoingRingTests(unittest.TestCase):
 
 
 class IncomingActorTests(unittest.TestCase):
-    def output(self, case=("current", "dm")):
+    def output(self, case=("standard", "dm")):
         return OutgoingRingTests().output(case)
 
     def test_rust_actor_markers_match_the_exact_public_schema(self):
@@ -3061,22 +3181,30 @@ class IncomingActorTests(unittest.TestCase):
                 self.assertEqual(acceptance_module.incoming_diagnostics(marker),
                                  {"checks": {}, "error": category})
                 with self.assertRaises(RuntimeError):
-                    acceptance_module.ring_passed_tests(self.output() + marker, ("current", "dm"))
+                    acceptance_module.ring_passed_tests(self.output() + marker, ("standard", "dm"))
                 malformed = marker.rstrip() + " private-payload\n"
                 evidence = acceptance_module.incoming_diagnostics(malformed)
                 self.assertEqual(evidence, {"checks": {}, "malformed": True})
                 self.assertNotIn("private-payload", json.dumps(evidence))
 
-    def test_actor_schema_does_not_replace_the_thirteen_sender_checks(self):
-        self.assertEqual(len(acceptance_module.RING_CHECKS), 13)
+    def test_profile_checks_preserve_all_thirteen_sender_checks(self):
+        self.assertEqual(len(acceptance_module.RING_CHECKS), 15)
+        self.assertEqual(acceptance_module.RING_CHECKS - {
+            "experimental_current_room_entry_rejected", "shipping_sticky_profile",
+        }, {
+            "sticky_sync", "own_crypto", "peer_trust", "joined_without_media", "encrypted_membership",
+            "invitation_receipt", "unsolicited_encrypted_notification", "fetched_decrypted_notification",
+            "targeted_reference", "redaction_receipt", "redaction_observed", "unsolicited_redaction_observed", "cleanup",
+        })
         self.assertEqual(acceptance_module.INCOMING_CHECKS, {
             "actor_discovered", "exact_key_once", "actor_withdrew", "admitted_target_preserved",
             "accepted_join_identity", "slot_unchanged", "quiet_receive_only",
             "established_after_withdrawal", "accepted_leave_observed", "actor_cleanup",
+            "profile_change_revokes_pending",
         })
         self.assertEqual(acceptance_module.INCOMING_REPLAY_CHECK, "account_replay_rejected")
 
-    def test_all_four_cases_require_actor_facts_and_only_current_dm_exercises_replay(self):
+    def test_all_four_cases_require_actor_facts_and_only_standard_dm_exercises_replay(self):
         for case in acceptance_module.RING_CASES:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
                 output = self.output(case)
@@ -3085,21 +3213,34 @@ class IncomingActorTests(unittest.TestCase):
                 record = runner.validated_record("fixed-label", output, test=False, ring_case=case,
                                                  oauth_checks=(), element_checks=False)
                 expected = dict.fromkeys(acceptance_module.INCOMING_CHECKS, True)
-                if case == ("current", "dm"):
+                if case == ("standard", "dm"):
                     expected[acceptance_module.INCOMING_REPLAY_CHECK] = True
                 self.assertEqual(record["incoming_checks"], expected)
                 self.assertEqual(record["ring_checks"], dict.fromkeys(acceptance_module.RING_CHECKS, True))
-                self.assertIs(record["account_replay_exercised"], case == ("current", "dm"))
+                self.assertIs(record["account_replay_exercised"], case == ("standard", "dm"))
                 marker = "MORPHEUS_INCOMING_CHECK account_replay_rejected=true\n"
-                invalid = output.replace(marker, "") if case == ("current", "dm") else output + marker
+                invalid = output.replace(marker, "") if case == ("standard", "dm") else output + marker
                 with self.assertRaises(RuntimeError):
                     acceptance_module.ring_passed_tests(invalid, case)
+
+    def test_experimental_current_cannot_be_relabelled_as_a_shipping_app_case(self):
+        self.assertEqual(acceptance_module.RING_CASES, (
+            ("standard", "dm"), ("standard", "room"),
+            ("sticky-2025", "dm"), ("sticky-2025", "room"),
+        ))
+        with self.assertRaises(RuntimeError):
+            acceptance_module.ring_passed_tests(self.output(), ("current", "dm"))
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "scanner")
+            with patch.object(acceptance_module.subprocess, "Popen") as spawn, self.assertRaises(RuntimeError):
+                runner.run("outgoing-ring-current-dm", ["no-execution"], ring_case=("current", "dm"))
+            spawn.assert_not_called()
 
     def test_every_actor_fact_is_mandatory_and_false_is_permanent_for_every_case(self):
         for case in acceptance_module.RING_CASES:
             complete = self.output(case)
             names = acceptance_module.INCOMING_CHECKS | (
-                {acceptance_module.INCOMING_REPLAY_CHECK} if case == ("current", "dm") else set())
+                {acceptance_module.INCOMING_REPLAY_CHECK} if case == ("standard", "dm") else set())
             for name in names:
                 marker = f"MORPHEUS_INCOMING_CHECK {name}=true"
                 for failure, output in (
@@ -3121,7 +3262,7 @@ class IncomingActorTests(unittest.TestCase):
                     self.assertEqual(evidence[kind.lower()], value)
                     for output in (marker + self.output(), self.output() + marker):
                         with self.assertRaises(RuntimeError):
-                            acceptance_module.ring_passed_tests(output, ("current", "dm"))
+                            acceptance_module.ring_passed_tests(output, ("standard", "dm"))
 
     def test_unknown_or_malformed_actor_markers_fail_closed_without_payload(self):
         malformed = (
@@ -3142,7 +3283,7 @@ class IncomingActorTests(unittest.TestCase):
                     "checks": {}, "malformed": True,
                 })
                 with self.assertRaises(RuntimeError):
-                    acceptance_module.ring_passed_tests(self.output() + marker + "\n", ("current", "dm"))
+                    acceptance_module.ring_passed_tests(self.output() + marker + "\n", ("standard", "dm"))
         # Arbitrary text cannot become a diagnostic merely by containing a marker.
         self.assertEqual(acceptance_module.incoming_diagnostics(
             "private-prefix MORPHEUS_INCOMING_ERROR unavailable\n"), {"checks": {}})
@@ -3169,7 +3310,7 @@ class IncomingActorTests(unittest.TestCase):
                 scanner.assert_called_once()
                 record = json.loads(next(line for line in visible.getvalue().splitlines() if line.startswith("{")))
                 self.assertEqual(record["status"], "passed")
-                self.assertIs(record["account_replay_exercised"], case == ("current", "dm"))
+                self.assertIs(record["account_replay_exercised"], case == ("standard", "dm"))
                 self.assertEqual(record["incoming_checks"], acceptance_module.incoming_evidence(output))
                 self.assertEqual(record["quiet_evidence"], "sampled_cache_and_media_state")
                 self.assertEqual(record["withdrawal_evidence"], "joined_after_sdk_cache_removal")
@@ -3185,7 +3326,7 @@ class IncomingActorTests(unittest.TestCase):
                 runner = Acceptance(Path(folder), "scanner")
                 with (OutgoingRingTests().mocked_run(runner, output, returncode=1, scanner_code=scan)
                       as (visible, _, scanner), self.assertRaises(RuntimeError)):
-                    runner.run("outgoing-ring-current-dm", ["test"], ring_case=("current", "dm"))
+                    runner.run("outgoing-ring-standard-dm", ["test"], ring_case=("standard", "dm"))
                 scanner.assert_called_once()
                 self.assertNotIn("private-account", visible.getvalue())
                 if scan:
@@ -3208,7 +3349,7 @@ class IncomingActorTests(unittest.TestCase):
                           "MORPHEUS_INCOMING_CHECK actor_cleanup=true\n")
                 with (ScopedContinuationTests().contained_child(runner, output),
                       self.assertRaises(RuntimeError) as caught):
-                    runner.run("outgoing-ring-current-dm", ["test"], ring_case=("current", "dm"), pid_namespace=True)
+                    runner.run("outgoing-ring-standard-dm", ["test"], ring_case=("standard", "dm"), pid_namespace=True)
                 self.assertNotIsInstance(caught.exception, acceptance_module.CheckFailure)
 
     def test_noncleanup_actor_failure_is_collectible_only_after_scan_and_containment(self):
@@ -3219,7 +3360,7 @@ class IncomingActorTests(unittest.TestCase):
             runner = Acceptance(Path(folder), "scanner")
             with (ScopedContinuationTests().contained_child(runner, output) as (visible, *_),
                   self.assertRaises(acceptance_module.CheckFailure)):
-                runner.run("outgoing-ring-current-dm", ["test"], ring_case=("current", "dm"), pid_namespace=True)
+                runner.run("outgoing-ring-standard-dm", ["test"], ring_case=("standard", "dm"), pid_namespace=True)
             self.assertNotIn("private-account", visible.getvalue())
             self.assertEqual(runner.results, [])
 
@@ -3237,8 +3378,8 @@ class ScopedContinuationTests(unittest.TestCase):
                 with self.contained_child(runner, output, scanner_code=scanner_code) as (
                     visible, _, _, _, _, scanner,
                 ), self.assertRaises(RuntimeError):
-                    runner.run("outgoing-ring-current-dm", ["test"],
-                               ring_case=("current", "dm"), pid_namespace=True)
+                    runner.run("outgoing-ring-standard-dm", ["test"],
+                               ring_case=("standard", "dm"), pid_namespace=True)
                 scanner.assert_called_once()
                 self.assertNotIn("private-server-data", visible.getvalue())
                 self.assertNotIn("private-account-event-key", visible.getvalue())
@@ -3265,8 +3406,8 @@ class ScopedContinuationTests(unittest.TestCase):
                 with self.contained_child(runner, output, scanner_code=scanner_code) as (
                     visible, _, _, _, _, scanner,
                 ), self.assertRaises(RuntimeError):
-                    runner.run("outgoing-ring-current-dm", ["test"],
-                               ring_case=("current", "dm"), pid_namespace=True)
+                    runner.run("outgoing-ring-standard-dm", ["test"],
+                               ring_case=("standard", "dm"), pid_namespace=True)
                 scanner.assert_called_once()
                 self.assertNotIn("private-server-data", visible.getvalue())
                 self.assertNotIn("private-account-event-key", visible.getvalue())
@@ -3501,7 +3642,7 @@ class ScopedContinuationTests(unittest.TestCase):
             self.assertEqual(runner.failures, [{"check": "local_rtc", "reason": "test_failed"}])
 
     def test_ring_failure_continues_four_fresh_cases_but_cleanup_failure_is_fatal(self):
-        for failure in (acceptance_module.CheckFailure("outgoing-ring-current-dm", "test_failed"),
+        for failure in (acceptance_module.CheckFailure("outgoing-ring-standard-dm", "test_failed"),
                         RuntimeError("cleanup failed")):
             with self.subTest(kind=type(failure).__name__), tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
                 runner = Acceptance(Path(folder), "scanner")
@@ -3514,7 +3655,7 @@ class ScopedContinuationTests(unittest.TestCase):
                     if isinstance(failure, acceptance_module.CheckFailure):
                         runner.outgoing_ring_cases()
                         self.assertEqual(run.call_count, 5)
-                        self.assertEqual(runner.failures, [{"check": "outgoing-ring-current-dm", "reason": "test_failed"}])
+                        self.assertEqual(runner.failures, [{"check": "outgoing-ring-standard-dm", "reason": "test_failed"}])
                     else:
                         with self.assertRaises(RuntimeError):
                             runner.outgoing_ring_cases()
@@ -3565,10 +3706,10 @@ class ScopedContinuationTests(unittest.TestCase):
 
     def test_inner_scan_and_ring_cleanup_failure_never_become_collectible(self):
         for output, extra in (("MORPHEUS_ELEMENT_STAGE native_test\nMORPHEUS_ELEMENT_FAILURE log_scan\n", {"element_checks": True}),
-                              ("running 1 test\nMORPHEUS_RING_CHECK cleanup=false\n", {"ring_case": ("current", "dm")})):
+                              ("running 1 test\nMORPHEUS_RING_CHECK cleanup=false\n", {"ring_case": ("standard", "dm")})):
             with self.subTest(extra=extra), tempfile.TemporaryDirectory() as folder:
                 runner = Acceptance(Path(folder), "scanner")
-                label = acceptance_module.ELEMENT_LABEL if "element_checks" in extra else "outgoing-ring-current-dm"
+                label = acceptance_module.ELEMENT_LABEL if "element_checks" in extra else "outgoing-ring-standard-dm"
                 with self.contained_child(runner, output), self.assertRaises(RuntimeError) as caught:
                     runner.run(label, ["test"], pid_namespace=True, **extra)
                 self.assertNotIsInstance(caught.exception, acceptance_module.CheckFailure)
