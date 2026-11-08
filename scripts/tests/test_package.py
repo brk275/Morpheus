@@ -1021,7 +1021,7 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                 "vendor/matrix-rtc-core/MORPHEUS_PROVENANCE.json"].replace(old, new)
             cases.append(changed)
         for index, changed in enumerate(cases):
-            with self.subTest(case=index), self.assertRaises(ValueError):
+            with self.subTest(case=index), self.assertRaises((ValueError, acquisition.S.SourceFailure)):
                 acquisition.source_inputs(changed)
 
     def test_closed_lock_cohorts_reject_subsets_new_origins_and_mixed_rtc_resolution(self):
@@ -1053,6 +1053,7 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                 calls.append((stage, command[-1]))
                 return command[-1].encode() if command[-1] == mirrors[cwd.name] else b""
             with mock.patch.object(acquisition, "checked", side_effect=lambda path, **options: Path(path)), \
+                    mock.patch.object(acquisition.S, "safe_git", return_value=["/pinned/git"]), \
                     mock.patch.object(acquisition.S, "object_id", side_effect=lambda kind, data: data.decode() or "0" * 40):
                 plan = acquisition.input_plan(home, packages, SimpleNamespace(run=run), {}, Path("/pinned/git"))
             self.assertEqual(set(plan["git_mirrors"]), set(pins))
