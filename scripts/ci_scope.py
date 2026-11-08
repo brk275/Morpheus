@@ -254,8 +254,8 @@ AUTOMATIC_CONTROL_INPUTS = frozenset((
     "scripts/ci_scope.py", "scripts/tests/test_ci_scope.py",
     ".github/workflows/ci.yml", "scripts/tests/test_ci_acceptance.py",
 ))
-REVIEWED_CONTROL_WORKFLOW_SHA256 = "0b88b9dd7c6b764b35695a59d17e54575c4b5836d688ac8224cdd45f0f1d0cd3"
-REVIEWED_CONTROL_WORKFLOW_BYTES = 68406
+REVIEWED_CONTROL_WORKFLOW_SHA256 = "f7ba2016331c9f05478786cf7d2a8f1c79154bc0754e0afb7f593b28d7fed5f9"
+REVIEWED_CONTROL_WORKFLOW_BYTES = 68493
 
 
 # The shared archive downloader is exercised by the existing four-platform
