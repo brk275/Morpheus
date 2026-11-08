@@ -91,7 +91,12 @@ Its only differences from shipping are:
 - a generated profile root instead of the standard app directories;
 - an explicitly requested sync policy: the shipping `Auto` for sliding sync,
   or `ClassicOnly`, which forces the same classic `/sync` loop that `Auto`
-  falls back to.
+  falls back to;
+- two counts of all currently attached component roots, each after an ordinary
+  redraw outside recorded scroll timing. These provide an upper bound on
+  attached message delegates without asking Slint to create or update instances;
+- paired numeric samples of the existing shipping top-row anchor, validating
+  actual row traversal and reporting a separate motion latency subset.
 
 The renderer is still the one Slint's default backend selects, with no
 backend or renderer override. The `AppWindow` and the `LiveUi` controller are
@@ -151,15 +156,34 @@ never IDs or text. The runner prints only a summary built from those reports.
 | `startup_ms.window_shown` | Process start until `AppWindow::show()` returned | A painted or presented window |
 | `startup_ms.first_render_hook` | Process start until the first `AfterRendering` callback | First presented frame |
 | `startup_ms.sync_running` | Process start until the account manager first reported its adapter running | Room list or timeline readiness |
-| `render_hook_span_us` | CPU time between Slint's `BeforeRendering` and `AfterRendering` callbacks; `AfterRendering` fires before the back buffer is presented | GPU time, presentation or a displayed frame |
+| `render_hook_span_us` | Elapsed wall-clock time between Slint's `BeforeRendering` and `AfterRendering` callbacks | Thread CPU busy time, GPU time, presentation or a displayed frame |
 | `render_hook_interval_us` | Time between consecutive `AfterRendering` callbacks during the scroll steps, including waits for the next dispatched event | Display refresh interval or FPS |
 | `dispatch_to_render_hook_us` | In-process wheel-event dispatch to the next `AfterRendering` | OS input latency, presentation or automation timing |
+| `steps_with_anchor_motion`, `steps_with_anchor_row_change` | Completed input steps whose shipping top-row anchor changed by index or more than 0.5 logical px; the row-change subset requires a different index | All input steps moving, exact distance, or presentation |
+| `dispatch_to_motion_render_hook_us` | Dispatch to the first render hook, restricted to steps with observed anchor motion at that same hook | A later poll or proof of presented pixels |
+| `anchor_index_min`, `anchor_index_max` | Range of shipping top-row indices observed during the completed steps; must span at least two rows | Whole-history traversal or a scroll-distance estimate |
 | `steps_accepted` | Wheel events an element, such as the timeline list, consumed | Proof of a particular scroll distance |
 | `*_observed*` | First seen by a 5 ms event-loop poll; an upper bound | A precise event time |
 | `request_until_loading_cleared_ms` | Production load-older callback until its loading flag clears; rows may publish slightly later | Time to render the new rows |
 | `fixture_distinct_decrypted` | Direct count of distinct fixture events in the window's message model; undecryptable events never enter it | A delegate count |
 | `rss_kib` | `/proc/self/status` on Linux; `unavailable` elsewhere | Heap size, or RSS on macOS or Windows |
-| `delegates` | `unmeasured`: Slint exposes no public count of instantiated rows | Evidence for or against full instantiation |
+| `delegates.after_history_upper_bound`, `delegates.after_scroll_upper_bound` | Total currently attached physical component roots, including unrelated UI components; a conservative upper bound on attached message delegates | Exact message-row count, cumulative allocations, peak live instances, or objects retained outside the attached tree |
+
+In the pinned native OpenGL/FemtoVG path, tree instantiation and the ListView
+layout pass run before `BeforeRendering`; buffer swap and presentation run
+after `AfterRendering`. The span can include OS descheduling and blocking GL
+driver calls. Some text/layout work can still occur during rendering. It does
+not isolate CPU busy time or establish a display refresh rate.
+
+The first `AfterRendering` for each timed step captures the existing shipping
+`timeline-anchor-index` and `timeline-anchor-offset` outputs after recording the
+original timestamp. These two scalar reads add acceptance-only observation work;
+they do not query geometry, create delegates, or move the list. The driver waits
+for a valid initial anchor outside timed input, rejects missing/out-of-range or
+non-finite anchors, and requires actual row-index traversal. It retains all 240
+attempts, including attempts that stop at a boundary. Zero-motion redraws cannot
+satisfy the motion requirement. The paired hook is still before presentation;
+this does not establish GPU completion, visible pixels, or a responsiveness target.
 
 The accessibility row counts in the offline record above remain a proxy.
 
@@ -174,14 +198,48 @@ The accessibility row counts in the offline record above remain a proxy.
   Installed-package performance needs its own path.
 - **Owner thresholds.** No pass or fail threshold is defined. The owner must
   set responsiveness thresholds from measured evidence.
-- **Unmeasured quantities.** Delegate instantiation, GPU time, presentation and
-  display refresh are not measured.
+- **Unmeasured quantities.** Exact message-delegate counts, peak live instances,
+  cumulative allocations, GPU time, presentation and display refresh are not
+  measured. The two attached component-root counts must satisfy
+  `0 < count < 10000` after the actual 10,000 fixture events have decrypted.
+  This proves a bound at those snapshots, not at every moment.
 - **Fixture variety.** Replies, reactions, edits, attachments and images are
   not in the fixture.
 - **Device key timing.** The exact-device wait only guards key distribution.
   The authoritative check is that all 10,000 events decrypt in each profile.
   An enrolled app that quits before publishing its device keys fails the seed
   at `enrolled_device_absent`; enrollment does not yet wait for that itself.
+
+### Attached delegate upper bounds
+
+The message repeater is a direct child of `ListView`; pinned Slint 1.18.1 selects
+viewport-based repetition. Each materialized message-row instance owns a distinct
+`ItemTreeRc`, reachable as a dynamic child from the window. Consequently the
+number of all attached physical component roots is an upper bound on attached
+message-row instances. A complete root count below 10,000 proves that all 10,000
+model messages are not simultaneously attached as delegates at that snapshot.
+It does not give an exact message-row count or prove a cumulative allocation bound.
+
+The instrumented driver takes two snapshots: after the actual decrypted full
+history has completed a layout/render, and after scrolling. Both require the
+room timeline page and the full model to remain active. The raw walk reads
+existing item-tree nodes, repeater ranges and weak child handles. It never uses
+element queries, `visit_descendants`, geometry, accessibility evaluation, debug
+metadata or instantiation/update functions. Missing children, duplicate physical
+owners, or bounded traversal failure refuses the measurement. Strong owners stay
+alive on the UI thread until the snapshot finishes. Every dynamic subtree is
+visited, including unrelated UI components; none are filtered by visibility.
+
+Two ordinary redraws occur outside the recorded scroll timing. Scroll capture is
+disabled before the second redraw, so it cannot fill a missed scroll observation
+or add scroll spans or intervals. The report discloses the added snapshots.
+Shipping compilation, UI, optimization and debug-info environment behavior are
+unchanged. No per-row callback or lifecycle hook is introduced.
+
+Source structure is not a runtime count. A fresh hosted run on the changed
+revision must supply these conservative counts for both adapters; earlier
+instrumented baselines cannot qualify the added instrumentation. A passing bound
+alone does not establish responsiveness or the full performance release gate.
 
 ### Seed run 39165425640: the `devices` stage
 

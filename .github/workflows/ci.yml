@@ -22,7 +22,7 @@ on:
         description: Existing Matrix suite (non-full requires Linux and matrix)
         type: choice
         default: full
-        options: [full, draft-recovery, drafts-only, timeline-reads, timeline-failures, media-only, app-timeline, outgoing-ring, native-call, oauth-only, rtc-recovery, element-interop]
+        options: [full, draft-recovery, drafts-only, timeline-reads, timeline-failures, media-only, app-timeline, outgoing-ring, native-call, oauth-only, rtc-recovery, rtc-media, element-interop]
 
 permissions:
   contents: read
@@ -77,8 +77,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --header 'Accept: application/octet-stream' --max-filesize 8230402 \
+            --connect-timeout 30 --max-time 120 \
+            https://api.github.com/repos/gitleaks/gitleaks/releases/assets/378332058 \
             --output "$archive"
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
           mkdir "$RUNNER_TEMP/gitleaks"
@@ -162,8 +164,9 @@ jobs:
     concurrency:
       group: native-${{ github.sha }}-${{ matrix.os }}
       cancel-in-progress: false
-    # Linux and Intel cold native graphs need compile room; test deadlines stay fixed.
-    timeout-minutes: ${{ (matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}
+    # Cold native graphs on both Mac architectures and Linux need compile room;
+    # Windows and every existing test deadline retain their prior bounds.
+    timeout-minutes: ${{ (matrix.os == 'macos-15' || matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
@@ -264,7 +267,7 @@ jobs:
         run: cargo test --locked --no-fail-fast -p morpheus-config -p morpheus-matrix -p morpheus-rtc
       - name: Check desktop and Matrix crates
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
-        run: cargo check --locked -p morpheus-app -p morpheus-matrix
+        run: cargo check --locked -p morpheus-app -p morpheus-matrix --features morpheus-app/native-calls
       - name: Build desktop with native call and device adapters
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
         run: cargo build --locked -p morpheus-app --features native-calls
@@ -467,6 +470,21 @@ jobs:
         # candidate at the final gate instead of rebuilding just to reach it.
         continue-on-error: true
         run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
+      - name: Compile focused call libraries before regression deadline
+        if: needs.scope.outputs.check_route == 'vendor'
+        # Full native checks already compile the app graph. A focused vendor
+        # route must finish its cold compilation before the bounded test step.
+        env:
+          SLINT_EMIT_DEBUG_INFO: "1"
+        run: cargo test --locked --no-fail-fast -p morpheus-rtc -p matrix-rtc-core -p matrix-rtc-call -p matrix-rtc-call-sdk -p matrix-rtc-transport -p matrix-rtc-matrix-sdk -p matrix-rtc-livekit --features morpheus-rtc/native-rtc,morpheus-rtc/native-devices --lib --no-run
+      - name: Test call authentication and media ownership libraries
+        id: rtc-library-tests
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor')
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          SLINT_EMIT_DEBUG_INFO: "1"
+        run: cargo test --locked --no-fail-fast -p morpheus-rtc -p matrix-rtc-core -p matrix-rtc-call -p matrix-rtc-call-sdk -p matrix-rtc-transport -p matrix-rtc-matrix-sdk -p matrix-rtc-livekit --features morpheus-rtc/native-rtc,morpheus-rtc/native-devices --lib
       - name: Test native device and call guards
         id: device-tests
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'devices')
@@ -489,6 +507,12 @@ jobs:
         continue-on-error: true
         timeout-minutes: 15
         run: python3 scripts/run_wayland_acceptance.py
+      - name: Compile focused vendor app prerequisites before regressions
+        if: needs.scope.outputs.check_route == 'vendor'
+        # The vendor route starts cold; full checks already compiled the app.
+        # These are exactly the first existing vendor test targets/features.
+        # Compile only here, under the job bound, without running tests twice.
+        run: cargo test --locked -p morpheus-app --features native-calls --test rtc_retained_events --test gl_config_preference --no-run
       - name: Test vendored security fixes
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor')
         id: vendor-tests
@@ -742,8 +766,9 @@ jobs:
             done
           fi
       - name: Compile focused app timeline test before live fixture deadlines
-        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads')
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'matrix') && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads')
         # Same target/features and Slint metadata as Acceptance.app_timeline.
+        # Vendor targets may have rebuilt the app without Slint test metadata.
         # Build under the existing job bound, before services/test clocks start;
         # the 480-second command and 420-second live-case limits stay fixed.
         env:
@@ -761,8 +786,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --header 'Accept: application/octet-stream' --max-filesize 8230402 \
+            --connect-timeout 30 --max-time 120 \
+            https://api.github.com/repos/gitleaks/gitleaks/releases/assets/378332058 \
             --output "$archive"
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
           mkdir -p "$RUNNER_TEMP/gitleaks"
@@ -807,6 +834,7 @@ jobs:
           WINDOWS_CAPTURE_OUTCOME: ${{ steps.windows-capture-tests.outcome }}
           WAYLAND_OUTCOME: ${{ steps.wayland-tests.outcome }}
           VENDOR_OUTCOME: ${{ steps.vendor-tests.outcome }}
+          RTC_LIBRARY_OUTCOME: ${{ steps.rtc-library-tests.outcome }}
           VIDEO_SOURCE_OUTCOME: ${{ steps.video-source-tests.outcome }}
           SDK_OUTCOME: ${{ steps.sdk-receipt-tests.outcome }}
           MATRIX_OUTCOME: ${{ steps.matrix-tests.outcome }}
@@ -842,6 +870,7 @@ jobs:
                   "windows-capture-tests": runner == "Windows" and route in ("all", "devices"),
                   "wayland-tests": runner == "Linux" and wayland == "true",
                   "vendor-tests": route in ("all", "vendor"),
+                  "rtc-library-tests": route in ("all", "vendor"),
                   "video-source-tests": route in ("all", "vendor", "desktop-video"),
                   "sdk-receipt-tests": route in ("all", "sdk"),
                   "matrix-tests": runner == "Linux" and route in ("all", "matrix"),
@@ -862,6 +891,7 @@ jobs:
               ("model-tests", "MODEL_OUTCOME"), ("desktop-tests", "DESKTOP_OUTCOME"),
               ("device-tests", "DEVICE_OUTCOME"), ("windows-capture-tests", "WINDOWS_CAPTURE_OUTCOME"),
               ("wayland-tests", "WAYLAND_OUTCOME"), ("vendor-tests", "VENDOR_OUTCOME"),
+              ("rtc-library-tests", "RTC_LIBRARY_OUTCOME"),
               ("video-source-tests", "VIDEO_SOURCE_OUTCOME"),
               ("sdk-receipt-tests", "SDK_OUTCOME"), ("matrix-tests", "MATRIX_OUTCOME"),
               ("preview-capture", "PREVIEW_OUTCOME"), ("preview-upload", "PREVIEW_UPLOAD_OUTCOME"))}
@@ -938,7 +968,7 @@ jobs:
                          "macos-arm": ["macos-15"], "macos-intel": ["macos-15-intel"]}
               routes = {"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "matrix", "wayland", "config", "helpers"}
               suites = {"full", "draft-recovery", "drafts-only", "timeline-reads", "timeline-failures",
-                        "media-only", "app-timeline", "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop"}
+                        "media-only", "app-timeline", "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "rtc-media", "element-interop"}
               if (event_name not in ("push", "pull_request", "workflow_dispatch")
                       or manual not in ("true", "false") or not isinstance(platform, str) or platform not in choices
                       or not isinstance(route, str) or route not in routes

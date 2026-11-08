@@ -22,6 +22,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import element_process_namespace as containment
 
 
+PIPEWIRE_PATCH_API_PATH = "/repos/PipeWire/pipewire/commits/800a25a01f99156d7d954f4d7fe1b0a6cf8ae7e3"
+PIPEWIRE_PATCH_SHA256 = "d46d38c905bf18e82515ade96fb4a8ab3fbd62fd0784b92655b21266de343584"
+
 class CommandFailure(RuntimeError):
     def __init__(self, reason):
         allowed = {"deadline", "output", "exit", "pipe", "cleanup", "input"}
@@ -167,22 +170,28 @@ def download(runner, *, url, maximum, root, environment, expected_size=None, exp
     import hashlib
     from urllib.parse import urlsplit
     parsed = urlsplit(url)
-    api_asset = parsed.hostname == "api.github.com"
+    api_host = parsed.hostname == "api.github.com"
+    api_asset = api_host and re.fullmatch(
+        r"/repos/(?:linuxdeploy/linuxdeploy|linuxdeploy/linuxdeploy-plugin-appimage|"
+        r"AppImage/type2-runtime)/releases/assets/[1-9][0-9]{0,19}", parsed.path)
+    api_patch = (api_host and parsed.path == PIPEWIRE_PATCH_API_PATH
+                 and type(maximum) is int and maximum == 32768
+                 and expected_sha256 == PIPEWIRE_PATCH_SHA256
+                 and expected_size in (None, 2181))
     if (parsed.scheme != "https" or parsed.username is not None or parsed.password is not None
             or parsed.hostname not in {"github.com", "api.github.com", "archive.ubuntu.com", "zlib.net"}
             or parsed.port not in (None, 443) or parsed.fragment or parsed.query
             or not 1 <= maximum <= 64 * 1024 * 1024
             or (parsed.hostname == "zlib.net" and parsed.path != "/fossils/zlib-1.3.2.tar.gz")
-            or (api_asset and not re.fullmatch(
-                r"/repos/(?:linuxdeploy/linuxdeploy|linuxdeploy/linuxdeploy-plugin-appimage|"
-                r"AppImage/type2-runtime)/releases/assets/[1-9][0-9]{0,19}", parsed.path))):
+            or (api_host and not (api_asset or api_patch))):
         raise CommandFailure("input")
     # Redirects never carry credentials; HTTPS-only redirection plus an exact
     # required final digest bounds release-asset indirection without accepting a
     # mutable tag as trust. No API Authorization header or ambient curlrc.
-    # Public asset-ID requests require this constant media type to return
+    # Public API requests use a fixed route-selected media type to return
     # bytes instead of JSON metadata; no caller-supplied headers are accepted.
-    headers = ["--header", "Accept: application/octet-stream"] if api_asset else []
+    headers = (["--header", "Accept: application/vnd.github.patch"] if api_patch else
+               ["--header", "Accept: application/octet-stream"] if api_asset else [])
     output = runner.run("download", ["/usr/bin/curl", "--disable", "--fail", "--silent", "--show-error",
                         "--location", "--max-redirs", "3", "--noproxy", "*", "--proto", "=https", "--proto-redir", "=https",
                         "--connect-timeout", "10", "--max-time", "120", "--max-filesize", str(maximum), *headers, url],
@@ -228,15 +237,20 @@ def download_package_input(runner, *, url, maximum, root, environment,
     from urllib.parse import urlsplit
     try:
         parsed = urlsplit(url)
-        api_asset = parsed.hostname == "api.github.com"
+        api_host = parsed.hostname == "api.github.com"
+        api_asset = api_host and re.fullmatch(
+            r"/repos/(?:linuxdeploy/linuxdeploy|linuxdeploy/linuxdeploy-plugin-appimage|"
+            r"AppImage/type2-runtime)/releases/assets/[1-9][0-9]{0,19}", parsed.path)
+        api_patch = (api_host and parsed.path == PIPEWIRE_PATCH_API_PATH
+                     and type(maximum) is int and maximum == 32768
+                     and expected_sha256 == PIPEWIRE_PATCH_SHA256
+                     and expected_size in (None, 2181))
         valid_url = (type(url) is str and parsed.scheme == "https"
                      and parsed.username is None and parsed.password is None
                      and parsed.hostname in {"github.com", "api.github.com", "archive.ubuntu.com", "zlib.net"}
                      and parsed.port in (None, 443) and not parsed.fragment and not parsed.query
                      and (parsed.hostname != "zlib.net" or parsed.path == "/fossils/zlib-1.3.2.tar.gz")
-                     and (not api_asset or re.fullmatch(
-                         r"/repos/(?:linuxdeploy/linuxdeploy|linuxdeploy/linuxdeploy-plugin-appimage|"
-                         r"AppImage/type2-runtime)/releases/assets/[1-9][0-9]{0,19}", parsed.path)))
+                     and (not api_host or api_asset or api_patch))
     except (TypeError, ValueError):
         raise CommandFailure("input") from None
     if (not valid_url or type(maximum) is not int
@@ -246,7 +260,8 @@ def download_package_input(runner, *, url, maximum, root, environment,
             or (expected_size is not None and
                 (type(expected_size) is not int or not 1 <= expected_size <= maximum))):
         raise CommandFailure("input")
-    headers = (["--header", "Accept: application/octet-stream", "--header", "Cache-Control: no-cache"]
+    headers = (["--header", "Accept: application/vnd.github.patch"] if api_patch else
+               ["--header", "Accept: application/octet-stream", "--header", "Cache-Control: no-cache"]
                if api_asset else [])
     deadline = time.monotonic() + 125
     transport = {18, 28, 52, 55, 56}

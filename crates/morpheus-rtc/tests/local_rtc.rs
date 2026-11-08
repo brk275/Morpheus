@@ -948,7 +948,11 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         _ => panic!("MORPHEUS_RTC_LATE_JOIN must be absent or 1"),
     };
     let options = match std::env::var("MORPHEUS_RTC_TEST_MODE").as_deref() {
-        Ok("current") | Err(std::env::VarError::NotPresent) => CallOptions::default(),
+        Ok("current") | Err(std::env::VarError::NotPresent) => CallOptions {
+            // Explicit historical/custom API coverage, not the shipping app profile.
+            auth_dialect: Some(morpheus_rtc::LiveKitAuthDialect::DirectDraft),
+            ..CallOptions::default()
+        },
         Ok("sticky-2025") => CallOptions::element_call_matrix_2_0(),
         _ => panic!("MORPHEUS_RTC_TEST_MODE must be absent, current or sticky-2025"),
     };

@@ -319,6 +319,9 @@ fn next_serial(serial: i32) -> i32 {
 }
 
 fn request_settings_reveal(ui: &AppWindow, id: &str) {
+    // Navigation can instantiate the conditional and set its mounted flag.
+    // Capture the original page state before callbacks/layout can change it.
+    let controls_were_mounted = ui.get_page() == 1 && ui.get_settings_controls_mounted();
     crate::matrix_links::clear(ui);
     crate::thread_browser::withdraw(ui);
     ui.invoke_prepare_settings_reveal();
@@ -328,7 +331,7 @@ fn request_settings_reveal(ui: &AppWindow, id: &str) {
     // A mounted page handles the changed serial immediately. A new conditional
     // starts with that value, so its trackers need one post-mount notification.
     // Keep the original registry ID, including the selected color/metric key.
-    if !ui.get_settings_controls_mounted() {
+    if !controls_were_mounted {
         ui.set_settings_pending_reveal_id(id.into());
         ui.set_settings_pending_reveal_serial(serial);
         ui.set_settings_reveal_pending(true);

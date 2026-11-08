@@ -12,14 +12,17 @@
   "changed_source_files": [
     "src/base_rtc_room.rs",
     "src/client/tests.rs",
+    "src/compat/dialect_backend.rs",
     "src/compat/ingest.rs",
     "src/encryption/mod.rs",
     "src/feeder/dialect.rs",
     "src/feeder/mod.rs",
     "src/feeder/tests.rs",
     "src/host/backend.rs",
+    "src/lib.rs",
     "src/own_membership.rs",
     "src/session.rs",
+    "src/transport.rs",
     "src/upkeep.rs",
     "tests/key_rotation.rs"
   ],

@@ -108,6 +108,7 @@
   "modifications": [
     "Cargo.toml adds existing sha2 0.10 dependency; root workspace/patch uses local source",
     "src/lib.rs: verified download, safe staging/extraction, receipt and cleanup; pinned SDK tag retained",
-    "src/archive.rs, src/pins.rs and src/archive_tests.rs: original Morpheus hardening and guarded tests"
+    "src/archive.rs, src/pins.rs and src/archive_tests.rs: original Morpheus hardening and guarded tests",
+    "src/pins.rs and verified downloader: fixed official GitHub asset API IDs, unauthenticated octet-stream/User-Agent headers; all existing archive bytes/SHA256 and security bounds retained"
   ]
 }

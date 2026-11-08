@@ -57,7 +57,7 @@ def prepare(prefix, *, variant):
     archives = {key: download(runner, url=client.R.BASE_URL + name, maximum=maximum,
                             expected_sha256=digest, root=prefix, environment=environment)
                 for key, (name, digest, maximum) in client.R.ARCHIVES.items()}
-    patch = download(runner, url="https://github.com/PipeWire/pipewire/commit/" + client.R.COMMIT + ".patch",
+    patch = download(runner, url="https://api.github.com/repos/PipeWire/pipewire/commits/" + client.R.COMMIT,
                      maximum=32768, expected_sha256=client.R.UPSTREAM_PATCH_SHA256,
                      root=prefix, environment=environment)
     stage, metadata = client.prepare_client(prefix, archives, patch, runner.run, variant=variant)
