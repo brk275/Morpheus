@@ -183,7 +183,7 @@ MANUAL_CHECKS = frozenset({"all", "models", "desktop", "desktop-video", "devices
                            "matrix", "wayland", "config", "helpers"})
 # Exact existing suites from run_matrix_acceptance.py; no new test composition.
 MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-reads",
-                           "timeline-failures", "media-only", "app-timeline",
+                           "timeline-failures", "recovery-only", "media-only", "app-timeline",
                            "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "rtc-media", "element-interop"})
 
 

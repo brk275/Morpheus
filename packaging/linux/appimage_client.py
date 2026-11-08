@@ -392,7 +392,7 @@ def appimage_config(base, stage):
         files[str(stage / name)] = NOTICE_DIR + "/" + name
     # The source is staged directly under its SONAME. No custom-file symlink is
     # used: Cargo Packager follows symlinks when copying appimage.files.
-    config["appimage"] = {"files": files, "excluded-libs": ["libpipewire-0.3.so*"]}
+    config["appimage"] = {"files": files, "excludedLibs": ["libpipewire-0.3.so*"]}
     return config
 
 

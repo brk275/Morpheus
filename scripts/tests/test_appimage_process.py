@@ -652,6 +652,77 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
         self.assertEqual(error.exception.reason, "not_ready")
 
 
+class PackageConfigPreflightTests(unittest.TestCase):
+    def test_real_cli_parse_preflight_precedes_native_build_and_keeps_actual_formats(self):
+        import copy
+        import json
+
+        class NativeBuildReached(Exception):
+            pass
+
+        for rejected in (False, True):
+            with self.subTest(rejected=rejected), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                stage = root / "client"
+                stage.mkdir()
+                runtime_notices = root / "runtime-notices"
+                runtime_notices.mkdir()
+                base = {"name": "morpheus-app", "formats": ["appimage"],
+                        "before-packaging-command": "must-not-run", "deb": {"files": {}}}
+                saved = copy.deepcopy(base)
+                generated = []
+                actual_config = P.client.appimage_config
+
+                def config(value, directory):
+                    result = actual_config(value, directory)
+                    generated.append(result)
+                    return result
+
+                calls = []
+
+                def run(label, argv, **options):
+                    calls.append(label)
+                    if label == "native-build":
+                        raise NativeBuildReached()
+                    self.assertEqual(label, "package-config")
+                    self.assertEqual(argv[:4], ["/tools/cargo", "packager", "--release", "--config"])
+                    self.assertEqual(len(argv), 5)
+                    probe = json.loads(argv[4])
+                    self.assertEqual(probe["formats"], [])
+                    self.assertEqual(probe["appimage"]["excludedLibs"], ["libpipewire-0.3.so*"])
+                    self.assertNotIn("before-packaging-command", probe)
+                    self.assertNotIn("--formats", argv)
+                    self.assertEqual(options["cwd"], root)
+                    self.assertEqual(options["timeout"], 30)
+                    self.assertEqual(options["output_limit"], 65536)
+                    self.assertEqual(options["stderr_limit"], 65536)
+                    if rejected:
+                        raise M.CommandFailure("exit")
+                    return b""
+
+                runner = SimpleNamespace(run=run)
+                with mock.patch.object(P, "ROOT", root), \
+                        mock.patch.object(P, "check_versions"), \
+                        mock.patch.object(P, "download_inputs", return_value=({}, {}, b"")), \
+                        mock.patch.object(P.runtime_builder, "prepare", return_value=(b"runtime", {}, runtime_notices)), \
+                        mock.patch.object(P.client, "seed_tools", return_value={}), \
+                        mock.patch.object(P.client, "prepare_client", return_value=(stage, {})), \
+                        mock.patch.object(P.client, "build_receipt", return_value=root / "receipt.json"), \
+                        mock.patch.object(P.client, "appimage_config", side_effect=config), \
+                        mock.patch.object(P, "package_config", return_value=base), \
+                        mock.patch.object(P.client, "read_regular") as binary_read:
+                    expected = M.CommandFailure if rejected else NativeBuildReached
+                    with self.assertRaises(expected):
+                        P.build_unsigned(runner, root, tools={"cargo": "/tools/cargo"},
+                                         environment={}, notices=SimpleNamespace())
+                self.assertEqual(calls, ["package-config"] if rejected else ["package-config", "native-build"])
+                binary_read.assert_not_called()
+                self.assertEqual(base, saved)
+                self.assertEqual(len(generated), 1)
+                self.assertEqual(generated[0]["formats"], ["appimage"])
+                self.assertEqual(set(generated[0]["appimage"]), {"files", "excludedLibs"})
+
+
 class PackageInputTests(unittest.TestCase):
     payload = b"pinned asset"
     url = "https://api.github.com/repos/linuxdeploy/linuxdeploy/releases/assets/602438599"

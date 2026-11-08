@@ -175,6 +175,31 @@ def build_unsigned(runner, root, *, tools, environment, notices, target=None, up
     if target.exists() and (target.is_symlink() or target.resolve() != target
                             or target.stat().st_uid != os.getuid()):
         raise PackageFailure("output")
+    config = client.appimage_config(package_config(ROOT, "linux"), stage)
+    if update is not None:
+        config["version"] = update["version"]
+    for path in runtime_notices.iterdir():
+        destination = runtime_builder.NOTICE_DIR + "/" + path.name
+        if destination in config["appimage"]["files"].values():
+            raise PackageFailure("notices")
+        config["appimage"]["files"][str(path)] = destination
+    # Native build is explicitly owned/bounded below. Avoid spawning an
+    # unbounded shell build inside Cargo Packager's before hook.
+    config.pop("before-packaging-command", None)
+    if any(name in config for name in ("before-each-package-command", "after-packaging-command")):
+        raise PackageFailure("configuration")
+    config["binaries-dir"] = str(target / "release")
+    output = root / "packages"
+    output.mkdir(mode=0o700)
+    config["out-dir"] = str(output)
+    # The pinned CLI deserializes the real config before an empty formats
+    # list returns, before hooks, context creation or package backends. Keep
+    # this parse-only copy separate from the actual AppImage selection.
+    probe_config = dict(config)
+    probe_config["formats"] = []
+    runner.run("package-config", [tools["cargo"], "packager", "--release",
+               "--config", json.dumps(probe_config)], cwd=ROOT, env=package_environment,
+               timeout=30, output_limit=65536, stderr_limit=65536)
     receipt = client.build_receipt(stage, source_metadata, variant="appimage")
     native_environment = {**package_environment, "CARGO_TARGET_DIR": str(target),
                           "MORPHEUS_PIPEWIRE_CLIENT_VARIANT": "appimage",
@@ -188,23 +213,6 @@ def build_unsigned(runner, root, *, tools, environment, notices, target=None, up
     binary_bytes = client.read_regular(binary, MAX_APPIMAGE)
     if not binary_bytes.startswith(b"\x7fELF\x02\x01"):
         raise PackageFailure("identity")
-    config = client.appimage_config(package_config(ROOT, "linux"), stage)
-    if update is not None:
-        config["version"] = update["version"]
-    for path in runtime_notices.iterdir():
-        destination = runtime_builder.NOTICE_DIR + "/" + path.name
-        if destination in config["appimage"]["files"].values():
-            raise PackageFailure("notices")
-        config["appimage"]["files"][str(path)] = destination
-    # Native build was explicitly owned/bounded above. Avoid spawning an
-    # unbounded shell build inside Cargo Packager's before hook.
-    config.pop("before-packaging-command", None)
-    if any(name in config for name in ("before-each-package-command", "after-packaging-command")):
-        raise PackageFailure("configuration")
-    config["binaries-dir"] = str(target / "release")
-    output = root / "packages"
-    output.mkdir(mode=0o700)
-    config["out-dir"] = str(output)
     notice_record = notices.prepare(runner, root, binary, stage, source_metadata, config, package_environment,
                                     runtime_metadata=runtime_metadata)
     runner.run("package", [tools["cargo"], "packager", "--release", "--formats", FORMAT,

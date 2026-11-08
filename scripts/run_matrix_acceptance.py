@@ -616,7 +616,8 @@ APP_TIMELINE_ONLY_CHECKS = (APP_TIMELINE_LABEL, APP_PEOPLE_LABEL)
 MEDIA_ONLY_CHECKS = ("media_local",)
 SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS,
-          "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
+          "timeline-failures": TIMELINE_FAILURE_CHECKS, "recovery-only": ("recovery_local",),
+          "media-only": MEDIA_ONLY_CHECKS,
           "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS,
           "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS), "oauth-only": OAUTH_LABELS,
           "rtc-recovery": OUTAGE_LABELS, "rtc-media": RTC_LABELS, "element-interop": (ELEMENT_LABEL,)}
@@ -1659,6 +1660,10 @@ class Acceptance:
                               "reason": "dependency_failed"}), flush=True)
         self.group((APP_RECOVERY_LABEL,), lambda: self.app_recovery(fixture))
 
+    def recovery_case(self):
+        recovery = fixture_from_output(self.script("local_matrix_env", "recovery-fixture"), self.root)
+        self.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})
+
     def timeline_failure_cases(self, fixture: Path):
         formatted = self.group(("formatted_local",), lambda: self.test("formatted_local", fixture))
         if formatted:
@@ -1932,6 +1937,11 @@ class Acceptance:
                     output.write("Focused timeline-read checks: real Synapse and an ephemeral OS Secret Service. "
                                  "Includes encrypted messages/threads, formatting, media, moderation, both search sync paths, key recovery, chat without a call service and generated-window model delivery/revocation. "
                                  "No OAuth, live-call interoperability or installed-app checks; this is not full acceptance.\n\n")
+                elif self.suite == "recovery-only":
+                    output.write("Focused encrypted-account recovery: the existing fresh-device case and "
+                                 "in-process manager stop/drop/reopen use disposable Synapse and OS Secret Service. "
+                                 "No Slint Settings UI, separate-process restart, other Matrix cases or RTC ran; "
+                                 "this is not full acceptance.\n\n")
                 elif self.suite == "timeline-failures":
                     output.write("Focused formatting, dependent moderation and fresh encrypted-history recovery checks. "
                                  "This is not full acceptance; other native and live UI evidence is recorded separately.\n\n")
@@ -2105,6 +2115,10 @@ def main():
             return
         if args.suite == "timeline-reads":
             acceptance.timeline_read_cases(fixture)
+            acceptance.finish_checks()
+            return
+        if args.suite == "recovery-only":
+            acceptance.group(("recovery_local",), acceptance.recovery_case)
             acceptance.finish_checks()
             return
         if args.suite == "timeline-failures":

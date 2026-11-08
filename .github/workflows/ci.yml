@@ -22,7 +22,7 @@ on:
         description: Existing Matrix suite (non-full requires Linux and matrix)
         type: choice
         default: full
-        options: [full, draft-recovery, drafts-only, timeline-reads, timeline-failures, media-only, app-timeline, outgoing-ring, native-call, oauth-only, rtc-recovery, rtc-media, element-interop]
+        options: [full, draft-recovery, drafts-only, timeline-reads, timeline-failures, recovery-only, media-only, app-timeline, outgoing-ring, native-call, oauth-only, rtc-recovery, rtc-media, element-interop]
 
 permissions:
   contents: read
@@ -247,7 +247,7 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path vendor/cpal/Cargo.toml -- --check
       - name: Prepare the pinned owned native PipeWire client
-        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'wayland' || (needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite != 'drafts-only' && needs.scope.outputs.matrix_suite != 'timeline-failures' && needs.scope.outputs.matrix_suite != 'media-only' && needs.scope.outputs.matrix_suite != 'oauth-only'))
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'wayland' || (needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite != 'drafts-only' && needs.scope.outputs.matrix_suite != 'timeline-failures' && needs.scope.outputs.matrix_suite != 'recovery-only' && needs.scope.outputs.matrix_suite != 'media-only' && needs.scope.outputs.matrix_suite != 'oauth-only'))
         timeout-minutes: 20
         shell: bash
         run: |
@@ -967,7 +967,7 @@ jobs:
                          "linux": ["ubuntu-24.04"], "windows": ["windows-2025"],
                          "macos-arm": ["macos-15"], "macos-intel": ["macos-15-intel"]}
               routes = {"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "matrix", "wayland", "config", "helpers"}
-              suites = {"full", "draft-recovery", "drafts-only", "timeline-reads", "timeline-failures",
+              suites = {"full", "draft-recovery", "drafts-only", "timeline-reads", "timeline-failures", "recovery-only",
                         "media-only", "app-timeline", "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "rtc-media", "element-interop"}
               if (event_name not in ("push", "pull_request", "workflow_dispatch")
                       or manual not in ("true", "false") or not isinstance(platform, str) or platform not in choices

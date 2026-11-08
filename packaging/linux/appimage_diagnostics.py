@@ -14,7 +14,7 @@ import stat
 import tempfile
 
 COMMANDS = frozenset((
-    "none", "unknown", "cargo-version", "packager-version", "download", "native-build", "package", "extract", "update-metadata",
+    "none", "unknown", "cargo-version", "packager-version", "download", "native-build", "package-config", "package", "extract", "update-metadata",
     "runtime-musl-build", "runtime-musl-install",
     "runtime-zlib-configure", "runtime-zlib-build", "runtime-zlib-install", "runtime-zstd-build",
     "runtime-mimalloc-build", "runtime-mimalloc-archive", "runtime-fuse-configure", "runtime-fuse-install",

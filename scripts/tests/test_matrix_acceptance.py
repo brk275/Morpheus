@@ -328,6 +328,42 @@ class FocusedSuiteTests(unittest.TestCase):
             self.assertNotIn("Full suite:", summary.read_text())
 
 
+class RecoveryOnlySuiteTests(unittest.TestCase):
+    def test_exact_case_requires_evidence_and_cannot_satisfy_full_acceptance(self):
+        self.assertEqual(acceptance_module.SUITES["recovery-only"], ("recovery_local",))
+        self.assertEqual(acceptance_module.SUITES["full"], acceptance_module.PLANNED_CHECKS)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="recovery-only")
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+            runner.results = [{"check": "recovery_local", "passed": 1, "seconds": 1}]
+            runner.finish_checks()
+            full = Acceptance(root, "scanner")
+            full.results = list(runner.results)
+            with self.assertRaises(RuntimeError):
+                full.finish_checks()
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            self.assertIn("not full acceptance", summary.read_text())
+            self.assertNotIn("Full suite:", summary.read_text())
+
+    def test_existing_fresh_fixture_and_opt_in_are_the_only_case_dispatched(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="recovery-only")
+            fixture = root / "recovery.json"
+            with patch.object(runner, "test") as test, \
+                    patch.object(runner, "script", return_value="private-fixture") as script, \
+                    patch.object(acceptance_module, "fixture_from_output", return_value=fixture) as read:
+                runner.recovery_case()
+            script.assert_called_once_with("local_matrix_env", "recovery-fixture")
+            read.assert_called_once_with("private-fixture", root)
+            test.assert_called_once_with("recovery_local", fixture,
+                                         extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})
+
+
 class TimelineFailureSuiteTests(unittest.TestCase):
     def test_closed_retry_requires_all_three_cases_and_cannot_satisfy_full_acceptance(self):
         expected = ("formatted_local", "moderation_local", "recovery_local")
@@ -936,6 +972,41 @@ class FinalizationTests(unittest.TestCase):
                     acceptance_module.main()
         self.assertIs(caught.exception, original)
         self.assert_both_cleanups(runner)
+
+    def test_recovery_only_main_runs_one_case_and_preserves_cleanup_on_failure(self):
+        for failure_at in (None, "test", "finish_checks"):
+            with self.subTest(failure_at=failure_at), self.mocked_main() as (runner, _):
+                runner.recovery_case.side_effect = lambda: Acceptance.recovery_case(runner)
+                failure = RuntimeError("fixed incomplete recovery result")
+                if failure_at:
+                    getattr(runner, failure_at).side_effect = failure
+                with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                               "--suite", "recovery-only"]):
+                    if failure_at:
+                        with self.assertRaises(RuntimeError) as caught:
+                            acceptance_module.main()
+                        self.assertIs(caught.exception, failure)
+                    else:
+                        self.assertIsNone(acceptance_module.main())
+                runner.group.assert_called_once_with(("recovery_local",), runner.recovery_case)
+                runner.test.assert_called_once()
+                self.assertEqual(runner.test.call_args.args[0], "recovery_local")
+                self.assertEqual(runner.test.call_args.kwargs,
+                                 {"extra": {"MORPHEUS_MATRIX_TEST_RECOVERY": "1"}})
+                self.assertEqual([call.args for call in runner.script.call_args_list], [
+                    ("local_matrix_env", "up"), ("local_matrix_env", "recovery-fixture"),
+                    ("local_matrix_rtc", "down"), ("local_matrix_env", "destroy"),
+                ])
+                runner.start_keyring.assert_called_once_with()
+                runner.require_containment.assert_called_once_with()
+                runner.app_timeline.assert_not_called()
+                runner.app_recovery.assert_not_called()
+                runner.rtc_cases.assert_not_called()
+                runner.outgoing_ring_cases.assert_not_called()
+                runner.element_case.assert_not_called()
+                runner.oauth_cases.assert_not_called()
+                runner.timeline_failure_cases.assert_not_called()
+                self.assert_both_cleanups(runner)
 
     def test_timeline_read_main_uses_only_selected_checks_and_preserves_cleanup(self):
         with self.mocked_main() as (runner, _):

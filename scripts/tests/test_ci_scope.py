@@ -372,7 +372,7 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(MANUAL_CHECKS, {"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk",
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
-                                         "timeline-failures", "media-only", "app-timeline",
+                                         "timeline-failures", "recovery-only", "media-only", "app-timeline",
                                          "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "rtc-media", "element-interop"})
         source = ast.parse((Path(__file__).resolve().parents[1]/"run_matrix_acceptance.py").read_text())
         suites = [node.value for node in source.body if isinstance(node,ast.Assign)
@@ -407,6 +407,19 @@ class ScopeTests(unittest.TestCase):
                     with self.subTest(suite=suite), self.assertRaises(ValueError):
                         event_selection({"inputs": {"platform": platform, "checks": "desktop-video",
                                                     "matrix_suite": suite}}, "workflow_dispatch")
+
+    def test_recovery_only_requires_explicit_linux_matrix_and_no_other_platform(self):
+        inputs = {"platform": "linux", "checks": "matrix", "matrix_suite": "recovery-only"}
+        self.assertEqual(event_selection({"inputs": inputs}, "workflow_dispatch"), {
+            "native": True, "native_matrix": {"os": ["ubuntu-24.04"]}, "config": False,
+            "wayland": False, "manual": True, "manual_platform": "linux",
+            "check_route": "matrix", "matrix_suite": "recovery-only",
+        })
+        for change in ({"platform": "all"}, {"platform": "windows"}, {"platform": "macos-arm"},
+                       {"checks": "all"}, {"checks": "desktop"}, {"checks": "helpers"},
+                       {"matrix_suite": "recovery-only-extra"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                event_selection({"inputs": inputs | change}, "workflow_dispatch")
 
     def test_element_interop_requires_explicit_linux_matrix_selection(self):
         inputs = {"platform": "linux", "checks": "matrix", "matrix_suite": "element-interop"}
