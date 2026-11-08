@@ -573,12 +573,13 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         end = "      - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC\n"
         self.assertEqual(source.count(start), 1)
         step = source.split(start, 1)[1].split(end, 1)[0]
-        condition = "        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads')\n"
+        condition = "        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'matrix') && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads')\n"
         self.assertIn(condition, step)
         self.assertIn('          SLINT_EMIT_DEBUG_INFO: "1"\n', step)
         self.assertNotIn("continue-on-error:", step)
         self.assertNotIn("timeout-minutes:", step)
         self.assertLess(source.index("      - name: Prepare the pinned owned native PipeWire client\n"), source.index(start))
+        self.assertLess(source.index("      - name: Test vendored security fixes\n"), source.index(start))
         self.assertLess(source.index(start), source.index(end))
         # Compare the real coordinator command/profile as source DATA. A future
         # target/feature/metadata mismatch must fail this existing helper gate.
