@@ -12195,8 +12195,18 @@ export component AppWindow inherits Window {
                         hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
                         open-recovery => { root.open-timeline-recovery(true, root.thread-recovery-serial); }
                     }
-                    if root.thread-root-id != "" : thread-scroll := ListView {
+                    if root.thread-root-id != "" : Rectangle {
+                        // Keep the seek driver alive independently of virtual rows.
+                        // ListView accepts only its single repeated child.
+                        background: transparent;
                         vertical-stretch: 1;
+                        horizontal-stretch: 1;
+                        min-width: thread-scroll.min-width;
+                        min-height: thread-scroll.min-height;
+                        preferred-width: 100%;
+                        preferred-height: 100%;
+                        thread-scroll := ListView {
+                        x: 0px; y: 0px; width: parent.width; height: parent.height;
                         horizontal-scrollbar-policy: always-off;
                         accessible-label: "Messages in this thread";
                         property <int> read-pass: 0;
@@ -12693,6 +12703,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                        }
                         }
                         Timer {
                             interval: 16ms;
