@@ -586,7 +586,7 @@ def windows_smoke(dist):
     package = artifact(dist, ".exe")
     require(not uninstall_registry(), "Refusing to replace an existing Morpheus installation")
     with tempfile.TemporaryDirectory(prefix="morpheus-package-") as temp:
-        work = Path(temp)
+        work = Path(temp).resolve(strict=True)
         installed = work / "Installed Morpheus"  # Exercise NSIS paths containing spaces.
         run(nsis_command(package, installed))
         uninstaller = installed / "uninstall.exe"

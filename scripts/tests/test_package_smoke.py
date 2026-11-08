@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, MagicMock, call
 
 from scripts import package_smoke
 
@@ -135,6 +135,48 @@ class PackageSmokeTests(unittest.TestCase):
                 (installed / "Symphonia-NOTICE.txt").write_bytes(b"Wrong source notice\n")
                 with self.assertRaisesRegex(RuntimeError, "Symphonia-NOTICE"):
                     package_smoke.check_resources(installed)
+
+    def test_windows_install_uses_one_canonical_owned_temp_root_for_all_operations(self):
+        alias = Path("/synthetic/SHORT~1/owned")
+        canonical = Path("/synthetic/Long User/owned")
+        installed = canonical / "Installed Morpheus"
+        executable = installed / "morpheus-app.exe"
+        uninstaller = installed / "uninstall.exe"
+        copied = canonical / "qa-uninstall.exe"
+        setup = Path("/synthetic/dist/setup.exe")
+        dist = Path("/synthetic/dist")
+        temporary = MagicMock()
+        temporary.__enter__.return_value = str(alias)
+        def resolve(path, **kwargs):
+            try:
+                suffix = path.relative_to(alias)
+            except ValueError:
+                return path
+            return canonical / suffix
+        entries = [{"DisplayName":"Morpheus", "DisplayVersion":"0.1.0",
+                    "InstallLocation":str(installed)}]
+        with patch.object(package_smoke.tempfile, "TemporaryDirectory", return_value=temporary) as allocate, \
+                patch.object(Path, "resolve", autospec=True, side_effect=resolve) as resolved, \
+                patch.object(Path, "exists", autospec=True, side_effect=lambda path:path == uninstaller), \
+                patch.object(package_smoke, "artifact", return_value=setup), \
+                patch.object(package_smoke, "uninstall_registry", side_effect=[[], entries, []]), \
+                patch.object(package_smoke, "package_version", return_value="0.1.0"), \
+                patch.object(package_smoke, "check_windows_binary") as pe, \
+                patch.object(package_smoke, "check_resources") as resources, \
+                patch.object(package_smoke, "windows_installed_launches") as launch, \
+                patch.object(package_smoke, "run") as run, \
+                patch.object(package_smoke.shutil, "copy2") as copy, \
+                patch.object(package_smoke, "record"):
+            package_smoke.windows_smoke(dist)
+        allocate.assert_called_once_with(prefix="morpheus-package-")
+        self.assertEqual(resolved.call_args_list[0], call(alias, strict=True))
+        pe.assert_called_once_with(executable)
+        resources.assert_called_once_with(installed, dist)
+        launch.assert_called_once_with(executable)
+        copy.assert_called_once_with(uninstaller, copied)
+        self.assertEqual(run.call_args_list, [call(package_smoke.nsis_command(setup, installed)),
+                                              call(package_smoke.nsis_command(copied, installed, uninstall=True))])
+        temporary.__exit__.assert_called_once()
 
     def test_nsis_last_option_keeps_destination_unquoted(self):
         for uninstall, flag in [(False, "/D="), (True, "_?=")]:
