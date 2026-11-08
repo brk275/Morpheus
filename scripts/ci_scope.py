@@ -643,6 +643,159 @@ def qualified_appearance_input_reuse(paths, event, event_name, force_all=False):
         return False
 
 
+# Inactive until maintainer review binds complete terminal native4 evidence.
+# This reuses exact compiled inputs, not binaries, caches or release acceptance.
+FULL_NATIVE_REUSE_ACCEPTED = False
+FULL_NATIVE_REUSE_SOURCE = "5e5da37c07b2aa06bc3655ae02571cac33a44c07"
+FULL_NATIVE_REUSE_TREE = "e9ecf72fdcd5e7a0c12fa23cd53823a2cf1b9110"
+FULL_NATIVE_REUSE_TESTED_MERGE = "86435f9c59a8ed2f694dbd6936de2f2281353d37"
+FULL_NATIVE_REUSE_TESTED_BASE = "2f61e413b1f2d844e0bd14535d1ddd367bcf042f"
+FULL_NATIVE_REUSE_WORKFLOW_SHA256 = "16dd55576e5fdb23c4ea0e635b29964b14fc5cd1cf1707d13fcf006d0ab6376b"
+FULL_NATIVE_REUSE_WORKFLOW_BYTES = 67540
+FULL_NATIVE_REUSE_RUN = 42444774758
+FULL_NATIVE_REUSE_JOBS = (
+    ("macos-15", 42444774758, 128621498303),
+    ("macos-15-intel", 42444774758, 128621498245),
+    ("ubuntu-24.04", 42444774758, 128621498354),
+    ("windows-2025", 42444774758, 128621498276),
+)
+FULL_NATIVE_REUSE_AGGREGATE_JOB = None
+FULL_NATIVE_REUSE_RECEIPT = None
+FULL_NATIVE_REUSE_QUALIFICATION = {
+    "accepted": FULL_NATIVE_REUSE_ACCEPTED,
+    "source": FULL_NATIVE_REUSE_SOURCE, "tree": FULL_NATIVE_REUSE_TREE,
+    "tested_merge": FULL_NATIVE_REUSE_TESTED_MERGE, "tested_base": FULL_NATIVE_REUSE_TESTED_BASE,
+    "workflow_sha256": FULL_NATIVE_REUSE_WORKFLOW_SHA256,
+    "run": FULL_NATIVE_REUSE_RUN, "jobs": FULL_NATIVE_REUSE_JOBS,
+    "aggregate_job": FULL_NATIVE_REUSE_AGGREGATE_JOB, "receipt_sha256": FULL_NATIVE_REUSE_RECEIPT,
+}
+
+
+def qualified_full_native_input_reuse(paths, event, event_name, force_all=False):
+    qualified = FULL_NATIVE_REUSE_QUALIFICATION
+    if (force_all is not False or event_name not in ("push", "pull_request")
+            or FULL_NATIVE_REUSE_ACCEPTED is not True or type(qualified) is not dict
+            or qualified != {"accepted": True, "source": FULL_NATIVE_REUSE_SOURCE,
+                "tree": FULL_NATIVE_REUSE_TREE, "tested_merge": FULL_NATIVE_REUSE_TESTED_MERGE,
+                "tested_base": FULL_NATIVE_REUSE_TESTED_BASE,
+                "workflow_sha256": FULL_NATIVE_REUSE_WORKFLOW_SHA256,
+                "run": FULL_NATIVE_REUSE_RUN, "jobs": FULL_NATIVE_REUSE_JOBS,
+                "aggregate_job": FULL_NATIVE_REUSE_AGGREGATE_JOB, "receipt_sha256": FULL_NATIVE_REUSE_RECEIPT}
+            or qualified["accepted"] is not True
+            or type(qualified["receipt_sha256"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", qualified["receipt_sha256"]) is None
+            or type(qualified["run"]) is not int or qualified["run"] <= 0
+            or type(qualified["aggregate_job"]) is not int or qualified["aggregate_job"] <= 0):
+        return False
+    jobs = qualified["jobs"]
+    if (type(jobs) is not tuple or len(jobs) != len(PLATFORMS)
+            or any(type(job) is not tuple or len(job) != 3 or job[0] not in PLATFORMS
+                   or type(job[1]) is not int or job[1] != qualified["run"]
+                   or type(job[2]) is not int or job[2] <= 0 for job in jobs)
+            or {job[0] for job in jobs} != set(PLATFORMS) or len({job[2] for job in jobs}) != 4
+            or qualified["aggregate_job"] in {job[2] for job in jobs}
+            or any(type(qualified[key]) is not str or re.fullmatch(r"[0-9a-f]{40}", qualified[key]) is None
+                   for key in ("source", "tree", "tested_merge", "tested_base"))
+            or type(paths) not in (list, tuple) or not paths
+            or any(type(path) is not str for path in paths) or len(set(paths)) != len(paths) or type(event) is not dict):
+        return False
+
+    repository, sender = event.get("repository"), event.get("sender")
+    if (type(repository) is not dict or type(sender) is not dict
+            or repository.get("full_name") != "brk275/Morpheus" or repository.get("private") is not False
+            or type(repository.get("owner")) is not dict or repository["owner"].get("login") != "brk275"
+            or type(repository.get("id")) is not int or repository["id"] <= 0
+            or type(repository["owner"].get("id")) is not int or repository["owner"]["id"] <= 0
+            or sender.get("login") != "brk275" or type(sender.get("id")) is not int
+            or sender["id"] != repository["owner"]["id"]
+            or any(os.environ.get(key) != "brk275" for key in ("GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR"))
+            or os.environ.get("GITHUB_REPOSITORY") != "brk275/Morpheus"
+            or os.environ.get("GITHUB_EVENT_NAME") != event_name):
+        return False
+    candidate = os.environ.get("GITHUB_SHA")
+    if type(candidate) is not str or re.fullmatch(r"[0-9a-f]{40}", candidate) is None:
+        return False
+    if event_name == "push":
+        if (event.get("ref") != "refs/heads/main" or os.environ.get("GITHUB_REF") != "refs/heads/main"
+                or event.get("after") != candidate or event.get("forced") is not False
+                or event.get("deleted") is not False or type(event.get("before")) is not str
+                or re.fullmatch(r"[0-9a-f]{40}", event["before"]) is None or event["before"] == "0" * 40):
+            return False
+    else:
+        pull = event.get("pull_request")
+        if (type(pull) is not dict or pull.get("state") != "open" or pull.get("merged") is not False
+                or type(event.get("number")) is not int or event["number"] <= 0
+                or pull.get("number") != event["number"]
+                or type(pull.get("user")) is not dict or pull["user"].get("login") != "brk275"
+                or type(pull["user"].get("id")) is not int or pull["user"]["id"] != repository["owner"]["id"]
+                or event.get("action") not in ("opened", "synchronize", "reopened")
+                or os.environ.get("GITHUB_BASE_REF") != "main"
+                or os.environ.get("GITHUB_REF") != f"refs/pull/{event['number']}/merge"):
+            return False
+        for field in ("base", "head"):
+            value = pull.get(field)
+            if (type(value) is not dict or type(value.get("repo")) is not dict
+                    or value["repo"].get("full_name") != repository["full_name"]
+                    or value["repo"].get("private") is not False or type(value["repo"].get("id")) is not int
+                    or value["repo"]["id"] != repository["id"]
+                    or type(value.get("sha")) is not str or re.fullmatch(r"[0-9a-f]{40}", value["sha"]) is None):
+                return False
+        if (pull["base"].get("ref") != "main" or type(pull["head"].get("ref")) is not str
+                or not pull["head"]["ref"] or os.environ.get("GITHUB_HEAD_REF") != pull["head"]["ref"]):
+            return False
+    command = ["git", "--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+               "-c", "core.fsmonitor=false", "-c", "core.attributesFile=/dev/null"]
+    environment = {key: value for key, value in os.environ.items() if not key.startswith(("GIT_", "SSH_"))}
+    environment.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", GIT_NO_REPLACE_OBJECTS="1",
+                       GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_ATTR_NOSYSTEM="1")
+    options = {"stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL, "timeout": 10, "env": environment}
+    try:
+        def output(args):
+            return subprocess.run(command + args, check=True, **options).stdout
+
+        if (output(["rev-parse", "--verify", "HEAD^{commit}"]) != candidate.encode() + b"\n"
+                or output(["cat-file", "-t", qualified["source"]]) != b"commit\n"
+                or output(["rev-parse", "--verify", qualified["source"] + "^{tree}"]) != qualified["tree"].encode() + b"\n"):
+            return False
+        # Check the actual PR merge parents, never just head.sha. A changed
+        # base must not inherit native qualification for untested inputs.
+        size = output(["cat-file", "-s", candidate])
+        if type(size) is not bytes or re.fullmatch(rb"[1-9][0-9]{0,5}\n", size) is None or int(size) > 65536:
+            return False
+        commit = output(["cat-file", "commit", candidate])
+        if type(commit) is not bytes or len(commit) != int(size):
+            return False
+        parents = [line[7:] for line in commit.split(b"\n\n", 1)[0].splitlines() if line.startswith(b"parent ")]
+        if event_name == "pull_request":
+            if parents != [pull[field]["sha"].encode() for field in ("base", "head")]:
+                return False
+        else:
+            ancestor = subprocess.run(command + ["merge-base", "--is-ancestor", event["before"], candidate],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, env=environment)
+            if type(ancestor.returncode) is not int or ancestor.returncode != 0:
+                return False
+        pattern = (rb"100644 blob [0-9a-f]{40}\tscripts/ci_scope\.py\x00"
+                   rb"100644 blob [0-9a-f]{40}\tscripts/tests/test_ci_scope\.py\x00")
+        for revision in (qualified["source"], candidate):
+            if re.fullmatch(pattern, output(["ls-tree", "--full-tree", "-z", revision, "--", *NATIVE_REUSE_SELECTORS])) is None:
+                return False
+        spec = qualified["source"] + ":.github/workflows/ci.yml"
+        if output(["cat-file", "-s", spec]) != str(FULL_NATIVE_REUSE_WORKFLOW_BYTES).encode() + b"\n":
+            return False
+        workflow = output(["cat-file", "blob", spec])
+        if type(workflow) is not bytes or len(workflow) != FULL_NATIVE_REUSE_WORKFLOW_BYTES or hashlib.sha256(workflow).hexdigest() != qualified["workflow_sha256"]:
+            return False
+        # The only exclusions are the two verified regular selector files.
+        # Every other leaf, mode, lock, workflow and test input must match.
+        compared = subprocess.run(command + ["diff-tree", "--quiet", "--exit-code", "--no-ext-diff",
+            "--no-textconv", "--no-renames", "--ignore-submodules=none", "-r", qualified["source"], candidate,
+            "--", ".", ":(top,exclude)scripts/ci_scope.py", ":(top,exclude)scripts/tests/test_ci_scope.py"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, env=environment)
+        return type(compared.returncode) is int and compared.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def event_selection(event, event_name):
     if event_name != "workflow_dispatch":
         paths, force_all = changed_paths(event, event_name)
@@ -655,6 +808,8 @@ def event_selection(event, event_name):
         if qualified_vendor_main_reuse(paths, event, event_name, force_all):
             route = "helpers"
         if route != "helpers" and qualified_appearance_input_reuse(paths, event, event_name, force_all):
+            route = "helpers"
+        if route != "helpers" and qualified_full_native_input_reuse(paths, event, event_name, force_all):
             route = "helpers"
         if route in ("desktop", "vendor"):
             selected = {"native": True, "native_matrix": {"os": list(PLATFORMS)},
