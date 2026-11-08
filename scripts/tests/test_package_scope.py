@@ -316,6 +316,18 @@ class NativeUpdateWorkflowTests(unittest.TestCase):
                 "      - name: Check Windows keyboard host before building\n        if: runner.os == 'Windows' && needs.scope.outputs.native_updates != 'true'",
                 "      - name: Install, inspect, launch and remove unsigned packages\n        if: needs.scope.outputs.native_updates != 'true' && (runner.os != 'Linux' || !inputs.appimage_updates)"):
             self.assertIn(text, workflow)
+        archive_units = (
+            "      - name: Check Windows archive units before packaging\n"
+            "        if: runner.os == 'Windows' && needs.scope.outputs.native_updates != 'true'\n"
+            "        shell: bash\n"
+            "        working-directory: ${{ format('{0}/fetch-source', env.MORPHEUS_NATIVE_SOURCE_ROOT) }}\n"
+            "        run: cargo test --locked -p webrtc-sys-build --lib\n"
+        )
+        self.assertIn(archive_units, workflow)
+        self.assertEqual(workflow.count("cargo test --locked -p webrtc-sys-build --lib"), 1)
+        self.assertLess(workflow.index("Prepare candidate-bound portable source notice inputs"),
+                        workflow.index(archive_units))
+        self.assertLess(workflow.index(archive_units), workflow.index("Build unsigned QA package"))
         self.assertLess(workflow.index("Check synthetic update runtime before building"),
                         workflow.index("Install pinned Rust toolchain"))
         self.assertIn('sys.version_info >= (3, 12)', workflow)
