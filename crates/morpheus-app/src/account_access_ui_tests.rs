@@ -2258,10 +2258,9 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
                     })
                     .is_some()
         })
-        .map(|node| item_bounds(&node))
         .collect();
     assert_eq!(viewports.len(), 1);
-    let viewport = viewports[0];
+    let viewport = item_bounds(&viewports[0]);
     let position = slint::LogicalPosition::new(
         (viewport.left + viewport.right) / 2.0,
         (viewport.top + viewport.bottom) / 2.0,
@@ -2293,13 +2292,69 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
             break;
         }
     }
-    assert_eq!(
-        control_bounds(&ui, &rows.last().unwrap().body).len(),
-        1,
-        "the actual tail is mounted"
-    );
+    // Latch the existing assertion results before observing failure facts.
+    // Reading layout properties for diagnostics cannot rescue this test.
+    let tail_mount_count = control_bounds(&ui, &rows.last().unwrap().body).len();
+    let tail_reported = latest_tail_report();
+    if tail_mount_count != 1 || !tail_reported {
+        let scroll = viewports[0]
+            .downcast::<slint::private_unstable_api::re_exports::Flickable>()
+            .unwrap();
+        let scroll = scroll.as_pin_ref();
+        let current = item_bounds(&viewports[0]);
+        let height = current.bottom - current.top;
+        let window = ui.window().size().to_logical(ui.window().scale_factor());
+        let content_y = scroll.content_y().0;
+        let content_height = scroll.content_height().0;
+        let pixels = |value: f32| {
+            (value.is_finite() && value.abs() <= 8_388_608.0)
+                .then(|| value.round() as i32)
+        };
+        let (any_tail_report, thread_report_count) = {
+            let observed = reports.borrow();
+            (
+                observed
+                    .iter()
+                    .any(|(thread, event)| *thread && event == &last),
+                observed.iter().filter(|(thread, _)| *thread).count().min(2048),
+            )
+        };
+        let first_reply_mounted = !control_bounds(&ui, &first).is_empty();
+        let anchor = ui.get_thread_anchor_index();
+        // This separate window contains only fixed synthetic fixture data.
+        // Emit no label, event ID, message text, source path or raw error body.
+        eprintln!(
+            "MORPHEUS_THREAD_READ_TAIL_DIAGNOSTIC {}",
+            serde_json::json!({
+                "schema": 1,
+                "check": "synthetic_thread_tail_after_wheel",
+                "tail_mount_count_capped": tail_mount_count.min(2),
+                "latest_thread_report_is_tail": tail_reported,
+                "any_thread_report_is_tail": any_tail_report,
+                "thread_report_count_capped": thread_report_count,
+                "first_reply_mounted": first_reply_mounted,
+                "viewport_height_px": pixels(height),
+                "viewport_top_px": pixels(current.top),
+                "viewport_bottom_px": pixels(current.bottom),
+                "window_width_px": pixels(window.width),
+                "window_height_px": pixels(window.height),
+                "content_height_px": pixels(content_height),
+                "content_y_px": pixels(content_y),
+                "estimated_end_gap_px": pixels(content_height + content_y - height),
+                "wheel_point_in_current_viewport": position.x >= current.left
+                    && position.x <= current.right && position.y >= current.top
+                    && position.y <= current.bottom,
+                "viewport_inside_window": current.left >= 0.0 && current.top >= 0.0
+                    && current.right <= window.width && current.bottom <= window.height,
+                "anchor_index": (-1..400).contains(&anchor).then_some(anchor),
+                "seek_active": ui.get_thread_seek_id() != 0,
+                "original_assertion_failed": true,
+            })
+        );
+    }
+    assert_eq!(tail_mount_count, 1, "the actual tail is mounted");
     assert!(
-        latest_tail_report(),
+        tail_reported,
         "only the laid-out visible tail reports progress"
     );
 
