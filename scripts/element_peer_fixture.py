@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from enum import Enum
+import hashlib
 import http.client
 import json
 import os
@@ -19,6 +20,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -40,6 +42,136 @@ OWNER_LABEL = "io.github.brk275.morpheus.element-peer-fixture"
 STATE_FILE = "element-peer-owner.json"
 FIXTURE_FILE = "element-peer.json"
 MAX_BODY = 1024 * 1024
+
+PATCHED_SDK_KIND = "patched_sdk_element_real_crypto_diagnostic"
+SDK_PRODUCTION_FILES = {
+    "src/matrixrtc/MembershipManager.ts": "ea3655bd51c665bc6dba35564bedbe477cc919e5798ca80c6f9d7929f0a01427",
+    "src/matrixrtc/MembershipManagerActionScheduler.ts": "442c36ebd042ad85aeb076d3980512926da8abe4265affcb4ec8d84f65baf2e1",
+}
+SDK_PATCH_SHA256 = "ff0adceb780806c43f11a5831b69372c6342242c043a21986e0e70d34ee1c6e5"
+MAX_ASSET_FILES = 16_384
+MAX_ASSET_FILE_BYTES = 32 * 1024 * 1024
+MAX_ASSET_TOTAL_BYTES = 512 * 1024 * 1024
+
+
+def patched_sdk_assets(receipt: Path, expected_sha256: str) -> tuple[Path, dict]:
+    """Validate an independently bound build receipt before mounting any assets.
+
+    This is an explicit diagnostic entrypoint. A receipt cannot turn source-built
+    assets into evidence about the application's unchanged official image.
+    Every asset is checked, including source maps; links and extra files fail.
+    """
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink,
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def regular_bytes(path, limit):
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or info.st_size > limit
+                or info.st_mode & 0o022):
+            raise FixtureError("invalid diagnostic asset")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if identity(opened) != identity(info):
+                raise FixtureError("diagnostic asset changed")
+            body = stream.read(limit + 1)
+            if len(body) != info.st_size or identity(os.fstat(stream.fileno())) != identity(opened):
+                raise FixtureError("diagnostic asset changed")
+        return body
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+
+    def mount_path(value):
+        # Docker --mount parses comma-delimited fields. Neither the receipt nor
+        # its asset directory may introduce a mount option or control byte.
+        if not isinstance(value, str) or any(char in value for char in (",", "\r", "\n", "\x00")):
+            raise ValueError
+        return Path(value)
+
+    try:
+        if not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
+            raise ValueError
+        receipt = mount_path(str(receipt))
+        unresolved_receipt = receipt.expanduser().absolute()
+        receipt = external_path(receipt)
+        if receipt != unresolved_receipt:
+            raise ValueError
+        body = regular_bytes(receipt, 4 * MAX_BODY)
+        if hashlib.sha256(body).hexdigest() != expected_sha256:
+            raise ValueError
+        data = json.loads(body, object_pairs_hook=unique_object)
+        if (set(data) != {"schema", "kind", "element_revision", "sdk_revision",
+                          "sdk_patch_sha256", "sdk_production_files", "stock_interoperability",
+                          "official_application_assets", "assets", "inventory", "build_inputs_sha256"}
+                or type(data["schema"]) is not int or data["schema"] != 1 or data["kind"] != PATCHED_SDK_KIND
+                or data["element_revision"] != REVISION or data["sdk_revision"] != SDK_REVISION
+                or data["sdk_patch_sha256"] != SDK_PATCH_SHA256
+                or data["sdk_production_files"] != SDK_PRODUCTION_FILES
+                or data["stock_interoperability"] is not False
+                or data["official_application_assets"] is not False
+                or not re.fullmatch(r"[a-f0-9]{64}", data["build_inputs_sha256"])):
+            raise ValueError
+        unresolved_assets = mount_path(data["assets"])
+        assets = external_path(unresolved_assets)
+        if not unresolved_assets.is_absolute() or unresolved_assets != assets:
+            raise ValueError
+        if (assets == receipt.parent or not assets.is_dir()
+                or assets.stat().st_uid != os.getuid() or assets.stat().st_mode & 0o077):
+            raise ValueError
+        inventory = data["inventory"]
+        if not isinstance(inventory, dict) or not 1 <= len(inventory) <= MAX_ASSET_FILES:
+            raise ValueError
+        total = 0
+        found = set()
+        # Inventory is bounded before traversal. Reject unexpected directories
+        # too, so a deeply nested or link-filled tree cannot escape these bounds.
+        stack = [(assets, 0)]
+        entries = 0
+        while stack:
+            directory, depth = stack.pop()
+            if depth > 16:
+                raise ValueError
+            for item in directory.iterdir():
+                entries += 1
+                if entries > 2 * MAX_ASSET_FILES:
+                    raise ValueError
+                info = item.lstat()
+                if (info.st_uid != os.getuid() or info.st_mode & 0o022
+                        or stat.S_ISLNK(info.st_mode)):
+                    raise ValueError
+                relative = item.relative_to(assets).as_posix()
+                if not re.fullmatch(r"[A-Za-z0-9_@+.-]+(?:/[A-Za-z0-9_@+.-]+)*", relative):
+                    raise ValueError
+                if stat.S_ISDIR(info.st_mode):
+                    stack.append((item, depth + 1))
+                    continue
+                if relative == "config.json" or relative not in inventory:
+                    raise ValueError
+                fact = inventory[relative]
+                if (not isinstance(fact, dict) or set(fact) != {"bytes", "sha256"}
+                        or type(fact["bytes"]) is not int
+                        or not 0 <= fact["bytes"] <= MAX_ASSET_FILE_BYTES
+                        or not re.fullmatch(r"[a-f0-9]{64}", fact["sha256"])):
+                    raise ValueError
+                content = regular_bytes(item, MAX_ASSET_FILE_BYTES)
+                total += len(content)
+                if (total > MAX_ASSET_TOTAL_BYTES or len(content) != fact["bytes"]
+                        or hashlib.sha256(content).hexdigest() != fact["sha256"]):
+                    raise ValueError
+                found.add(relative)
+        if found != set(inventory) or "index.html" not in found:
+            raise ValueError
+        return assets, data
+    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        raise FixtureError("invalid patched SDK build receipt") from None
 
 
 class Stage(str, Enum):
@@ -101,11 +233,15 @@ def configuration(homeserver_url: str, livekit_service_url: str, server_name: st
     }
 
 
-def nginx_configuration(port: int) -> str:
+def nginx_configuration(port: int, *, patched_sdk: bool = False) -> str:
     if type(port) is not int or not 1 <= port <= 65535:
         raise FixtureError("invalid fixture listener")
-    # Override only deployment binding/log paths. The official app and assets
-    # stay untouched at /app; /fixture is never within a served directory.
+    if type(patched_sdk) is not bool:
+        raise FixtureError("invalid application asset mode")
+    app_root = "/patched-sdk-app" if patched_sdk else "/app"
+    config_alias = "alias /fixture/config.json; " if patched_sdk else ""
+    # Stock mode uses untouched /app. Diagnostic mode has a distinct readonly
+    # root; only exact /config.json can expose the private deployment config.
     return f"""pid /tmp/nginx.pid;
 master_process off;
 error_log /fixture/nginx-error.log warn;
@@ -122,10 +258,10 @@ http {{
     server {{
         listen 127.0.0.1:{port};
         server_name localhost;
-        root /app;
+        root {app_root};
         gzip_static on;
         gzip_vary on;
-        location = /config.json {{ add_header Cache-Control "no-store"; }}
+        location = /config.json {{ {config_alias}add_header Cache-Control "no-store"; }}
         location / {{
             try_files $uri $uri/ /index.html;
             add_header Cache-Control "public, max-age=30, stale-while-revalidate=30";
@@ -218,7 +354,22 @@ def save_state(root: Path, state: dict):
 def up(root: Path, homeserver_url: str = "http://127.0.0.1:18008",
        livekit_service_url: str = "http://127.0.0.1:18010",
        server_name: str = "morpheus-a.test") -> dict:
-    """Start one stock-image peer and return immutable evidence plus local URL.
+    """Start only the unchanged stock application assets."""
+    return _up(root, homeserver_url, livekit_service_url, server_name)
+
+
+def up_patched_sdk(root: Path, receipt: Path, expected_sha256: str,
+                   homeserver_url: str = "http://127.0.0.1:18008",
+                   livekit_service_url: str = "http://127.0.0.1:18010",
+                   server_name: str = "morpheus-a.test") -> dict:
+    """Explicit diagnostic companion; never supplies stock compatibility proof."""
+    assets, data = patched_sdk_assets(receipt, expected_sha256)
+    return _up(root, homeserver_url, livekit_service_url, server_name,
+               patched=(assets, data, expected_sha256))
+
+
+def _up(root, homeserver_url, livekit_service_url, server_name, *, patched=None):
+    """Start one owned peer with explicitly selected assets and local URL.
 
     Overall Docker/startup deadline is 420 seconds (image pull at most 300).
     Failed setup attempts remove owned containers and preserve private data.
@@ -244,7 +395,7 @@ def up(root: Path, homeserver_url: str = "http://127.0.0.1:18008",
         port = reservation.getsockname()[1]
         base_url = f"http://127.0.0.1:{port}"
         write_private(root / "config.json", json.dumps(config) + "\n", create=True)
-        write_private(root / "nginx.conf", nginx_configuration(port), create=True)
+        write_private(root / "nginx.conf", nginx_configuration(port, patched_sdk=patched is not None), create=True)
         # nginx's error file remains owner-only regardless of the image umask.
         write_private(root / "nginx-error.log", "", create=True)
         set_stage(Stage.PULL)
@@ -253,6 +404,8 @@ def up(root: Path, homeserver_url: str = "http://127.0.0.1:18008",
         verify_image(docker)
         set_stage(Stage.CREATE)
         cidfile = root / "element-peer.cid"
+        app_mount = (f"type=bind,src={patched[0]},dst=/patched-sdk-app,readonly" if patched
+                     else f"type=bind,src={root / 'config.json'},dst=/app/config.json,readonly")
         result = docker.run(
             "create", "--name", "morpheus-element-" + state["owner"],
             "--cidfile", str(cidfile), "--label", OWNER_LABEL + "=" + state["owner"],
@@ -260,7 +413,7 @@ def up(root: Path, homeserver_url: str = "http://127.0.0.1:18008",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=32m", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--user", f"{os.getuid()}:{os.getgid()}",
             "--mount", f"type=bind,src={root},dst=/fixture",
-            "--mount", f"type=bind,src={root / 'config.json'},dst=/app/config.json,readonly",
+            "--mount", app_mount,
             "--entrypoint", "nginx", IMAGE, "-c", "/fixture/nginx.conf", "-g", "daemon off;",
         )
         cid = result.stdout.decode().strip()
@@ -284,6 +437,15 @@ def up(root: Path, homeserver_url: str = "http://127.0.0.1:18008",
             "sdk_revision": SDK_REVISION, "protocol": "matrix_2_0_sticky2025",
             "official_image_identity_verified": True,
         }
+        if patched:
+            metadata.update({
+                "kind": PATCHED_SDK_KIND, "stock_interoperability": False,
+                "official_application_assets": False,
+                "official_image_identity_verified": False,
+                "official_server_image_identity_verified": True,
+                "patched_sdk_receipt_sha256": patched[2],
+                "sdk_production_files": SDK_PRODUCTION_FILES,
+            })
         write_private(root / FIXTURE_FILE, json.dumps(metadata) + "\n", create=True)
         return metadata
     except BaseException:

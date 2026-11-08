@@ -23,7 +23,7 @@ import time
 import wave
 
 from fixture_paths import external_path, private_directory, write_private
-from element_peer_fixture import down, up
+from element_peer_fixture import PATCHED_SDK_KIND, down, up, up_patched_sdk
 from element_process_namespace import assert_contained
 
 REPO = Path(__file__).resolve().parent.parent
@@ -36,6 +36,7 @@ CHECKS = frozenset((
     "browser_group_roster", "browser_group_audio", "browser_screen", "browser_group_departure",
     "browser_key_rotation", "browser_post_rotation_screen", "browser_post_rotation_audio",
 ))
+PATCHED_SDK_CHECKS = (CHECKS - {"official_image"}) | {"patched_sdk_assets"}
 STAGES = frozenset((
     "configuration", "tool_install", "browser_install", "native_test_build", "media_fixture",
     "browser_launch", "browser_login", "browser_identity", "browser_room_sync", "native_join_wait",
@@ -58,12 +59,15 @@ STAGE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_STAGE ([a-z_]+)$", re.MULTILINE)
 FAILURE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_FAILURE ([a-z_]+)$", re.MULTILINE)
 
 
-def evidence(output: str, *, complete=False) -> dict[str, bool]:
+def evidence(output: str, *, complete=False, patched_sdk=False) -> dict[str, bool]:
+    required = PATCHED_SDK_CHECKS if patched_sdk else CHECKS
     result = {}
     for key, value in CHECK_PATTERN.findall(output):
-        if key in CHECKS:
+        if key in required:
             result[key] = result.get(key, True) and value == "true"
-    if complete and (set(result) != CHECKS or not all(result.values())
+    forbidden = "official_image" if patched_sdk else "patched_sdk_assets"
+    if complete and (set(result) != required or not all(result.values())
+                     or any(key == forbidden for key, _ in CHECK_PATTERN.findall(output))
                      or any(value in FAILURES for value in FAILURE_PATTERN.findall(output))):
         raise RuntimeError("evidence")
     return result
@@ -381,11 +385,14 @@ class Runner:
                 native_output.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n"))
 
 
-def execute(root: Path, fixture: Path, gitleaks: str):
+def execute(root: Path, fixture: Path, gitleaks: str, *, patched_sdk_receipt=None, receipt_sha256=None):
     if sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_OS") != "Linux":
         raise RuntimeError("configuration")
     if "MORPHEUS_ELEMENT_DIAG_REFRESH" in os.environ:
         raise RuntimeError("configuration")
+    if (patched_sdk_receipt is None) != (receipt_sha256 is None):
+        raise RuntimeError("configuration")
+    patched_sdk = patched_sdk_receipt is not None
     assert_contained()
     fixture = external_path(fixture)
     if not fixture.is_file() or fixture.stat().st_mode & 0o077:
@@ -411,10 +418,22 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         built = runner.command(["cargo", "test", "--locked", "-p", "morpheus-rtc", "--features", "native-devices",
                                 "--test", "element_call_peer", "--no-run", "--message-format=json"], seconds=600)
         binary = native_executable(built)
-        peer = runner.service(lambda: up(root / "service"))
-        if peer.get("official_image_identity_verified") is not True:
-            raise RuntimeError("evidence")
-        write_private(runner.logs / "image.log", "MORPHEUS_ELEMENT_CHECK official_image=true\n", create=True)
+        if patched_sdk:
+            peer = runner.service(lambda: up_patched_sdk(root / "service", patched_sdk_receipt, receipt_sha256))
+            if (peer.get("kind") != PATCHED_SDK_KIND
+                    or peer.get("official_server_image_identity_verified") is not True
+                    or peer.get("official_image_identity_verified") is not False
+                    or peer.get("official_application_assets") is not False
+                    or peer.get("stock_interoperability") is not False
+                    or peer.get("patched_sdk_receipt_sha256") != receipt_sha256):
+                raise RuntimeError("evidence")
+            image_fact = "patched_sdk_assets"
+        else:
+            peer = runner.service(lambda: up(root / "service"))
+            if peer.get("official_image_identity_verified") is not True or "kind" in peer:
+                raise RuntimeError("evidence")
+            image_fact = "official_image"
+        write_private(runner.logs / "image.log", f"MORPHEUS_ELEMENT_CHECK {image_fact}=true\n", create=True)
         runner.mark("media_fixture")
         media_fixtures(root)
         extra = {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture), "MORPHEUS_ELEMENT_PEER_ROOT": str(root),
@@ -456,7 +475,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         if peers_complete and children_joined and not exact_native_pass(native_output):
             failure = "evidence"
         failure = failure or cleanup_failure
-        facts = evidence(output, complete=not failure)
+        facts = evidence(output, complete=not failure, patched_sdk=patched_sdk)
     except RuntimeError as error:
         failure = str(error)
         output, native_output, facts = "", "", {}
@@ -482,6 +501,8 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         print("MORPHEUS_ELEMENT_FAILURE " + failure, flush=True)
         raise RuntimeError(failure)
     runner.mark("complete")
+    if patched_sdk:
+        print("MORPHEUS_PATCHED_SDK_DIAGNOSTIC stock_interoperability=false", flush=True)
     return facts
 
 
@@ -490,6 +511,8 @@ def main():
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--fixture", required=True, type=Path)
     parser.add_argument("--gitleaks", required=True)
+    parser.add_argument("--patched-sdk-receipt", type=Path)
+    parser.add_argument("--patched-sdk-receipt-sha256")
     args = parser.parse_args()
     # The outer acceptance runner has a longer watchdog and also calls down.
     # A graceful cancellation still lets this process kill its owned groups.
@@ -499,7 +522,8 @@ def main():
     signal.signal(signal.SIGINT, interrupted)
     signal.signal(signal.SIGALRM, interrupted)
     signal.alarm(1_740)
-    execute(args.root, args.fixture, args.gitleaks)
+    execute(args.root, args.fixture, args.gitleaks,
+            patched_sdk_receipt=args.patched_sdk_receipt, receipt_sha256=args.patched_sdk_receipt_sha256)
 
 
 if __name__ == "__main__":

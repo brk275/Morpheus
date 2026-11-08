@@ -50,6 +50,23 @@ class EvidenceTests(unittest.TestCase):
                 with self.subTest(group_fact=name), self.assertRaisesRegex(RuntimeError, "evidence"):
                     target.evidence(value, complete=True)
 
+    def test_patched_sdk_facts_cannot_qualify_unchanged_stock(self):
+        patched = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in target.PATCHED_SDK_CHECKS)
+        stock = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in target.CHECKS)
+        self.assertEqual(target.evidence(patched, complete=True, patched_sdk=True),
+                         dict.fromkeys(target.PATCHED_SDK_CHECKS, True))
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(patched, complete=True)
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(stock, complete=True, patched_sdk=True)
+        for mode in (False, True):
+            with self.assertRaisesRegex(RuntimeError, "evidence"):
+                target.evidence(stock + "\n" + patched, complete=True, patched_sdk=mode)
+        for name in target.CHECKS - {"official_image"}:
+            broken = patched.replace(f"MORPHEUS_ELEMENT_CHECK {name}=true", "")
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "evidence"):
+                target.evidence(broken, complete=True, patched_sdk=True)
+
     def test_exact_named_nonempty_test_result_is_required(self):
         result = f"test {target.TEST_NAME} ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"
         self.assertTrue(target.exact_native_pass(result))
