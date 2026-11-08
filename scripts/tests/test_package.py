@@ -1457,6 +1457,64 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
             self.assertNotIn(foreign, output.getvalue())
 
 
+    @unittest.skipIf(os.name == "nt", "Darwin admission is modeled without native process execution")
+    def test_darwin_system_git_shim_is_exact_root_owned_and_generic_files_stay_single_link(self):
+        from scripts import native_notice_source as acquisition
+        tool = Path("/usr/bin/git")
+        overrides = {}
+        def metadata(path):
+            values = {"st_mode": (stat.S_IFREG if path == tool else stat.S_IFDIR) | 0o755,
+                      "st_uid": 0, "st_nlink": 78 if path == tool else 2}
+            values.update(overrides.get(path, {}))
+            return SimpleNamespace(**values)
+        with mock.patch.object(acquisition, "os", SimpleNamespace(name="posix", getuid=lambda:501)), \
+                mock.patch.object(acquisition.sys, "platform", "darwin"), \
+                mock.patch.object(Path, "resolve", autospec=True, side_effect=lambda path, **kwargs:path), \
+                mock.patch.object(Path, "lstat", autospec=True, side_effect=metadata):
+            self.assertEqual(acquisition.system_git(), tool)
+            with self.assertRaises(ValueError):
+                acquisition.checked(tool)
+            for component in (tool, *tool.parents):
+                for bad in ({"st_uid":501}, {"st_mode":stat.S_IFLNK | 0o777},
+                            {"st_mode":stat.S_IFREG | 0o777}):
+                    overrides[component] = bad
+                    with self.subTest(component=str(component), bad=bad), self.assertRaises(ValueError):
+                        acquisition.system_git()
+                overrides.clear()
+            for bad in ({"st_nlink":0}, {"st_mode":stat.S_IFREG | 0o644}):
+                overrides[tool] = bad
+                with self.assertRaises(ValueError):
+                    acquisition.system_git()
+            overrides.clear()
+            with mock.patch.object(Path, "resolve", return_value=Path("/foreign/git")):
+                with self.assertRaises(ValueError):
+                    acquisition.system_git()
+
+    @unittest.skipIf(os.name == "nt", "Darwin admission is modeled without native process execution")
+    def test_darwin_system_git_rechecks_fixed_shim_before_every_spawn(self):
+        from scripts import native_notice_source as acquisition
+        tool = Path("/usr/bin/git")
+        commands = acquisition.Commands(Path("/owned"), {})
+        with mock.patch.object(acquisition, "os", SimpleNamespace(name="posix")), \
+                mock.patch.object(acquisition.sys, "platform", "darwin"), \
+                mock.patch.object(acquisition.platform, "machine", return_value="arm64"), \
+                mock.patch.object(acquisition, "_notice_checked", side_effect=lambda phase, path, **kwargs:Path(path)), \
+                mock.patch.object(acquisition, "system_git", side_effect=[tool, ValueError("synthetic refusal")]) as selected, \
+                mock.patch.object(acquisition, "checked", side_effect=ValueError("generic refusal")) as generic, \
+                mock.patch.object(acquisition.subprocess, "Popen") as spawned:
+            self.assertEqual(acquisition.tools({"HOME":"/owned"})[2], tool)
+            with self.assertRaises(ValueError):
+                commands.run("git", [str(tool), "--version"], cwd=Path("/owned"), env={}, timeout=1, output_limit=1024)
+            self.assertEqual(selected.call_args_list, [mock.call(), mock.call()])
+            self.assertEqual(commands.sequence, 0)
+            for alias in ("/opt/homebrew/bin/git", "/usr/bin/other", "/owned/scanner"):
+                with self.subTest(alias=alias), self.assertRaises(ValueError):
+                    commands.run("tool", [alias, "--version"], cwd=Path("/owned"), env={}, timeout=1, output_limit=1024)
+            self.assertEqual(selected.call_count, 2)
+            self.assertEqual(generic.call_count, 3)
+            self.assertEqual(commands.sequence, 0)
+            spawned.assert_not_called()
+
     @unittest.skipIf(os.name == "nt", "Windows path/ACL admission is modeled without native calls")
     def test_windows_system_git_hardlinks_keep_exact_path_and_all_acl_guards(self):
         from scripts import native_notice_windows as windows

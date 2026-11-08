@@ -278,8 +278,26 @@ _CARGO_STDERR_MARKERS = {
 
 
 def system_git():
-    require(os.name == "nt" and sys.platform == "win32")
-    return S.windows_security().system_git()
+    if os.name == "nt":
+        require(sys.platform == "win32")
+        return S.windows_security().system_git()
+    # Apple's fixed system Git launcher shares hardlinks with other command
+    # shims. It is executable input, not a writable source/scanner/data file.
+    # Keep every path component canonical, root-owned and non-writable by
+    # group/other; only this exact Darwin tool may have multiple links.
+    require(sys.platform == "darwin")
+    path = Path("/usr/bin/git")
+    require(path.resolve(strict=True) == path)
+    for item in (path, *path.parents):
+        info = item.lstat()
+        require(not stat.S_ISLNK(info.st_mode) and info.st_uid == 0
+                and not info.st_mode & 0o022)
+        if item == path:
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink >= 1
+                    and info.st_mode & 0o111)
+        else:
+            require(stat.S_ISDIR(info.st_mode))
+    return path
 
 def require(value):
     if not value:
@@ -443,7 +461,7 @@ def tools(environment):
     directory = rustup / ("toolchains/1.99.0-" + host) / "bin"
     cargo, rustc = (_notice_checked(name, directory / (name + suffix)) for name in ("cargo", "rustc"))
     _notice_phase("git")
-    git = system_git() if os.name == "nt" else _notice_checked("git", Path("/usr/bin/git"))
+    git = system_git()
     return cargo, rustc, git, rustup
 
 
@@ -486,8 +504,9 @@ class Commands:
         # Revalidate only the exact protected provider Git at EVERY spawn,
         # including all Windows ACLs. Source/scanner/data and all other tools
         # retain checked()'s strict single-link admission.
-        if (os.name == "nt" and sys.platform == "win32"
-                and str(command[0]) == str(Path(os.environ["PROGRAMFILES"]) / "Git/cmd/git.exe")):
+        if ((sys.platform == "darwin" and str(command[0]) == "/usr/bin/git")
+                or (os.name == "nt" and sys.platform == "win32"
+                    and str(command[0]) == str(Path(os.environ["PROGRAMFILES"]) / "Git/cmd/git.exe"))):
             require(system_git() == Path(command[0]))
         else:
             checked(Path(command[0]))
