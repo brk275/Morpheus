@@ -565,7 +565,7 @@ jobs:
                   with helper_opener.open(helper_url, timeout=30) as response:
                       assert response.status == 200
                       helper = response.read(65537)
-                  assert len(helper) <= 65536 and hashlib.sha256(helper).hexdigest() == "4fd3c52bb508da4c7ec52a63d21c2e5aa3cc3576a5ec6317f3c15ca7b729b626"
+                  assert len(helper) <= 65536 and hashlib.sha256(helper).hexdigest() == "1d77695947f3a50f3209d03f891f5577ac8b429cf4e069ba6fe1144a69d69b5c"
                   namespace = {"__name__":"morpheus_trusted_native_notice_windows"}
                   exec(compile(helper, "<pinned workflow ownership helper>", "exec"), namespace)
                   security = namespace["security"]()

@@ -284,6 +284,25 @@ class NativeUpdateWorkflowTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 instance.redirect_request(request, None, 302, "Found", {}, "https://github.com/fixture")
 
+    def test_native_scanner_helper_pin_matches_the_exact_workflow_revision_source(self):
+        # The bootstrap URL names this workflow revision, so authenticate its
+        # complete reviewed helper bytes before loading any Windows ownership API.
+        source = native_scanner_source()
+        pins = [node.comparators[0].value for node in ast.walk(source)
+                if isinstance(node, ast.Compare) and len(node.ops) == 1
+                and isinstance(node.ops[0], ast.Eq) and len(node.comparators) == 1
+                and isinstance(node.comparators[0], ast.Constant)
+                and isinstance(node.comparators[0].value, str)
+                and isinstance(node.left, ast.Call)
+                and ast.unparse(node.left) == "hashlib.sha256(helper).hexdigest()"]
+        self.assertEqual(pins, ["1d77695947f3a50f3209d03f891f5577ac8b429cf4e069ba6fe1144a69d69b5c"])
+        helper = Path(__file__).resolve().parents[1] / "native_notice_windows.py"
+        self.assertEqual(hashlib.sha256(helper.read_bytes()).hexdigest(), pins[0])
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/package-qa.yml").read_text()
+        self.assertIn('workflow_revision = os.environ["GITHUB_SHA"]', workflow)
+        self.assertIn('"https://raw.githubusercontent.com/brk275/Morpheus/" + workflow_revision', workflow)
+        self.assertIn('+ "/scripts/native_notice_windows.py"', workflow)
+
     def test_permanent_route_has_exact_host_pins_and_no_extra_ordinary_build_or_smoke(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/package-qa.yml").read_text()
         for text in ("NATIVE_UPDATES: ${{ inputs.native_updates }}", "native_updates: ${{ steps.scope.outputs.native_updates }}",
