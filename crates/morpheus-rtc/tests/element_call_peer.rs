@@ -522,7 +522,11 @@ fn group_event_probe_rejects_spoofed_membership_and_oversized_payloads() {
         changed["content"][path] = serde_json::json!("mismatch");
         assert!(!matches_group_event(&changed.to_string(), room, &member));
     }
-    assert!(!matches_group_event(&"x".repeat(64 * 1024 + 1), room, &member));
+    assert!(!matches_group_event(
+        &"x".repeat(64 * 1024 + 1),
+        room,
+        &member
+    ));
     // Observed raw wire shape from the pinned Sticky2025 codec's LEGACY_JOIN,
     // with only its identities replaced by deterministic fixture values.
     let legacy_content: serde_json::Value = serde_json::from_str(
@@ -547,7 +551,11 @@ fn group_event_probe_rejects_spoofed_membership_and_oversized_payloads() {
         "type": "org.matrix.msc4143.rtc.member", "sender": legacy_member.user_id,
         "room_id": room, "content": legacy_content,
     });
-    assert!(matches_group_event(&legacy.to_string(), room, &legacy_member));
+    assert!(matches_group_event(
+        &legacy.to_string(),
+        room,
+        &legacy_member
+    ));
     for membership in [
         serde_json::Value::Null,
         serde_json::json!("leave"),
@@ -567,14 +575,26 @@ fn group_event_probe_rejects_spoofed_membership_and_oversized_payloads() {
         .as_object_mut()
         .unwrap()
         .remove("application");
-    assert!(!matches_group_event(&changed.to_string(), room, &legacy_member));
+    assert!(!matches_group_event(
+        &changed.to_string(),
+        room,
+        &legacy_member
+    ));
     let mut changed = legacy.clone();
     changed["content"]["application"]["type"] = serde_json::json!("other");
-    assert!(!matches_group_event(&changed.to_string(), room, &legacy_member));
+    assert!(!matches_group_event(
+        &changed.to_string(),
+        room,
+        &legacy_member
+    ));
     let encrypted = serde_json::json!({
         "type": "m.room.encrypted", "sender": member.user_id, "room_id": room,
     });
-    assert!(matches_group_envelope(&encrypted.to_string(), room, &member.user_id));
+    assert!(matches_group_envelope(
+        &encrypted.to_string(),
+        room,
+        &member.user_id
+    ));
     assert!(!matches_group_envelope(
         &encrypted.to_string(),
         "!other:example.invalid",
@@ -585,7 +605,11 @@ fn group_event_probe_rejects_spoofed_membership_and_oversized_payloads() {
         room,
         "@other:example.invalid",
     ));
-    assert!(!matches_group_envelope(&value.to_string(), room, &member.user_id));
+    assert!(!matches_group_envelope(
+        &value.to_string(),
+        room,
+        &member.user_id
+    ));
     assert!(!matches_group_envelope(
         &"x".repeat(64 * 1024 + 1),
         room,
@@ -876,7 +900,9 @@ async fn group_and_screen(
                 Err(_) => eprintln!("MORPHEUS_ELEMENT_GROUP_ROSTER {role} unavailable"),
             }
         }
-        group_event_probe(rtc, &late, room, &bob.user_id).await.emit();
+        group_event_probe(rtc, &late, room, &bob.user_id)
+            .await
+            .emit();
     }
     converged.expect("Three-member native rosters did not converge");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_group_roster=true");
