@@ -429,6 +429,8 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
         with mock.patch.object(P, "download", return_value=b"asset") as downloaded:
             P.download_inputs(runner, Path("/private"), {})
         self.assertEqual(len(downloaded.call_args_list), 6)
+        self.assertEqual(downloaded.call_args_list[-1].kwargs["url"],
+                         "https://api.github.com" + M.PIPEWIRE_PATCH_API_PATH)
         self.assertEqual([call.kwargs["url"] for call in downloaded.call_args_list[:2]], list(api_urls[:2]))
         self.assertFalse(any("/AppImage/type2-runtime/releases/assets/" in call.kwargs["url"]
                              for call in downloaded.call_args_list))
@@ -439,6 +441,41 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
                 "expected_sha256": pin["sha256"], "root": Path("/private"), "environment": {},
                 "stage": "download-linuxdeploy" if pin["cache_name"] == "linuxdeploy-x86_64.AppImage" else "download-appimage-plugin",
             })
+
+    def test_only_pinned_pipewire_commit_api_uses_fixed_patch_header(self):
+        self.assertEqual(M.PIPEWIRE_PATCH_SHA256, P.client.R.UPSTREAM_PATCH_SHA256)
+        self.assertEqual(M.PIPEWIRE_PATCH_API_PATH, "/repos/PipeWire/pipewire/commits/" + P.client.R.COMMIT)
+        url = "https://api.github.com" + M.PIPEWIRE_PATCH_API_PATH
+        for packaged in (False, True):
+            payload = b"wrong patch bytes"
+            if packaged:
+                payload += b"\nMORPHEUS_INPUT_STATUS:200:0\n"
+            runner = SimpleNamespace(run=mock.Mock(return_value=payload))
+            download = M.download_package_input if packaged else M.download
+            with self.subTest(packaged=packaged), self.assertRaises(M.CommandFailure) as caught:
+                download(runner, url=url, maximum=32768, expected_sha256=M.PIPEWIRE_PATCH_SHA256,
+                         root=Path("/private"), environment={})
+            # Admit only the fixed route; wrong bytes must still fail its pin.
+            self.assertEqual(caught.exception.reason, "input")
+            runner.run.assert_called_once()
+            argv = runner.run.call_args.args[1]
+            self.assertEqual(argv[-1], url)
+            headers = [argv[i + 1] for i, item in enumerate(argv) if item == "--header"]
+            self.assertEqual(headers, ["Accept: application/vnd.github.patch"])
+            self.assertEqual(argv[argv.index("--proto") + 1], "=https")
+            self.assertEqual(argv[argv.index("--proto-redir") + 1], "=https")
+            self.assertEqual(argv[argv.index("--max-filesize") + 1], "32768")
+            runner.run.reset_mock()
+            for changes in ({"url": url[:-1] + "0"}, {"url": url + "?private=x"},
+                            {"url": url + "/extra"}, {"url": url.replace("PipeWire", "other")},
+                            {"expected_sha256": "0" * 64}, {"maximum": 32769},
+                            {"maximum": 32768.0}, {"expected_size": 2182}):
+                arguments = dict(url=url, maximum=32768, expected_sha256=M.PIPEWIRE_PATCH_SHA256,
+                                 root=Path("/private"), environment={})
+                arguments.update(changes)
+                with self.subTest(packaged=packaged, changes=changes), self.assertRaises(M.CommandFailure):
+                    download(runner, **arguments)
+            runner.run.assert_not_called()
 
     def test_invalid_origin_size_or_digest_never_accepted(self):
         runner = SimpleNamespace(run=mock.Mock(return_value=b"asset"))
