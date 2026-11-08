@@ -19,7 +19,7 @@ import urllib.request
 MAX_DOWNLOAD = 128 * 1024 * 1024
 MAX_LOG = 8 * 1024 * 1024
 SOURCE_PREFIX = "matrix-js-sdk-3f05dc4d104a3dfc753c5e3549a18c74fab4b076"
-PROPOSAL = "c56d21cdf5567c3c534dc5bba7768af8f321529360ad678ffc91d445b255c2fd"
+PROPOSAL = "c0d643de8ad286901a0f69c80ba9e660546313b70c9cb4bbecfa79ebe63af898"
 
 
 def need(value):

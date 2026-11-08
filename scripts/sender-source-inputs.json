@@ -1,10 +1,10 @@
 {
-  "proposal_sha256": "c56d21cdf5567c3c534dc5bba7768af8f321529360ad678ffc91d445b255c2fd",
+  "proposal_sha256": "c0d643de8ad286901a0f69c80ba9e660546313b70c9cb4bbecfa79ebe63af898",
   "proposal_files": {
     "spec/unit/matrixrtc/MembershipManager.spec.ts": {
       "before_sha256": "82cfc9ac48444ce30a9071e7e4181b0b8aca059bcfd5d9b4aa4e97e9a7782250",
-      "after_sha256": "d6cd6e1453f3f8e9dc98786d4237488594398c5ed4269cfccac30970ebe18449",
-      "after_bytes": 114184
+      "after_sha256": "061571db8a884331a1aa03f634086e6f818e48427891e903f55e2b0337eb79f1",
+      "after_bytes": 114927
     },
     "spec/unit/matrixrtc/mocks.ts": {
       "before_sha256": "53ab9a4d3ba45427d77d90c28e40cfaecf9e809e43d9b060565be969b3dca269",
@@ -13,8 +13,8 @@
     },
     "src/matrixrtc/MembershipManager.ts": {
       "before_sha256": "49bc6e10a3b90a110ac07df1558a0eff26724a8bfe1ba7aa00e42b28acb440b0",
-      "after_sha256": "90efa3cd0364378a35501d240b99470ae153f7cb6eacaa876d18d8841dd6d349",
-      "after_bytes": 80642
+      "after_sha256": "ea3655bd51c665bc6dba35564bedbe477cc919e5798ca80c6f9d7929f0a01427",
+      "after_bytes": 81157
     },
     "src/matrixrtc/MembershipManagerActionScheduler.ts": {
       "before_sha256": "3a4ef26cc897253e2498bb593d008485ee5aa98f33793660f892003f13ae9628",

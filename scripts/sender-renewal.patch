@@ -23,7 +23,7 @@
  
  /**
   * Create a promise that will resolve once a mocked method is called.
-@@ -1634,6 +1643,365 @@
+@@ -1634,6 +1643,374 @@
              });
          });
  
@@ -311,6 +311,10 @@
 +
 +            it("replaces a cancelled delayed leave before one throttled current-membership retry", async () => {
 +                const { manager, own } = await joined();
++                const expiry = internals(manager).scheduler.actions
++                    .filter((action) => action.type === MembershipActionType.UpdateExpiry)
++                    .map(({ ts, type }) => ({ ts, type }));
++                expect(expiry).toHaveLength(1);
 +                vi.mocked(client._unstable_restartScheduledDelayedEvent).mockRejectedValueOnce(notFoundError());
 +                await manager.onRTCSessionMemberUpdate([own, peer("B1")]);
 +                await vi.advanceTimersByTimeAsync(250);
@@ -323,6 +327,11 @@
 +                await vi.advanceTimersByTimeAsync(5000);
 +                expect(client._unstable_sendStickyEvent).toHaveBeenCalledTimes(2);
 +                expect(manager.status).toBe(Status.Connected);
++                const actions = internals(manager).scheduler.actions;
++                expect(actions.filter((action) => action.type === MembershipActionType.UpdateExpiry)).toEqual(expiry);
++                const restarts = actions.filter((action) => action.type === MembershipActionType.RestartDelayedEvent);
++                expect(restarts).toHaveLength(1);
++                expect(actions.some((action) => action.type === MembershipActionType.RefreshMembership)).toBe(false);
 +            });
 +
 +            it("does not resend for unencrypted rooms or a different call slot", async () => {
@@ -422,7 +431,7 @@
  
      SendJoinEvent = "SendJoinEvent",
      //  -> MembershipActionType.SendJoinEvent if we run into a rate limit and need to retry
-@@ -218,6 +225,146 @@
+@@ -218,6 +225,155 @@
      implements IMembershipManager
  {
      private activated = false;
@@ -552,7 +561,16 @@
 +                            ? { ...action, type: MembershipActionType.RefreshMembership }
 +                            : action,
 +                    );
-+                return "replace" in protection ? { replace: actions } : { insert: actions };
++                if ("replace" in protection) {
++                    // Protection replaced an expiry retry's maintenance. This is
++                    // an additive peer refresh: retain the ordinary expiry at its
++                    // original absolute timestamp, alongside the dedicated retry.
++                    const maintenance = this.scheduler.actions.filter(
++                        (action) => action.type === MembershipActionType.UpdateExpiry,
++                    );
++                    return { replace: [...actions, ...maintenance] };
++                }
++                return { insert: actions };
 +            }
 +            // A genuine rejoin owns its ordinary SendDelayedEvent/SendJoinEvent
 +            // recovery; do not keep a refresh flag that those actions cannot clear.
@@ -569,7 +587,7 @@
      private readonly logger: Logger;
      protected callIntent: RTCCallIntent | undefined;
      protected callCapabilities: RTCCallCapability[] | undefined;
-@@ -245,6 +392,7 @@
+@@ -245,6 +401,7 @@
              this.logger.error("MembershipManager is already running. Ignoring join request.");
              return;
          }
@@ -577,7 +595,7 @@
          this.publishedTransports = publishedTransports;
          this.leavePromiseResolvers = undefined;
          this.activated = true;
-@@ -260,6 +408,7 @@
+@@ -260,6 +417,7 @@
              .finally(() => {
                  // Should already be set to false when calling `leave` in non error cases.
                  this.activated = false;
@@ -585,7 +603,7 @@
                  // Here the scheduler is not running anymore so we the `membershipLoopHandler` is not called to emit.
                  if (this.oldStatus && this.oldStatus !== this.status) {
                      this.emit(MembershipManagerEvent.StatusChanged, this.oldStatus, this.status);
-@@ -288,6 +437,7 @@
+@@ -288,6 +446,7 @@
              // reset scheduled actions so we will not do any new actions.
              this.leavePromiseResolvers = Promise.withResolvers<boolean>();
              this.activated = false;
@@ -593,7 +611,7 @@
              this.scheduler.initiateLeave();
              if (timeout) setTimeout(() => this.leavePromiseResolvers?.resolve(false), timeout);
          }
-@@ -302,6 +452,8 @@
+@@ -302,6 +461,8 @@
          }
  
          this._ownMembership = memberships.find((m) => isMyMembership(m, this.userId, this.deviceId));
@@ -602,7 +620,7 @@
  
          if (!this._ownMembership) {
              // If one of these actions are scheduled or are getting inserted in the next iteration, we should already
-@@ -320,6 +472,7 @@
+@@ -320,6 +481,7 @@
                  );
              } else {
                  // Only react to our own membership missing if we have not already scheduled sending a new membership DirectMembershipManagerAction.Join
@@ -610,7 +628,7 @@
                  this.scheduler.initiateJoin();
              }
          }
-@@ -357,7 +510,7 @@
+@@ -357,7 +519,7 @@
       */
      public constructor(
          private readonly joinConfig: (SessionConfig & MembershipConfig) | undefined,
@@ -619,7 +637,7 @@
          protected readonly client: MembershipManagerClient,
          public readonly slotDescription: SlotDescription,
          parentLogger?: Logger,
-@@ -495,6 +648,9 @@
+@@ -495,6 +657,9 @@
                      return createInsertActionUpdate(MembershipActionType.SendLeaveEvent);
                  }
              }
@@ -629,7 +647,7 @@
              case MembershipActionType.SendJoinEvent: {
                  return this.sendJoinEvent();
              }
-@@ -682,12 +838,18 @@
+@@ -682,12 +847,18 @@
          // which stores the predicted timestamp at which the server will send the delayed leave event if there wont be any further
          // successful restart requests.
          this.state.expectedServerDelayLeaveTs = Date.now() + this.delayedLeaveEventDelayMs;
@@ -648,7 +666,7 @@
          const outcome = await this.tryRestartDelayedEvent(delayId);
          if (outcome === "ok") {
              return createInsertActionUpdate(MembershipActionType.RestartDelayedEvent, this.delayedLeaveEventRestartMs);
-@@ -704,7 +866,10 @@
+@@ -704,7 +875,10 @@
              MembershipActionType.RestartDelayedEvent,
              "restartScheduledDelayedEvent",
          );
@@ -660,7 +678,7 @@
  
          // In other error cases we have no idea what is happening
          throw Error("Could not restart delayed event, even though delayed events are supported. " + outcome.error);
-@@ -755,10 +920,36 @@
+@@ -755,10 +929,36 @@
      /** Sends the event that marks our membership as left. */
      protected clientSendLeaveMembership: () => Promise<ISendEventResponse> = () => this.clientSendMembership({});
  
@@ -699,7 +717,7 @@
                  this.setAndEmitProbablyLeft(false);
                  this.state.startTime = Date.now();
                  this.state.membershipExpiryTs = this.membershipExpiryTsOf(myMembership);
-@@ -769,6 +960,7 @@
+@@ -769,6 +969,7 @@
                  // A successful (re-)join is a fresh membership: failures accumulated by the previous one
                  // (e.g. delayed event restarts that timed out before the server sent our leave) must not carry over.
                  this.state.networkErrorRetries.clear();
@@ -707,7 +725,7 @@
                  // An UpdateExpiry action might be left over from a previous join event.
                  // We can reach sendJoinEvent when the delayed leave event gets send by the HS.
                  // The branch where we might have a leftover UpdateExpiry action is:
-@@ -792,8 +984,14 @@
+@@ -792,8 +993,14 @@
                      ],
                  };
              })
@@ -724,7 +742,7 @@
                  if (update) return update;
                  throw e;
              });
-@@ -873,6 +1071,12 @@
+@@ -873,6 +1080,12 @@
       * @returns `undefined` if the membership can be sent, otherwise the action to take instead.
       */
      private async ensureDelayedLeaveEventProtectsMembership(): Promise<ActionUpdate | undefined> {
@@ -737,7 +755,7 @@
          if (!this.state.delayId) return this.waitForPendingDelayedLeaveEvent();
  
          const outcome = await this.tryRestartDelayedEvent(this.state.delayId);
-@@ -932,6 +1136,7 @@
+@@ -932,6 +1145,7 @@
              "restartScheduledDelayedEvent",
          );
          if (!update) throw error;
@@ -745,7 +763,7 @@
  
          // A transient failure does not mean the delayed leave event is not there. What we need for the update to be
          // safe is that it is still pending when the update lands, and `expectedServerDelayLeaveTs` tells us that:
-@@ -1241,7 +1446,7 @@
+@@ -1241,7 +1455,7 @@
      }
  
      public get status(): Status {
@@ -754,7 +772,7 @@
          if (actions.length === 1) {
              const { type } = actions[0];
              switch (type) {
-@@ -1299,9 +1504,13 @@
+@@ -1299,9 +1513,13 @@
   * rather than state events.
   */
  export class StickyEventMembershipManager extends MembershipManager {
