@@ -2390,7 +2390,7 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
     );
 
     wheel(-1_000_000.0);
-    for _ in 0..40 {
+    for frame in 1..=40 {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
         settle(&ui).await;
         if reports
@@ -2399,6 +2399,11 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
             .is_some_and(|(thread, event)| *thread && event == &last)
         {
             break;
+        }
+        // Repeat the real wheel after its 180 ms animation has measured the
+        // virtual extent; keep this original forty-frame observation bound.
+        if frame == 12 {
+            wheel(-1_000_000.0);
         }
     }
     assert!(
@@ -2454,7 +2459,7 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
     );
 
     wheel(-1_000_000.0);
-    for _ in 0..40 {
+    for frame in 1..=40 {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
         settle(&ui).await;
         if reports
@@ -2463,6 +2468,11 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
             .is_some_and(|(_, event)| !event.is_empty())
         {
             break;
+        }
+        // Repeat the real wheel after its 180 ms animation has measured the
+        // virtual extent; keep this original forty-frame observation bound.
+        if frame == 12 {
+            wheel(-1_000_000.0);
         }
     }
     assert!(
