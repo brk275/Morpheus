@@ -253,6 +253,27 @@ def owned_window_on_first_output(tree, pid):
     require(matches == ["HEADLESS-1"])
 
 
+def portal_backend_owned(run, pid):
+    require(type(pid) is int and 0 < pid <= 0xFFFFFFFF)
+    deadline = time.monotonic() + 3
+    base = ["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+            "--object-path", "/org/freedesktop/DBus", "--method"]
+    name = "org.freedesktop.impl.portal.desktop.wlr"
+    # An absent startup name is a successful D-Bus false result, not a failed
+    # command. Swallowing a failed PID query had already latched diagnostics.
+    raw = run("capture-portal-owner", [*base, "org.freedesktop.DBus.NameHasOwner", name], seconds=3)
+    require(re.fullmatch(rb"\((?:true|false),\)\s*", raw) is not None)
+    if re.fullmatch(rb"\(false,\)\s*", raw):
+        return False
+    remaining = deadline - time.monotonic()
+    require(remaining > 0)
+    raw = run("capture-portal-owner", [*base, "org.freedesktop.DBus.GetConnectionUnixProcessID", name],
+              seconds=remaining)
+    match = re.fullmatch(rb"\(uint32 ([0-9]{1,10}),\)\s*", raw)
+    require(match is not None and time.monotonic() <= deadline)
+    return int(match[1]) == pid
+
+
 def run_case(runner, root, artifact, appdir, peer_binary, backend, fixture, environment, *, bindings, diagnostics=None):
     control = root / "peer-control"
     mode = "eager_bindings" if bindings else "ordinary"
@@ -319,17 +340,7 @@ def run_case(runner, root, artifact, appdir, peer_binary, backend, fixture, envi
         owner.wait_for(lambda: (runtime / "pipewire-0").is_socket(), watch=[pipewire])
         wireplumber = owner.start("wireplumber", [executable("wireplumber")], env)
         portal_backend = owner.start("portal-wlr", [str(backend), "--loglevel", "ERROR", "--config", str(root / "config/wlr.ini")], env)
-        def backend_owned():
-            try:
-                raw = run("capture-portal-owner", ["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus", "--method", "org.freedesktop.DBus.GetConnectionUnixProcessID", "org.freedesktop.impl.portal.desktop.wlr"], seconds=3)
-                match = re.fullmatch(rb"\(uint32 ([0-9]+),\)\s*", raw)
-                return match is not None and int(match[1]) == portal_backend.pid
-            except Exception as error:
-                from appimage_process import CommandFailure
-                if isinstance(error, CommandFailure) and error.reason == "exit":
-                    return False
-                raise
-        owner.wait_for(backend_owned, watch=[portal_backend, bus])
+        owner.wait_for(lambda: portal_backend_owned(run, portal_backend.pid), watch=[portal_backend, bus])
         portal = owner.start("portal", ["/usr/libexec/xdg-desktop-portal", "--replace"], env)
         run("capture-focus", ["swaymsg", "-q", "focus output HEADLESS-1"])
         peer_env = {**env, "MORPHEUS_APPIMAGE_PEER_CONTROL": str(control)}

@@ -29,6 +29,40 @@ class ProofTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(M.CaptureFailure):
                 M.peer_proof(value)
 
+    def test_portal_startup_absence_is_successful_false_then_exact_owned_pid(self):
+        run = mock.Mock(side_effect=[b"(false,)\n", b"(true,)\n", b"(uint32 123,)\n"])
+        self.assertFalse(M.portal_backend_owned(run, 123))
+        self.assertEqual(run.call_count, 1)
+        self.assertTrue(M.portal_backend_owned(run, 123))
+        methods = [call.args[1][-2] for call in run.call_args_list]
+        self.assertEqual(methods, ["org.freedesktop.DBus.NameHasOwner",
+                                   "org.freedesktop.DBus.NameHasOwner",
+                                   "org.freedesktop.DBus.GetConnectionUnixProcessID"])
+        for call in run.call_args_list:
+            self.assertEqual(call.args[0], "capture-portal-owner")
+            self.assertEqual(call.args[1][-1], "org.freedesktop.impl.portal.desktop.wlr")
+            self.assertTrue(0 < call.kwargs["seconds"] <= 3)
+            self.assertNotIn("expected_status", call.kwargs)
+
+    def test_portal_ownership_never_accepts_other_pid_or_malformed_bus_answers(self):
+        self.assertFalse(M.portal_backend_owned(mock.Mock(side_effect=[b"(true,)\n", b"(uint32 124,)\n"]), 123))
+        for responses in ([b"(false, true)\n"], [b"(true,)\n", b"(uint32 123, uint32 124)\n"],
+                          [b"(true,)\n", b"(123,)\n"]):
+            with self.subTest(responses=responses), self.assertRaises(M.CaptureFailure):
+                M.portal_backend_owned(mock.Mock(side_effect=responses), 123)
+        with self.assertRaises(M.CaptureFailure):
+            M.portal_backend_owned(mock.Mock(), True)
+
+    def test_portal_bus_command_failures_propagate_and_second_query_shares_original_budget(self):
+        from appimage_process import CommandFailure
+        for responses in ([CommandFailure("exit")], [b"(true,)\n", CommandFailure("exit")]):
+            with self.subTest(responses=responses), self.assertRaises(CommandFailure):
+                M.portal_backend_owned(mock.Mock(side_effect=responses), 123)
+        run = mock.Mock(return_value=b"(true,)\n")
+        with mock.patch.object(M.time, "monotonic", side_effect=[0, 4]), self.assertRaises(M.CaptureFailure):
+            M.portal_backend_owned(run, 123)
+        self.assertEqual(run.call_count, 1)
+
     def test_source_markers_match_all_required_peer_receipts(self):
         import re
         source = (ROOT / "packaging/linux/appimage_peer.rs").read_text()

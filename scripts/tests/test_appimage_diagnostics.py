@@ -67,6 +67,78 @@ class ProgressTests(unittest.TestCase):
                 self.assertEqual(visible["command_stage"], "capture-inventory")
                 self.assertNotIn("private", json.dumps(visible))
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX private peer log identity")
+    def test_peer_panic_reducer_is_postscan_private_and_does_not_replace_failure(self):
+        import os
+        frame = b"thread 'receiving_peer' panicked at packaging/linux/appimage_peer.rs:380:10:\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            session = root / "ordinary/session"
+            session.mkdir(parents=True, mode=0o700)
+            (root / "ordinary").chmod(0o700)
+            path = session / "peer.stderr.log"
+            def log(body):
+                path.write_bytes(body)
+                path.chmod(0o600)
+            progress = D.Progress(root)
+            progress.wrapper("capture")
+            progress.capture("ordinary", "portal")
+            progress.command("capture-portal-owner")
+            progress.failed(C.CommandFailure("exit"))
+            prior = dict(progress.value["failure"])
+            progress.capture("ordinary", "peer")
+            progress.cleanup(True)
+            for label, token in D.PEER_PANIC_LABELS.items():
+                log(frame + label + b": private server error and key material\n")
+                result = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                self.assertEqual(result["peer_failure_marker"],
+                                 {"status": "scanned_private_peer_stderr", "panic_site": token})
+                self.assertEqual(result["failure"], prior)
+                self.assertNotIn("private", json.dumps(result["peer_failure_marker"]).replace("scanned_private_peer_stderr", ""))
+            for prefix in (b"tests/../../../", b"crates/morpheus-rtc/tests/../../../",
+                           b"/synthetic/private-build/crates/morpheus-rtc/tests/../../../"):
+                log(frame.replace(b"packaging/linux/", prefix + b"packaging/linux/")
+                    + b"Peer login failed: private\n")
+                self.assertEqual(D.peer_failure_marker(root, "ordinary", scan_passed=True)["panic_site"], "login")
+            modern = frame.replace(b"' panicked", b"' (2147483647) panicked")
+            log(modern + b"Peer login failed: private\n")
+            self.assertEqual(D.peer_failure_marker(root, "ordinary", scan_passed=True)["panic_site"], "login")
+            for malformed in (b"' (not-a-number) panicked", b"' (12345678901) panicked"):
+                log(frame.replace(b"' panicked", malformed) + b"Peer login failed: private\n")
+                self.assertEqual(D.peer_failure_marker(root, "ordinary", scan_passed=True)["panic_site"], "unknown")
+            log(frame + b"Peer login failed: private\n" + b"\n" * 65536
+                + modern + b"Peer join failed: private\n")
+            self.assertEqual(D.peer_failure_marker(root, "ordinary", scan_passed=True)["panic_site"], "unknown")
+            log(frame + b"Peer login failed: private\n" + frame + b"Peer join failed: private\n")
+            self.assertEqual(D.peer_failure_marker(root, "ordinary", scan_passed=True)["panic_site"], "ambiguous")
+            for body in (b"Peer login failed: private\n", frame + b"unrecognized private message\n",
+                         frame.replace(b"appimage_peer.rs", b"foreign.rs") + b"Peer login failed: private\n"):
+                log(body)
+                self.assertEqual(D.peer_failure_marker(root, "ordinary", scan_passed=True)["panic_site"], "unknown")
+            with mock.patch.object(D.Path, "lstat", side_effect=AssertionError("must not read")):
+                self.assertEqual(D.peer_failure_marker(root, "ordinary", scan_passed=False),
+                                 {"status": "withheld", "panic_site": "unknown"})
+            with mock.patch.object(D, "peer_failure_marker", side_effect=AssertionError("cleanup must precede read")):
+                result = D.public_failure(root, scan_passed=True, outer_cleanup="failed", outer_reason="namespace_exit")
+                self.assertNotIn("peer_failure_marker", result)
+            path.unlink()
+            self.assertEqual(D.peer_failure_marker(root, "ordinary", scan_passed=True)["status"], "unavailable")
+            target = session / "foreign"
+            target.write_bytes(frame + b"Peer login failed: private\n")
+            target.chmod(0o600)
+            path.symlink_to(target)
+            with self.assertRaises(ValueError):
+                D.peer_failure_marker(root, "ordinary", scan_passed=True)
+            path.unlink()
+            os.link(target, path)
+            with self.assertRaises(ValueError):
+                D.peer_failure_marker(root, "ordinary", scan_passed=True)
+            path.unlink()
+            log(frame + b"Peer login failed: private\n")
+            path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                D.peer_failure_marker(root, "ordinary", scan_passed=True)
+
     def test_first_failure_position_survives_later_commands_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

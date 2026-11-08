@@ -273,6 +273,97 @@ def package_failure_markers(root, *, scan_passed):
     return {"status": "scanned_private_pair", "error_markers": sorted(errors), "script_markers": sorted(scripts)}
 
 
+# Only exact static panic labels in the authenticated receiving peer source.
+# Error suffixes, thread names, paths and source lines never leave the reducer.
+PEER_PANIC_LABELS = {
+    b"Cannot open peer store": "open_store",
+    b"Peer login failed": "login",
+    b"Peer sticky room sync did not become ready": "sticky_sync",
+    b"Cannot read peer rooms": "sticky_sync",
+    b"Peer sync closed": "sticky_sync",
+    b"Peer client missing": "client",
+    b"Cannot open fixture slot": "slot_open",
+    b"Peer join failed": "join",
+    **{label: "cross_signing" for label in (
+        b"Signed-in client has no user ID",
+        b"Cannot refresh own cross-signing identity before bootstrap",
+        b"Cannot read own device before bootstrap",
+        b"Cross-signing bootstrap challenge timed out",
+        b"Cross-signing bootstrap failed without a password challenge",
+        b"Cross-signing bootstrap timed out", b"Cross-signing bootstrap failed",
+        b"Refreshing own cross-signing identity timed out",
+        b"Cannot refresh own cross-signing identity",
+        b"Own cross-signing identity missing after bootstrap",
+        b"Own cross-signing identity is not verified",
+        b"Cannot read own device after cross-signing bootstrap",
+        b"Own device missing after cross-signing bootstrap",
+        b"Signing own device timed out", b"Cannot sign own device",
+        b"Refreshing signed own device timed out", b"Cannot refresh signed own device",
+        b"Cannot read signed own device", b"Signed own device missing",
+        b"Own device is not signed by the cross-signing identity")},
+}
+PEER_PANIC_FRAME = re.compile(
+    rb"thread '[^\r\n]{1,128}'(?: \([0-9]{1,10}\))? panicked at "
+    rb"(?:[^\x00\r\n]{1,4096}/)?"
+    rb"packaging/linux/appimage_peer\.rs:[0-9]{1,6}:[0-9]{1,4}:")
+
+
+def peer_failure_marker(root, mode, *, scan_passed):
+    """Reduce one completed, scanned private stderr; never establish acceptance."""
+    result = {"status": "withheld", "panic_site": "unknown"}
+    if scan_passed is not True:
+        return result
+    from appimage_client import private_directory
+    case = {"ordinary": "ordinary", "eager_bindings": "bindings"}.get(mode)
+    if case is None:
+        raise ValueError("Invalid private peer mode")
+    directory = Path(root)
+    for part in (None, case, "session"):
+        if part is not None:
+            directory = directory / part
+        try:
+            private_directory(directory)
+        except FileNotFoundError:
+            return {"status": "unavailable", "panic_site": "unknown"}
+    path = directory / "peer.stderr.log"
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return {"status": "unavailable", "panic_site": "unknown"}
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+            or before.st_mode & 0o077 or before.st_nlink != 1
+            or not 0 <= before.st_size <= 8 * 1024 * 1024):
+        raise ValueError("Unsafe private peer log")
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink,
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if identity(before) != identity(opened):
+            raise ValueError("Changed private peer log")
+        data = stream.read(8 * 1024 * 1024 + 1)
+        if (identity(opened) != identity(os.fstat(stream.fileno()))
+                or len(data) != before.st_size):
+            raise ValueError("Changed private peer log")
+    if identity(before) != identity(path.lstat()):
+        raise ValueError("Changed private peer log")
+    # A single exact peer panic frame and its immediately following static
+    # label are diagnostic provenance, not proof that the exception is causal.
+    if data.count(b"\n") > 65536:
+        return {"status": "scanned_private_peer_stderr", "panic_site": "unknown"}
+    lines = data.split(b"\n", 65536)
+    sites = []
+    for index, line in enumerate(lines[:-1]):
+        if len(line) <= 4608 and PEER_PANIC_FRAME.fullmatch(line.rstrip(b"\r")):
+            message = lines[index + 1].rstrip(b"\r")
+            site = next((token for label, token in PEER_PANIC_LABELS.items()
+                         if message == label or message.startswith(label + b": ")), "unknown")
+            sites.append(site)
+    return {"status": "scanned_private_peer_stderr",
+            "panic_site": sites[0] if len(sites) == 1 else "ambiguous" if sites else "unknown"}
+
+
 def public_failure(root, *, scan_passed, outer_cleanup, outer_reason):
     """Only a validated fixed record can leave the private workspace."""
     withheld = {"diagnostics": "withheld", "passed": False}
@@ -293,6 +384,11 @@ def public_failure(root, *, scan_passed, outer_cleanup, outer_reason):
         if (value["failure"] is not None and value["failure"]["command_stage"] == "package"
                 and value["failure"]["reason"] == "command_exit"):
             result["package_failure_markers"] = package_failure_markers(root, scan_passed=scan_passed)
+        if (value["wrapper_phase"] == "capture" and value["capture_phase"] == "peer"
+                and "peer_ready" not in value["peer_facts"]
+                and value["inner_cleanup"] == "passed" and outer_cleanup == "passed"):
+            result["peer_failure_marker"] = peer_failure_marker(
+                root, value["capture_mode"], scan_passed=scan_passed)
         return result
     except (OSError, RuntimeError, ValueError, TypeError, KeyError):
         return withheld
