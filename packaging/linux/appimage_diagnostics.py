@@ -39,6 +39,8 @@ COMMANDS = frozenset((
 WRAPPER = frozenset(("namespace", "startup", "build", "capture", "source", "complete"))
 MODES = frozenset(("none", "ordinary", "eager_bindings"))
 PHASES = frozenset(("none", "setup", "bus", "keyring", "display", "display_start", "display_wayland_wait", "display_ipc_wait", "portal", "peer", "launch", "identity", "login", "join",
+                    "login_homeserver", "login_username", "login_password", "login_submit",
+                    "login_room_wait", "login_room_open", "login_call_stage",
                     "static_frame", "changed_frame", "screen_stopped", "reopened_frame", "changed_after_reopen", "source_loss",
                     "app_left", "app_close", "bindings", "complete"))
 PEER_FACTS = frozenset(("unavailable_audio_verified", "peer_ready", "exact_sender_joined", "static_frame", "changed_frame",
@@ -55,6 +57,7 @@ BUILTIN_REASONS = {
 REASONS = frozenset((*BUILTIN_REASONS.values(), "command_deadline", "command_output", "command_exit", "command_pipe", "command_cleanup", "command_input",
                      "command_http_forbidden", "command_http_not_found", "command_http_rate_limited", "command_http_unavailable",
                      "command_http_rejected", "command_download_transport", "command_download_tls",
+                     "ui_wait_timeout", "ui_app_exited", "ui_tree_bound",
                      "interrupted", "capture", "identity", "binding", "package", "inventory", "unknown", "namespace_exit",
                      "namespace_deadline", "namespace_output", "cleanup",
                      "inventory_input", "inventory_tool", "inventory_elf", "inventory_dependency",
@@ -77,6 +80,13 @@ def reason(error):
     for kind, token in BUILTIN_REASONS.items():
         if type(error) is kind:
             return token
+    from linux_package_ui import DiagnosticFailure
+    # This owned UI driver exposes only these fixed failure codes here. Never
+    # publish a selector, entered value, foreign property or exception text.
+    if type(error) is DiagnosticFailure:
+        value = error.code
+        return "ui_" + value if type(value) is str and value in {
+            "wait_timeout", "app_exited", "tree_bound"} else "unknown"
     from appimage_notices import InventoryFailure
     # Only our exact exception type has a bounded sub-reason. Never inspect
     # a foreign exception's message, properties or payload for publication.

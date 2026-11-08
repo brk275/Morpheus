@@ -47,6 +47,42 @@ class ProgressTests(unittest.TestCase):
             visible = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="source_missing")
             self.assertEqual(visible["failure"]["reason"], "source_missing")
 
+    def test_owned_ui_reasons_are_fixed_and_foreign_properties_are_not_read(self):
+        from linux_package_ui import DiagnosticFailure
+        for code in ("wait_timeout", "app_exited", "tree_bound"):
+            self.assertEqual(D.reason(DiagnosticFailure(code)), "ui_" + code)
+        for code in ("private account and password", None, ["wait_timeout"]):
+            self.assertEqual(D.reason(DiagnosticFailure(code)), "unknown")
+        class ForeignFailure(DiagnosticFailure):
+            @property
+            def code(self):
+                raise AssertionError("foreign code must never be inspected")
+        self.assertEqual(D.reason(ForeignFailure.__new__(ForeignFailure)), "unknown")
+
+    def test_login_subphases_and_ui_failure_are_latched_and_scan_gated(self):
+        from linux_package_ui import DiagnosticFailure
+        for phase in ("login_homeserver", "login_username", "login_password", "login_submit",
+                      "login_room_wait", "login_room_open", "login_call_stage"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                progress = D.Progress(root)
+                progress.wrapper("capture")
+                progress.command("capture-window")
+                progress.capture("ordinary", phase)
+                progress.failed(DiagnosticFailure("wait_timeout"))
+                progress.command("capture-inventory")
+                progress.cleanup(True)
+                self.assertTrue(D.valid_record(progress.value))
+                self.assertEqual(set(progress.value), D.FIELDS)
+                self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                                 {"diagnostics": "withheld", "passed": False})
+                visible = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                self.assertEqual(visible["failure"]["capture_phase"], phase)
+                self.assertEqual(visible["failure"]["reason"], "ui_wait_timeout")
+                self.assertEqual(visible["failure"]["command_stage"], "capture-window")
+                self.assertEqual(visible["command_stage"], "capture-inventory")
+                self.assertNotIn("private", json.dumps(visible))
+
     def test_display_subphases_are_closed_latched_and_scan_gated(self):
         for phase in ("display_start", "display_wayland_wait", "display_ipc_wait"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
