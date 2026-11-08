@@ -2219,9 +2219,10 @@ async fn assert_thread_virtual_read_reporting(main_ui: &AppWindow) {
         });
     let contexts = Rc::new(Cell::new(0));
     let observed = contexts.clone();
-    ui.global::<crate::RoomActivity>().on_context_changed(move || {
-        observed.set(observed.get() + 1);
-    });
+    ui.global::<crate::RoomActivity>()
+        .on_context_changed(move || {
+            observed.set(observed.get() + 1);
+        });
     let mut rows: Vec<_> = (31_000..31_400)
         .map(|i| Arc::new(rich_fixture(i)))
         .collect();
