@@ -965,6 +965,101 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
         with self.assertRaises(ValueError):acquisition.source_inputs(foreign)
 
 
+    def vendored_rtc_notice_files(self):
+        from scripts import native_notice_source as acquisition
+        names = ("matrix-rtc-call", "matrix-rtc-call-sdk", "matrix-rtc-core",
+                 "matrix-rtc-livekit", "matrix-rtc-matrix-sdk", "matrix-rtc-transport")
+        root = '[workspace]\nmembers = [' + ','.join('"vendor/' + name + '"' for name in names) + ']\n'
+        root += '[patch."https://github.com/element-hq/matrix-rust-rtc"]\n'
+        root += ''.join(name + ' = {path = "vendor/' + name + '"}\n' for name in names)
+        files = {"Cargo.toml": root.encode()}
+        pins = acquisition.PINS - {acquisition.RTC_SOURCE}
+        lock = 'version = 4\n' + ''.join('[[package]]\nname = "fixture' + str(i)
+            + '"\nversion = "0.1.0"\nsource = "' + pin + '"\n' for i, pin in enumerate(sorted(pins)))
+        for name in names:
+            prefix = "vendor/" + name + "/"
+            files[prefix + "Cargo.toml"] = ('[package]\nname = "' + name
+                + '"\nversion = "0.5.0-rc.2"\nlicense = "AGPL-3.0-only"\n').encode()
+            for license_name in ("LICENSE", "LICENSE-COMMERCIAL"):
+                files[prefix + license_name] = b"Synthetic license fixture\n"
+            lock += '[[package]]\nname = "' + name + '"\nversion = "0.5.0-rc.2"\n'
+            record = {"repository": acquisition.RTC_REPOSITORY, "upstream_repository": acquisition.RTC_REPOSITORY,
+                      "revision": acquisition.RTC_REVISION, "version": "0.5.0-rc.2", "package": name,
+                      "crate_path": "crates/" + name, "package_path": "crates/" + name}
+            provenance = acquisition.RTC_PROVENANCE[name]
+            files[prefix + provenance] = (json.dumps(record).encode() if provenance.endswith(".json")
+                else (name + " 0.5.0-rc.2 " + acquisition.RTC_REVISION).encode())
+        files["Cargo.lock"] = lock.encode()
+        return files
+
+    def test_exact_two_git_origins_require_complete_authenticated_local_rtc(self):
+        from scripts import native_notice_source as acquisition
+        files = self.vendored_rtc_notice_files()
+        packages = acquisition.source_inputs(files)
+        self.assertEqual(acquisition.lock_git_sources(packages), acquisition.PINS - {acquisition.RTC_SOURCE})
+        self.assertEqual(len(packages), 8)
+        cases = []
+        missing_patch = dict(files)
+        missing_patch["Cargo.toml"] = files["Cargo.toml"].replace(
+            b'matrix-rtc-core = {path = "vendor/matrix-rtc-core"}\n', b'')
+        cases.append(missing_patch)
+        wrong_path = dict(files)
+        wrong_path["Cargo.toml"] = files["Cargo.toml"].replace(
+            b'path = "vendor/matrix-rtc-core"', b'path = "vendor/../vendor/matrix-rtc-core"')
+        cases.append(wrong_path)
+        for name in ("Cargo.toml", "LICENSE", "MORPHEUS_PROVENANCE.json"):
+            changed = dict(files); changed.pop("vendor/matrix-rtc-core/" + name)
+            cases.append(changed)
+        changed = dict(files)
+        changed["vendor/matrix-rtc-core/Cargo.toml"] = files["vendor/matrix-rtc-core/Cargo.toml"].replace(
+            b'0.5.0-rc.2', b'0.5.0-rc.1')
+        cases.append(changed)
+        for old, new in ((acquisition.RTC_REVISION.encode(), b"a" * 40),
+                         (b'"revision":', b'"revision":"duplicate", "revision":')):
+            changed = dict(files)
+            changed["vendor/matrix-rtc-core/MORPHEUS_PROVENANCE.json"] = files[
+                "vendor/matrix-rtc-core/MORPHEUS_PROVENANCE.json"].replace(old, new)
+            cases.append(changed)
+        for index, changed in enumerate(cases):
+            with self.subTest(case=index), self.assertRaises(ValueError):
+                acquisition.source_inputs(changed)
+
+    def test_closed_lock_cohorts_reject_subsets_new_origins_and_mixed_rtc_resolution(self):
+        from scripts import native_notice_source as acquisition
+        files = self.vendored_rtc_notice_files()
+        sdk = next(pin for pin in acquisition.PINS if "matrix-org/matrix-rust-sdk" in pin)
+        for body in (files["Cargo.lock"].replace(('source = "' + sdk + '"\n').encode(), b''),
+                     files["Cargo.lock"].replace(b'github.com/matrix-org/', b'github.com/foreign/'),
+                     files["Cargo.lock"].replace(b'name = "matrix-rtc-core"\nversion = "0.5.0-rc.2"',
+                         b'name = "matrix-rtc-core"\nversion = "0.5.0-rc.2"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "'
+                         + b'a' * 64 + b'"'),
+                     files["Cargo.lock"] + b'[[package]]\nname = "matrix-rtc-foreign"\nversion = "0.5.0-rc.2"\n'):
+            changed = dict(files); changed["Cargo.lock"] = body
+            with self.subTest(lock=body[-96:]), self.assertRaises(ValueError):
+                acquisition.source_inputs(changed)
+
+    def test_notice_input_plan_only_demands_validated_actual_git_mirrors(self):
+        from scripts import native_notice_source as acquisition
+        packages = acquisition.source_inputs(self.vendored_rtc_notice_files())
+        pins = sorted(acquisition.PINS - {acquisition.RTC_SOURCE})
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            (home / "registry/cache/index.crates.io-0123456789abcdef").mkdir(parents=True)
+            db = home / "git/db"; db.mkdir(parents=True)
+            mirrors = {"first": pins[0].rsplit("#", 1)[1], "second": pins[1].rsplit("#", 1)[1]}
+            for name in mirrors: (db / name).mkdir()
+            calls = []
+            def run(stage, command, *, cwd, **options):
+                calls.append((stage, command[-1]))
+                return command[-1].encode() if command[-1] == mirrors[cwd.name] else b""
+            with mock.patch.object(acquisition, "checked", side_effect=lambda path, **options: Path(path)), \
+                    mock.patch.object(acquisition.S, "object_id", side_effect=lambda kind, data: data.decode() or "0" * 40):
+                plan = acquisition.input_plan(home, packages, SimpleNamespace(run=run), {}, Path("/pinned/git"))
+            self.assertEqual(set(plan["git_mirrors"]), set(pins))
+            self.assertEqual({revision for _, revision in calls}, set(mirrors.values()))
+            self.assertEqual(len(calls), 4)
+
+
     def test_source_parent_keeps_windows_owned_home_and_unix_existing_temp_policy(self):
         from scripts import native_notice_source as acquisition
         with tempfile.TemporaryDirectory() as temporary:

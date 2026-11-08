@@ -40,6 +40,18 @@ PINS = frozenset({
     "git+https://github.com/jplatte/const_panic?rev=e0b317a9a7bde2d48a7d15b6a60d70e4a41d3b5f#e0b317a9a7bde2d48a7d15b6a60d70e4a41d3b5f",
     "git+https://github.com/matrix-org/matrix-rust-sdk?rev=c6ad52ecc09eaa36601f55effb0a48a533eb87dd#c6ad52ecc09eaa36601f55effb0a48a533eb87dd",
 })
+RTC_SOURCE = "git+https://github.com/element-hq/matrix-rust-rtc?tag=v0.5.0-rc.2#53880ef1ef66b62df555ce71ccd1d6c85b813596"
+RTC_REPOSITORY = "https://github.com/element-hq/matrix-rust-rtc"
+RTC_REVISION = "53880ef1ef66b62df555ce71ccd1d6c85b813596"
+RTC_VERSION = "0.5.0-rc.2"
+RTC_PROVENANCE = {
+    "matrix-rtc-call": "UPSTREAM.json",
+    "matrix-rtc-call-sdk": "MORPHEUS_PATCH.md",
+    "matrix-rtc-core": "MORPHEUS_PROVENANCE.json",
+    "matrix-rtc-livekit": "README.md",
+    "matrix-rtc-matrix-sdk": "UPSTREAM_FILES.json",
+    "matrix-rtc-transport": "MORPHEUS_PATCH.md",
+}
 SCANNERS = {
     ("darwin", "arm64"): "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f",
     ("darwin", "x86_64"): "cee01fea7173f1b779dff188e1c26ecbcb4027d394acc573b23aaf0be260e291",
@@ -349,11 +361,53 @@ def guard(environment, system=sys.platform):
             and not boolean(inputs.get("source_bundle")))
 
 
+def lock_git_sources(packages):
+    sources = frozenset(p["source"] for p in packages if p.get("source", "").startswith("git+"))
+    # Two closed cohorts, never an arbitrary subset of the known origins.
+    require(sources in (PINS, PINS - {RTC_SOURCE}))
+    return sources
+
+
+def vendored_rtc_sources(files, packages, catalog):
+    patches = S.toml_file(files, "Cargo.toml").get("patch", {}).get(RTC_REPOSITORY)
+    require(type(patches) is dict and set(patches) == set(RTC_PROVENANCE))
+    locked = [p for p in packages if p["name"].startswith("matrix-rtc-")]
+    require(len(locked) == len(RTC_PROVENANCE)
+            and {p["name"] for p in locked} == set(RTC_PROVENANCE)
+            and all(p["version"] == RTC_VERSION and p.get("source") is None for p in locked))
+    for name, provenance in RTC_PROVENANCE.items():
+        path = "vendor/" + name
+        require(patches[name] == {"path": path})
+        local = catalog.get((name, RTC_VERSION))
+        require(type(local) is dict and local["manifest"] == path + "/Cargo.toml"
+                and {path + "/LICENSE", path + "/LICENSE-COMMERCIAL"}
+                    <= set(local["license_text_candidates"]))
+        body = files.get(path + "/" + provenance)
+        require(type(body) is bytes and 0 < len(body) <= 64 * 1024)
+        if provenance.endswith(".json"):
+            record = S.unique_json(body)
+            repository = "upstream_repository" if name == "matrix-rtc-core" else "repository"
+            require(type(record) is dict and record.get(repository) == RTC_REPOSITORY
+                    and record.get("revision") == RTC_REVISION)
+            if name == "matrix-rtc-core":
+                require(record.get("package") == name and record.get("version") == RTC_VERSION)
+            elif name == "matrix-rtc-call":
+                require(record.get("crate_path") == "crates/" + name and record.get("version") == RTC_VERSION)
+            else:
+                require(record.get("package_path") == "crates/" + name)
+        else:
+            require(RTC_REVISION.encode() in body and name.encode() in body and RTC_VERSION.encode() in body)
+
+
 def source_inputs(files):
-    # Same closed lock/origin policy as the unchanged Linux source-only route.
     packages = S.lock_packages(files)
-    require({p["source"] for p in packages if p.get("source", "").startswith("git+")} == PINS)
-    documents = {"Cargo.toml"} | {record["manifest"] for record in S.package_catalog(files).values()}
+    sources = lock_git_sources(packages)
+    catalog = S.package_catalog(files)
+    if RTC_SOURCE not in sources:
+        vendored_rtc_sources(files, packages, catalog)
+    # The manifest allowlist retains all three exact origins: locally patched
+    # RTC dependencies still declare the original tag in their manifests.
+    documents = {"Cargo.toml"} | {record["manifest"] for record in catalog.values()}
     expected = set()
     for source in PINS:
         url, query = source[4:].split("?", 1); kind, value = query.split("#", 1)[0].split("=", 1)
@@ -597,7 +651,7 @@ def input_plan(home, packages, runner, environment, git):
         checked(path,directory=True); require(re.fullmatch(r"[A-Za-z0-9_.-]{1,128}",path.name)); mirrors.append(path)
     require(0 < len(mirrors) <= 16)
     result={}
-    for source in sorted(PINS):
+    for source in sorted(lock_git_sources(packages)):
         revision=source.rsplit("#",1)[1]; matches=[]
         for mirror in mirrors:
             raw=runner.run("cache-commit",[*S.safe_git(str(git),mirror),"cat-file","commit",revision],
