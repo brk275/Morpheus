@@ -183,10 +183,34 @@ fn reviewed_asset_download_uses_the_fixed_official_api_identity() {
         "f9be49b9fee9cd1588da8a40c85bda21f5ea49c4ed82662dc889b1c919569a08"
     );
     assert_eq!(
-        arm.download_url(),
-        "https://api.github.com/repos/livekit/rust-sdks/releases/assets/419683228"
+        super::release_download_url("mac-arm64-release"),
+        "https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-mac-arm64-release.zip"
     );
+    // API IDs remain immutable provenance references; acquisition uses the
+    // official release route, still admitted only by exact archive bytes/SHA.
+    for (triple, asset_id) in [
+        ("android-arm-release", 419683134),
+        ("android-arm64-release", 419683135),
+        ("android-x64-release", 419683137),
+        ("ios-device-arm64-release", 419683142),
+        ("ios-simulator-arm64-release", 419683136),
+        ("linux-arm64-release", 419683218),
+        ("linux-x64-release", 419683224),
+        ("mac-arm64-release", 419683228),
+        ("mac-x64-release", 419683232),
+        ("win-arm64-release", 419683250),
+        ("win-x64-release", 419683258),
+    ] {
+        assert_eq!(super::pins::for_triple(triple).unwrap().asset_id, asset_id);
+        assert_eq!(
+            super::release_download_url(triple),
+            format!(
+                "https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-{triple}.zip"
+            )
+        );
+    }
     assert!(super::pins::for_triple("mac-arm64-debug").is_none());
+    assert!(super::pins::for_triple("../mac-arm64-release").is_none());
 }
 
 #[test]

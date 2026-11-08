@@ -74,12 +74,3 @@ pub(super) fn for_triple(triple: &str) -> Option<Pin> {
         sha256,
     })
 }
-
-impl Pin {
-    pub(super) fn download_url(&self) -> String {
-        format!(
-            "https://api.github.com/repos/livekit/rust-sdks/releases/assets/{}",
-            self.asset_id
-        )
-    }
-}

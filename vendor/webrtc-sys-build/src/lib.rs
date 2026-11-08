@@ -112,12 +112,15 @@ fn prebuilt_relative_path(triple: &str) -> PathBuf {
     PathBuf::from(format!("livekit/{triple}-{WEBRTC_TAG}/{triple}"))
 }
 
-pub fn download_url() -> String {
+fn release_download_url(triple: &str) -> String {
     format!(
-        "https://github.com/livekit/rust-sdks/releases/download/{}/{}.zip",
-        WEBRTC_TAG,
-        format!("webrtc-{}", webrtc_triple())
+        "https://github.com/livekit/rust-sdks/releases/download/{}/webrtc-{}.zip",
+        WEBRTC_TAG, triple
     )
+}
+
+pub fn download_url() -> String {
+    release_download_url(&webrtc_triple())
 }
 
 /// Used location of libwebrtc depending on whether it's a custom build or not
@@ -254,7 +257,8 @@ pub fn download_webrtc() -> Result<()> {
     if WEBRTC_TAG != pins::TAG {
         return Err(anyhow!("Native SDK release pins need review"));
     }
-    let pin = pins::for_triple(&webrtc_triple())
+    let triple = webrtc_triple();
+    let pin = pins::for_triple(&triple)
         .ok_or_else(|| anyhow!("No reviewed native SDK archive for this target/profile"))?;
     if webrtc_dir.exists() {
         archive::check_receipt(&webrtc_dir, &pin)?;
@@ -273,7 +277,7 @@ pub fn download_webrtc() -> Result<()> {
         .build()
         .map_err(|_| anyhow!("Cannot initialize native SDK download"))?;
     let response = client
-        .get(pin.download_url())
+        .get(release_download_url(&triple))
         .header(reqwest::header::ACCEPT, "application/octet-stream")
         .header(reqwest::header::USER_AGENT, "morpheus-native-sdk")
         .send()
