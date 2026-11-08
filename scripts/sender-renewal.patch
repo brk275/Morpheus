@@ -671,7 +671,8 @@
 +        const generation = this.peerRefreshGeneration;
          const myMembership = this.makeMyMembership(this.membershipEventExpiryMs);
          return await this.clientSendMembership(myMembership)
-             .then(() => {
+-            .then(() => {
++            .then((): ActionUpdate => {
 +                if (
 +                    retryType === MembershipActionType.RefreshMembership &&
 +                    (generation !== this.peerRefreshGeneration || !this.activated)
@@ -706,11 +707,13 @@
                  // An UpdateExpiry action might be left over from a previous join event.
                  // We can reach sendJoinEvent when the delayed leave event gets send by the HS.
                  // The branch where we might have a leftover UpdateExpiry action is:
-@@ -793,7 +985,13 @@
+@@ -792,8 +984,14 @@
+                     ],
                  };
              })
-             .catch((e) => {
+-            .catch((e) => {
 -                const update = this.actionUpdateFromErrors(e, MembershipActionType.SendJoinEvent, "sendStateEvent");
++            .catch((e): ActionUpdate => {
 +                if (
 +                    retryType === MembershipActionType.RefreshMembership &&
 +                    (generation !== this.peerRefreshGeneration || !this.activated)

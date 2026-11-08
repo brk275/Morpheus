@@ -1,5 +1,5 @@
 {
-  "proposal_sha256": "a068084e3d888d738a64b8c18d7e6b82ab8f33f913f2f1687699484a3f1f3342",
+  "proposal_sha256": "c56d21cdf5567c3c534dc5bba7768af8f321529360ad678ffc91d445b255c2fd",
   "proposal_files": {
     "spec/unit/matrixrtc/MembershipManager.spec.ts": {
       "before_sha256": "82cfc9ac48444ce30a9071e7e4181b0b8aca059bcfd5d9b4aa4e97e9a7782250",
@@ -13,8 +13,8 @@
     },
     "src/matrixrtc/MembershipManager.ts": {
       "before_sha256": "49bc6e10a3b90a110ac07df1558a0eff26724a8bfe1ba7aa00e42b28acb440b0",
-      "after_sha256": "6215001d2d5f1f32971ba44b8504672ebe806b03400761f30ae73cc0bc2dc8d1",
-      "after_bytes": 80614
+      "after_sha256": "90efa3cd0364378a35501d240b99470ae153f7cb6eacaa876d18d8841dd6d349",
+      "after_bytes": 80642
     },
     "src/matrixrtc/MembershipManagerActionScheduler.ts": {
       "before_sha256": "3a4ef26cc897253e2498bb593d008485ee5aa98f33793660f892003f13ae9628",
