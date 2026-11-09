@@ -327,6 +327,84 @@ class SelectorTests(unittest.TestCase):
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_capture_failure_reasons_are_closed_and_never_echo_invalid_values(self):
+        class ForeignString(str):
+            pass
+        class PrivateValue:
+            def __repr__(self):
+                raise AssertionError("must not inspect")
+            def __str__(self):
+                raise AssertionError("must not inspect")
+        self.assertEqual(M.CaptureFailure().reason, "capture")
+        for reason in M.CAPTURE_FAILURE_REASONS:
+            failure = M.CaptureFailure(reason)
+            self.assertEqual(failure.reason, reason)
+            self.assertEqual(str(failure), "Installed AppImage capture acceptance failed")
+        for invalid in (None, [], "private unknown body", ForeignString("capture"), PrivateValue()):
+            with self.assertRaises(ValueError) as caught:
+                M.CaptureFailure(invalid)
+            self.assertEqual(str(caught.exception), "Invalid capture failure reason")
+
+    def test_wait_failure_preserves_process_and_per_sink_guard_order(self):
+        owner = M.Processes(Path("/private"))
+        observed = []
+        class Sink:
+            def __init__(self, name, failed=False, truncated=False):
+                self.name, self.failure, self.limit = name, failed, truncated
+            @property
+            def failed(self):
+                observed.append(self.name + ":failed")
+                return self.failure
+            @property
+            def truncated(self):
+                observed.append(self.name + ":truncated")
+                return self.limit
+        cases = ((1, [Sink("first", True, True)], "process_exit", []),
+                 (None, [Sink("first", True, True)], "log_failure", ["first:failed"]),
+                 (None, [Sink("first", truncated=True), Sink("second", failed=True)],
+                  "log_limit", ["first:failed", "first:truncated"]))
+        for status, sinks, reason, expected in cases:
+            observed.clear(); owner.sinks = {"app": sinks}
+            predicate = mock.Mock(side_effect=AssertionError("must not inspect pixels"))
+            with self.subTest(reason=reason), \
+                    mock.patch.object(M.time, "monotonic", return_value=0), \
+                    mock.patch.object(M.containment, "status", return_value=status) as check:
+                with self.assertRaises(M.CaptureFailure) as caught:
+                    owner.wait_for(predicate, watch=("owned",))
+            self.assertEqual(caught.exception.reason, reason)
+            self.assertEqual(observed, expected)
+            check.assert_called_once_with("owned")
+            predicate.assert_not_called()
+
+    def test_wait_keeps_deadline_sleep_success_and_foreign_exception_semantics(self):
+        owner = M.Processes(Path("/private"))
+        owner.sinks = {"app": [SimpleNamespace(failed=False, truncated=False)]}
+        marker = object(); predicate = mock.Mock(side_effect=[False, marker])
+        with mock.patch.object(M.time, "monotonic", side_effect=[10, 10, 10.1]), \
+                mock.patch.object(M.time, "sleep") as sleep, \
+                mock.patch.object(M.containment, "status", return_value=None) as status:
+            self.assertIs(owner.wait_for(predicate, seconds=1, watch=("owned",)), marker)
+        sleep.assert_called_once_with(0.1)
+        self.assertEqual(status.call_count, 2)
+        predicate = mock.Mock()
+        with mock.patch.object(M.time, "monotonic", side_effect=[10, 11]), \
+                mock.patch.object(M.containment, "status") as status:
+            with self.assertRaises(M.CaptureFailure) as caught:
+                owner.wait_for(predicate, seconds=1, watch=("owned",))
+        self.assertEqual(caught.exception.reason, "wait_timeout")
+        status.assert_not_called(); predicate.assert_not_called()
+        original = RuntimeError("private detail")
+        for failing_status in (True, False):
+            predicate = mock.Mock(side_effect=None if failing_status else original)
+            with mock.patch.object(M.time, "monotonic", return_value=0), \
+                    mock.patch.object(M.containment, "status", return_value=None,
+                                      side_effect=original if failing_status else None):
+                with self.assertRaises(RuntimeError) as caught:
+                    owner.wait_for(predicate, watch=("owned",))
+            self.assertIs(caught.exception, original)
+            if failing_status:
+                predicate.assert_not_called()
+
     class Sink:
         def __init__(self, path):
             self.attach = mock.Mock()

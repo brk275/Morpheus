@@ -40,9 +40,15 @@ VOLUMES = ("morpheus-synapse-a-data", "morpheus-synapse-b-data")
 NETWORK = "morpheus-matrix-test"
 
 
+CAPTURE_FAILURE_REASONS = frozenset(("capture", "process_exit", "log_failure", "log_limit", "wait_timeout"))
+
+
 class CaptureFailure(RuntimeError):
-    def __init__(self):
+    def __init__(self, reason="capture"):
+        if type(reason) is not str or reason not in CAPTURE_FAILURE_REASONS:
+            raise ValueError("Invalid capture failure reason")
         super().__init__("Installed AppImage capture acceptance failed")
+        self.reason = reason
 
 
 def require(value):
@@ -144,13 +150,19 @@ class Processes:
     def wait_for(self, predicate, *, seconds=30, watch=()):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            require(all(containment.status(process) is None for process in watch))
-            require(all(not sink.failed and not sink.truncated for pair in self.sinks.values() for sink in pair))
+            if not all(containment.status(process) is None for process in watch):
+                raise CaptureFailure("process_exit")
+            for pair in self.sinks.values():
+                for sink in pair:
+                    if sink.failed:
+                        raise CaptureFailure("log_failure")
+                    if sink.truncated:
+                        raise CaptureFailure("log_limit")
             value = predicate()
             if value:
                 return value
             time.sleep(0.1)
-        raise CaptureFailure()
+        raise CaptureFailure("wait_timeout")
 
     def finish(self, name, process, seconds=30):
         require(containment.wait_owned(process, seconds) == 0)

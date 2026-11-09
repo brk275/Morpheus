@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
+from types import ModuleType
 import tempfile
 
 COMMANDS = frozenset((
@@ -58,6 +60,7 @@ REASONS = frozenset((*BUILTIN_REASONS.values(), "command_deadline", "command_out
                      "command_http_forbidden", "command_http_not_found", "command_http_rate_limited", "command_http_unavailable",
                      "command_http_rejected", "command_download_transport", "command_download_tls",
                      "ui_wait_timeout", "ui_app_exited", "ui_tree_bound",
+                     "capture_process_exit", "capture_log_failure", "capture_log_limit", "capture_wait_timeout",
                      "interrupted", "capture", "identity", "binding", "package", "inventory", "unknown", "namespace_exit",
                      "namespace_deadline", "namespace_output", "cleanup",
                      "inventory_input", "inventory_tool", "inventory_elf", "inventory_dependency",
@@ -77,6 +80,16 @@ def reason(error):
         return "command_" + error.reason if "command_" + error.reason in REASONS else "unknown"
     if isinstance(error, (KeyboardInterrupt, SystemExit)):
         return "interrupted"
+    # The driver already owns any instance of its exact exception type.
+    # Do not import the driver or inspect a foreign exception's properties.
+    capture_module = sys.modules.get("appimage_capture")
+    capture_type = (vars(capture_module).get("CaptureFailure")
+                    if type(capture_module) is ModuleType else None)
+    if type(error) is capture_type:
+        value = error.reason
+        if type(value) is str and value in {"capture", "process_exit", "log_failure", "log_limit", "wait_timeout"}:
+            return "capture" if value == "capture" else "capture_" + value
+        return "unknown"
     for kind, token in BUILTIN_REASONS.items():
         if type(error) is kind:
             return token

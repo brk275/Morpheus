@@ -18,6 +18,47 @@ import package_appimage as P
 
 
 class ProgressTests(unittest.TestCase):
+    def test_capture_wait_reasons_require_exact_loaded_owner_and_closed_values(self):
+        import appimage_capture as capture
+        expected = {"capture": "capture", "process_exit": "capture_process_exit",
+                    "log_failure": "capture_log_failure", "log_limit": "capture_log_limit",
+                    "wait_timeout": "capture_wait_timeout"}
+        self.assertEqual(set(expected), capture.CAPTURE_FAILURE_REASONS)
+        for value, token in expected.items():
+            with self.subTest(value=value):
+                failure = capture.CaptureFailure(value)
+                self.assertEqual(D.reason(failure), token)
+                self.assertIn(token, D.REASONS)
+                with tempfile.TemporaryDirectory() as directory:
+                    progress = D.Progress(Path(directory))
+                    progress.failed(failure)
+                    original = dict(progress.value["failure"])
+                    self.assertEqual(original["reason"], token)
+                    progress.failed(RuntimeError("private replacement"))
+                    self.assertEqual(progress.value["failure"], original)
+                    self.assertNotIn("private", json.dumps(progress.value))
+        class ForeignString(str):
+            pass
+        failure = capture.CaptureFailure()
+        for invalid in (None, [], "private unknown body", ForeignString("capture")):
+            failure.reason = invalid
+            self.assertEqual(D.reason(failure), "unknown")
+        class CaptureFailure(capture.CaptureFailure):
+            def __init__(self):
+                RuntimeError.__init__(self, "private body")
+            @property
+            def reason(self):
+                raise AssertionError("foreign property must not be read")
+        foreign = CaptureFailure()
+        self.assertEqual(D.reason(foreign), "capture")
+        with mock.patch.dict(sys.modules, {"appimage_capture": None}):
+            self.assertEqual(D.reason(foreign), "capture")
+        class UnrelatedFailure(RuntimeError):
+            @property
+            def reason(self):
+                raise AssertionError("foreign property must not be read")
+        self.assertEqual(D.reason(UnrelatedFailure("private body")), "unknown")
+
     def test_native_capture_codes_match_static_rust_and_do_not_reflect_private_text(self):
         import re
         source = (Path(__file__).resolve().parents[2] /
