@@ -188,7 +188,6 @@ class PackageSmokeTests(unittest.TestCase):
     def test_windows_install_uses_one_canonical_owned_temp_root_for_all_operations(self):
         alias = Path("/synthetic/SHORT~1/owned")
         canonical = Path("/synthetic/Long User/owned")
-        anchor = Path("/synthetic/private/source")
         installed = canonical / "Installed Morpheus"
         executable = installed / "morpheus-app.exe"
         uninstaller = installed / "uninstall.exe"
@@ -205,8 +204,7 @@ class PackageSmokeTests(unittest.TestCase):
             return canonical / suffix
         entries = [{"DisplayName":"Morpheus", "DisplayVersion":"0.1.0",
                     "InstallLocation":str(installed)}]
-        with patch.object(package_smoke, "windows_smoke_root", return_value=anchor) as admit, \
-                patch.object(package_smoke.tempfile, "TemporaryDirectory", return_value=temporary) as allocate, \
+        with patch.object(package_smoke, "windows_smoke_workspace", return_value=temporary) as allocate, \
                 patch.object(Path, "resolve", autospec=True, side_effect=resolve) as resolved, \
                 patch.object(Path, "exists", autospec=True, side_effect=lambda path:path == uninstaller), \
                 patch.object(package_smoke, "artifact", return_value=setup), \
@@ -219,8 +217,7 @@ class PackageSmokeTests(unittest.TestCase):
                 patch.object(package_smoke.shutil, "copy2") as copy, \
                 patch.object(package_smoke, "record"):
             package_smoke.windows_smoke(dist)
-        admit.assert_called_once_with()
-        allocate.assert_called_once_with(prefix="morpheus-package-", dir=anchor)
+        allocate.assert_called_once_with()
         self.assertEqual(resolved.call_args_list[0], call(alias, strict=True))
         pe.assert_called_once_with(executable)
         resources.assert_called_once_with(installed, dist)
@@ -294,6 +291,138 @@ class PackageSmokeTests(unittest.TestCase):
                 package_smoke.windows_smoke(Path("/synthetic/dist"))
         allocate.assert_not_called()
         run.assert_not_called()
+
+    def test_windows_smoke_workspace_uses_exclusive_private_creator_and_exact_cleanup(self):
+        from scripts import native_notice_source as source
+        anchor = Path("/synthetic/private/source")
+        work = anchor / ("morpheus-package-" + "a" * 32)
+        identities = {anchor: SimpleNamespace(st_dev=1, st_ino=2),
+                      work: SimpleNamespace(st_dev=1, st_ino=3)}
+        with patch.object(package_smoke, "windows_smoke_root", return_value=anchor) as admit, \
+                patch.object(package_smoke.secrets, "token_hex", return_value="a" * 32) as nonce, \
+                patch.object(source, "private_directory", return_value=work) as create, \
+                patch.object(source, "checked") as checked, \
+                patch.object(Path, "lstat", autospec=True, side_effect=lambda path: identities[path]), \
+                patch.object(package_smoke.shutil, "rmtree") as remove, \
+                patch.object(package_smoke.tempfile, "TemporaryDirectory") as unsafe_temp:
+            with package_smoke.windows_smoke_workspace() as actual:
+                self.assertEqual(actual, work)
+                create.assert_called_once_with(work)
+                remove.assert_not_called()
+            self.assertEqual(admit.call_count, 3)
+            nonce.assert_called_once_with(16)
+            self.assertEqual(checked.call_args_list, [call(work, directory=True, private=True)] * 2)
+            remove.assert_called_once_with(work)
+            unsafe_temp.assert_not_called()
+
+    def test_windows_smoke_workspace_never_adopts_or_deletes_changed_authority(self):
+        from scripts import native_notice_source as source
+        anchor = Path("/synthetic/private/source")
+        work = anchor / ("morpheus-package-" + "a" * 32)
+        identities = {anchor: SimpleNamespace(st_dev=1, st_ino=2),
+                      work: SimpleNamespace(st_dev=1, st_ino=3)}
+        with patch.object(package_smoke, "windows_smoke_root", return_value=anchor), \
+                patch.object(package_smoke.secrets, "token_hex", return_value="a" * 32), \
+                patch.object(source, "private_directory", return_value=work) as create, \
+                patch.object(source, "checked") as checked, \
+                patch.object(Path, "lstat", autospec=True, side_effect=lambda path: identities[path]), \
+                patch.object(package_smoke.shutil, "rmtree") as remove, \
+                patch.object(package_smoke, "record") as record:
+            create.side_effect = ValueError("Refused existing child")
+            with self.assertRaises(ValueError):
+                with package_smoke.windows_smoke_workspace():
+                    self.fail("An existing or refused workspace must not be entered")
+            remove.assert_not_called()
+            create.side_effect = None
+            for changed in (anchor, work):
+                original = identities[changed]
+                with self.subTest(changed=changed), self.assertRaises(RuntimeError):
+                    with package_smoke.windows_smoke_workspace():
+                        identities[changed] = SimpleNamespace(st_dev=1, st_ino=99)
+                identities[changed] = original
+                remove.assert_not_called()
+            checked.side_effect = [None, ValueError("Refused workspace ACL")]
+            with self.assertRaisesRegex(RuntimeError, "Primary installed failure"):
+                with package_smoke.windows_smoke_workspace():
+                    raise RuntimeError("Primary installed failure")
+            remove.assert_not_called()
+            record.assert_called_once_with("windows_smoke_workspace_retained", status="failed")
+            record.side_effect = BrokenPipeError("Closed output")
+            checked.side_effect = [None, ValueError("Refused workspace ACL")]
+            with self.assertRaisesRegex(RuntimeError, "Primary installed failure"):
+                with package_smoke.windows_smoke_workspace():
+                    raise RuntimeError("Primary installed failure")
+            remove.assert_not_called()
+
+    def test_windows_smoke_workspace_rechecks_anchor_before_installer_entry(self):
+        from scripts import native_notice_source as source
+        anchor = Path("/synthetic/private/source")
+        work = anchor / ("morpheus-package-" + "a" * 32)
+        identities = {anchor: SimpleNamespace(st_dev=1, st_ino=2),
+                      work: SimpleNamespace(st_dev=1, st_ino=3)}
+        def replaced_anchor(path):
+            self.assertEqual(path, work)
+            identities[anchor] = SimpleNamespace(st_dev=1, st_ino=99)
+            return work
+        with patch.object(package_smoke, "windows_smoke_root", return_value=anchor), \
+                patch.object(package_smoke.secrets, "token_hex", return_value="a" * 32), \
+                patch.object(source, "private_directory", side_effect=replaced_anchor), \
+                patch.object(source, "checked"), \
+                patch.object(Path, "lstat", autospec=True, side_effect=lambda path: identities[path]), \
+                patch.object(package_smoke.shutil, "rmtree") as remove, \
+                patch.object(package_smoke, "record"):
+            with self.assertRaisesRegex(RuntimeError, "reservation identity changed"):
+                with package_smoke.windows_smoke_workspace():
+                    self.fail("Installer body must not enter after anchor replacement")
+            remove.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Actual Windows DACL boundary requires a fresh hosted Windows runner")
+    def test_windows_private_workspace_real_dacl_read_and_owned_cleanup(self):
+        from scripts import native_notice_source as source
+        from scripts import native_notices as notices
+        for key, value in {
+            "GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted", "RUNNER_OS": "Windows",
+            "GITHUB_REPOSITORY": "brk275/Morpheus", "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_ACTOR": "brk275", "GITHUB_TRIGGERING_ACTOR": "brk275",
+        }.items():
+            self.assertEqual(os.environ.get(key), value)
+        self.assertIn(os.environ.get("IMAGEOS"), {"win25", "win25-vs2026"})
+        self.assertGreaterEqual(sys.version_info, (3, 12, 10))
+        security = source.S.windows_security()
+        # create_root uses exclusive CreateDirectoryW + exact user/SYSTEM DACL;
+        # no existing directory or source/profile/vault is read or repaired.
+        anchor = security.create_root(Path.home().resolve(strict=True))
+        original = anchor.lstat()
+        try:
+            security.path(anchor, directory=True, private=True)
+            with tempfile.TemporaryDirectory(prefix="morpheus-legacy-", dir=anchor) as temp:
+                legacy = Path(temp).resolve(strict=True)
+                self.assertEqual(legacy.parent, anchor)
+                leaf = legacy / "notice.txt"
+                leaf.write_bytes(b"Synthetic notice boundary")
+                # CPython mkdir(0700) explicitly installs OWNER_RIGHTS (OW),
+                # which the unchanged ordinary source/notice policy rejects.
+                with self.assertRaises(ValueError):
+                    notices.read_regular(leaf, 128)
+            self.assertFalse(legacy.exists())
+            # Only reservation admission is modeled: all directory creation,
+            # Win32 ownership/DACL queries, opened reads and deletion are real.
+            with patch.object(package_smoke, "windows_smoke_root", return_value=anchor):
+                with package_smoke.windows_smoke_workspace() as work:
+                    self.assertEqual(work.parent, anchor)
+                    security.path(work, directory=True, private=True)
+                    leaf = work / "notice.txt"
+                    leaf.write_bytes(b"Synthetic notice boundary")
+                    self.assertEqual(notices.read_regular(leaf, 128), b"Synthetic notice boundary")
+            self.assertFalse(work.exists())
+        finally:
+            security.path(anchor, directory=True, private=True)
+            current = anchor.lstat()
+            self.assertEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
+            # Never recursively delete an unexpected child after a failed case.
+            self.assertEqual(list(anchor.iterdir()), [])
+            anchor.rmdir()
+        self.assertFalse(anchor.exists())
 
     def test_nsis_last_option_keeps_destination_unquoted(self):
         for uninstall, flag in [(False, "/D="), (True, "_?=")]:

@@ -615,15 +615,13 @@ class ProfileLifecycleTests(unittest.TestCase):
             entry = {"DisplayName": "Morpheus", "DisplayVersion": smoke.package_version(), "InstallLocation": str(installed)}
             events = []
             with patch.object(smoke, "record"), \
-                    patch.object(smoke, "windows_smoke_root", return_value=Path(work).parent) as admit, \
-                    patch.object(smoke.tempfile, "TemporaryDirectory", return_value=contextlib.nullcontext(work)) as allocate, \
+                    patch.object(smoke, "windows_smoke_workspace", return_value=contextlib.nullcontext(work)) as allocate, \
                     patch.object(smoke, "uninstall_registry", side_effect=[[], [entry], []]), \
                     patch.object(smoke, "run", side_effect=lambda *a, **k: events.append("nsis")), \
                     patch.object(smoke, "check_windows_binary"), patch.object(smoke, "check_resources"), \
                     patch.object(smoke, "windows_installed_launches", side_effect=lambda e: events.append(("launches", e))):
                 smoke.windows_smoke(dist)
-            admit.assert_called_once_with()
-            allocate.assert_called_once_with(prefix="morpheus-package-", dir=Path(work).parent)
+            allocate.assert_called_once_with()
             self.assertEqual(events, ["nsis", ("launches", installed / "morpheus-app.exe")])
 
 

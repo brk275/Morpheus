@@ -7,6 +7,7 @@ permissions, uploads installers, or treats a startup smoke as release acceptance
 
 import argparse
 import configparser
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -612,10 +613,57 @@ def windows_smoke_root():
     return root
 
 
+@contextlib.contextmanager
+def windows_smoke_workspace():
+    # Windows mkdir(0700), including tempfile.mkdtemp, installs an OWNER_RIGHTS
+    # ACE. Create this fresh child with the existing exact user/SYSTEM DACL
+    # instead; never repair an existing directory or relax a resource reader.
+    if __package__:
+        from . import native_notice_source as source
+    else:
+        import native_notice_source as source
+    anchor = windows_smoke_root()
+    anchor_info = anchor.lstat()
+    work = source.private_directory(anchor / ("morpheus-package-" + secrets.token_hex(16)))
+    work_info = work.lstat()
+    failed = False
+    try:
+        require(windows_smoke_root() == anchor, "Windows smoke reservation changed")
+        current = anchor.lstat()
+        require((current.st_dev, current.st_ino) == (anchor_info.st_dev, anchor_info.st_ino),
+                "Windows smoke reservation identity changed")
+        source.checked(work, directory=True, private=True)
+        current = work.lstat()
+        require((current.st_dev, current.st_ino) == (work_info.st_dev, work_info.st_ino),
+                "Windows smoke workspace identity changed")
+        yield work
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            require(windows_smoke_root() == anchor, "Windows smoke reservation changed")
+            current = anchor.lstat()
+            require((current.st_dev, current.st_ino) == (anchor_info.st_dev, anchor_info.st_ino),
+                    "Windows smoke reservation identity changed")
+            source.checked(work, directory=True, private=True)
+            current = work.lstat()
+            require((current.st_dev, current.st_ino) == (work_info.st_dev, work_info.st_ino),
+                    "Windows smoke workspace identity changed")
+            shutil.rmtree(work)
+        except BaseException:
+            if not failed:
+                raise
+            try:
+                record("windows_smoke_workspace_retained", status="failed")
+            except BaseException:
+                pass  # A closed output stream must not replace the primary failure.
+
+
 def windows_smoke(dist):
     package = artifact(dist, ".exe")
     require(not uninstall_registry(), "Refusing to replace an existing Morpheus installation")
-    with tempfile.TemporaryDirectory(prefix="morpheus-package-", dir=windows_smoke_root()) as temp:
+    with windows_smoke_workspace() as temp:
         work = Path(temp).resolve(strict=True)
         installed = work / "Installed Morpheus"  # Exercise NSIS paths containing spaces.
         run(nsis_command(package, installed))
