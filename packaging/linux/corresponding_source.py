@@ -20,6 +20,7 @@ Complete-native requests remain blocked by the SDK/compiler/system/relink gaps.
 from __future__ import annotations
 
 import ast
+import contextlib
 import fnmatch
 import gzip
 import hashlib
@@ -62,12 +63,37 @@ UNRESOLVED = (
 )
 
 
+SOURCE_PHASES = frozenset(("workspace_acquisition", "workspace_export", "lock_admission", "catalog_admission",
+                           "plan_admission", "native_material", "dependency_export",
+                           "dependency_catalog", "registry_material", "native_receipt",
+                           "native_recipe", "runtime_receipt", "runtime_link_inputs",
+                           "runtime_prefix", "notice_material", "runtime_notice",
+                           "runtime_uapi", "runtime_relink", "pipewire_receipt",
+                           "pipewire_objects", "pipewire_notice", "pipewire_deployment", "sdk_pin"))
+
+
 class SourceFailure(RuntimeError):
     def __init__(self, reason):
         allowed = {"input", "path", "bounds", "identity", "lock", "missing",
                    "archive", "link", "submodule", "git", "manifest", "output"}
         self.reason = reason if reason in allowed else "input"
+        self.source_phase = None
         super().__init__("Corresponding source preparation failed: " + self.reason)
+
+
+@contextlib.contextmanager
+def source_phase(phase):
+    """Attribute only our exact failure without changing its reason or identity."""
+    if type(phase) is not str or phase not in SOURCE_PHASES:
+        raise ValueError("Invalid source failure phase")
+    try:
+        yield
+    except SourceFailure as error:
+        # Nested boundaries retain the first, most specific attribution. Foreign
+        # subclasses can define arbitrary properties, so never inspect them.
+        if type(error) is SourceFailure and error.source_phase is None:
+            error.source_phase = phase
+        raise
 
 
 def require(value, reason="input"):
@@ -878,15 +904,16 @@ def runtime_linked_sources(runtime, spec, host):
 
 
 def native_material(plan, files, revision, budget):
-    try:
-        return _native_material(plan, files, revision, budget)
-    except SourceFailure:
-        raise
-    except FileNotFoundError:
-        raise SourceFailure("missing") from None
-    except (OSError, KeyError, TypeError, AttributeError, ValueError, UnicodeError,
-            OverflowError, RecursionError, struct.error):
-        raise SourceFailure("identity") from None
+    with source_phase("native_material"):
+        try:
+            return _native_material(plan, files, revision, budget)
+        except SourceFailure:
+            raise
+        except FileNotFoundError:
+            raise SourceFailure("missing") from None
+        except (OSError, KeyError, TypeError, AttributeError, ValueError, UnicodeError,
+                OverflowError, RecursionError, struct.error):
+            raise SourceFailure("identity") from None
 
 
 def _native_material(plan, files, revision, budget):
@@ -898,144 +925,159 @@ def _native_material(plan, files, revision, budget):
     if "native_inputs" not in plan:
         return {}, {"coverage": "rust-only", "native_sources_complete": False,
                     "actual_native_build_inputs_verified": False}
-    selected = plan["native_inputs"]
-    require(type(selected) is dict and set(selected) == {"coverage", "package_artifact", "package_receipt",
-                "runtime_notices", "pipewire_notices"} and selected["coverage"] == "known-components"
-            and all(type(selected[key]) is str and 0 < len(selected[key]) <= 4096
-                    for key in selected if key != "coverage"), "missing")
-    spec, host, pipewire = native_recipe(files)
-    receipt_bytes = read_owned(selected["package_receipt"], MAX_NATIVE_RECEIPT, private=True)
-    receipt = unique_json(receipt_bytes)
-    require(type(receipt) is dict and type(receipt.get("schema")) is int and receipt["schema"] == 1 and receipt.get("format") == "appimage"
-            and receipt.get("source_revision") == revision and receipt.get("unsigned") is True
-            and receipt.get("distribution_ready") is False, "identity")
-    inventory = receipt.get("inventory")
-    require(type(inventory) is dict and type(inventory.get("schema")) is int and inventory["schema"] == 1
-            and inventory.get("distribution_ready") is False
-            and type(inventory.get("notice_sha256")) is dict
-            and type(inventory.get("deployed")) is list and len(inventory["deployed"]) <= 256, "identity")
-    runtime = receipt.get("source_built_runtime")
-    require(type(runtime) is dict and type(runtime.get("schema")) is int and runtime["schema"] == 1
-            and runtime.get("sources") == spec["archives"] and runtime.get("patches") == spec["patches"]
-            and runtime.get("runtime_revision") == spec["runtime_revision"]
-            and runtime.get("fresh_private_prefix") is True
-            and runtime.get("upstream_runtime_binary_downloaded") is False
-            and runtime.get("distribution_ready") is False
-            and runtime.get("host_inputs", {}).get("manifest_sha256") == spec["host_manifest_sha256"]
-            and inventory.get("runtime_sources") == spec["archives"]
-            and inventory.get("runtime_source_patches") == spec["patches"], "identity")
-    linked_sources = runtime_linked_sources(runtime, spec, host)
-    runtime_identity = runtime.get("runtime")
-    require(type(runtime_identity) is dict and type(runtime_identity.get("size")) is int
-            and 1024 <= runtime_identity["size"] <= MAX_RUNTIME, "identity")
-    package_size, package_hash, prefix = hash_owned_file(selected["package_artifact"], MAX_BUNDLE,
-                                                        prefix_bytes=runtime_identity["size"])
-    require(package_hash == receipt.get("appimage_sha256") and package_size > len(prefix)
-            and inventory.get("runtime_input_sha256") == runtime_identity.get("sha256"), "identity")
-    runtime_prefix_identity(prefix, runtime_identity, receipt.get("embedded_runtime"))
-    del prefix
-    expected_runtime = {"SOURCE.json", "RELINKING.txt", "linux-uapi-headers.tar.gz", "runtime-relink.o.gz",
-                        "runtime-build.json", "runtime-build-host.json", "appimage_runtime_build.py"}
-    for component, pin in spec["archives"].items():
-        require(type(pin) is dict and type(pin.get("filename")) is str and ATOM.fullmatch(pin["filename"])
-                and type(pin.get("size")) is int and 0 < pin["size"] <= MAX_FILE
-                and type(pin.get("sha256")) is str and HASH.fullmatch(pin["sha256"])
-                and type(pin.get("licenses")) is dict, "manifest")
-        expected_runtime.add(pin["filename"])
-        expected_runtime.update(component + "-" + name for name in pin["licenses"])
-    expected_runtime.update(spec["patches"])
-    expected_runtime.update(spec["regressions"])
-    expected_pipewire = {"SOURCE.json", "exported-node-startup.patch", *pipewire["licenses"],
-                         *(pin["filename"] for pin in pipewire["archives"].values())}
-    material, recorded = {}, {}
-    for component, names, doc, directory in (("runtime", expected_runtime, RUNTIME_DOC, selected["runtime_notices"]),
-                                            ("pipewire", expected_pipewire, PIPEWIRE_DOC, selected["pipewire_notices"])):
-        directory = fixed_stage(directory, names)
-        inventory_names = {path[len(doc) + 1:] for path in inventory["notice_sha256"] if path.startswith(doc + "/")}
-        require(inventory_names == names, "missing")
-        for name in sorted(names):
-            source_path(name)
-            data = read_owned(directory / name, MAX_FILE)
-            require(digest(data) == inventory["notice_sha256"][doc + "/" + name], "identity")
-            target = "native/" + component + "/" + name
-            require(target not in material, "identity")
-            budget.add(entries=1, expanded=len(data), inputs=len(data), paths=len(target.encode()))
-            material[target] = data
-            recorded[target] = {"sha256": digest(data), "bytes": len(data), "deployed_notice": doc + "/" + name,
-                                "included_in_bundle": True}
+    with source_phase("native_receipt"):
+        selected = plan["native_inputs"]
+        require(type(selected) is dict and set(selected) == {"coverage", "package_artifact", "package_receipt",
+                    "runtime_notices", "pipewire_notices"} and selected["coverage"] == "known-components"
+                and all(type(selected[key]) is str and 0 < len(selected[key]) <= 4096
+                        for key in selected if key != "coverage"), "missing")
+    with source_phase("native_recipe"):
+        spec, host, pipewire = native_recipe(files)
+    with source_phase("native_receipt"):
+        receipt_bytes = read_owned(selected["package_receipt"], MAX_NATIVE_RECEIPT, private=True)
+        receipt = unique_json(receipt_bytes)
+        require(type(receipt) is dict and type(receipt.get("schema")) is int and receipt["schema"] == 1 and receipt.get("format") == "appimage"
+                and receipt.get("source_revision") == revision and receipt.get("unsigned") is True
+                and receipt.get("distribution_ready") is False, "identity")
+        inventory = receipt.get("inventory")
+        require(type(inventory) is dict and type(inventory.get("schema")) is int and inventory["schema"] == 1
+                and inventory.get("distribution_ready") is False
+                and type(inventory.get("notice_sha256")) is dict
+                and type(inventory.get("deployed")) is list and len(inventory["deployed"]) <= 256, "identity")
+    with source_phase("runtime_receipt"):
+        runtime = receipt.get("source_built_runtime")
+        require(type(runtime) is dict and type(runtime.get("schema")) is int and runtime["schema"] == 1
+                and runtime.get("sources") == spec["archives"] and runtime.get("patches") == spec["patches"]
+                and runtime.get("runtime_revision") == spec["runtime_revision"]
+                and runtime.get("fresh_private_prefix") is True
+                and runtime.get("upstream_runtime_binary_downloaded") is False
+                and runtime.get("distribution_ready") is False
+                and runtime.get("host_inputs", {}).get("manifest_sha256") == spec["host_manifest_sha256"]
+                and inventory.get("runtime_sources") == spec["archives"]
+                and inventory.get("runtime_source_patches") == spec["patches"], "identity")
+    with source_phase("runtime_link_inputs"):
+        linked_sources = runtime_linked_sources(runtime, spec, host)
+    with source_phase("runtime_prefix"):
+        runtime_identity = runtime.get("runtime")
+        require(type(runtime_identity) is dict and type(runtime_identity.get("size")) is int
+                and 1024 <= runtime_identity["size"] <= MAX_RUNTIME, "identity")
+        package_size, package_hash, prefix = hash_owned_file(selected["package_artifact"], MAX_BUNDLE,
+                                                            prefix_bytes=runtime_identity["size"])
+        require(package_hash == receipt.get("appimage_sha256") and package_size > len(prefix)
+                and inventory.get("runtime_input_sha256") == runtime_identity.get("sha256"), "identity")
+        runtime_prefix_identity(prefix, runtime_identity, receipt.get("embedded_runtime"))
+        del prefix
+    with source_phase("notice_material"):
+        expected_runtime = {"SOURCE.json", "RELINKING.txt", "linux-uapi-headers.tar.gz", "runtime-relink.o.gz",
+                            "runtime-build.json", "runtime-build-host.json", "appimage_runtime_build.py"}
+        for component, pin in spec["archives"].items():
+            require(type(pin) is dict and type(pin.get("filename")) is str and ATOM.fullmatch(pin["filename"])
+                    and type(pin.get("size")) is int and 0 < pin["size"] <= MAX_FILE
+                    and type(pin.get("sha256")) is str and HASH.fullmatch(pin["sha256"])
+                    and type(pin.get("licenses")) is dict, "manifest")
+            expected_runtime.add(pin["filename"])
+            expected_runtime.update(component + "-" + name for name in pin["licenses"])
+        expected_runtime.update(spec["patches"])
+        expected_runtime.update(spec["regressions"])
+        expected_pipewire = {"SOURCE.json", "exported-node-startup.patch", *pipewire["licenses"],
+                             *(pin["filename"] for pin in pipewire["archives"].values())}
+        material, recorded = {}, {}
+        for component, names, doc, directory in (("runtime", expected_runtime, RUNTIME_DOC, selected["runtime_notices"]),
+                                                ("pipewire", expected_pipewire, PIPEWIRE_DOC, selected["pipewire_notices"])):
+            directory = fixed_stage(directory, names)
+            inventory_names = {path[len(doc) + 1:] for path in inventory["notice_sha256"] if path.startswith(doc + "/")}
+            require(inventory_names == names, "missing")
+            for name in sorted(names):
+                source_path(name)
+                data = read_owned(directory / name, MAX_FILE)
+                require(digest(data) == inventory["notice_sha256"][doc + "/" + name], "identity")
+                target = "native/" + component + "/" + name
+                require(target not in material, "identity")
+                budget.add(entries=1, expanded=len(data), inputs=len(data), paths=len(target.encode()))
+                material[target] = data
+                recorded[target] = {"sha256": digest(data), "bytes": len(data), "deployed_notice": doc + "/" + name,
+                                    "included_in_bundle": True}
     def content(component, name):
         return material["native/" + component + "/" + name]
-    require(unique_json(content("runtime", "SOURCE.json")) == runtime, "identity")
-    for component, pin in spec["archives"].items():
-        data = content("runtime", pin["filename"])
-        require(len(data) == pin["size"] and digest(data) == pin["sha256"], "identity")
-        for name, license_pin in pin["licenses"].items():
-            data = content("runtime", component + "-" + name)
-            require(len(data) == license_pin["bytes"] and digest(data) == license_pin["sha256"], "identity")
-    for group in ("patches", "regressions"):
-        for name, pin in spec[group].items():
-            data = content("runtime", name)
-            require(data == files.get("packaging/linux/runtime-patches/" + name)
-                    and len(data) == pin["size"] and digest(data) == pin["sha256"], "identity")
-    for name in ("runtime-build.json", "runtime-build-host.json", "appimage_runtime_build.py"):
-        require(content("runtime", name) == files.get("packaging/linux/" + name), "identity")
-    require(content("runtime", "RELINKING.txt") == literal_recipe_text(files,
-                "packaging/linux/appimage_runtime_build.py", "RELINKING.txt"), "identity")
-    uapi_headers(content("runtime", "linux-uapi-headers.tar.gz"), spec, host)
-    relink = bounded_single_gzip(content("runtime", "runtime-relink.o.gz"), MAX_RUNTIME)
-    require(relink[:7] == b"\x7fELF\x02\x01\x01" and len(relink) >= 64
-            and struct.unpack_from("<HH", relink, 16) == (1, 62)
-            and digest(relink) == runtime.get("runtime_object_sha256"), "identity")
-    del relink
-    client = unique_json(content("pipewire", "SOURCE.json"))
-    require(type(client) is dict and set(client) == {"schema", "source_version", "upstream_commit", "upstream_patch_sha256",
-                "patched_source_sha256", "source_archives", "source_client_sha256", "build_id", "needed", "objects",
-                "tool_version_output_sha256", "configure", "config_sha256", "recipe_sha256"}
-            and type(client.get("schema")) is int and client["schema"] == 1
-            and client.get("source_version") == pipewire["VERSION"]
-            and client.get("upstream_commit") == pipewire["COMMIT"]
-            and client.get("upstream_patch_sha256") == pipewire["UPSTREAM_PATCH_SHA256"]
-            and client.get("patched_source_sha256") == pipewire["PATCHED_SOURCE_SHA256"]
-            and client.get("source_archives") == {key: pin["sha256"] for key, pin in pipewire["archives"].items()}
-            and client.get("configure") == list(pipewire["CONFIGURE"])
-            and "variant" not in client, "identity")
-    sources = source_assignment(files, "scripts/pipewire_startup_probe.py", "SOURCES")
-    require(type(sources) is tuple and type(client["objects"]) is dict
-            and set(client["objects"]) == {name + ".c.o" for name in sources}
-            and all(type(x) is str and HASH.fullmatch(x) for x in client["objects"].values()), "identity")
-    for field in ("source_client_sha256", "config_sha256", "recipe_sha256"):
-        require(type(client[field]) is str and HASH.fullmatch(client[field]), "identity")
-    require(type(client["build_id"]) is str and OID.fullmatch(client["build_id"])
-            and type(client["needed"]) is list and 0 < len(client["needed"]) <= 128
-            and all(type(value) is str and ATOM.fullmatch(value) for value in client["needed"])
-            and type(client["tool_version_output_sha256"]) is dict
-            and set(client["tool_version_output_sha256"]) == {"patch", "meson", "ninja", "cc", "pkg-config"}
-            and all(type(value) is str and HASH.fullmatch(value)
-                    for value in client["tool_version_output_sha256"].values()), "identity")
-    require(digest(content("pipewire", "exported-node-startup.patch")) == pipewire["UPSTREAM_PATCH_SHA256"], "identity")
-    for pin in pipewire["archives"].values():
-        data = content("pipewire", pin["filename"])
-        require(len(data) <= pin["maximum_bytes"] and digest(data) == pin["sha256"], "identity")
-    for name, sha in pipewire["licenses"].items():
-        require(digest(content("pipewire", name)) == sha, "identity")
-    shipped = receipt.get("pipewire")
-    require(type(shipped) is dict and shipped.get("source_client_sha256") == client.get("source_client_sha256")
-            and shipped.get("build_id") == client.get("build_id") and shipped.get("needed") == client.get("needed"), "identity")
-    for kind, relative, source_hash, deployed_hash in (
-            ("project", "usr/bin/morpheus-app", receipt.get("native_executable_sha256"), None),
-            ("pipewire", "usr/lib/libpipewire-0.3.so.0", client.get("source_client_sha256"), shipped.get("sha256"))):
-        matches = [entry for entry in inventory["deployed"] if type(entry) is dict and entry.get("relative_path") == relative]
-        require(len(matches) == 1 and matches[0].get("kind") == kind
-                and type(source_hash) is str and HASH.fullmatch(source_hash)
-                and matches[0].get("source_sha256") == source_hash
-                and (deployed_hash is None or matches[0].get("deployed_sha256") == deployed_hash), "identity")
+    with source_phase("runtime_notice"):
+        require(unique_json(content("runtime", "SOURCE.json")) == runtime, "identity")
+        for component, pin in spec["archives"].items():
+            data = content("runtime", pin["filename"])
+            require(len(data) == pin["size"] and digest(data) == pin["sha256"], "identity")
+            for name, license_pin in pin["licenses"].items():
+                data = content("runtime", component + "-" + name)
+                require(len(data) == license_pin["bytes"] and digest(data) == license_pin["sha256"], "identity")
+        for group in ("patches", "regressions"):
+            for name, pin in spec[group].items():
+                data = content("runtime", name)
+                require(data == files.get("packaging/linux/runtime-patches/" + name)
+                        and len(data) == pin["size"] and digest(data) == pin["sha256"], "identity")
+        for name in ("runtime-build.json", "runtime-build-host.json", "appimage_runtime_build.py"):
+            require(content("runtime", name) == files.get("packaging/linux/" + name), "identity")
+        require(content("runtime", "RELINKING.txt") == literal_recipe_text(files,
+                    "packaging/linux/appimage_runtime_build.py", "RELINKING.txt"), "identity")
+    with source_phase("runtime_uapi"):
+        uapi_headers(content("runtime", "linux-uapi-headers.tar.gz"), spec, host)
+    with source_phase("runtime_relink"):
+        relink = bounded_single_gzip(content("runtime", "runtime-relink.o.gz"), MAX_RUNTIME)
+        require(relink[:7] == b"\x7fELF\x02\x01\x01" and len(relink) >= 64
+                and struct.unpack_from("<HH", relink, 16) == (1, 62)
+                and digest(relink) == runtime.get("runtime_object_sha256"), "identity")
+        del relink
+    with source_phase("pipewire_receipt"):
+        client = unique_json(content("pipewire", "SOURCE.json"))
+        require(type(client) is dict and set(client) == {"schema", "source_version", "upstream_commit", "upstream_patch_sha256",
+                    "patched_source_sha256", "source_archives", "source_client_sha256", "build_id", "needed", "objects",
+                    "tool_version_output_sha256", "configure", "config_sha256", "recipe_sha256"}
+                and type(client.get("schema")) is int and client["schema"] == 1
+                and client.get("source_version") == pipewire["VERSION"]
+                and client.get("upstream_commit") == pipewire["COMMIT"]
+                and client.get("upstream_patch_sha256") == pipewire["UPSTREAM_PATCH_SHA256"]
+                and client.get("patched_source_sha256") == pipewire["PATCHED_SOURCE_SHA256"]
+                and client.get("source_archives") == {key: pin["sha256"] for key, pin in pipewire["archives"].items()}
+                and client.get("configure") == list(pipewire["CONFIGURE"])
+                and "variant" not in client, "identity")
+    with source_phase("pipewire_objects"):
+        sources = source_assignment(files, "scripts/pipewire_startup_probe.py", "SOURCES")
+        require(type(sources) is tuple and type(client["objects"]) is dict
+                and set(client["objects"]) == {name + ".c.o" for name in sources}
+                and all(type(x) is str and HASH.fullmatch(x) for x in client["objects"].values()), "identity")
+        for field in ("source_client_sha256", "config_sha256", "recipe_sha256"):
+            require(type(client[field]) is str and HASH.fullmatch(client[field]), "identity")
+        require(type(client["build_id"]) is str and OID.fullmatch(client["build_id"])
+                and type(client["needed"]) is list and 0 < len(client["needed"]) <= 128
+                and all(type(value) is str and ATOM.fullmatch(value) for value in client["needed"])
+                and type(client["tool_version_output_sha256"]) is dict
+                and set(client["tool_version_output_sha256"]) == {"patch", "meson", "ninja", "cc", "pkg-config"}
+                and all(type(value) is str and HASH.fullmatch(value)
+                        for value in client["tool_version_output_sha256"].values()), "identity")
+    with source_phase("pipewire_notice"):
+        require(digest(content("pipewire", "exported-node-startup.patch")) == pipewire["UPSTREAM_PATCH_SHA256"], "identity")
+        for pin in pipewire["archives"].values():
+            data = content("pipewire", pin["filename"])
+            require(len(data) <= pin["maximum_bytes"] and digest(data) == pin["sha256"], "identity")
+        for name, sha in pipewire["licenses"].items():
+            require(digest(content("pipewire", name)) == sha, "identity")
+    with source_phase("pipewire_deployment"):
+        shipped = receipt.get("pipewire")
+        require(type(shipped) is dict and shipped.get("source_client_sha256") == client.get("source_client_sha256")
+                and shipped.get("build_id") == client.get("build_id") and shipped.get("needed") == client.get("needed"), "identity")
+        for kind, relative, source_hash, deployed_hash in (
+                ("project", "usr/bin/morpheus-app", receipt.get("native_executable_sha256"), None),
+                ("pipewire", "usr/lib/libpipewire-0.3.so.0", client.get("source_client_sha256"), shipped.get("sha256"))):
+            matches = [entry for entry in inventory["deployed"] if type(entry) is dict and entry.get("relative_path") == relative]
+            require(len(matches) == 1 and matches[0].get("kind") == kind
+                    and type(source_hash) is str and HASH.fullmatch(source_hash)
+                    and matches[0].get("source_sha256") == source_hash
+                    and (deployed_hash is None or matches[0].get("deployed_sha256") == deployed_hash), "identity")
     # The exact authenticated SDK pin and wrapper source are included by the
     # committed workspace. They do not identify full matching WebRTC source or
     # attest which prebuilt archive member the final native link consumed.
-    sdk_path = "vendor/webrtc-sys-build/src/pins.rs"
-    require(sdk_path in files and len(files[sdk_path]) <= 65536, "missing")
-    sdk = re.findall(rb'"linux-x64-release"\s*=>\s*\(\s*([0-9]+),\s*"([0-9a-f]{64})",\s*\)', files[sdk_path])
-    require(len(sdk) == 1, "manifest")
+    with source_phase("sdk_pin"):
+        sdk_path = "vendor/webrtc-sys-build/src/pins.rs"
+        require(sdk_path in files and len(files[sdk_path]) <= 65536, "missing")
+        sdk = re.findall(rb'"linux-x64-release"\s*=>\s*\(\s*([0-9]+),\s*"([0-9a-f]{64})",\s*\)', files[sdk_path])
+        require(len(sdk) == 1, "manifest")
     # Raw receipt JSON may contain command text and local build paths. Validate
     # it above but export only its digest/closed bindings, never its raw text.
     # Recipes/patches already in the complete workspace are referenced once.
@@ -1089,11 +1131,16 @@ def build(runner, root, repository, revision, git_tool, environment, plan_path):
     """Write the selected workspace/lock scope; keep partial native coverage explicit."""
     root, repository = Path(root), Path(repository)
     budget = Budget()
-    workspace, source, files = git_export(runner, repository, revision, git_tool, environment, budget)
-    packages = lock_packages(files)
-    local_catalog = package_catalog(files)
-    plan = input_plan(plan_path, packages)
-    native_files, native_coverage = native_material(plan, files, source["commit"], budget)
+    with source_phase("workspace_export"):
+        workspace, source, files = git_export(runner, repository, revision, git_tool, environment, budget)
+    with source_phase("lock_admission"):
+        packages = lock_packages(files)
+    with source_phase("catalog_admission"):
+        local_catalog = package_catalog(files)
+    with source_phase("plan_admission"):
+        plan = input_plan(plan_path, packages)
+    with source_phase("native_material"):
+        native_files, native_coverage = native_material(plan, files, source["commit"], budget)
     records, git_records = [], {}
     manifest = {"schema": 1, "source": source, "cargo_lock_sha256": digest(files["Cargo.lock"]),
                 "source_scope": ("complete-committed-workspace-all-Cargo.lock-and-receipt-bound-known-native-material"
@@ -1130,35 +1177,38 @@ def build(runner, root, repository, revision, git_tool, environment, plan_path):
                     del files, workspace, local_catalog
                     for git_source, mirror in sorted(plan["git_mirrors"].items()):
                         revision_pin = git_source.rsplit("#", 1)[1]
-                        payload, identity, git_files = git_export(runner, mirror, revision_pin, git_tool, environment, budget)
+                        with source_phase("dependency_export"):
+                            payload, identity, git_files = git_export(runner, mirror, revision_pin, git_tool, environment, budget)
                         name = "git/" + digest(git_source.encode()) + "-" + revision_pin + ".tar.gz"
                         tar_add(archive, name, payload)
-                        catalog = package_catalog(git_files)
-                        git_records[git_source] = {"archive": name, **identity}
-                        for package in packages:
-                            if package.get("source") == git_source:
-                                key = (package["name"], package["version"])
-                                require(key in catalog, "missing")
-                                records.append({"name": key[0], "version": key[1], "source": git_source,
-                                                "source_archive": name, **catalog[key]})
+                        with source_phase("dependency_catalog"):
+                            catalog = package_catalog(git_files)
+                            git_records[git_source] = {"archive": name, **identity}
+                            for package in packages:
+                                if package.get("source") == git_source:
+                                    key = (package["name"], package["version"])
+                                    require(key in catalog, "missing")
+                                    records.append({"name": key[0], "version": key[1], "source": git_source,
+                                                    "source_archive": name, **catalog[key]})
                         del payload, git_files, catalog
-                    cache = Path(plan["registry_cache"])
-                    require(cache.is_absolute() and cache.resolve(strict=True) == cache, "path")
-                    for package in packages:
-                        if package.get("source") != REGISTRY:
-                            continue
-                        filename = package["name"] + "-" + package["version"] + ".crate"
-                        payload = read_owned(cache / filename, MAX_ARCHIVE)
-                        crate_files = registry_contents(payload, package, budget)
-                        catalog = package_catalog(crate_files, published=True)
-                        key = (package["name"], package["version"])
-                        require(key in catalog and catalog[key]["manifest"] == "Cargo.toml", "identity")
-                        name = "registry/" + filename
-                        tar_add(archive, name, payload)
-                        records.append({"name": key[0], "version": key[1], "source": REGISTRY,
-                                        "source_archive": name, "archive_sha256": package["checksum"],
-                                        "archive_bytes": len(payload), **catalog[key]})
-                        del payload, crate_files, catalog
+                    with source_phase("registry_material"):
+                        cache = Path(plan["registry_cache"])
+                        require(cache.is_absolute() and cache.resolve(strict=True) == cache, "path")
+                        for package in packages:
+                            if package.get("source") != REGISTRY:
+                                continue
+                            filename = package["name"] + "-" + package["version"] + ".crate"
+                            payload = read_owned(cache / filename, MAX_ARCHIVE)
+                            crate_files = registry_contents(payload, package, budget)
+                            catalog = package_catalog(crate_files, published=True)
+                            key = (package["name"], package["version"])
+                            require(key in catalog and catalog[key]["manifest"] == "Cargo.toml", "identity")
+                            name = "registry/" + filename
+                            tar_add(archive, name, payload)
+                            records.append({"name": key[0], "version": key[1], "source": REGISTRY,
+                                            "source_archive": name, "archive_sha256": package["checksum"],
+                                            "archive_bytes": len(payload), **catalog[key]})
+                            del payload, crate_files, catalog
                     require(len(records) == len(packages), "missing")
                     manifest["cargo_packages"] = sorted(records, key=lambda x: (x["name"], x["version"], x["source"]))
                     manifest["bounds_observed"] = vars(budget)

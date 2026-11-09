@@ -140,36 +140,38 @@ def vendored_rtc_sources(files, packages, catalog):
 
 
 def source_inputs(files):
-    packages = S.lock_packages(files)
-    sources = lock_git_sources(packages)
-    catalog = S.package_catalog(files)
-    if RTC_SOURCE not in sources:
-        vendored_rtc_sources(files, packages, catalog)
-    # Keep all three exact manifest origins: local RTC patches still declare
-    # their authenticated upstream tag; only fetched mirrors follow the lock.
-    documents = {"Cargo.toml"} | {record["manifest"] for record in catalog.values()}
-    expected = set()
-    for source in PINS:
-        url, query = source[4:].split("?", 1)
-        kind, value = query.split("#", 1)[0].split("=", 1)
-        expected.add((url, kind, value))
-    def inspect(value):
-        if type(value) is dict:
-            if "git" in value:
-                kinds = [key for key in ("rev", "tag", "branch") if key in value]
-                S.require(len(kinds) == 1 and (value["git"], kinds[0], value[kinds[0]]) in expected, "lock")
-            S.require("registry" not in value or value["registry"] == "crates-io", "lock")
-            S.require("registry-index" not in value, "lock")
-            for child in value.values():
-                inspect(child)
-        elif type(value) is list:
-            for child in value:
-                inspect(child)
-    for name in documents:
-        document = S.toml_file(files, name)
-        S.require(not document.get("replace"), "lock")
-        S.require(set(document.get("patch", {})) <= {"crates-io", *(item[0] for item in expected)}, "lock")
-        inspect(document)
+    with S.source_phase("lock_admission"):
+        packages = S.lock_packages(files)
+        sources = lock_git_sources(packages)
+    with S.source_phase("catalog_admission"):
+        catalog = S.package_catalog(files)
+        if RTC_SOURCE not in sources:
+            vendored_rtc_sources(files, packages, catalog)
+        # Keep all three exact manifest origins: local RTC patches still declare
+        # their authenticated upstream tag; only fetched mirrors follow the lock.
+        documents = {"Cargo.toml"} | {record["manifest"] for record in catalog.values()}
+        expected = set()
+        for source in PINS:
+            url, query = source[4:].split("?", 1)
+            kind, value = query.split("#", 1)[0].split("=", 1)
+            expected.add((url, kind, value))
+        def inspect(value):
+            if type(value) is dict:
+                if "git" in value:
+                    kinds = [key for key in ("rev", "tag", "branch") if key in value]
+                    S.require(len(kinds) == 1 and (value["git"], kinds[0], value[kinds[0]]) in expected, "lock")
+                S.require("registry" not in value or value["registry"] == "crates-io", "lock")
+                S.require("registry-index" not in value, "lock")
+                for child in value.values():
+                    inspect(child)
+            elif type(value) is list:
+                for child in value:
+                    inspect(child)
+        for name in documents:
+            document = S.toml_file(files, name)
+            S.require(not document.get("replace"), "lock")
+            S.require(set(document.get("patch", {})) <= {"crates-io", *(item[0] for item in expected)}, "lock")
+            inspect(document)
     return packages
 
 
@@ -260,21 +262,24 @@ def acquire_inputs(root, cargo, rustc, environment, *, progress=None):
         version = runner.run(label, [tool, "--version"], cwd=root / "fetch", env=environment,
                              timeout=30, output_limit=256, stderr_limit=65536)
         S.require(version.startswith(prefix) and version.endswith(b"\n") and version.count(b"\n") == 1, "identity")
-    _, source, files = S.git_export(runner, ROOT, P.expected_revision(environment),
-                                    P.owned_tool("/usr/bin/git", root_owned=True), environment, S.Budget())
+    with S.source_phase("workspace_acquisition"):
+        _, source, files = S.git_export(runner, ROOT, P.expected_revision(environment),
+                                        P.owned_tool("/usr/bin/git", root_owned=True), environment, S.Budget())
     packages = source_inputs(files)
     # Cargo discovers configuration from cwd's ancestors and the new Cargo
     # home, not the separate --manifest-path. Reject ambient ancestor config.
-    for directory in (root / "fetch", root, *root.parents):
-        S.require(not any((directory / ".cargo" / name).exists() for name in ("config", "config.toml")), "input")
+    with S.source_phase("plan_admission"):
+        for directory in (root / "fetch", root, *root.parents):
+            S.require(not any((directory / ".cargo" / name).exists() for name in ("config", "config.toml")), "input")
     runner.run("source-cargo-fetch", [cargo, "--config", "net.git-fetch-with-cli=false",
                "--config", "net.retry=0", "--config", "registry.global-credential-providers=[]",
                "fetch", "--locked", "--manifest-path", str(ROOT / "Cargo.toml")],
                cwd=root / "fetch", env=environment, timeout=1200,
                output_limit=8 * 1024 * 1024, stderr_limit=8 * 1024 * 1024)
     P.verify_checkout(ROOT, P.expected_revision(environment))
-    check_cache_bounds(root / "cargo")
-    plan = input_plan(root / "cargo", packages, runner, environment)
+    with S.source_phase("plan_admission"):
+        check_cache_bounds(root / "cargo")
+        plan = input_plan(root / "cargo", packages, runner, environment)
     P.client.write_new(root / "plan.json", json.dumps(plan, sort_keys=True).encode() + b"\n")
     P.client.write_new(root / "prepared.json", json.dumps({
         "schema": 1, "source_revision": source["commit"], "source_tree": source["tree"],

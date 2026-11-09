@@ -18,6 +18,51 @@ import package_appimage as P
 
 
 class ProgressTests(unittest.TestCase):
+    def test_source_failure_phase_is_exact_owned_closed_latched_and_scan_gated(self):
+        import corresponding_source as source
+        for phase in source.SOURCE_PHASES:
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); progress = D.Progress(root)
+                progress.wrapper("source"); progress.command("source-objects")
+                failure = source.SourceFailure("identity")
+                with self.assertRaises(source.SourceFailure):
+                    with source.source_phase(phase):
+                        raise failure
+                progress.failed(failure)
+                first = dict(progress.value["failure"])
+                self.assertEqual(first["source_phase"], phase)
+                self.assertEqual(first["reason"], "source_identity")
+                progress.failed(source.SourceFailure("missing"))
+                self.assertEqual(progress.value["failure"], first)
+                self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                                 {"diagnostics": "withheld", "passed": False})
+                visible = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                self.assertEqual(visible["failure"], first)
+                self.assertFalse(visible["passed"])
+                self.assertNotIn("private", json.dumps(visible))
+
+    def test_source_phase_rejects_foreign_properties_unknown_values_and_other_failure_kinds(self):
+        import corresponding_source as source
+        class ForeignFailure(source.SourceFailure):
+            @property
+            def source_phase(self):
+                raise AssertionError("foreign property must not be read")
+        self.assertIsNone(D.source_phase(ForeignFailure.__new__(ForeignFailure)))
+        class ForeignString(str):
+            pass
+        failure = source.SourceFailure("identity")
+        for invalid in (None, [], "private path", ForeignString("native_receipt")):
+            failure.source_phase = invalid
+            self.assertIsNone(D.source_phase(failure))
+        with tempfile.TemporaryDirectory() as directory:
+            progress = D.Progress(Path(directory)); progress.failed(failure)
+            self.assertNotIn("source_phase", progress.value["failure"])
+            for phase, reason in (("private path", "source_identity"), ([], "source_identity"),
+                                  ("native_receipt", "command_exit")):
+                candidate = json.loads(json.dumps(progress.value))
+                candidate["failure"].update(source_phase=phase, reason=reason)
+                self.assertFalse(D.valid_record(candidate))
+
     def test_capture_wait_reasons_require_exact_loaded_owner_and_closed_values(self):
         import appimage_capture as capture
         expected = {"capture": "capture", "process_exit": "capture_process_exit",

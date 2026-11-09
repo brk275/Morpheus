@@ -56,6 +56,8 @@ BUILTIN_REASONS = {
     UnicodeDecodeError: "python_decode", KeyError: "python_key",
     TypeError: "python_type", ValueError: "python_value",
 }
+SOURCE_REASONS = frozenset(("source_input", "source_path", "source_bounds", "source_identity", "source_lock", "source_missing",
+                            "source_archive", "source_link", "source_submodule", "source_git", "source_manifest", "source_output"))
 REASONS = frozenset((*BUILTIN_REASONS.values(), "command_deadline", "command_output", "command_exit", "command_pipe", "command_cleanup", "command_input",
                      "command_http_forbidden", "command_http_not_found", "command_http_rate_limited", "command_http_unavailable",
                      "command_http_rejected", "command_download_transport", "command_download_tls",
@@ -67,8 +69,7 @@ REASONS = frozenset((*BUILTIN_REASONS.values(), "command_deadline", "command_out
                      "inventory_package", "inventory_notice", "inventory_deployment", "inventory_limit",
                      "inventory_elf_build_id", "inventory_elf_needed", "inventory_elf_soname",
                      "inventory_elf_search", "inventory_search",
-                     "source_input", "source_path", "source_bounds", "source_identity", "source_lock", "source_missing",
-                     "source_archive", "source_link", "source_submodule", "source_git", "source_manifest", "source_output"))
+                     *SOURCE_REASONS))
 CLEANUP = frozenset(("not_started", "passed", "failed"))
 POSITIONS = ("wrapper_phase", "command_stage", "capture_mode", "capture_phase")
 FIELDS = frozenset((*POSITIONS, "schema", "peer_facts", "failure", "inner_cleanup"))
@@ -118,6 +119,15 @@ def reason(error):
             "PackageFailure": "package", "InventoryFailure": "inventory"}.get(type(error).__name__, "unknown")
 
 
+def source_phase(error):
+    from corresponding_source import SOURCE_PHASES, SourceFailure
+    if type(error) is SourceFailure:
+        value = error.source_phase
+        if type(value) is str and value in SOURCE_PHASES:
+            return value
+    return None
+
+
 SHARE_CONTROL_FIELDS = frozenset(("observation", "state", "enabled", "checked"))
 SHARE_CONTROL_STATES = frozenset(("share", "cancel", "stop", "missing", "ambiguous", "unreadable"))
 
@@ -146,11 +156,16 @@ def valid_record(value):
     if failure is None:
         return True
     if (type(failure) is not dict or set(failure) not in
-            ({*POSITIONS, "reason"}, {*POSITIONS, "reason", "share_control"})
+            ({*POSITIONS, "reason"}, {*POSITIONS, "reason", "share_control"},
+             {*POSITIONS, "reason", "source_phase"})
             or failure["wrapper_phase"] not in WRAPPER or failure["command_stage"] not in COMMANDS
             or failure["capture_mode"] not in MODES or failure["capture_phase"] not in PHASES
             or failure["reason"] not in REASONS):
         return False
+    if "source_phase" in failure:
+        from corresponding_source import SOURCE_PHASES
+        return (type(failure["source_phase"]) is str and failure["source_phase"] in SOURCE_PHASES
+                and type(failure["reason"]) is str and failure["reason"] in SOURCE_REASONS)
     if "share_control" not in failure:
         return True
     return (failure["wrapper_phase"] == "capture" and failure["command_stage"] == "capture-yellow"
@@ -210,6 +225,9 @@ class Progress:
         self.peer(control)
         if self.value["failure"] is None:
             failure = {**{key: self.value[key] for key in POSITIONS}, "reason": reason(error)}
+            phase = source_phase(error)
+            if phase is not None:
+                failure["source_phase"] = phase
             if share_control is not None:
                 failure["share_control"] = share_control
                 if not valid_record({**self.value, "failure": failure}):

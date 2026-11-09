@@ -1,5 +1,6 @@
 """Bounded source/archive checks with mocked Git; no child, hooks or downloads."""
 
+import contextlib
 import gzip
 import io
 import json
@@ -155,6 +156,104 @@ def native_fixture(root):
 
 
 class SourceTests(unittest.TestCase):
+    def test_source_phase_keeps_exact_first_failure_and_ignores_foreign_properties(self):
+        original = S.SourceFailure("identity")
+        original_args = original.args
+        with self.assertRaises(S.SourceFailure) as caught:
+            with S.source_phase("native_material"):
+                with S.source_phase("runtime_prefix"):
+                    raise original
+        self.assertIs(caught.exception, original)
+        self.assertEqual((original.reason, original.args, original.source_phase),
+                         ("identity", original_args, "runtime_prefix"))
+        class ForeignFailure(S.SourceFailure):
+            @property
+            def source_phase(self):
+                raise AssertionError("foreign property must not be read")
+        foreign = ForeignFailure.__new__(ForeignFailure)
+        with self.assertRaises(ForeignFailure) as caught:
+            with S.source_phase("workspace_export"):
+                raise foreign
+        self.assertIs(caught.exception, foreign)
+        for invalid in (None, [], "private source path"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                with S.source_phase(invalid):
+                    self.fail("invalid phase must fail before the body")
+
+    def test_source_build_admission_failures_stop_before_output_and_later_steps(self):
+        operations = ("git_export", "lock_packages", "package_catalog", "input_plan", "native_material")
+        phases = ("workspace_export", "lock_admission", "catalog_admission", "plan_admission", "native_material")
+        values = ((b"workspace", {"commit": "8" * 40}, {"Cargo.lock": b"lock"}),
+                  [], {}, {}, ({}, {}))
+        for failed_index, phase in enumerate(phases):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                original, observed = S.SourceFailure("identity"), []
+                with contextlib.ExitStack() as stack:
+                    for index, operation in enumerate(operations):
+                        def invoke(*args, index=index, operation=operation, **kwargs):
+                            observed.append(operation)
+                            if index == failed_index:
+                                raise original
+                            return values[index]
+                        stack.enter_context(mock.patch.object(S, operation, side_effect=invoke))
+                    with self.assertRaises(S.SourceFailure) as caught:
+                        S.build(None, Path(directory), Path(directory), "8" * 40, "/usr/bin/git", {}, "/unused")
+                self.assertIs(caught.exception, original)
+                self.assertEqual((original.reason, original.source_phase), ("identity", phase))
+                self.assertEqual(observed, list(operations[:failed_index + 1]))
+                self.assertFalse((Path(directory) / S.BUNDLE_NAME).exists())
+
+    def test_dependency_and_registry_failures_keep_phase_and_remove_partial_bundle(self):
+        git_source = "git+https://github.com/fixture/source?rev=pin#" + "a" * 40
+        for phase in ("dependency_export", "dependency_catalog", "registry_material"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                cache = root / "cache"; cache.mkdir()
+                original = S.SourceFailure("identity")
+                source = S.REGISTRY if phase == "registry_material" else git_source
+                packages = [{"name": "fixture", "version": "1.0.0", "source": source}]
+                plan = {"registry_cache": str(cache),
+                        "git_mirrors": {} if source == S.REGISTRY else {git_source: "/mirror"}}
+                exports = [(b"workspace", {"commit": "8" * 40}, {"Cargo.lock": b"lock"}),
+                           original if phase == "dependency_export" else (b"dependency", {}, {})]
+                catalogs = [{}, original if phase == "dependency_catalog" else {}]
+                with mock.patch.object(S, "git_export", side_effect=exports), \
+                        mock.patch.object(S, "lock_packages", return_value=packages), \
+                        mock.patch.object(S, "package_catalog", side_effect=catalogs), \
+                        mock.patch.object(S, "input_plan", return_value=plan), \
+                        mock.patch.object(S, "native_material", return_value=({}, {})), \
+                        mock.patch.object(S, "read_owned", side_effect=original), \
+                        mock.patch.object(S, "registry_contents") as registry:
+                    with self.assertRaises(S.SourceFailure) as caught:
+                        S.build(None, root, root, "8" * 40, "/usr/bin/git", {}, "/unused")
+                self.assertIs(caught.exception, original)
+                self.assertEqual((original.reason, original.source_phase), ("identity", phase))
+                self.assertFalse((root / S.BUNDLE_NAME).exists())
+                registry.assert_not_called()
+
+    def test_native_source_groups_keep_identity_guards_and_specific_phase(self):
+        for phase in ("native_recipe", "native_receipt", "runtime_prefix", "notice_material"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP", str(ROOT))) as directory:
+                root = Path(directory)
+                plan, files, receipt, _, _ = native_fixture(root)
+                if phase == "native_recipe":
+                    files["packaging/linux/runtime-build.json"] += b" "
+                elif phase == "native_receipt":
+                    receipt["source_revision"] = "9" * 40
+                    (root / "build-receipt.json").write_text(json.dumps(receipt))
+                elif phase == "runtime_prefix":
+                    receipt["embedded_runtime"]["runtime_sha256"] = "0" * 64
+                    (root / "build-receipt.json").write_text(json.dumps(receipt))
+                else:
+                    (root / "runtime/musl.tar.gz").write_bytes(b"tampered source")
+                with self.assertRaises(S.SourceFailure) as caught:
+                    S.native_material(plan, files, "8" * 40, S.Budget())
+                self.assertEqual((caught.exception.reason, caught.exception.source_phase), ("identity", phase))
+        for error, reason in ((FileNotFoundError("private path"), "missing"), (KeyError("private key"), "identity")):
+            with mock.patch.object(S, "_native_material", side_effect=error), self.assertRaises(S.SourceFailure) as caught:
+                S.native_material({}, {}, "8" * 40, S.Budget())
+            self.assertEqual((caught.exception.reason, caught.exception.source_phase), (reason, "native_material"))
+
     def test_native_assembly_is_bound_to_the_actual_package_and_stays_partial(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP", str(ROOT))) as directory:
             root = Path(directory)
