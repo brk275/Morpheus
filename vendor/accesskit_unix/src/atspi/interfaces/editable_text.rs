@@ -110,7 +110,8 @@ mod tests {
         let interface = EditableTextInterface::new(
             adapter.platform_node(adapter.root_id().with_same_tree(NodeId(1))),
         );
-        assert!(interface.set_text_contents("Synthetic replacement").unwrap());
+        let replacement = "Synthetic replacement";
+        assert!(interface.set_text_contents(replacement).unwrap());
         assert_eq!(requests.lock().unwrap().len(), 1);
         let copy: fdo::Result<()> = interface.copy_text(0, 1);
         assert!(matches!(copy, Err(fdo::Error::NotSupported(_))));
@@ -124,7 +125,7 @@ mod tests {
         }
         assert_eq!(requests.lock().unwrap().len(), 1);
         drop(adapter);
-        assert!(interface.set_text_contents("Synthetic replacement").is_err());
+        assert!(interface.set_text_contents(replacement).is_err());
         assert_eq!(requests.lock().unwrap().len(), 1);
     }
 }

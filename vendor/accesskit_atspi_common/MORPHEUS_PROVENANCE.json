@@ -127,7 +127,7 @@
       "upstream_url": "https://github.com/AccessKit/accesskit/blob/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE.chromium"
     }
   ],
-  "reviewed_patch_sha256": "ac23dcb36c29b7b119af6b0be9701ef053b744dcdac10dedf8fd1047a3d5444e",
+  "reviewed_patch_sha256": "e62b55b06b5179f65a365e9c579b447ff0b305dd463a271db76867d4683b6e11",
   "modifications": [
     "src/adapter.rs",
     "src/node.rs"

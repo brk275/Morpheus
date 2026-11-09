@@ -897,11 +897,13 @@ mod tests {
         for role in [Role::TextInput, Role::PasswordInput] {
             let (adapter, requests, _) = editable_adapter(editable_input(role));
             let node = adapter.platform_node(adapter.root_id().with_same_tree(LocalNodeId(1)));
-            assert!(node
-                .interfaces()
-                .unwrap()
-                .contains(atspi_common::Interface::EditableText));
-            node.set_text_contents("Synthetic \u{e9} \u{1f642}").unwrap();
+            assert!(
+                node.interfaces()
+                    .unwrap()
+                    .contains(atspi_common::Interface::EditableText)
+            );
+            node.set_text_contents("Synthetic \u{e9} \u{1f642}")
+                .unwrap();
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].action, accesskit::Action::SetValue);
@@ -918,10 +920,11 @@ mod tests {
     fn editable_text_rechecks_live_capability_visibility_and_enabled_state() {
         let (mut adapter, requests, interfaces) = editable_adapter(editable_input(Role::TextInput));
         let node = adapter.platform_node(adapter.root_id().with_same_tree(LocalNodeId(1)));
-        assert!(node
-            .interfaces()
-            .unwrap()
-            .contains(atspi_common::Interface::EditableText));
+        assert!(
+            node.interfaces()
+                .unwrap()
+                .contains(atspi_common::Interface::EditableText)
+        );
         for state in 0..6 {
             let mut input = editable_input(Role::TextInput);
             match state {
@@ -939,10 +942,12 @@ mod tests {
                 _ => input = editable_input(Role::SpinButton),
             }
             adapter.update(update(vec![(LocalNodeId(1), input)]));
-            assert!(!node
-                .interfaces()
-                .unwrap()
-                .contains(atspi_common::Interface::EditableText));
+            assert!(
+                !node
+                    .interfaces()
+                    .unwrap()
+                    .contains(atspi_common::Interface::EditableText)
+            );
             assert!(matches!(
                 node.set_text_contents("Synthetic"),
                 Err(crate::Error::UnsupportedInterface)
@@ -956,9 +961,11 @@ mod tests {
             LocalNodeId(1),
             editable_input(Role::TextInput),
         )]));
-        assert!(interfaces.lock().unwrap().iter().any(|(added, set)| {
-            *added && set.contains(atspi_common::Interface::EditableText)
-        }));
+        assert!(
+            interfaces.lock().unwrap().iter().any(|(added, set)| {
+                *added && set.contains(atspi_common::Interface::EditableText)
+            })
+        );
         for hidden in [false, true] {
             let mut parent = with_children(Role::Window, &[LocalNodeId(1)]);
             if hidden {

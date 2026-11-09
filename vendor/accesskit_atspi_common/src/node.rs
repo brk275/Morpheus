@@ -465,8 +465,7 @@ impl NodeWrapper<'_> {
                 | Role::EmailInput
                 | Role::PhoneNumberInput
                 | Role::UrlInput
-        )
-            || node.is_read_only_or_disabled()
+        ) || node.is_read_only_or_disabled()
             || !node.data().supports_action(Action::SetValue)
             || filter(node) != FilterResult::Include
         {
