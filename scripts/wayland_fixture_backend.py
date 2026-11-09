@@ -98,6 +98,38 @@ def add_producer_diagnostics(source: Path) -> None:
     text = text.replace(PRODUCER_QUEUE, PRODUCER_DIAGNOSTIC_QUEUE, 1)
     source.write_text(text, encoding="utf-8")
 
+# CI-only fresh-cast initial snapshot; not an upstream backport.
+INITIAL_HEADER_SHA256 = '11dcf2c033c22b4e83db900ac310004bee204ce215a43f16161e3dd3b6451ec3'
+INITIAL_COPY_SHA256 = '788d334c6a7c315a741ef8caaafffe61ad80f0f1d7a78eaed96d993d9328c644'
+INITIAL_PRODUCER_SHA256 = '9c3d1ef9d2b6a8ec46b0dc4a95f994905c759a194af4849214b501c2f92f7e36'
+INITIAL_HEADER_ANCHOR = '\tbool initialized;'
+INITIAL_COPY_ANCHOR = '\tzwlr_screencopy_frame_v1_copy_with_damage(frame, cast->current_frame.xdpw_buffer->buffer);'
+INITIAL_QUEUE_ANCHOR = '\tconst int queue_result = pw_stream_queue_buffer(cast->stream, pw_buf);'
+INITIAL_HEADER_REPLACEMENT = '\tbool initialized;\n\tbool morpheus_initial_frame_queued;'
+INITIAL_COPY_REPLACEMENT = '\tif (cast->morpheus_initial_frame_queued) {\n\t\tzwlr_screencopy_frame_v1_copy_with_damage(frame, cast->current_frame.xdpw_buffer->buffer);\n\t} else {\n\t\tzwlr_screencopy_frame_v1_copy(frame, cast->current_frame.xdpw_buffer->buffer);\n\t}'
+INITIAL_QUEUE_REPLACEMENT = '\tconst int queue_result = pw_stream_queue_buffer(cast->stream, pw_buf);\n\tif (!buffer_corrupt && queue_result >= 0) {\n\t\tcast->morpheus_initial_frame_queued = true;\n\t}'
+
+
+def adapt_initial_frame(header: Path, capture: Path, producer: Path) -> None:
+    """Request real pixels until the first valid producer queue is accepted."""
+    inputs = (
+        (header, INITIAL_HEADER_SHA256, INITIAL_HEADER_ANCHOR, INITIAL_HEADER_REPLACEMENT),
+        (capture, INITIAL_COPY_SHA256, INITIAL_COPY_ANCHOR, INITIAL_COPY_REPLACEMENT),
+        (producer, INITIAL_PRODUCER_SHA256, INITIAL_QUEUE_ANCHOR, INITIAL_QUEUE_REPLACEMENT),
+    )
+    changes = []
+    for path, expected, anchor, replacement in inputs:
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise RuntimeError("Wayland fixture initial-frame source checksum mismatch")
+        text = data.decode("utf-8")
+        if text.count(anchor) != 1:
+            raise RuntimeError("Wayland fixture initial-frame anchor did not match exactly")
+        changes.append((path, text.replace(anchor, replacement, 1)))
+    # Check all three identities and anchors before changing any source file.
+    for path, text in changes:
+        path.write_text(text, encoding="utf-8")
+
 
 def extract_verified_archive(data: bytes, destination: Path) -> None:
     if len(data) > ARCHIVE_LIMIT or hashlib.sha256(data).hexdigest() != ARCHIVE_SHA256:
@@ -151,6 +183,9 @@ def prepare_backend(root: Path, run_command) -> Path:
     extract_verified_archive(data, source)
     adapt_shm_check(source / "src" / "screencast" / "screencast.c")
     add_producer_diagnostics(source / "src" / "screencast" / "pipewire_screencast.c")
+    adapt_initial_frame(source / "include" / "screencast_common.h",
+                        source / "src" / "screencast" / "wlr_screencast.c",
+                        source / "src" / "screencast" / "pipewire_screencast.c")
     build = root / "backend-build"
     run_command("backend-configure", [
         "meson", "setup", str(build), str(source), "--buildtype=release",

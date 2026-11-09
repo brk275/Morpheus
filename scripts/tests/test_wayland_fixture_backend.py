@@ -126,3 +126,56 @@ class WaylandBackendTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, expected):
                         MODULE.add_producer_diagnostics(source)
                 self.assertEqual(source.read_text(), content)
+
+    def test_initial_frame_adaptation_binds_all_sources_and_one_valid_queue_handoff(self):
+        originals = ("before\n" + MODULE.INITIAL_HEADER_ANCHOR + "\nafter\n",
+                     "before\n" + MODULE.INITIAL_COPY_ANCHOR + "\nafter\n",
+                     "before\n" + MODULE.INITIAL_QUEUE_ANCHOR + "\nafter\n")
+        anchors = (MODULE.INITIAL_HEADER_ANCHOR, MODULE.INITIAL_COPY_ANCHOR,
+                   MODULE.INITIAL_QUEUE_ANCHOR)
+        replacements = (MODULE.INITIAL_HEADER_REPLACEMENT, MODULE.INITIAL_COPY_REPLACEMENT,
+                        MODULE.INITIAL_QUEUE_REPLACEMENT)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = tuple(Path(directory) / name for name in ("header.h", "copy.c", "producer.c"))
+            for path, text in zip(paths, originals):
+                path.write_text(text)
+            with mock.patch.multiple(MODULE, **dict(zip(
+                    ("INITIAL_HEADER_SHA256", "INITIAL_COPY_SHA256", "INITIAL_PRODUCER_SHA256"),
+                    (hashlib.sha256(text.encode()).hexdigest() for text in originals)))):
+                MODULE.adapt_initial_frame(*paths)
+            for path, original, anchor, replacement in zip(paths, originals, anchors, replacements):
+                self.assertEqual(path.read_text(), original.replace(anchor, replacement, 1))
+            copy = paths[1].read_text()
+            producer = paths[2].read_text()
+            self.assertEqual(copy.count("zwlr_screencopy_frame_v1_copy(frame,"), 1)
+            self.assertEqual(copy.count("zwlr_screencopy_frame_v1_copy_with_damage(frame,"), 1)
+            self.assertEqual(producer.count("pw_stream_queue_buffer(cast->stream, pw_buf)"), 1)
+            self.assertIn("if (!buffer_corrupt && queue_result >= 0)", producer)
+            self.assertLess(producer.index("const int queue_result"),
+                            producer.index("morpheus_initial_frame_queued = true"))
+            self.assertNotIn("seq", copy)
+            self.assertNotIn("seq", producer)
+            with self.assertRaisesRegex(RuntimeError, "source checksum mismatch"):
+                MODULE.adapt_initial_frame(*paths)
+
+    def test_initial_frame_adaptation_rejects_any_changed_or_duplicate_source_before_writes(self):
+        anchors = (MODULE.INITIAL_HEADER_ANCHOR, MODULE.INITIAL_COPY_ANCHOR,
+                   MODULE.INITIAL_QUEUE_ANCHOR)
+        names = ("INITIAL_HEADER_SHA256", "INITIAL_COPY_SHA256", "INITIAL_PRODUCER_SHA256")
+        for index in range(3):
+            for duplicate in (False, True):
+                originals = ["before\n" + anchor + "\nafter\n" for anchor in anchors]
+                if duplicate:
+                    originals[index] += anchors[index] + "\n"
+                with self.subTest(index=index, duplicate=duplicate), tempfile.TemporaryDirectory() as directory:
+                    paths = tuple(Path(directory) / name for name in ("header.h", "copy.c", "producer.c"))
+                    for path, text in zip(paths, originals):
+                        path.write_text(text)
+                    digests = [hashlib.sha256(text.encode()).hexdigest() for text in originals]
+                    if not duplicate:
+                        digests[index] = "0" * 64
+                    with mock.patch.multiple(MODULE, **dict(zip(names, digests))):
+                        with self.assertRaisesRegex(RuntimeError, "checksum mismatch|did not match exactly"):
+                            MODULE.adapt_initial_frame(*paths)
+                    for path, text in zip(paths, originals):
+                        self.assertEqual(path.read_text(), text)

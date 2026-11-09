@@ -42,6 +42,39 @@ by upstream's later removal of this check during
 not a verbatim upstream backport. Newer 0.8.0 also changes compositor/protocol
 requirements, so the fixture does not silently substitute that release.
 
+## Fresh-cast initial pixel handoff adaptation
+
+The pinned backend uses one screencopy manager across portal sessions. Its
+[`copy_with_damage` protocol](https://github.com/emersion/xdg-desktop-portal-wlr/blob/74428f2a8fa7f252e2a46fdf5b697536c66c8a1c/protocols/wlr-screencopy-unstable-v1.xml#L185-L204)
+waits for damage tracked since the prior copy from that manager. A newly
+allocated cast does not reset that history. Pinned `wlr_screencast.c` requests
+`copy_with_damage` even for its initial real frame, so reopening an unchanged
+source does not itself guarantee a fresh frame request that can complete.
+
+The fixture applies an additional local compatibility adaptation after the
+existing SHM and diagnostic changes. Exact complete SHA-256 identities and
+single-occurrence anchors for the header, copy code and already instrumented
+producer are checked before any of these three files is changed. Each fresh
+cast's zero-initialized flag requests ordinary `copy`, which captures real
+current pixels without waiting for new damage, until a non-corrupt frame is
+accepted by the existing `pw_stream_queue_buffer` call. Only that successful
+producer handoff sets the flag. Metadata-only negotiation, missing buffers,
+failed copies, corrupt/paused returns and rejected queue operations do not.
+Later copies retain the original `copy_with_damage` behavior. No queue call,
+pixels, damage event, compositor change, retry loop or timeout is added.
+
+This is a Morpheus fixture-owned portal adaptation, **not** an upstream
+backport or a shipping Morpheus capture fix. Inspected upstream master
+[`d5199cacef010a7f727ef0a5f7dd66e3c3196432`](https://github.com/emersion/xdg-desktop-portal-wlr/blob/d5199cacef010a7f727ef0a5f7dd66e3c3196432/src/screencast/wlr_screencopy.c#L162-L164)
+still uses `copy_with_damage`; its newer graph scheduling is not silently
+substituted. A successful producer queue is not proof of delivery to the app
+or receiving peer. The unchanged actual static-pixel, changed-pixel, stop,
+reopen, source-loss, identity and cleanup assertions remain authoritative.
+Run `42651527264` on source `056ab99` reached format, buffers and Streaming but
+reported `first_processing` on the second share. This is consistent with
+missing producer delivery; it does not establish that damage waiting was the
+actual cause. Runtime acceptance remains open until the adapted fixture runs.
+
 Meson configures and builds only inside the fixture's mode-0700 temporary
 directory. There is no `meson install`, system replacement, distributed backend
 binary, or change to Morpheus packaging. Downloads, source, compiler output,
