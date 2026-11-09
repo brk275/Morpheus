@@ -715,8 +715,9 @@ class MacUI:
         require_ui(all(node.id == index for index, node in enumerate(nodes)), "bridge_invalid")
         require_ui(bool(nodes) and nodes[0].parent == -1, "bridge_invalid")
         self.diagnostics.operation("node_owner")
-        require_ui(nodes[0].pid == self.pid and not nodes[0].error, "bridge_invalid")
-        self.diagnostics.value["ax_root_seen"] = True
+        require_ui(nodes[0].pid == self.pid, "bridge_invalid")
+        if not nodes[0].error:
+            self.diagnostics.value["ax_root_seen"] = True
         for node in nodes:
             self.diagnostics.operation("node_owner")
             if node.error or node.pid != self.pid:

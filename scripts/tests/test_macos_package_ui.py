@@ -936,13 +936,55 @@ class ProfileLifecycleTests(unittest.TestCase):
 
 
 class TraversalTests(unittest.TestCase):
-    def test_unowned_root_or_errored_root_is_not_a_tree(self):
-        for root in (node(0, pid=1, role="AXApplication", parent=-1), node(0, role="AXApplication", parent=-1, error=True)):
+    def test_unowned_root_is_fatal_even_when_its_attributes_are_unreadable(self):
+        for unreadable in (False, True):
+            root = node(0, pid=1, role="AXApplication", parent=-1, error=unreadable)
             instance, _, diagnostics = driver([{"ok": True, "nodes": [root], "bounded": False}])
-            with self.subTest(root=root), self.assertRaises(ui.DiagnosticFailure) as error:
+            with self.subTest(error=unreadable), self.assertRaises(ui.DiagnosticFailure) as error:
                 list(instance.nodes())
             self.assertEqual(error.exception.code, "bridge_invalid")
             self.assertFalse(diagnostics.value["ax_root_seen"])
+            self.assertEqual(diagnostics.value["incomplete_passes"], 0)
+
+    def test_owned_root_read_error_never_proves_a_matching_control(self):
+        for matching_child in (False, True):
+            root = node(0, role="AXApplication", parent=-1, error=True)
+            children = [node(1, "Homeserver URL", role="AXTextField")] if matching_child else []
+            instance, bridge, diagnostics = driver([
+                {"ok": True, "nodes": [root, *children], "bounded": False}])
+            with self.subTest(matching_child=matching_child), self.assertRaises(ui.IncompleteTraversal):
+                instance.find("Homeserver URL")
+            self.assertFalse(diagnostics.value["ax_root_seen"])
+            self.assertEqual(diagnostics.value["incomplete_passes"], 1)
+            self.assertEqual([command["op"] for command in bridge.commands], ["snapshot"])
+
+    def test_owned_root_read_error_retries_only_until_a_complete_snapshot(self):
+        root = node(0, role="AXApplication", parent=-1, error=True)
+        failed = {"ok": True, "nodes": [root], "bounded": False}
+        complete = snapshot(node(1, "Homeserver URL", role="AXTextField"))
+        instance, bridge, diagnostics = driver([failed, complete])
+        with patch.object(ui.time, "sleep"):
+            found = instance.wait("Homeserver URL")
+        self.assertEqual(found.id, 1)
+        self.assertTrue(diagnostics.value["ax_root_seen"])
+        self.assertEqual(diagnostics.value["incomplete_passes"], 1)
+        self.assertEqual([command["op"] for command in bridge.commands], ["snapshot", "snapshot"])
+
+    def test_owned_root_read_error_still_expires_without_any_action(self):
+        root = node(0, role="AXApplication", parent=-1, error=True)
+        failed = {"ok": True, "nodes": [root], "bounded": False}
+        clock = Clock(0)
+        with patch.object(ui.time, "monotonic", side_effect=clock):
+            instance, bridge, diagnostics = driver([failed])
+            def advance(_seconds):
+                clock.now = 1
+            with patch.object(ui.time, "sleep", side_effect=advance), \
+                    self.assertRaises(ui.DiagnosticFailure) as error:
+                instance.wait_for(lambda: instance.find("Homeserver URL"), seconds=1)
+        self.assertEqual(error.exception.code, "wait_timeout")
+        self.assertFalse(diagnostics.value["ax_root_seen"])
+        self.assertEqual(diagnostics.value["incomplete_passes"], 1)
+        self.assertEqual([command["op"] for command in bridge.commands], ["snapshot"])
 
     def test_unowned_node_is_skipped_and_marks_the_pass_incomplete(self):
         instance, _, diagnostics = driver([snapshot(node(1, "Homeserver URL", role="AXTextField"), node(2, "Other app", pid=5))])
