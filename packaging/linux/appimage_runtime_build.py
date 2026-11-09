@@ -210,7 +210,9 @@ def host_inputs(run, expected, *, uapi_paths=()):
         fail("tool")
     names = [pin["package"] for pin in packages]
     query = client.R.trusted_tool("dpkg-query")
-    output = run("tool-version", [query, "-W", "--showformat=${Package}\t${Version}\t${db:Status-Status}\n", *names], bound=16384)
+    # dpkg-query expands its own escapes. Keep the recorded argv free of raw
+    # controls without changing the exact tab/newline-delimited query output.
+    output = run("tool-version", [query, "-W", r"--showformat=${Package}\t${Version}\t${db:Status-Status}\n", *names], bound=16384)
     wanted = {pin["package"] + "\t" + pin["version"] + "\tinstalled" for pin in packages}
     lines = output.decode("ascii").splitlines()
     if len(lines) != len(wanted) or set(lines) != wanted:

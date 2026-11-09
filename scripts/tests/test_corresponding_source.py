@@ -156,6 +156,39 @@ def native_fixture(root):
 
 
 class SourceTests(unittest.TestCase):
+    def test_host_query_receipt_uses_literal_escapes_and_passes_strict_linked_source_checks(self):
+        import appimage_runtime_build as runtime
+        with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP", str(ROOT))) as directory:
+            _, _, receipt, spec, _ = native_fixture(Path(directory))
+            host = {"packages": [{"package": "compiler", "version": "fixed"}], "files": {}}
+            data = json.dumps(host, sort_keys=True).encode()
+            spec["host_manifest_sha256"] = S.digest(data)
+            commands = []
+            def run(stage, argv, *, bound):
+                commands.append({"stage": stage, "argv": list(argv), "cwd": "$BUILD",
+                                 "maximum_seconds": 120, "maximum_output": bound})
+                return b"compiler\tfixed\tinstalled\n"
+            with mock.patch.object(runtime.client, "read_regular", return_value=data), \
+                    mock.patch.object(runtime.client.R, "trusted_tool", return_value="/usr/bin/dpkg-query"):
+                inputs = runtime.host_inputs(run, S.digest(data))
+            self.assertEqual(inputs["packages"], host["packages"])
+            self.assertTrue(inputs["actual_bytes_match_pinned_packages"])
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(commands[0]["argv"], ["/usr/bin/dpkg-query", "-W",
+                r"--showformat=${Package}\t${Version}\t${db:Status-Status}\n", "compiler"])
+            recorded = receipt["source_built_runtime"]
+            recorded["host_inputs"], recorded["commands"] = inputs, commands
+            self.assertTrue(S.runtime_linked_sources(recorded, spec, host))
+            # The old producer's decoded LF and other raw controls remain
+            # rejected by the unchanged consumer, without receipt rewriting.
+            for unsafe in ("--showformat=${Package}\t${Version}\t${db:Status-Status}\n",
+                           "raw\rcontrol", "raw\0control"):
+                changed = json.loads(json.dumps(recorded))
+                changed["commands"][0]["argv"][2] = unsafe
+                with self.subTest(unsafe=repr(unsafe)), self.assertRaises(S.SourceFailure) as caught:
+                    S.runtime_linked_sources(changed, spec, host)
+                self.assertEqual(caught.exception.reason, "identity")
+
     def test_source_phase_keeps_exact_first_failure_and_ignores_foreign_properties(self):
         original = S.SourceFailure("identity")
         original_args = original.args
