@@ -17,6 +17,74 @@ class StartupDiagnosticTests(unittest.TestCase):
     def facts(self, raw, status=127):
         return M.startup_failure_diagnostics(io.BytesIO(raw), status)
 
+    def test_windows_origins_are_exact_static_codes_and_keep_known_fatal_categories(self):
+        import re
+        source = (Path(__file__).resolve().parents[2] /
+                  "crates/morpheus-app/src/main.rs").read_text()
+        block = source.split("impl StartupOrigin {", 1)[1].split(
+            "fn startup_error_origin<E>", 1)[0]
+        codes = {code.encode("ascii") for code in re.findall(
+            r'Self::[A-Za-z]+ => "([a-z_]+)"', block)}
+        self.assertEqual(codes, M.WINDOWS_STARTUP_ORIGINS)
+        with patch.object(M.sys, 'platform', 'win32'):
+            for code in codes:
+                with self.subTest(code=code):
+                    raw = (M.WINDOWS_STARTUP_ORIGIN_PREFIX + code +
+                           b'\r\nError: private renderer path/account body\r\n')
+                    self.assertEqual(self.facts(raw, 1), {
+                        'category': 'windows_startup_origin', 'exit_status': 1,
+                        'missing_library': None, 'origin': code.decode('ascii')})
+            raw = (M.WINDOWS_STARTUP_ORIGIN_PREFIX + b'updater_session\n' +
+                   M.WINDOWS_STARTUP_REASON_PREFIX + b'ledger_file\nError: UnsupportedPackage\n')
+            self.assertEqual(self.facts(raw, 1), {
+                'category': 'windows_update_unsupported_package', 'exit_status': 1,
+                'missing_library': None, 'origin': 'updater_session', 'reason': 'ledger_file'})
+            raw = M.WINDOWS_STARTUP_ORIGIN_PREFIX + b'window_create\nError: NotWritable\n'
+            self.assertEqual(self.facts(raw, 1)['category'], 'windows_update_not_writable')
+
+    def test_windows_origin_requires_one_known_marker_and_one_fatal_without_reflection(self):
+        origin = M.WINDOWS_STARTUP_ORIGIN_PREFIX + b'window_create\n'
+        fatal = b'Error: private path/account/renderer body\n'
+        cases = (origin, fatal, origin + origin + fatal, origin + fatal + fatal,
+                 origin + b'Error: NotWritable\n' + fatal,
+                 origin.replace(b'window_create', b'private_unknown') + fatal,
+                 origin.replace(b'window_create', b'window_create private_suffix') + fatal,
+                 origin.replace(b'ORIGIN ', b'ORIGIN') + fatal,
+                 origin + M.WINDOWS_STARTUP_REASON_PREFIX + b'ledger_file\n' + fatal,
+                 origin + fatal + b'MORPHEUS_WINDOWS_STARTUP_REJECTunknown\n')
+        with patch.object(M.sys, 'platform', 'win32'):
+            for raw in cases:
+                with self.subTest(raw=raw):
+                    result = self.facts(raw, 1)
+                    self.assertEqual(result, {'category': 'unclassified', 'exit_status': 1,
+                                              'missing_library': None})
+                    self.assertNotIn('private', json.dumps(result))
+            raw = origin + fatal + b'private nonfatal body\n'
+            self.assertEqual(self.facts(raw, 1)['origin'], 'window_create')
+            result = self.facts(origin + fatal + b'x' * M.STARTUP_LOG_BOUND, 1)
+            self.assertEqual(result['category'], 'private_log_exceeded_bound')
+            self.assertNotIn('origin', result)
+
+    def test_windows_origin_observation_preserves_the_failed_launch_and_stop(self):
+        process = Mock(pid=1234)
+        def spawn(*args, **kwargs):
+            kwargs['stdout'].write(M.WINDOWS_STARTUP_ORIGIN_PREFIX +
+                                   b'audio_attach\nError: Apartment\n')
+            kwargs['stdout'].flush()
+            return process
+        with patch.object(M.sys, 'platform', 'win32'), patch.object(M, 'require_nonreaping_wait'), \
+                patch.object(M.subprocess, 'Popen', side_effect=spawn), \
+                patch.object(M, 'process_status', return_value=1), \
+                patch.object(M, 'stop_process') as stop, patch('builtins.print') as output:
+            with self.assertRaisesRegex(RuntimeError, r'Installed app exited during startup \(status 1\)'):
+                M.launch_smoke(Path('synthetic-installed.exe'), 'win32')
+        stop.assert_called_once_with(process)
+        record = json.loads(output.call_args.args[0])
+        self.assertEqual(record['status'], 'failed')
+        self.assertEqual(record['diagnostic'], {'category': 'windows_startup_origin',
+                         'exit_status': 1, 'missing_library': None, 'origin': 'audio_attach'})
+        self.assertNotIn('Apartment', output.call_args.args[0])
+
     def test_only_literal_library_names_can_leave_the_private_log(self):
         for name in M.STARTUP_LIBRARY_NAMES:
             result = self.facts(missing(name.encode()))

@@ -1675,6 +1675,82 @@ fn continue_account_action(ui: &AppWindow, action: i32) {
     }
 }
 
+// Fixed support metadata only. Return the original error unchanged; never
+// format its body or replace it when private stderr is unavailable.
+#[derive(Clone, Copy)]
+enum StartupOrigin {
+    AcceptanceRequest,
+    UpdaterDispatch,
+    UpdaterSession,
+    UpdaterSessionLock,
+    WindowCreate,
+    WindowShow,
+    AudioAttach,
+    UpdaterAcknowledge,
+    ProfileRoot,
+    DataDirectory,
+    AccountWindowHide,
+    AccountErrorWindow,
+    AccountStoreBlocked,
+    ConfigStore,
+    RuntimeCreate,
+    RuntimeInstall,
+    RuntimeBorrow,
+    RuntimePublish,
+    WindowRun,
+    AudioRun,
+    CleanupFailure,
+    CleanupOutcome,
+    CleanupMissing,
+    RuntimeFinalize,
+}
+
+impl StartupOrigin {
+    fn code(self) -> &'static str {
+        match self {
+            Self::AcceptanceRequest => "acceptance_request",
+            Self::UpdaterDispatch => "updater_dispatch",
+            Self::UpdaterSession => "updater_session",
+            Self::UpdaterSessionLock => "updater_session_lock",
+            Self::WindowCreate => "window_create",
+            Self::WindowShow => "window_show",
+            Self::AudioAttach => "audio_attach",
+            Self::UpdaterAcknowledge => "updater_acknowledge",
+            Self::ProfileRoot => "profile_root",
+            Self::DataDirectory => "data_directory",
+            Self::AccountWindowHide => "account_window_hide",
+            Self::AccountErrorWindow => "account_error_window",
+            Self::AccountStoreBlocked => "account_store_blocked",
+            Self::ConfigStore => "config_store",
+            Self::RuntimeCreate => "runtime_create",
+            Self::RuntimeInstall => "runtime_install",
+            Self::RuntimeBorrow => "runtime_borrow",
+            Self::RuntimePublish => "runtime_publish",
+            Self::WindowRun => "window_run",
+            Self::AudioRun => "audio_run",
+            Self::CleanupFailure => "cleanup_failure",
+            Self::CleanupOutcome => "cleanup_outcome",
+            Self::CleanupMissing => "cleanup_missing",
+            Self::RuntimeFinalize => "runtime_finalize",
+        }
+    }
+}
+
+fn startup_error_origin<E>(origin: StartupOrigin, error: E) -> E {
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "MORPHEUS_WINDOWS_STARTUP_ORIGIN {}",
+            origin.code()
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = origin;
+    error
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(morpheus_windows_update_acceptance)]
     {
@@ -1704,7 +1780,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(morpheus_macos_update_acceptance)]
     return updater::run_macos_update_acceptance().map_err(Into::into);
     #[cfg(not(morpheus_macos_update_acceptance))]
-    updater::reject_macos_update_acceptance_request()?;
+    updater::reject_macos_update_acceptance_request()
+        .map_err(|error| startup_error_origin(StartupOrigin::AcceptanceRequest, error))?;
     #[cfg(not(morpheus_windows_update_acceptance))]
     if std::env::var_os("MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_PLAN").is_some()
         || std::env::var_os("MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_PLAN_SHA256").is_some()
@@ -1712,7 +1789,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .skip(1)
             .any(|arg| arg.to_string_lossy().starts_with("--morpheus-windows-qa-"))
     {
-        return Err("Private Windows update acceptance is not compiled into this build".into());
+        return Err(startup_error_origin(
+            StartupOrigin::AcceptanceRequest,
+            "Private Windows update acceptance is not compiled into this build".into(),
+        ));
     }
     // `config validate` and `config schema` run first: before the screenshot
     // preview, the updater, the startup session, the window, the account
@@ -1730,14 +1810,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if preview_capture::early_dispatch()? {
         return Ok(());
     }
-    if updater::early_dispatch()? {
+    if updater::early_dispatch()
+        .map_err(|error| startup_error_origin(StartupOrigin::UpdaterDispatch, error))?
+    {
         return Ok(());
     }
     // Declared first and dropped last, after runtimes/account workers stop.
-    let update_session = Arc::new(Mutex::new(updater::StartupSession::begin()?));
+    let update_session = Arc::new(Mutex::new(
+        updater::StartupSession::begin()
+            .map_err(|error| startup_error_origin(StartupOrigin::UpdaterSession, error))?,
+    ));
     if update_session
         .lock()
-        .map_err(|_| updater::UpdateError::RecoveryRequired)?
+        .map_err(|_| updater::UpdateError::RecoveryRequired)
+        .map_err(|error| startup_error_origin(StartupOrigin::UpdaterSessionLock, error))?
         .restarted
     {
         return Ok(());
@@ -1762,20 +1848,25 @@ fn run_application(
     morpheus_rtc::install_crypto_provider();
     #[cfg(target_os = "macos")]
     let macos_application = macos_termination::Application::install()?;
-    let ui = AppWindow::new()?;
+    let ui = AppWindow::new()
+        .map_err(|error| startup_error_origin(StartupOrigin::WindowCreate, error))?;
     timeline_model::register_thread_rows(&ui);
     ui.set_login_loading(true);
-    ui.show()?;
+    ui.show().map_err(|error| startup_error_origin(StartupOrigin::WindowShow, error))?;
     #[cfg(all(windows, feature = "native-calls"))]
-    let wasapi_ui = windows_audio::attach()?;
+    let wasapi_ui = windows_audio::attach()
+        .map_err(|error| startup_error_origin(StartupOrigin::AudioAttach, error))?;
     #[cfg(morpheus_timeline_acceptance)]
     acceptance.mark_window_shown();
     update_session
         .lock()
-        .map_err(|_| updater::UpdateError::RecoveryRequired)?
-        .acknowledge_before_store()?;
+        .map_err(|_| updater::UpdateError::RecoveryRequired)
+        .map_err(|error| startup_error_origin(StartupOrigin::UpdaterSessionLock, error))?
+        .acknowledge_before_store()
+        .map_err(|error| startup_error_origin(StartupOrigin::UpdaterAcknowledge, error))?;
     #[cfg(not(morpheus_timeline_acceptance))]
-    let qa_profile = qa_profile_root()?;
+    let qa_profile = qa_profile_root()
+        .map_err(|error| startup_error_origin(StartupOrigin::ProfileRoot, error))?;
     // The run's generated, isolated profile replaces the standard app paths.
     #[cfg(morpheus_timeline_acceptance)]
     let qa_profile = Some(acceptance.profile_root().to_path_buf());
@@ -1783,7 +1874,8 @@ fn run_application(
         root.join("data")
     } else {
         ProjectDirs::from("io.github", "brk275", "Morpheus")
-            .ok_or("No application data directory is available")?
+            .ok_or("No application data directory is available")
+            .map_err(|error| startup_error_origin(StartupOrigin::DataDirectory, error))?
             .data_dir()
             .to_path_buf()
     };
@@ -1793,9 +1885,14 @@ fn run_application(
         Err(error) => {
             // No account worker, sign-in callback or preview is initialized
             // on this path. Keep the saved-account protection fail-closed.
-            ui.hide()?;
-            startup_error::show(&error)?;
-            return Err("Saved-account startup was blocked".into());
+            ui.hide()
+                .map_err(|error| startup_error_origin(StartupOrigin::AccountWindowHide, error))?;
+            startup_error::show(&error)
+                .map_err(|error| startup_error_origin(StartupOrigin::AccountErrorWindow, error))?;
+            return Err(startup_error_origin(
+                StartupOrigin::AccountStoreBlocked,
+                "Saved-account startup was blocked".into(),
+            ));
         }
     };
     // A sliding run keeps the shipping automatic policy; a classic run forces
@@ -1808,19 +1905,24 @@ fn run_application(
     let store = if let Some(root) = &qa_profile {
         ConfigStore::at(root.join("config.toml"))
     } else {
-        ConfigStore::standard()?
+        ConfigStore::standard()
+            .map_err(|error| startup_error_origin(StartupOrigin::ConfigStore, error))?
     };
     let voice_spaces = Arc::new(VoiceSpaces::new(store.clone()));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
+        .build()
+        .map_err(|error| startup_error_origin(StartupOrigin::RuntimeCreate, error))?;
     #[cfg(not(target_os = "macos"))]
     let runtime_owner =
-        app_shutdown::RuntimeOwner::install(runtime).map_err(app_shutdown::ShutdownError)?;
+        app_shutdown::RuntimeOwner::install(runtime)
+            .map_err(app_shutdown::ShutdownError)
+            .map_err(|error| startup_error_origin(StartupOrigin::RuntimeInstall, error))?;
     #[cfg(not(target_os = "macos"))]
     let runtime = runtime_owner
         .borrow_runtime()
-        .map_err(app_shutdown::ShutdownError)?;
+        .map_err(app_shutdown::ShutdownError)
+        .map_err(|error| startup_error_origin(StartupOrigin::RuntimeBorrow, error))?;
     // Subscribed before the startup restore below can start a sync.
     #[cfg(morpheus_timeline_acceptance)]
     acceptance.observe_sync(&manager, runtime.handle());
@@ -2321,7 +2423,8 @@ fn run_application(
         );
         runtime_owner
             .publish(actual.clone())
-            .map_err(app_shutdown::ShutdownError)?;
+            .map_err(app_shutdown::ShutdownError)
+            .map_err(|error| startup_error_origin(StartupOrigin::RuntimePublish, error))?;
         actual
     };
 
@@ -4995,7 +5098,9 @@ fn run_application(
         let acceptance_failed = acceptance.finish().is_err();
         #[cfg(not(morpheus_timeline_acceptance))]
         let acceptance_failed = false;
-        let outcome = ran.map_err(app_shutdown::ShutdownError)?;
+        let outcome = ran
+            .map_err(app_shutdown::ShutdownError)
+            .map_err(|error| startup_error_origin(StartupOrigin::AudioRun, error))?;
         let completed = match outcome.cleanup {
             Some(Ok(report)) => Some(report),
             _ => None,
@@ -5010,22 +5115,35 @@ fn run_application(
         };
         // All independent cleanup/finalization attempts precede return, while
         // the real event-loop failure keeps its original first precedence.
-        outcome.ui?;
+        outcome.ui.map_err(|error| startup_error_origin(StartupOrigin::WindowRun, error))?;
         if let Some(failure) = outcome.failure {
-            return Err(Box::new(app_shutdown::ShutdownError(failure)));
+            return Err(startup_error_origin(
+                StartupOrigin::CleanupFailure,
+                Box::new(app_shutdown::ShutdownError(failure)) as Box<dyn std::error::Error>,
+            ));
         }
         match outcome.cleanup {
             Some(Ok(report)) => report
                 .outcome(acceptance_failed)
-                .map_err(app_shutdown::ShutdownError)?,
-            Some(Err(failure)) => return Err(Box::new(app_shutdown::ShutdownError(failure))),
+                .map_err(app_shutdown::ShutdownError)
+                .map_err(|error| startup_error_origin(StartupOrigin::CleanupOutcome, error))?,
+            Some(Err(failure)) => {
+                return Err(startup_error_origin(
+                    StartupOrigin::CleanupFailure,
+                    Box::new(app_shutdown::ShutdownError(failure)) as Box<dyn std::error::Error>,
+                ));
+            }
             None => {
-                return Err(Box::new(app_shutdown::ShutdownError(
-                    app_shutdown::Failure::Ownership,
-                )));
+                return Err(startup_error_origin(
+                    StartupOrigin::CleanupMissing,
+                    Box::new(app_shutdown::ShutdownError(app_shutdown::Failure::Ownership))
+                        as Box<dyn std::error::Error>,
+                ));
             }
         }
-        finalized.map_err(app_shutdown::ShutdownError)?;
+        finalized
+            .map_err(app_shutdown::ShutdownError)
+            .map_err(|error| startup_error_origin(StartupOrigin::RuntimeFinalize, error))?;
         Ok(())
     }
     #[cfg(all(not(target_os = "macos"), not(all(windows, feature = "native-calls"))))]
@@ -5049,7 +5167,7 @@ fn run_application(
             Some(report) if !report.retain => runtime_owner.finalize(&shutdown_resources, report),
             _ => Err(app_shutdown::Failure::Ownership),
         };
-        ui_result?;
+        ui_result.map_err(|error| startup_error_origin(StartupOrigin::WindowRun, error))?;
         if let Some(failure) = task_failure {
             return Err(Box::new(app_shutdown::ShutdownError(failure)));
         }
@@ -5067,6 +5185,15 @@ fn run_application(
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
+
+    #[test]
+    fn startup_origin_observer_returns_the_same_owned_error() {
+        let error = Box::new(String::from("private error body"));
+        let original = std::ptr::from_ref(error.as_ref());
+        let observed = startup_error_origin(StartupOrigin::WindowCreate, error);
+        assert_eq!(std::ptr::from_ref(observed.as_ref()), original);
+        assert_eq!(observed.as_str(), "private error body");
+    }
 
     #[test]
     fn shutdown_failures_report_only_closed_static_categories() {

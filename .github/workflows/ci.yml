@@ -242,8 +242,10 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
       - name: Check formatting
-        if: runner.os == 'Linux' && needs.scope.outputs.check_route != 'sdk-archive'
+        if: needs.scope.outputs.check_route != 'sdk-archive' && (runner.os == 'Linux' || (github.event_name == 'workflow_dispatch' && needs.scope.outputs.manual == 'true' && needs.scope.outputs.manual_platform != 'all'))
+        shell: bash
         run: |
+          set -euo pipefail
           cargo fmt --all -- --check
           cargo fmt --manifest-path vendor/cpal/Cargo.toml -- --check
           cargo fmt --manifest-path vendor/accesskit_atspi_common/Cargo.toml -- --check

@@ -585,10 +585,25 @@ class NativeRouteWorkflowTests(unittest.TestCase):
             self.assertNotIn(excluded, step)
         self.assertIn("SDK_ARCHIVE_OUTCOME: ${{ steps.sdk-archive-tests.outcome }}", source)
         self.assertIn('("sdk-archive-tests", "SDK_ARCHIVE_OUTCOME")', source)
-        self.assertIn("if: runner.os == 'Linux' && needs.scope.outputs.check_route != 'sdk-archive'", source)
+        formatting = source.split("      - name: Check formatting\n", 1)[1].split(
+            "      - name: Check SDK archive helper formatting\n", 1)[0]
+        self.assertIn("needs.scope.outputs.check_route != 'sdk-archive'", formatting)
 
     def test_manual_inputs_and_fixed_routes_keep_existing_security_and_commands(self):
         source=WORKFLOW.read_text(encoding="utf-8")
+        formatting = source.split("      - name: Check formatting\n", 1)[1].split(
+            "      - name: Check SDK archive helper formatting\n", 1)[0]
+        self.assertIn("        if: needs.scope.outputs.check_route != 'sdk-archive' && (runner.os == 'Linux' || (github.event_name == 'workflow_dispatch' && needs.scope.outputs.manual == 'true' && needs.scope.outputs.manual_platform != 'all'))\n", formatting)
+        self.assertIn("        shell: bash\n", formatting)
+        self.assertEqual(formatting.split("        run: |\n", 1)[1],
+                         "          set -euo pipefail\n"
+                         "          cargo fmt --all -- --check\n"
+                         "          cargo fmt --manifest-path vendor/cpal/Cargo.toml -- --check\n"
+                         "          cargo fmt --manifest-path vendor/accesskit_atspi_common/Cargo.toml -- --check\n"
+                         "          cargo fmt --manifest-path vendor/accesskit_unix/Cargo.toml -- --check\n")
+        self.assertNotIn("continue-on-error:", formatting)
+        self.assertLess(source.index("      - name: Check formatting\n"),
+                        source.index("      - name: Build desktop with native call and device adapters\n"))
         for value in ("options: [all, linux, windows, macos-arm, macos-intel]",
                       "cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}",
                       "github.actor == github.repository_owner", "github.triggering_actor == github.repository_owner",

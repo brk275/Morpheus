@@ -370,6 +370,37 @@ WINDOWS_STARTUP_REASONS = frozenset((
 ))
 
 
+# One static origin is authoritative only beside exactly one fatal result.
+# Never return the fatal body's unknown text, even when its origin is known.
+WINDOWS_STARTUP_ORIGIN_PREFIX = b"MORPHEUS_WINDOWS_STARTUP_ORIGIN "
+WINDOWS_STARTUP_ORIGINS = frozenset((
+    b"acceptance_request",
+    b"updater_dispatch",
+    b"updater_session",
+    b"updater_session_lock",
+    b"window_create",
+    b"window_show",
+    b"audio_attach",
+    b"updater_acknowledge",
+    b"profile_root",
+    b"data_directory",
+    b"account_window_hide",
+    b"account_error_window",
+    b"account_store_blocked",
+    b"config_store",
+    b"runtime_create",
+    b"runtime_install",
+    b"runtime_borrow",
+    b"runtime_publish",
+    b"window_run",
+    b"audio_run",
+    b"cleanup_failure",
+    b"cleanup_outcome",
+    b"cleanup_missing",
+    b"runtime_finalize",
+))
+
+
 def startup_failure_diagnostics(log, status):
     """Reduce private startup stderr to fixed facts; never return foreign text.
 
@@ -396,6 +427,16 @@ def startup_failure_diagnostics(log, status):
         lines = [line.removesuffix(b"\r") for line in raw.split(b"\n")]
         fatal = [line for line in lines if line.startswith(b"Error:")]
         reasons = [line for line in lines if line.startswith(b"MORPHEUS_WINDOWS_STARTUP_REJECT")]
+        origins = [line for line in lines if line.startswith(b"MORPHEUS_WINDOWS_STARTUP_ORIGIN")]
+        origin_facts = {}
+        if origins:
+            if (len(origins) != 1 or len(fatal) != 1
+                    or not origins[0].startswith(WINDOWS_STARTUP_ORIGIN_PREFIX)):
+                return facts
+            origin = origins[0][len(WINDOWS_STARTUP_ORIGIN_PREFIX):]
+            if origin not in WINDOWS_STARTUP_ORIGINS:
+                return facts
+            origin_facts = {"origin": origin.decode("ascii")}
         if reasons:
             if (len(reasons) != 1 or fatal != [b"Error: UnsupportedPackage"]
                     or not reasons[0].startswith(WINDOWS_STARTUP_REASON_PREFIX)):
@@ -403,10 +444,12 @@ def startup_failure_diagnostics(log, status):
             reason = reasons[0][len(WINDOWS_STARTUP_REASON_PREFIX):]
             if reason not in WINDOWS_STARTUP_REASONS:
                 return facts
-            return {**facts, "category": "windows_update_unsupported_package",
+            return {**facts, **origin_facts, "category": "windows_update_unsupported_package",
                     "reason": reason.decode("ascii")}
         if len(fatal) == 1 and fatal[0] in WINDOWS_STARTUP_ERROR_LINES:
-            return {**facts, "category": WINDOWS_STARTUP_ERROR_LINES[fatal[0]]}
+            return {**facts, **origin_facts, "category": WINDOWS_STARTUP_ERROR_LINES[fatal[0]]}
+        if origin_facts:
+            return {**facts, **origin_facts, "category": "windows_startup_origin"}
         return facts
     missing = re.findall(
         rb"(?m)^[^\r\n]{1,4096}: error while loading shared libraries: "
