@@ -1026,9 +1026,8 @@ impl Actor {
                     // Even a superseded original must be disposed; never fall
                     // back to the current same-kind publication.
                     if self.ended {
-                        let _ = respond.send(Err(TransportError::Closed(
-                            "the engine has ended".into(),
-                        )));
+                        let _ = respond
+                            .send(Err(TransportError::Closed("the engine has ended".into())));
                         return;
                     }
                     track

@@ -316,7 +316,9 @@ fn enumerate(root: &Path, complete: bool) -> Result<Vec<String>, UpdateError> {
                 .replace('\\', "/");
             if meta.is_dir() {
                 if !["licenses", "themes"].contains(&name.as_str()) {
-                    return Err(startup_unsupported(StartupUnsupportedReason::LedgerDirectory));
+                    return Err(startup_unsupported(
+                        StartupUnsupportedReason::LedgerDirectory,
+                    ));
                 }
                 visit(root, &path, depth + 1, result)?;
             } else if meta.is_file() {
@@ -340,7 +342,9 @@ fn enumerate(root: &Path, complete: bool) -> Result<Vec<String>, UpdateError> {
     let mut expected = all_paths().map(str::to_owned).collect::<Vec<_>>();
     expected.sort();
     if complete && found != expected {
-        return Err(startup_unsupported(StartupUnsupportedReason::LedgerComplete));
+        return Err(startup_unsupported(
+            StartupUnsupportedReason::LedgerComplete,
+        ));
     }
     Ok(found)
 }
@@ -370,7 +374,9 @@ fn check_tree(
     check_entry(root, uninstaller)?;
     let executable = native::read(&root.join("morpheus-app.exe"), MAX_UPDATE_BYTES)?;
     let executable_identity = pe_identity(&executable).map_err(|error| match error {
-        UpdateError::UnsupportedPackage => startup_unsupported(StartupUnsupportedReason::InstalledPe),
+        UpdateError::UnsupportedPackage => {
+            startup_unsupported(StartupUnsupportedReason::InstalledPe)
+        }
         other => other,
     })?;
     if executable_identity != manifest.identity {
@@ -455,11 +461,15 @@ impl WindowsSession {
         let marker = native::read(&self.root.path.join(MARKER), MARKER_LIMIT as u64)?;
         let manifest = Manifest::parse(&marker)?;
         if manifest.identity != self.identity {
-            return Err(startup_unsupported(StartupUnsupportedReason::MarkerIdentity));
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::MarkerIdentity,
+            ));
         }
         let uninstaller = native::read(&self.root.path.join(UNINSTALLER), 16 * 1024 * 1024)?;
         if uninstaller.len() < 64 || &uninstaller[..2] != b"MZ" {
-            return Err(startup_unsupported(StartupUnsupportedReason::UninstallerImage));
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::UninstallerImage,
+            ));
         }
         let entry = Entry {
             path: UNINSTALLER.into(),
@@ -469,7 +479,9 @@ impl WindowsSession {
         check_tree(&self.root.path, &manifest, &hash(&marker), &entry)?;
         let registration = self.registry.snapshot(&self.root.path)?;
         if registration.version != manifest.identity.version {
-            return Err(startup_unsupported(StartupUnsupportedReason::RegistrationVersion));
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::RegistrationVersion,
+            ));
         }
         Ok((manifest, marker, entry, registration))
     }
@@ -1517,7 +1529,9 @@ fn begin_startup_with_validation(
         .file_name()
         .is_none_or(|n| n != "morpheus-app.exe")
     {
-        return Err(startup_unsupported(StartupUnsupportedReason::ExecutableName));
+        return Err(startup_unsupported(
+            StartupUnsupportedReason::ExecutableName,
+        ));
     }
     let identity = embedded_identity()?;
     let mut session = WindowsSession::lock(

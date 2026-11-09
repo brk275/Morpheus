@@ -423,7 +423,9 @@ impl Directory {
                 .components()
                 .any(|p| matches!(p, Component::ParentDir | Component::CurDir))
         {
-            return Err(startup_unsupported(StartupUnsupportedReason::DirectoryInput));
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::DirectoryInput,
+            ));
         }
         let mut ancestors = Vec::new();
         let mut current = PathBuf::new();
@@ -447,7 +449,9 @@ impl Directory {
             ancestors.push(file);
         }
         if ancestors.is_empty() {
-            return Err(startup_unsupported(StartupUnsupportedReason::DirectoryHandles));
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::DirectoryHandles,
+            ));
         }
         let mut units = vec![0_u16; 30_001];
         let count = unsafe {
@@ -459,7 +463,9 @@ impl Directory {
             )
         } as usize;
         if count == 0 || count >= units.len() {
-            return Err(startup_unsupported(StartupUnsupportedReason::DirectoryCanonicalRead));
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::DirectoryCanonicalRead,
+            ));
         }
         use std::os::windows::ffi::OsStringExt;
         let canonical = PathBuf::from(std::ffi::OsString::from_wide(&units[..count]));
@@ -470,7 +476,9 @@ impl Directory {
             || !u8::try_from(display[4]).is_ok_and(|b| b.is_ascii_alphabetic())
             || display[5..7] != [58, 92]
         {
-            return Err(startup_unsupported(StartupUnsupportedReason::DirectoryCanonicalShape));
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::DirectoryCanonicalShape,
+            ));
         }
         let drive_root = display[4..7]
             .iter()
@@ -500,7 +508,9 @@ pub(super) fn require_fixed_drive(kind: u32) -> Result<(), UpdateError> {
     if kind == 3 {
         Ok(())
     } else {
-        Err(startup_unsupported(StartupUnsupportedReason::DirectoryDrive))
+        Err(startup_unsupported(
+            StartupUnsupportedReason::DirectoryDrive,
+        ))
     }
 }
 
@@ -794,10 +804,14 @@ impl Registry {
             unsafe {
                 RegCloseKey(machine);
             }
-            return Err(startup_unsupported(StartupUnsupportedReason::RegistryMachinePresent));
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::RegistryMachinePresent,
+            ));
         }
         if found != 2 {
-            return Err(startup_unsupported(StartupUnsupportedReason::RegistryMachineStatus));
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::RegistryMachineStatus,
+            ));
         }
         let parts = KEY_PATH.split('\\').collect::<Vec<_>>();
         let mut parents = Vec::<RegistryKey>::new();
@@ -809,7 +823,9 @@ impl Registry {
             // Open the actual key, not a registry symbolic-link target. Keep
             // opened ancestors and resolve children relative to those handles.
             if unsafe { RegOpenKeyExW(base, text(part).as_ptr(), 8, access, &mut handle) } != 0 {
-                return Err(startup_unsupported(StartupUnsupportedReason::RegistryComponentOpen));
+                return Err(startup_unsupported(
+                    StartupUnsupportedReason::RegistryComponentOpen,
+                ));
             }
             let key = RegistryKey(handle);
             let mut kind = 0;
@@ -825,7 +841,9 @@ impl Registry {
                 )
             } != 2
             {
-                return Err(startup_unsupported(StartupUnsupportedReason::RegistryLinkValue));
+                return Err(startup_unsupported(
+                    StartupUnsupportedReason::RegistryLinkValue,
+                ));
             }
             secure(handle, 4, final_key)?;
             if final_key {
@@ -837,7 +855,9 @@ impl Registry {
             base = handle;
             parents.push(key);
         }
-        Err(startup_unsupported(StartupUnsupportedReason::RegistryMissingFinal))
+        Err(startup_unsupported(
+            StartupUnsupportedReason::RegistryMissingFinal,
+        ))
     }
 
     fn value(&self, name: &str, kind: u32) -> Result<Vec<u8>, UpdateError> {
@@ -890,7 +910,9 @@ impl Registry {
             || self.number("NoModify")? != 1
             || self.number("NoRepair")? != 1
         {
-            return Err(startup_unsupported(StartupUnsupportedReason::RegistrationLiterals));
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::RegistrationLiterals,
+            ));
         }
         let install = self.string("InstallLocation")?;
         let location = install
@@ -900,7 +922,9 @@ impl Registry {
                 startup_unsupported(StartupUnsupportedReason::RegistrationInstallQuotes)
             })?;
         if Directory::open(Path::new(location))?.path != root {
-            return Err(startup_unsupported(StartupUnsupportedReason::RegistrationInstallPath));
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::RegistrationInstallPath,
+            ));
         }
         let uninstall = self.string("UninstallString")?;
         let uninstall_path = uninstall

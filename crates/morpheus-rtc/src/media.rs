@@ -350,7 +350,10 @@ mod tests {
         };
         assert!(matches!(old.set_muted(false), Err(MediaError::CallEnded)));
         assert!(matches!(old.unpublish().await, Err(MediaError::CallEnded)));
-        assert!(matches!(current.unpublish().await, Err(MediaError::WrongCall)));
+        assert!(matches!(
+            current.unpublish().await,
+            Err(MediaError::WrongCall)
+        ));
         assert!(matches!(
             old.push_video(tiny_frame()),
             Err(MediaError::CallEnded)
