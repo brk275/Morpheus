@@ -46,6 +46,7 @@ pub enum MediaError {
 /// A local media track whose format is checked before entering libwebrtc.
 pub struct Publication {
     track: Arc<dyn LocalTrackHandle>,
+    control: Option<matrix_rtc_call_sdk::PublicationControl>,
     audio: Option<AudioSourceConfig>,
     video: Option<VideoSourceConfig>,
     lease: CallLease,
@@ -84,7 +85,11 @@ impl Publication {
         if !self.is_active() {
             return Err(MediaError::CallEnded);
         }
-        self.track.unpublish().await?;
+        self.control
+            .as_ref()
+            .ok_or(MediaError::WrongCall)?
+            .unpublish()
+            .await?;
         Ok(())
     }
 
@@ -197,9 +202,14 @@ impl RtcService {
             .clone();
         let audio = options.audio;
         let video = options.video;
-        let track = call.publish(options).await?;
+        let (track, control) = call
+            .engine()
+            .publish_controlled(options)
+            .await
+            .map_err(matrix_rtc_call_sdk::LiveKitCallError::Media)?;
         Ok(Publication {
             track,
+            control: Some(control),
             audio,
             video,
             lease,
@@ -294,8 +304,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn old_publication_cannot_capture_or_unmute_after_leave_and_rejoin() {
+    #[tokio::test]
+    async fn old_publication_cannot_capture_or_unmute_after_leave_and_rejoin() {
         let info = CallInfo {
             room_id: "!room:example.test".into(),
             slot_id: "m.call#ROOM".into(),
@@ -306,6 +316,7 @@ mod tests {
         let old_track = Arc::new(FakeVideoTrack(AtomicUsize::new(0)));
         let old = Publication {
             track: old_track.clone(),
+            control: None, // Only synthetic unit publications lack a minted control.
             audio: None,
             video: Some(VideoSourceConfig {
                 width: 2,
@@ -329,6 +340,7 @@ mod tests {
         let new_track = Arc::new(FakeVideoTrack(AtomicUsize::new(0)));
         let current = Publication {
             track: new_track.clone(),
+            control: None,
             audio: None,
             video: Some(VideoSourceConfig {
                 width: 2,
@@ -337,6 +349,8 @@ mod tests {
             lease: new_lease,
         };
         assert!(matches!(old.set_muted(false), Err(MediaError::CallEnded)));
+        assert!(matches!(old.unpublish().await, Err(MediaError::CallEnded)));
+        assert!(matches!(current.unpublish().await, Err(MediaError::WrongCall)));
         assert!(matches!(
             old.push_video(tiny_frame()),
             Err(MediaError::CallEnded)

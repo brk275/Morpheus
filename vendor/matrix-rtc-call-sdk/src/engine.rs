@@ -179,6 +179,9 @@ enum ActorMessage {
     /// Retract one of our own publications.
     Unpublish {
         kind: MediaStreamKind,
+        /// A control minted by this engine may retract its original track even
+        /// after replacement; the completion still cannot clear a newer track.
+        original: Option<Arc<dyn LocalTrackHandle>>,
         respond: oneshot::Sender<Result<(), TransportError>>,
     },
     /// Publish a local track on the own-focus connection.
@@ -252,6 +255,31 @@ impl EngineHandle {
             key_index,
             active,
         });
+    }
+}
+
+/// Identity-bound retraction capability minted only by its publishing engine.
+/// It retains the original track, never a lookup by kind or a replacement call.
+pub struct PublicationControl {
+    track: Arc<dyn LocalTrackHandle>,
+    messages: mpsc::UnboundedSender<ActorMessage>,
+}
+
+impl PublicationControl {
+    /// Retract only the original track, including after same-kind replacement.
+    /// A closed or ended originating engine refuses the request.
+    pub async fn unpublish(&self) -> Result<(), TransportError> {
+        let (respond, response) = oneshot::channel();
+        self.messages
+            .send(ActorMessage::Unpublish {
+                kind: self.track.kind(),
+                original: Some(Arc::clone(&self.track)),
+                respond,
+            })
+            .map_err(|_| TransportError::Closed("the engine is gone".into()))?;
+        response
+            .await
+            .map_err(|_| TransportError::Closed("the engine is gone".into()))?
     }
 }
 
@@ -505,6 +533,23 @@ impl CallEngine {
             .map_err(|_| TransportError::Closed("the engine is gone".into()))?
     }
 
+    /// Publish with an originating-engine retraction capability.
+    ///
+    /// The control cannot be rebound to arbitrary tracks or another engine.
+    /// Unlike kind-based retraction, it also disposes a superseded original
+    /// without touching the replacement publication or its roster entry.
+    pub async fn publish_controlled(
+        &self,
+        options: PublishOptions,
+    ) -> Result<(Arc<dyn LocalTrackHandle>, PublicationControl), TransportError> {
+        let track = self.publish(options).await?;
+        let control = PublicationControl {
+            track: Arc::clone(&track),
+            messages: self.messages.clone(),
+        };
+        Ok((track, control))
+    }
+
     /// Mute or unmute one of our own publications.
     ///
     /// Peers are told, so their UI can show it — which is the difference
@@ -550,7 +595,11 @@ impl CallEngine {
     pub async fn unpublish(&self, kind: MediaStreamKind) -> Result<(), TransportError> {
         let (respond, response) = oneshot::channel();
         self.messages
-            .send(ActorMessage::Unpublish { kind, respond })
+            .send(ActorMessage::Unpublish {
+                kind,
+                original: None,
+                respond,
+            })
             .map_err(|_| TransportError::Closed("the engine is gone".into()))?;
         response
             .await
@@ -967,12 +1016,30 @@ impl Actor {
                 }
                 let _ = respond.send(outcome);
             }
-            ActorMessage::Unpublish { kind, respond } => {
-                let Some(publication) = self.local_tracks.get(&kind) else {
-                    let _ = respond.send(Err(TransportError::Unsupported(format!(
-                        "nothing of kind {kind:?} is published locally"
-                    ))));
-                    return;
+            ActorMessage::Unpublish {
+                kind,
+                original,
+                respond,
+            } => {
+                let track = if let Some(track) = original {
+                    // Only engine-minted controls can carry an original track.
+                    // Even a superseded original must be disposed; never fall
+                    // back to the current same-kind publication.
+                    if self.ended {
+                        let _ = respond.send(Err(TransportError::Closed(
+                            "the engine has ended".into(),
+                        )));
+                        return;
+                    }
+                    track
+                } else {
+                    let Some(publication) = self.local_tracks.get(&kind) else {
+                        let _ = respond.send(Err(TransportError::Unsupported(format!(
+                            "nothing of kind {kind:?} is published locally"
+                        ))));
+                        return;
+                    };
+                    Arc::clone(&publication.track)
                 };
                 // Awaited off-actor like the publish itself, and the actor
                 // learns the outcome through `LocalUnpublished`: a retraction
@@ -980,7 +1047,6 @@ impl Actor {
                 // back as success from the transport), and clearing local
                 // state on a failed attempt would leave a still-live
                 // publication that nothing can mute or retract anymore.
-                let track = Arc::clone(&publication.track);
                 let messages = self.messages_tx.clone();
                 rt::spawn(async move {
                     let outcome = track.unpublish().await;
@@ -1822,6 +1888,10 @@ mod tests {
         unpublished: StdMutex<Vec<MediaStreamKind>>,
         /// Makes the next unpublish calls fail at the transport.
         fail_unpublish: AtomicBool,
+        next_local_track: AtomicU32,
+        unpublished_tracks: StdMutex<Vec<u32>>,
+        /// One retained test-only gate for an in-flight original retraction.
+        unpublish_gate: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     }
 
     struct FakeTransport {
@@ -1918,12 +1988,14 @@ mod tests {
 
     struct FakeLocalTrack {
         kind: MediaStreamKind,
+        id: u32,
         state: Arc<TransportState>,
     }
 
     impl FakeLocalTrack {
         fn new(kind: MediaStreamKind, state: Arc<TransportState>) -> Self {
-            Self { kind, state }
+            let id = state.next_local_track.fetch_add(1, Ordering::SeqCst);
+            Self { kind, id, state }
         }
     }
 
@@ -1943,10 +2015,16 @@ mod tests {
         }
 
         async fn unpublish(&self) -> Result<(), TransportError> {
+            let gate = self.state.unpublish_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                entered.notify_one();
+                release.notified().await;
+            }
             if self.state.fail_unpublish.load(Ordering::SeqCst) {
                 return Err(TransportError::Closed("fake unpublish failure".into()));
             }
             self.state.unpublished.lock().unwrap().push(self.kind);
+            self.state.unpublished_tracks.lock().unwrap().push(self.id);
             Ok(())
         }
     }
@@ -3632,6 +3710,150 @@ mod tests {
                 .streams
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn controlled_unpublish_removes_the_original_stream_and_transport() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+        let _connection = adopt(&fx);
+        let (_track, control) = fx
+            .engine
+            .publish_controlled(PublishOptions::screen_share(VideoSourceConfig {
+                width: 1920,
+                height: 1080,
+            }))
+            .await
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+        control.unpublish().await.unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStopped {
+                member_id: "own".into(),
+                kind: MediaStreamKind::ScreenShare,
+            }
+        );
+        assert_eq!(*fx.state.unpublished_tracks.lock().unwrap(), vec![0]);
+        let own = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.is_local)
+            .unwrap();
+        assert!(own.streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn controlled_old_unpublish_disposes_only_the_superseded_track() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+        let _connection = adopt(&fx);
+        let (_old_track, old) = fx
+            .engine
+            .publish_controlled(PublishOptions::microphone())
+            .await
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+        let (_new_track, current) = fx
+            .engine
+            .publish_controlled(PublishOptions::microphone())
+            .await
+            .unwrap();
+        old.unpublish().await.unwrap();
+        settle(&fx.engine).await;
+        assert_eq!(*fx.state.unpublished_tracks.lock().unwrap(), vec![0]);
+        let own = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.is_local)
+            .unwrap();
+        assert_eq!(own.streams.len(), 1);
+        current.unpublish().await.unwrap();
+        settle(&fx.engine).await;
+        assert_eq!(*fx.state.unpublished_tracks.lock().unwrap(), vec![0, 1]);
+        let own = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.is_local)
+            .unwrap();
+        assert!(own.streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn controlled_inflight_old_completion_preserves_replacement() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+        let _connection = adopt(&fx);
+        let (_old_track, old) = fx
+            .engine
+            .publish_controlled(PublishOptions::microphone())
+            .await
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *fx.state.unpublish_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+        let pending = tokio::spawn(async move { old.unpublish().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let (_new_track, current) = fx
+            .engine
+            .publish_controlled(PublishOptions::microphone())
+            .await
+            .unwrap();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        settle(&fx.engine).await;
+        assert_eq!(*fx.state.unpublished_tracks.lock().unwrap(), vec![0]);
+        let own = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.is_local)
+            .unwrap();
+        assert_eq!(own.streams.len(), 1);
+        current.unpublish().await.unwrap();
+        settle(&fx.engine).await;
+        assert_eq!(*fx.state.unpublished_tracks.lock().unwrap(), vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn controlled_handle_cannot_keep_a_stopped_or_dropped_engine_alive() {
+        for shutdown in [false, true] {
+            let fx = fixture();
+            let _connection = adopt(&fx);
+            let (_track, control) = fx
+                .engine
+                .publish_controlled(PublishOptions::microphone())
+                .await
+                .unwrap();
+            if shutdown {
+                fx.engine.shutdown().await;
+            }
+            drop(fx.engine);
+            let result = tokio::time::timeout(Duration::from_secs(2), control.unpublish())
+                .await
+                .unwrap();
+            assert!(matches!(result, Err(TransportError::Closed(_))));
+            assert!(fx.state.unpublished_tracks.lock().unwrap().is_empty());
+        }
     }
 
     /// Unpublishing something we never published is an error, mirroring mute.

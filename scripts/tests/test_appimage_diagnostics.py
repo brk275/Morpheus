@@ -17,6 +17,57 @@ import package_appimage as P
 
 
 class ProgressTests(unittest.TestCase):
+    def test_share_control_schema_rejects_unknown_fields_types_and_unrelated_positions(self):
+        good = {"observation": "after_timeout", "state": "share", "enabled": False, "checked": True}
+        self.assertTrue(D.valid_share_control(good))
+        for change in ({"state": "private source"}, {"enabled": 1}, {"checked": "true"},
+                       {"observation": True}, {"private": "foreign body"},
+                       {"state": "missing", "enabled": True}):
+            with self.subTest(change=change):
+                self.assertFalse(D.valid_share_control(good | change))
+        for value in (None, [], {}, {key: value for key, value in good.items() if key != "checked"}):
+            self.assertFalse(D.valid_share_control(value))
+        from linux_package_ui import DiagnosticFailure
+        with tempfile.TemporaryDirectory() as directory:
+            progress = D.Progress(Path(directory))
+            progress.wrapper("capture"); progress.command("capture-yellow")
+            progress.capture("ordinary", "reopened_frame")
+            progress.failed(DiagnosticFailure("wait_timeout"), share_control=good)
+            for key, value in (("capture_phase", "static_frame"), ("command_stage", "capture-green"),
+                               ("wrapper_phase", "build"), ("reason", "command_exit")):
+                candidate = json.loads(json.dumps(progress.value))
+                candidate["failure"][key] = value
+                self.assertFalse(D.valid_record(candidate))
+            candidate = json.loads(json.dumps(progress.value))
+            candidate["failure"]["unexpected"] = "private"
+            self.assertFalse(D.valid_record(candidate))
+
+    def test_share_control_failure_is_first_latched_private_and_independently_scan_gated(self):
+        from linux_package_ui import DiagnosticFailure
+        observation = {"observation": "after_timeout", "state": "cancel", "enabled": True, "checked": False}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); progress = D.Progress(root)
+            progress.wrapper("capture"); progress.command("capture-yellow")
+            progress.capture("ordinary", "reopened_frame")
+            progress.failed(DiagnosticFailure("wait_timeout"), share_control=observation)
+            original = dict(progress.value["failure"])
+            progress.command("capture-inventory")
+            progress.failed(RuntimeError("private later failure"), share_control={"foreign": "private"})
+            progress.cleanup(True)
+            self.assertEqual(progress.value["failure"], original)
+            self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                             {"diagnostics": "withheld", "passed": False})
+            result = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertEqual(result["failure"]["share_control"], observation)
+            self.assertEqual(result["failure"]["command_stage"], "capture-yellow")
+            self.assertFalse(result["passed"])
+            self.assertNotIn("private", json.dumps(result))
+            value = json.loads(progress.path.read_bytes())
+            value["failure"]["share_control"]["foreign"] = "private body"
+            progress.path.write_text(json.dumps(value))
+            self.assertEqual(D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit"),
+                             {"diagnostics": "withheld", "passed": False})
+
     def test_native_source_phase_commands_and_reasons_are_closed_and_scan_gated(self):
         from corresponding_source import SourceFailure
         commands = {"source-cargo-version", "source-rustc-version", "source-cargo-fetch", "cache-git-commit",

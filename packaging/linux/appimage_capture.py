@@ -19,13 +19,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import appimage_client as client
 from appimage_runtime import RuntimeIdentity
 import element_process_namespace as containment
-from linux_package_ui import AccessibleUI, IncompleteTraversal
+from linux_package_ui import AccessibleUI, DiagnosticFailure, IncompleteTraversal
 import package_smoke as smoke
 from run_wayland_acceptance import CappedPrivateLog, configs, private_environment
 from wayland_fixture_backend import prepare_backend
@@ -174,6 +175,19 @@ class Processes:
         require(not failed)
 
 
+def wait_for_share_control(ui, *, reopened, diagnostics, control):
+    try:
+        return ui.wait("Stop screen sharing")
+    except BaseException as error:
+        if (reopened is True and diagnostics is not None and type(error) is DiagnosticFailure
+                and error.code == "wait_timeout"):
+            try:
+                diagnostics.failed(error, control, share_control=ui.share_control_snapshot())
+            except BaseException:
+                pass  # Observation I/O cannot replace the original failed wait.
+        raise
+
+
 class InstalledUI(AccessibleUI):
     def find_control(self, label, *, editable=False):
         matches = []
@@ -206,6 +220,68 @@ class InstalledUI(AccessibleUI):
         node, action = self.wait_for(lambda: self.find_control(label))
         self.wait_for(lambda: node.getState().contains(self.api.STATE_ENABLED))
         require(action.doAction(0))
+
+    def share_control_snapshot(self):
+        """One read-only post-timeout pass; never rescue the failed wait."""
+        unknown = {"observation": "after_timeout", "state": "unreadable",
+                   "enabled": None, "checked": None}
+        labels = {"Choose a display or window to share": "share",
+                  "Cancel system screen selection": "cancel", "Stop screen sharing": "stop"}
+        deadline = time.monotonic() + 2
+        matches = []
+        original = self.diagnostics
+        def check_deadline():
+            if time.monotonic() >= deadline:
+                raise TimeoutError()
+        def observe_operation(operation):
+            check_deadline()
+            original.operation(operation)
+        try:
+            # ObservedSequence can issue several IPC calls between node yields.
+            # Its existing per-operation hooks must share this observation budget.
+            self.diagnostics = SimpleNamespace(value=original.value, count=original.count,
+                                               operation=observe_operation)
+            for node in self.nodes():
+                if time.monotonic() >= deadline:
+                    return unknown
+                check_deadline()
+                name = node.name or ""
+                if type(name) is not str:
+                    return unknown
+                if name not in labels:
+                    continue
+                try:
+                    check_deadline()
+                    action = node.queryAction()
+                    check_deadline()
+                    count = action.nActions
+                except NotImplementedError:
+                    continue
+                if count > 0:
+                    if len(matches) < 2:
+                        matches.append((node, labels[name]))
+            if getattr(self, "pass_incomplete", False) or time.monotonic() >= deadline:
+                return unknown
+            if len(matches) != 1:
+                return {**unknown, "state": "missing" if not matches else "ambiguous"}
+            node, state = matches[0]
+            enabled = checked = None
+            try:
+                check_deadline()
+                flags = node.getState()
+                check_deadline()
+                enabled = bool(flags.contains(self.api.STATE_ENABLED))
+                checked = bool(flags.contains(self.api.STATE_CHECKED))
+            except (AttributeError, NotImplementedError):
+                pass
+            if time.monotonic() >= deadline:
+                return unknown
+            return {**unknown, "state": state, "enabled": enabled, "checked": checked}
+        except Exception:
+            # Foreign errors and incomplete ownership/traversal cannot be evidence.
+            return unknown
+        finally:
+            self.diagnostics = original
 
     def application_pid(self):
         found = set()
@@ -381,7 +457,7 @@ def run_case(runner, root, artifact, appdir, peer_binary, backend, fixture, envi
                 # A new real pixel change on the reopened source; this does
                 # not claim untouched static-source reopening is verified.
                 run("capture-yellow", ["swaymsg", "-q", "output HEADLESS-2 bg #f0f020 solid_color"])
-            ui.wait("Stop screen sharing")
+            wait_for_share_control(ui, reopened=reopened, diagnostics=diagnostics, control=control)
         phase("static_frame")
         share()
         request(control, "static")

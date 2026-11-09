@@ -194,3 +194,15 @@ library download, linker bypass or test disablement is introduced. Fresh
 Windows SDK library tests with `--features matrix-sdk` remain required; source
 review is not a passing link or runtime result. Other platforms' dependency
 activation and ordinary application dependencies are unchanged.
+
+## Identity-bound local unpublish
+
+`publish_controlled` mints a private-field `PublicationControl` bound to the
+original track and publishing engine. Morpheus uses it instead of calling raw
+transport unpublish, so successful retraction updates the engine's own roster.
+A superseded original is still disposed at its exact transport handle; the
+existing pointer-identity completion fence preserves any replacement. Ended or
+closed engines refuse this control, and Morpheus retains its call-lease fence.
+The existing kind-based API, dependency versions and security policy are unchanged.
+This fixes separate bookkeeping, not a proven cause of the AppImage restart-label
+timeout. Existing actor tests cover exact original disposal and replacement races.

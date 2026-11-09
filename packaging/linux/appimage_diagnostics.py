@@ -105,6 +105,22 @@ def reason(error):
             "PackageFailure": "package", "InventoryFailure": "inventory"}.get(type(error).__name__, "unknown")
 
 
+SHARE_CONTROL_FIELDS = frozenset(("observation", "state", "enabled", "checked"))
+SHARE_CONTROL_STATES = frozenset(("share", "cancel", "stop", "missing", "ambiguous", "unreadable"))
+
+
+def valid_share_control(value):
+    if (type(value) is not dict or set(value) != SHARE_CONTROL_FIELDS
+            or type(value["observation"]) is not str or value["observation"] != "after_timeout"
+            or type(value["state"]) is not str
+            or value["state"] not in SHARE_CONTROL_STATES
+            or any(value[key] is not None and type(value[key]) is not bool
+                   for key in ("enabled", "checked"))):
+        return False
+    return (value["state"] in {"share", "cancel", "stop"}
+            or value["enabled"] is None and value["checked"] is None)
+
+
 def valid_record(value):
     if (type(value) is not dict or set(value) != FIELDS or type(value["schema"]) is not int or value["schema"] != 1
             or value["wrapper_phase"] not in WRAPPER or value["command_stage"] not in COMMANDS
@@ -116,9 +132,18 @@ def valid_record(value):
     failure = value["failure"]
     if failure is None:
         return True
-    return (type(failure) is dict and set(failure) == {*POSITIONS, "reason"}
-            and failure["wrapper_phase"] in WRAPPER and failure["command_stage"] in COMMANDS
-            and failure["capture_mode"] in MODES and failure["capture_phase"] in PHASES and failure["reason"] in REASONS)
+    if (type(failure) is not dict or set(failure) not in
+            ({*POSITIONS, "reason"}, {*POSITIONS, "reason", "share_control"})
+            or failure["wrapper_phase"] not in WRAPPER or failure["command_stage"] not in COMMANDS
+            or failure["capture_mode"] not in MODES or failure["capture_phase"] not in PHASES
+            or failure["reason"] not in REASONS):
+        return False
+    if "share_control" not in failure:
+        return True
+    return (failure["wrapper_phase"] == "capture" and failure["command_stage"] == "capture-yellow"
+            and failure["capture_mode"] in {"ordinary", "eager_bindings"}
+            and failure["capture_phase"] == "reopened_frame" and failure["reason"] == "ui_wait_timeout"
+            and valid_share_control(failure["share_control"]))
 
 
 class Progress:
@@ -168,10 +193,15 @@ class Progress:
             except (OSError, RuntimeError):
                 pass
 
-    def failed(self, error, control=None):
+    def failed(self, error, control=None, *, share_control=None):
         self.peer(control)
         if self.value["failure"] is None:
-            self.value["failure"] = {**{key: self.value[key] for key in POSITIONS}, "reason": reason(error)}
+            failure = {**{key: self.value[key] for key in POSITIONS}, "reason": reason(error)}
+            if share_control is not None:
+                failure["share_control"] = share_control
+                if not valid_record({**self.value, "failure": failure}):
+                    raise ValueError("Invalid share-control observation")
+            self.value["failure"] = failure
         self.save()
 
     def cleanup(self, passed):

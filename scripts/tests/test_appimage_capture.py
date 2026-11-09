@@ -22,6 +22,87 @@ class ProofTests(unittest.TestCase):
         return ("test " + M.PEER_TEST + " ... " + outcome + "\n"
                 + "test result: " + summary + " 0 measured; 0 filtered out; finished in 1s\n").encode()
 
+    def test_post_timeout_share_snapshot_is_closed_owned_complete_and_action_free(self):
+        def node(label, *, actions=1, enabled=True, checked=False):
+            action = mock.Mock(nActions=actions)
+            flags = SimpleNamespace(contains=lambda key: {1: enabled, 2: checked}[key])
+            return SimpleNamespace(name=label, queryAction=mock.Mock(return_value=action),
+                                   getState=mock.Mock(return_value=flags)), action
+        def ui(nodes):
+            value = M.InstalledUI.__new__(M.InstalledUI)
+            value.api = SimpleNamespace(STATE_ENABLED=1, STATE_CHECKED=2)
+            value.diagnostics = SimpleNamespace(value={}, operation=mock.Mock(), count=mock.Mock())
+            value.nodes = mock.Mock(return_value=iter(nodes))
+            value.pass_incomplete = False
+            return value
+        labels = {"Choose a display or window to share": "share",
+                  "Cancel system screen selection": "cancel", "Stop screen sharing": "stop"}
+        for label, state in labels.items():
+            control, action = node(label, enabled=False, checked=True)
+            foreign, ignored = node("private account and source label")
+            value = ui([foreign, control])
+            with self.subTest(state=state), mock.patch.object(M.time, "monotonic", return_value=0):
+                facts = value.share_control_snapshot()
+            self.assertEqual(facts, {"observation": "after_timeout", "state": state,
+                                     "enabled": False, "checked": True})
+            action.doAction.assert_not_called(); ignored.doAction.assert_not_called()
+            self.assertNotIn("private", json.dumps(facts))
+        control, action = node("Stop screen sharing")
+        region, _ = node("Choose a display or window to share", actions=0)
+        for nodes, state in (([], "missing"), ([region], "missing"),
+                             ([control, control], "ambiguous")):
+            with self.subTest(state=state), mock.patch.object(M.time, "monotonic", return_value=0):
+                self.assertEqual(ui(nodes).share_control_snapshot(),
+                                 {"observation": "after_timeout", "state": state,
+                                  "enabled": None, "checked": None})
+        value = ui([control]); value.pass_incomplete = True
+        with mock.patch.object(M.time, "monotonic", return_value=0):
+            self.assertEqual(value.share_control_snapshot()["state"], "unreadable")
+        value = ui([control]); value.nodes.side_effect = RuntimeError("private transport body")
+        self.assertEqual(value.share_control_snapshot()["state"], "unreadable")
+        with mock.patch.object(M.time, "monotonic", side_effect=[0, 3]):
+            self.assertEqual(ui([control]).share_control_snapshot()["state"], "unreadable")
+        action.doAction.assert_not_called()
+        # A child-list materialization can perform many IPCs without yielding.
+        # Advancing the clock in its first count must prevent the next IPC.
+        value = ui([]); original = value.diagnostics; clock = [0]
+        def first_count():
+            clock[0] = 3
+            return 3
+        children = SimpleNamespace(get_child_count=mock.Mock(side_effect=first_count),
+                                   get_child_at_index=mock.Mock(return_value=control))
+        def buffered_nodes():
+            list(UI.ObservedSequence(children, value.diagnostics, "node"))
+            yield control
+        value.nodes = buffered_nodes
+        with mock.patch.object(M.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertEqual(value.share_control_snapshot()["state"], "unreadable")
+        self.assertEqual(children.get_child_count.call_count, 1)
+        children.get_child_at_index.assert_not_called()
+        self.assertIs(value.diagnostics, original)
+
+    def test_share_timeout_observation_never_rescues_or_replaces_the_original_wait(self):
+        failure = UI.DiagnosticFailure("wait_timeout")
+        facts = {"observation": "after_timeout", "state": "stop", "enabled": True, "checked": True}
+        for reopened in (False, True):
+            instance = SimpleNamespace(wait=mock.Mock(side_effect=failure),
+                                       share_control_snapshot=mock.Mock(return_value=facts))
+            diagnostics = SimpleNamespace(failed=mock.Mock(side_effect=OSError("private observation failure")))
+            with self.subTest(reopened=reopened), self.assertRaises(UI.DiagnosticFailure) as caught:
+                M.wait_for_share_control(instance, reopened=reopened, diagnostics=diagnostics, control=None)
+            self.assertIs(caught.exception, failure)
+            instance.wait.assert_called_once_with("Stop screen sharing")
+            self.assertEqual(instance.share_control_snapshot.call_count, int(reopened))
+            self.assertEqual(diagnostics.failed.call_count, int(reopened))
+        instance.wait.side_effect = UI.DiagnosticFailure("app_exited")
+        instance.share_control_snapshot.reset_mock(); diagnostics.failed.reset_mock()
+        with self.assertRaises(UI.DiagnosticFailure):
+            M.wait_for_share_control(instance, reopened=True, diagnostics=diagnostics, control=None)
+        instance.share_control_snapshot.assert_not_called(); diagnostics.failed.assert_not_called()
+        marker = object(); instance.wait.side_effect = None; instance.wait.return_value = marker
+        self.assertIs(M.wait_for_share_control(instance, reopened=True, diagnostics=diagnostics, control=None), marker)
+        instance.share_control_snapshot.assert_not_called(); diagnostics.failed.assert_not_called()
+
     def test_named_peer_and_one_full_success_are_both_required(self):
         M.peer_proof(self.proof())
         for value in (b"", self.proof("ignored"), self.proof(summary="ok. 0 passed; 0 failed; 1 ignored;"),
