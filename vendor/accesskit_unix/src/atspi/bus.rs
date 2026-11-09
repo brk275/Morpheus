@@ -216,7 +216,8 @@ impl Bus {
             self.unregister_interface::<TextInterface>(&path).await?;
         }
         if old_interfaces.contains(Interface::EditableText) {
-            self.unregister_interface::<EditableTextInterface>(&path).await?;
+            self.unregister_interface::<EditableTextInterface>(&path)
+                .await?;
         }
         if old_interfaces.contains(Interface::Value) {
             self.unregister_interface::<ValueInterface>(&path).await?;
