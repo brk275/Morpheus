@@ -128,6 +128,33 @@ def source_phase(error):
     return None
 
 
+PROCESS_EXIT_FIELDS = frozenset(("role", "status", "app_stdout", "app_stderr", "peer_stdout", "peer_stderr"))
+PROCESS_EXIT_ROLES = frozenset(("app", "peer", "other", "unknown"))
+PROCESS_LOG_STATES = frozenset(("clear", "failed", "truncated", "failed_truncated", "unknown"))
+
+
+def valid_process_exit(value):
+    if (type(value) is not dict or any(type(key) is not str for key in value)
+            or set(value) != PROCESS_EXIT_FIELDS
+            or type(value["role"]) is not str or value["role"] not in PROCESS_EXIT_ROLES
+            or value["status"] is not None and (type(value["status"]) is not int
+                                                or not -128 <= value["status"] <= 255)):
+        return False
+    return all(type(value[key]) is str and value[key] in PROCESS_LOG_STATES
+               for key in ("app_stdout", "app_stderr", "peer_stdout", "peer_stderr"))
+
+
+def process_exit(error):
+    module = sys.modules.get("appimage_capture")
+    owner = vars(module).get("CaptureFailure") if type(module) is ModuleType else None
+    if type(error) is owner:
+        values = vars(error)
+        reason, value = values.get("reason"), values.get("process_exit")
+        if type(reason) is str and reason == "process_exit" and valid_process_exit(value):
+            return dict(value)
+    return None
+
+
 SHARE_CONTROL_FIELDS = frozenset(("observation", "state", "enabled", "checked"))
 SHARE_CONTROL_STATES = frozenset(("share", "cancel", "stop", "missing", "ambiguous", "unreadable"))
 
@@ -157,11 +184,13 @@ def valid_record(value):
         return True
     if (type(failure) is not dict or set(failure) not in
             ({*POSITIONS, "reason"}, {*POSITIONS, "reason", "share_control"},
-             {*POSITIONS, "reason", "source_phase"})
+             {*POSITIONS, "reason", "source_phase"}, {*POSITIONS, "reason", "process_exit"})
             or failure["wrapper_phase"] not in WRAPPER or failure["command_stage"] not in COMMANDS
             or failure["capture_mode"] not in MODES or failure["capture_phase"] not in PHASES
             or failure["reason"] not in REASONS):
         return False
+    if "process_exit" in failure:
+        return failure["reason"] == "capture_process_exit" and valid_process_exit(failure["process_exit"])
     if "source_phase" in failure:
         from corresponding_source import SOURCE_PHASES
         return (type(failure["source_phase"]) is str and failure["source_phase"] in SOURCE_PHASES
@@ -228,6 +257,9 @@ class Progress:
             phase = source_phase(error)
             if phase is not None:
                 failure["source_phase"] = phase
+            exited = process_exit(error)
+            if exited is not None:
+                failure["process_exit"] = exited
             if share_control is not None:
                 failure["share_control"] = share_control
                 if not valid_record({**self.value, "failure": failure}):
@@ -347,6 +379,17 @@ def package_failure_markers(root, *, scan_passed):
 # Only exact static panic labels in the authenticated receiving peer source.
 # Error suffixes, thread names, paths and source lines never leave the reducer.
 PEER_PANIC_LABELS = {
+    b"Installed app sender disappeared": "sender_missing",
+    b"Installed app sender changed": "sender_changed",
+    b"Installed app participant changed": "participant_changed",
+    b"Screen track has no video frames": "screen_frames",
+    b"Installed screen track ended before matching pixels": "screen_stream_ended",
+    b"Installed screen pixels were not delivered": "screen_pixel_deadline",
+    b"Installed app did not reach the next peer phase": "command_deadline",
+    b"Call ended instead of screen share": "call_ended_during_stop",
+    b"Installed screen track did not stop": "screen_stop_deadline",
+    b"Peer cleanup failed": "cleanup",
+    b"Installed capture phase deadline exceeded": "work_deadline",
     b"Cannot open peer store": "open_store",
     b"Peer login failed": "login",
     b"Peer sticky room sync did not become ready": "sticky_sync",
@@ -379,11 +422,17 @@ PEER_PANIC_FRAME = re.compile(
     rb"packaging/linux/appimage_peer\.rs:[0-9]{1,6}:[0-9]{1,4}:")
 
 
-def peer_failure_marker(root, mode, *, scan_passed):
+def peer_failure_marker(root, mode, *, scan_passed, include_sites=False):
     """Reduce one completed, scanned private stderr; never establish acceptance."""
-    result = {"status": "withheld", "panic_site": "unknown"}
+    if type(include_sites) is not bool:
+        raise ValueError("Invalid peer marker selection")
+    def record(status, site="unknown", sites=()):
+        value = {"status": status, "panic_site": site}
+        if include_sites:
+            value["panic_sites"] = sorted(set(sites))
+        return value
     if scan_passed is not True:
-        return result
+        return record("withheld")
     from appimage_client import private_directory
     case = {"ordinary": "ordinary", "eager_bindings": "bindings"}.get(mode)
     if case is None:
@@ -395,12 +444,12 @@ def peer_failure_marker(root, mode, *, scan_passed):
         try:
             private_directory(directory)
         except FileNotFoundError:
-            return {"status": "unavailable", "panic_site": "unknown"}
+            return record("unavailable")
     path = directory / "peer.stderr.log"
     try:
         before = path.lstat()
     except FileNotFoundError:
-        return {"status": "unavailable", "panic_site": "unknown"}
+        return record("unavailable")
     if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
             or before.st_mode & 0o077 or before.st_nlink != 1
             or not 0 <= before.st_size <= 8 * 1024 * 1024):
@@ -419,10 +468,10 @@ def peer_failure_marker(root, mode, *, scan_passed):
             raise ValueError("Changed private peer log")
     if identity(before) != identity(path.lstat()):
         raise ValueError("Changed private peer log")
-    # A single exact peer panic frame and its immediately following static
-    # label are diagnostic provenance, not proof that the exception is causal.
+    # Exact peer panic frames and their immediately following static labels
+    # are observed context, not proof that an exception is causal.
     if data.count(b"\n") > 65536:
-        return {"status": "scanned_private_peer_stderr", "panic_site": "unknown"}
+        return record("scanned_private_peer_stderr")
     lines = data.split(b"\n", 65536)
     sites = []
     for index, line in enumerate(lines[:-1]):
@@ -431,8 +480,8 @@ def peer_failure_marker(root, mode, *, scan_passed):
             site = next((token for label, token in PEER_PANIC_LABELS.items()
                          if message == label or message.startswith(label + b": ")), "unknown")
             sites.append(site)
-    return {"status": "scanned_private_peer_stderr",
-            "panic_site": sites[0] if len(sites) == 1 else "ambiguous" if sites else "unknown"}
+    return record("scanned_private_peer_stderr",
+                  sites[0] if len(sites) == 1 else "ambiguous" if sites else "unknown", sites)
 
 
 CAPTURE_FAILURE_PREFIX = b"MORPHEUS_NATIVE_CAPTURE_FAILURE "
@@ -562,6 +611,16 @@ def public_failure(root, *, scan_passed, outer_cleanup, outer_reason):
             result["peer_failure_marker"] = peer_failure_marker(
                 root, value["capture_mode"], scan_passed=scan_passed)
         failure = value["failure"]
+        if (failure is not None and failure["wrapper_phase"] == "capture"
+                and failure["capture_phase"] == "reopened_frame"
+                and failure["reason"] == "capture_process_exit"
+                and value["inner_cleanup"] == "passed" and outer_cleanup == "passed"):
+            # Observed static markers are diagnostic context only. They do not
+            # establish which process failed, causality or package acceptance.
+            result["peer_failure_marker"] = peer_failure_marker(
+                root, failure["capture_mode"], scan_passed=scan_passed, include_sites=True)
+            result["native_capture_failure_markers"] = capture_failure_markers(
+                root, failure["capture_mode"], scan_passed=scan_passed)
         if (failure is not None and failure["wrapper_phase"] == "capture"
                 and failure["capture_phase"] == "reopened_frame"
                 and failure["command_stage"] == "capture-yellow"

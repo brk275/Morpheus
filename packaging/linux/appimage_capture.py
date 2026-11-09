@@ -49,6 +49,7 @@ class CaptureFailure(RuntimeError):
             raise ValueError("Invalid capture failure reason")
         super().__init__("Installed AppImage capture acceptance failed")
         self.reason = reason
+        self.process_exit = None
 
 
 def require(value):
@@ -122,6 +123,7 @@ class Processes:
     """Unreaped owned group leaders plus bounded private dual-pipe drains."""
     def __init__(self, root):
         self.root, self.owned, self.sinks = root, [], {}
+        self.children = {}
         self.stack = contextlib.ExitStack()
 
     def start(self, name, argv, environment, *, stdin=None):
@@ -139,6 +141,7 @@ class Processes:
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
             # Register ownership before either thread can fail to attach.
             self.owned.append(process)
+            self.children[name] = process
             self.sinks[name] = (out, err)
             out.attach(process.stdout)
             err.attach(process.stderr)
@@ -147,11 +150,49 @@ class Processes:
             if input_file is not None:
                 input_file.close()
 
+    @staticmethod
+    def _log_state(sink):
+        if type(sink) is not CappedPrivateLog:
+            return "unknown"
+        values = vars(sink)
+        failed, truncated = values.get("failed"), values.get("truncated")
+        if type(failed) is not bool or type(truncated) is not bool:
+            return "unknown"
+        return ("failed_truncated" if failed and truncated else "failed" if failed else
+                "truncated" if truncated else "clear")
+
+    def _exit_fact(self, process, status):
+        # Match only exact objects registered by this owner. No process
+        # attributes, extra wait/status call, pipe read or raw text is needed.
+        names = [name for name, child in self.children.items() if child is process
+                 and any(child is owned for owned in self.owned)]
+        if len(names) != 1:
+            return None
+        role = names[0] if names[0] in {"app", "peer"} else "other"
+        # app is the retained AppImage launcher, not the extracted GUI child;
+        # this wait status must not be presented as the GUI child's signal.
+        result = {"role": role, "status": status if type(status) is int and -128 <= status <= 255 else None}
+        for name in ("app", "peer"):
+            child = self.children.get(name)
+            pair = self.sinks.get(name)
+            owned = child is not None and any(child is item for item in self.owned)
+            for index, stream in enumerate(("stdout", "stderr")):
+                sink = pair[index] if owned and type(pair) is tuple and len(pair) == 2 else None
+                result[name + "_" + stream] = self._log_state(sink)
+        return result
+
     def wait_for(self, predicate, *, seconds=30, watch=()):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            if not all(containment.status(process) is None for process in watch):
-                raise CaptureFailure("process_exit")
+            for process in watch:
+                status = containment.status(process)
+                if status is not None:
+                    failure = CaptureFailure("process_exit")
+                    try:
+                        failure.process_exit = self._exit_fact(process, status)
+                    except BaseException:
+                        pass  # Diagnostics cannot replace the original failure.
+                    raise failure
             for pair in self.sinks.values():
                 for sink in pair:
                     if sink.failed:
@@ -184,6 +225,7 @@ class Processes:
         except BaseException:
             failed = True
         self.owned.clear()
+        self.children.clear()
         require(not failed)
 
 

@@ -241,6 +241,7 @@ impl Fixture {
 fn track_added(identity: &str, kind: MediaStreamKind) -> ConnectionEvent {
     ConnectionEvent::TrackAdded {
         identity: identity.to_owned(),
+        publication_id: "publication".into(),
         kind,
         track: Arc::new(FakeTrack(kind)),
     }
@@ -295,6 +296,7 @@ async fn an_identity_on_another_publishers_transport_cannot_supply_media_or_stat
     }));
     own.send(ConnectionEvent::TrackRemoved {
         identity: "id-bob".into(),
+        publication_id: "publication".into(),
         kind: MediaStreamKind::Microphone,
     })
     .unwrap();
@@ -426,6 +428,7 @@ async fn a_parked_receiver_does_not_reappear_under_a_new_membership_timestamp() 
     let weak = Arc::downgrade(&old);
     own.send(ConnectionEvent::TrackAdded {
         identity: "id-bob".into(),
+        publication_id: "publication".into(),
         kind: MediaStreamKind::Camera,
         track: old,
     })
@@ -1105,6 +1108,7 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
         let old_weak = Arc::downgrade(&old_track);
         old.send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
+            publication_id: "publication".into(),
             kind: MediaStreamKind::Microphone,
             track: old_track,
         })
@@ -1132,6 +1136,7 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
         let late_weak = Arc::downgrade(&late_track);
         old.send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
+            publication_id: "publication".into(),
             kind: MediaStreamKind::Microphone,
             track: late_track,
         })
@@ -1150,6 +1155,7 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
         current
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".into(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Microphone,
                 track: fresh.clone(),
             })
@@ -1196,6 +1202,7 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
     ] {
         peer.send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
+            publication_id: "publication".into(),
             kind,
             track,
         })
@@ -1251,6 +1258,7 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
     let replacement: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
     peer.send(ConnectionEvent::TrackAdded {
         identity: "id-bob".into(),
+        publication_id: "publication".into(),
         kind: MediaStreamKind::Camera,
         track: replacement.clone(),
     })
@@ -1288,6 +1296,7 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
     for kind in [MediaStreamKind::Camera, MediaStreamKind::Microphone] {
         peer.send(ConnectionEvent::TrackRemoved {
             identity: "id-bob".into(),
+            publication_id: "publication".into(),
             kind,
         })
         .unwrap();
@@ -1328,6 +1337,7 @@ async fn parked_media_is_not_restored_after_its_track_or_connection_retires() {
         let peer = fx.sender(PEER_FOCUS);
         peer.send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
+            publication_id: "publication".into(),
             kind: MediaStreamKind::Camera,
             track,
         })
@@ -1345,6 +1355,7 @@ async fn parked_media_is_not_restored_after_its_track_or_connection_retires() {
             0 => {
                 peer.send(ConnectionEvent::TrackRemoved {
                     identity: "id-bob".into(),
+                    publication_id: "publication".into(),
                     kind: MediaStreamKind::Camera,
                 })
                 .unwrap();
@@ -1401,6 +1412,7 @@ async fn retired_generation_events_cannot_refill_parked_media() {
     let weak = Arc::downgrade(&track);
     peer.send(ConnectionEvent::TrackAdded {
         identity: "id-bob".into(),
+        publication_id: "publication".into(),
         kind: MediaStreamKind::Camera,
         track,
     })
@@ -1427,6 +1439,7 @@ async fn replacing_the_adopted_connection_discards_its_parked_handles() {
     let weak = Arc::downgrade(&track);
     old.send(ConnectionEvent::TrackAdded {
         identity: "id-bob".into(),
+        publication_id: "publication".into(),
         kind: MediaStreamKind::Camera,
         track,
     })
@@ -1463,6 +1476,62 @@ async fn replacing_the_adopted_connection_discards_its_parked_handles() {
     fx.pool.close();
 }
 
+/// A delayed unsubscribe belongs to its publication, not the latest same-kind handle.
+#[tokio::test]
+async fn an_old_publication_removal_cannot_remove_the_replacement_handle() {
+    for membership_known in [true, false] {
+        let mut fx = Fixture::new();
+        let peer = fx.adopt();
+        if membership_known {
+            fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+        }
+        let old: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::ScreenShare));
+        let replacement: Arc<dyn RemoteTrackHandle> =
+            Arc::new(FakeTrack(MediaStreamKind::ScreenShare));
+        for (publication_id, track) in [("old", old), ("new", replacement.clone())] {
+            peer.send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".into(),
+                publication_id: publication_id.into(),
+                kind: MediaStreamKind::ScreenShare,
+                track,
+            })
+            .unwrap();
+        }
+        fx.drain().await;
+        peer.send(ConnectionEvent::TrackRemoved {
+            identity: "id-bob".into(),
+            publication_id: "old".into(),
+            kind: MediaStreamKind::ScreenShare,
+        })
+        .unwrap();
+        let events = fx.drain().await;
+        assert!(!events.contains(&PoolEvent::StreamRemoved {
+            member_id: "bob".into(),
+            kind: MediaStreamKind::ScreenShare,
+        }));
+        if !membership_known {
+            fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+        }
+        let tracks = fx.pool.remote_tracks();
+        assert!(Arc::ptr_eq(
+            &tracks.get("bob", MediaStreamKind::ScreenShare).unwrap(),
+            &replacement,
+        ));
+        peer.send(ConnectionEvent::TrackRemoved {
+            identity: "id-bob".into(),
+            publication_id: "new".into(),
+            kind: MediaStreamKind::ScreenShare,
+        })
+        .unwrap();
+        assert!(fx.drain().await.contains(&PoolEvent::StreamRemoved {
+            member_id: "bob".into(),
+            kind: MediaStreamKind::ScreenShare,
+        }));
+        assert!(tracks.get("bob", MediaStreamKind::ScreenShare).is_none());
+        fx.pool.close();
+    }
+}
+
 /// Moving between focuses cannot give the old focus ownership of the new handle.
 #[tokio::test]
 async fn an_old_connection_removal_cannot_remove_the_replacement_handle() {
@@ -1478,6 +1547,7 @@ async fn an_old_connection_removal_cannot_remove_the_replacement_handle() {
     fx.sender(PEER_FOCUS)
         .send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
+            publication_id: "publication".into(),
             kind: MediaStreamKind::Camera,
             track: replacement.clone(),
         })
@@ -1485,6 +1555,7 @@ async fn an_old_connection_removal_cannot_remove_the_replacement_handle() {
     fx.drain().await;
     old.send(ConnectionEvent::TrackRemoved {
         identity: "id-bob".into(),
+        publication_id: "publication".into(),
         kind: MediaStreamKind::Camera,
     })
     .unwrap();
@@ -1513,6 +1584,7 @@ async fn an_active_old_incarnation_cannot_be_parked_after_same_key_adoption() {
     let weak = Arc::downgrade(&track);
     old.send(ConnectionEvent::TrackAdded {
         identity: "id-bob".into(),
+        publication_id: "publication".into(),
         kind: MediaStreamKind::Camera,
         track,
     })
@@ -1536,6 +1608,7 @@ async fn an_active_old_incarnation_cannot_be_parked_after_same_key_adoption() {
     replacement
         .send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
+            publication_id: "publication".into(),
             kind: MediaStreamKind::Camera,
             track: current.clone(),
         })
@@ -1564,6 +1637,7 @@ async fn an_active_idle_retired_focus_cannot_be_parked_after_a_lapse() {
     fx.sender(PEER_FOCUS)
         .send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
+            publication_id: "publication".into(),
             kind: MediaStreamKind::Camera,
             track,
         })

@@ -18,6 +18,91 @@ import package_appimage as P
 
 
 class ProgressTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "POSIX private capture log identities")
+    def test_process_exit_markers_require_scan_cleanup_and_keep_all_closed_peer_sites(self):
+        import appimage_capture as capture
+        peer_source = (ROOT / "packaging/linux/appimage_peer.rs").read_bytes()
+        for label in D.PEER_PANIC_LABELS:
+            self.assertIn(label, peer_source)
+        frame = b"thread 'peer' panicked at packaging/linux/appimage_peer.rs:327:10:\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); session = root / "bindings/session"
+            session.mkdir(mode=0o700, parents=True); (root / "bindings").chmod(0o700)
+            peer_log = session / "peer.stderr.log"
+            peer_log.write_bytes(frame + b"Installed screen track ended before matching pixels\n" +
+                                 frame + b"Installed capture phase deadline exceeded: private payload\n")
+            peer_log.chmod(0o600)
+            app_log = session / "app.stderr.log"
+            app_log.write_bytes(D.CAPTURE_FAILURE_PREFIX + b"capture_worker\nprivate payload\n")
+            app_log.chmod(0o600)
+            progress = D.Progress(root); progress.wrapper("capture")
+            progress.capture("eager_bindings", "reopened_frame"); progress.command("capture-yellow")
+            progress.failed(capture.CaptureFailure("process_exit")); progress.cleanup(True)
+            first = dict(progress.value["failure"])
+            result = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertEqual(result["failure"], first); self.assertFalse(result["passed"])
+            self.assertEqual(result["peer_failure_marker"], {"status": "scanned_private_peer_stderr",
+                "panic_site": "ambiguous", "panic_sites": ["screen_stream_ended", "work_deadline"]})
+            self.assertEqual(result["native_capture_failure_markers"],
+                             {"status": "scanned_private_app_stderr", "codes": ["capture_worker"]})
+            self.assertNotIn("private payload", json.dumps(result))
+            with mock.patch.object(D, "peer_failure_marker", side_effect=AssertionError("must not read")), \
+                    mock.patch.object(D, "capture_failure_markers", side_effect=AssertionError("must not read")):
+                self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                                 {"diagnostics": "withheld", "passed": False})
+                result = D.public_failure(root, scan_passed=True, outer_cleanup="failed", outer_reason="namespace_exit")
+                self.assertNotIn("peer_failure_marker", result)
+                self.assertNotIn("native_capture_failure_markers", result)
+            self.assertEqual(progress.value["failure"], first)
+
+    def test_owned_capture_exit_is_closed_first_latched_and_independently_scan_gated(self):
+        import appimage_capture as capture
+        observed = {"role": "app", "status": -13, "app_stdout": "clear", "app_stderr": "truncated",
+                    "peer_stdout": "unknown", "peer_stderr": "failed"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); progress = D.Progress(root)
+            progress.wrapper("capture"); progress.capture("eager_bindings", "reopened_frame")
+            progress.command("capture-yellow")
+            failure = capture.CaptureFailure("process_exit"); failure.process_exit = dict(observed)
+            progress.failed(failure); original = dict(progress.value["failure"])
+            failure.process_exit["status"] = 0
+            self.assertEqual(original["process_exit"], observed)
+            progress.failed(RuntimeError("private later error")); progress.cleanup(True)
+            self.assertEqual(progress.value["failure"], original)
+            self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                             {"diagnostics": "withheld", "passed": False})
+            visible = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertEqual(visible["failure"], original); self.assertFalse(visible["passed"])
+            self.assertNotIn("private", json.dumps(visible))
+            for change in ({"role": "private name"}, {"status": True}, {"status": -129}, {"status": 256},
+                           {"app_stderr": "private text"}, {"pid": 123}):
+                candidate = json.loads(json.dumps(progress.value))
+                candidate["failure"]["process_exit"].update(change)
+                self.assertFalse(D.valid_record(candidate))
+            candidate = json.loads(json.dumps(progress.value))
+            candidate["failure"]["reason"] = "capture_wait_timeout"
+            self.assertFalse(D.valid_record(candidate))
+
+    def test_capture_exit_ignores_foreign_exception_properties_and_invalid_owned_values(self):
+        import appimage_capture as capture
+        class ForeignFailure(capture.CaptureFailure):
+            @property
+            def process_exit(self):
+                raise AssertionError("foreign property must not be inspected")
+        self.assertIsNone(D.process_exit(ForeignFailure.__new__(ForeignFailure)))
+        class ForeignString(str):
+            pass
+        observed = {"role": "peer", "status": 101, "app_stdout": "clear", "app_stderr": "clear",
+                    "peer_stdout": "clear", "peer_stderr": "clear"}
+        for invalid in (None, [], {**observed, "role": ForeignString("peer")},
+                        {**observed, "peer_stderr": ForeignString("clear")}):
+            failure = capture.CaptureFailure("process_exit"); failure.process_exit = invalid
+            self.assertIsNone(D.process_exit(failure))
+        failure = capture.CaptureFailure("wait_timeout"); failure.process_exit = observed
+        self.assertIsNone(D.process_exit(failure))
+        with mock.patch.dict(sys.modules, {"appimage_capture": None}):
+            self.assertIsNone(D.process_exit(capture.CaptureFailure("process_exit")))
+
     def test_source_failure_phase_is_exact_owned_closed_latched_and_scan_gated(self):
         import corresponding_source as source
         for phase in source.SOURCE_PHASES:

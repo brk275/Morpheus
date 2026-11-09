@@ -22,3 +22,10 @@ Local changes (October 10, 2026):
 The companion `livekit-api` patch applies the policy to reconnects, cloud region
 fallbacks and authenticated diagnostic requests. Focused regression tests cover
 invalid endpoints, response redaction and all common HTTP redirect statuses.
+
+Remote subscription events preserve the actual LiveKit publication SID through
+`ConnectionEvent::TrackAdded` and `TrackRemoved`. The pool uses it with the
+original connection generation to reject an older publication's delayed
+unsubscribe after a same-kind replacement. Same-SID encrypted receiver instance
+admission remains unchanged. This adds no endpoint, permission, dependency or
+logging change and does not claim installed capture or release acceptance.

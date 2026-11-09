@@ -155,3 +155,20 @@ verification; the actual participant and room must then match the exact checked
 claims. Subscriber handles cannot publish local tracks or activate sender keys,
 even when the service grants them permission to publish. No token payload is
 retained in diagnostics. These source regressions have not been executed locally.
+
+## Exact remote publication removal
+
+Remote add/remove events carry an opaque publication identity. The pool retains
+it with each active or parked receiver and accepts removal only for that identity
+on the original connection generation. A delayed unsubscribe for an earlier
+publication cannot remove a replacement stream of the same member and kind.
+Connection retirement still removes its exact owned handles. LiveKit supplies
+its actual publication SID; synthetic transports must pair the same identity on
+matching add/remove events. The identifier is not added to event Debug output.
+
+The existing pool test module covers old-add/new-add/old-remove ordering for
+both active and not-yet-mapped receivers, followed by matching new removal.
+Existing connection replacement and encrypted receiver admission guards remain.
+This correction does not reject a late stale add, prove the cause of an installed
+capture failure, or establish hosted/native/package acceptance. Upstream source,
+licenses, manifests, features and dependency locks remain unchanged.

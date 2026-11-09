@@ -93,6 +93,7 @@ type TrackMap = Arc<Mutex<HashMap<(String, MediaStreamKind), PooledTrack>>>;
 struct PooledTrack {
     connection_key: String,
     generation: u64,
+    publication_id: String,
     track: Arc<dyn RemoteTrackHandle>,
     /// Participant-level state observed while this exact receiver was present.
     /// A new receiver starts unknown; state never follows only a member ID.
@@ -613,12 +614,13 @@ impl MediaPool {
                             *kind,
                             pooled.connection_key.clone(),
                             pooled.generation,
+                            pooled.publication_id.clone(),
                         )
                     })
             })
             .collect();
-        for (member, kind, key, generation) in retired {
-            self.remove_track(&member, kind, &key, generation);
+        for (member, kind, key, generation, publication_id) in retired {
+            self.remove_track(&member, kind, &key, generation, &publication_id);
         }
         for member in snapshot {
             let first_seen = self.known_members.insert(member.member_id.clone());
@@ -975,10 +977,17 @@ impl MediaPool {
             .expect("track map mutex poisoned")
             .iter()
             .filter(|((member, _), _)| member == member_id)
-            .map(|((_, kind), track)| (*kind, track.connection_key.clone(), track.generation))
+            .map(|((_, kind), track)| {
+                (
+                    *kind,
+                    track.connection_key.clone(),
+                    track.generation,
+                    track.publication_id.clone(),
+                )
+            })
             .collect();
-        for (kind, key, generation) in retired {
-            self.remove_track(member_id, kind, &key, generation);
+        for (kind, key, generation, publication_id) in retired {
+            self.remove_track(member_id, kind, &key, generation, &publication_id);
         }
     }
 
@@ -1177,20 +1186,23 @@ impl MediaPool {
         }
     }
 
-    /// Removes a member's stream, if it came over `connection_key`: a removal
-    /// the old connection reports after the member moved is not theirs.
+    /// Remove only the exact publication from its original connection incarnation.
+    /// A delayed unsubscribe cannot retire a replacement on the same connection.
     fn remove_track(
         &mut self,
         member_id: &str,
         kind: MediaStreamKind,
         connection_key: &str,
         generation: u64,
+        publication_id: &str,
     ) {
         let removed = {
             let mut tracks = self.tracks.lock().expect("track map mutex poisoned");
             let key = (member_id.to_owned(), kind);
             let ours = tracks.get(&key).is_some_and(|pooled| {
-                pooled.connection_key == connection_key && pooled.generation == generation
+                pooled.connection_key == connection_key
+                    && pooled.generation == generation
+                    && pooled.publication_id == publication_id
             });
             ours && tracks.remove(&key).is_some()
         };
@@ -1496,19 +1508,21 @@ impl MediaPool {
         }
 
         log::warn!("peer-focus connection {key} is gone ({message}); reconnecting");
-        let mut lost: Vec<(String, MediaStreamKind)> = self
+        let mut lost: Vec<(String, MediaStreamKind, String)> = self
             .tracks
             .lock()
             .expect("track map mutex poisoned")
             .iter()
             .filter(|(_, pooled)| pooled.connection_key == key)
-            .map(|(stream, _)| stream.clone())
+            .map(|((member_id, kind), pooled)| {
+                (member_id.clone(), *kind, pooled.publication_id.clone())
+            })
             .collect();
         // The map is a `HashMap`; the events derived from it must come out
         // in a stable order.
         lost.sort();
-        for (member_id, kind) in lost {
-            self.remove_track(&member_id, kind, key, generation);
+        for (member_id, kind, publication_id) in lost {
+            self.remove_track(&member_id, kind, key, generation, &publication_id);
         }
         self.mark_degraded(key);
 
@@ -1604,12 +1618,14 @@ impl MediaPool {
             }
             ConnectionEvent::TrackAdded {
                 identity,
+                publication_id,
                 kind,
                 track,
             } => {
                 let pooled = PooledTrack {
                     connection_key: connection_key.to_owned(),
                     generation,
+                    publication_id,
                     track,
                     encryption_state: None,
                     owner: None,
@@ -1642,13 +1658,23 @@ impl MediaPool {
                     }
                 }
             }
-            ConnectionEvent::TrackRemoved { identity, kind } => {
+            ConnectionEvent::TrackRemoved {
+                identity,
+                publication_id,
+                kind,
+            } => {
                 match self
                     .identity_on_connection(&identity, connection_key)
                     .cloned()
                 {
                     Some(member_id) => {
-                        self.remove_track(&member_id, kind, connection_key, generation);
+                        self.remove_track(
+                            &member_id,
+                            kind,
+                            connection_key,
+                            generation,
+                            &publication_id,
+                        );
                     }
                     None => {
                         if let Some(pending) = self.pending_tracks.get_mut(&identity) {
@@ -1656,6 +1682,7 @@ impl MediaPool {
                                 *pending_kind != kind
                                     || pooled.connection_key != connection_key
                                     || pooled.generation != generation
+                                    || pooled.publication_id != publication_id
                             });
                         }
                     }

@@ -174,11 +174,16 @@ pub enum ConnectionEvent {
     },
     TrackAdded {
         identity: String,
+        /// Opaque publication identity, scoped to this participant and connection.
+        /// A replacement publication must use a different value.
+        publication_id: String,
         kind: MediaStreamKind,
         track: Arc<dyn RemoteTrackHandle>,
     },
     TrackRemoved {
         identity: String,
+        /// The identity supplied by the corresponding `TrackAdded` event.
+        publication_id: String,
         kind: MediaStreamKind,
     },
     TrackMuted {
@@ -224,7 +229,7 @@ impl fmt::Debug for ConnectionEvent {
                 .field("identity", identity)
                 .field("kind", kind)
                 .finish_non_exhaustive(),
-            Self::TrackRemoved { identity, kind } => f
+            Self::TrackRemoved { identity, kind, .. } => f
                 .debug_struct("TrackRemoved")
                 .field("identity", identity)
                 .field("kind", kind)

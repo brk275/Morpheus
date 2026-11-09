@@ -2434,6 +2434,7 @@ mod tests {
         connection
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
@@ -2472,6 +2473,7 @@ mod tests {
         connection
             .send(ConnectionEvent::TrackRemoved {
                 identity: "id-bob".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Microphone,
             })
             .unwrap();
@@ -2498,6 +2500,7 @@ mod tests {
         connection
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Camera,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
             })
@@ -2831,6 +2834,7 @@ mod tests {
         connection
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::with_stats(
                     MediaStreamKind::Microphone,
@@ -2873,6 +2877,7 @@ mod tests {
             connection
                 .send(ConnectionEvent::TrackAdded {
                     identity: format!("id-{member_id}"),
+                    publication_id: "publication".into(),
                     kind,
                     track: Arc::new(track),
                 })
@@ -3022,6 +3027,7 @@ mod tests {
         connection
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Microphone,
                 // `FakeTrack::new` leaves the trait default in place.
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
@@ -3049,6 +3055,7 @@ mod tests {
         connection
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
@@ -3131,6 +3138,7 @@ mod tests {
             .unwrap()
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
@@ -3172,6 +3180,7 @@ mod tests {
             .unwrap()
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
@@ -4074,6 +4083,7 @@ mod tests {
             .unwrap()
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Camera,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
             })
@@ -4219,6 +4229,7 @@ mod tests {
         connection
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".into(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Camera,
                 track: camera.clone(),
             })
@@ -4823,6 +4834,7 @@ mod tests {
         connection
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-b".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })

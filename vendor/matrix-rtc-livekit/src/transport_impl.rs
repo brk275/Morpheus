@@ -1019,6 +1019,7 @@ async fn translate_room_events(
                 let kind = stream_kind(publication.source(), publication.kind());
                 Some(ConnectionEvent::TrackAdded {
                     identity: participant.identity().to_string(),
+                    publication_id: publication.sid().to_string(),
                     kind,
                     track: Arc::new(LiveKitRemoteTrack { kind, track }),
                 })
@@ -1029,6 +1030,7 @@ async fn translate_room_events(
                 ..
             } => Some(ConnectionEvent::TrackRemoved {
                 identity: participant.identity().to_string(),
+                publication_id: publication.sid().to_string(),
                 kind: stream_kind(publication.source(), publication.kind()),
             }),
             RoomEvent::TrackMuted {

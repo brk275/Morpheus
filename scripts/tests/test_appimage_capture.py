@@ -327,6 +327,62 @@ class SelectorTests(unittest.TestCase):
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_owned_exit_retains_first_status_and_plain_app_peer_log_observations(self):
+        def sink(failed=False, truncated=False):
+            value = M.CappedPrivateLog.__new__(M.CappedPrivateLog)
+            value.failed, value.truncated = failed, truncated
+            return value
+        for role, status in (("app", 0), ("app", -13), ("peer", 101)):
+            with self.subTest(role=role, status=status):
+                app, peer = object(), object()
+                owner = M.Processes(Path("/private"))
+                owner.owned = [app, peer]; owner.children = {"app": app, "peer": peer}
+                owner.sinks = {"app": (sink(), sink(truncated=True)),
+                               "peer": (sink(failed=True), sink(True, True))}
+                predicate = mock.Mock(side_effect=AssertionError("predicate must not run"))
+                statuses = [status] if role == "app" else [None, status]
+                with mock.patch.object(M.time, "monotonic", return_value=0), \
+                        mock.patch.object(M.containment, "status", side_effect=statuses) as check:
+                    with self.assertRaises(M.CaptureFailure) as caught:
+                        owner.wait_for(predicate, watch=(app, peer))
+                self.assertEqual(caught.exception.reason, "process_exit")
+                self.assertEqual(caught.exception.process_exit, {
+                    "role": role, "status": status, "app_stdout": "clear", "app_stderr": "truncated",
+                    "peer_stdout": "failed", "peer_stderr": "failed_truncated"})
+                self.assertEqual(check.call_args_list, [mock.call(app)] if role == "app" else
+                                 [mock.call(app), mock.call(peer)])
+                predicate.assert_not_called()
+
+    def test_exit_observation_rejects_unowned_objects_and_foreign_sink_properties(self):
+        class ForeignSink:
+            @property
+            def failed(self):
+                raise AssertionError("foreign property must not be inspected")
+            @property
+            def truncated(self):
+                raise AssertionError("foreign property must not be inspected")
+        owner = M.Processes(Path("/private")); child = object()
+        self.assertIsNone(owner._exit_fact(child, 1))
+        owner.owned = [child]; owner.children = {"app": child}
+        owner.sinks = {"app": (ForeignSink(), ForeignSink())}
+        for invalid in (True, 256, -129, "private status"):
+            result = owner._exit_fact(child, invalid)
+            self.assertIsNone(result["status"])
+            self.assertEqual([result[key] for key in ("app_stdout", "app_stderr", "peer_stdout", "peer_stderr")],
+                             ["unknown"] * 4)
+
+    def test_exit_diagnostic_failure_cannot_replace_original_reason_or_repoll(self):
+        owner = M.Processes(Path("/private")); child = object()
+        predicate = mock.Mock()
+        with mock.patch.object(M.time, "monotonic", return_value=0), \
+                mock.patch.object(M.containment, "status", return_value=-11) as status, \
+                mock.patch.object(owner, "_exit_fact", side_effect=RuntimeError("private diagnostic failure")):
+            with self.assertRaises(M.CaptureFailure) as caught:
+                owner.wait_for(predicate, watch=(child,))
+        self.assertEqual(caught.exception.reason, "process_exit")
+        self.assertIsNone(caught.exception.process_exit)
+        status.assert_called_once_with(child); predicate.assert_not_called()
+
     def test_capture_failure_reasons_are_closed_and_never_echo_invalid_values(self):
         class ForeignString(str):
             pass
