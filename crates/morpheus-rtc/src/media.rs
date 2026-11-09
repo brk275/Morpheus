@@ -43,6 +43,95 @@ pub enum MediaError {
     Transport(#[from] matrix_rtc_transport::TransportError),
 }
 
+/// Closed Linux capture support metadata. No backend text or input is encoded.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureFailureCode {
+    PortalSetup,
+    PortalCreate,
+    PortalSelect,
+    PortalStart,
+    PortalRemote,
+    PortalSelection,
+    PipeWireSetup,
+    PortalSessionClosed,
+    PipeWireUnconnected,
+    PipeWireError,
+    PipeWirePaused,
+    FormatRejected,
+    BufferPlaneMissing,
+    FrameChunkRejected,
+    PipelineUnknown,
+    FirstFormat,
+    FirstBuffer,
+    FirstStreaming,
+    FirstProcessing,
+    FirstDequeue,
+    FirstFrame,
+    CaptureWorker,
+    CaptureStartTimeout,
+    CaptureSelectTimeout,
+    CapturePublish,
+    CapturePublishTimeout,
+    CaptureFramePush,
+    CaptureUnpublish,
+    CaptureWorkerShutdown,
+    CapturePreviousWorker,
+    CaptureThreadSpawn,
+    CaptureStartRejected,
+}
+
+#[cfg(target_os = "linux")]
+impl CaptureFailureCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PortalSetup => "portal_setup",
+            Self::PortalCreate => "portal_create",
+            Self::PortalSelect => "portal_select",
+            Self::PortalStart => "portal_start",
+            Self::PortalRemote => "portal_remote",
+            Self::PortalSelection => "portal_selection",
+            Self::PipeWireSetup => "pipewire_setup",
+            Self::PortalSessionClosed => "portal_session_closed",
+            Self::PipeWireUnconnected => "pipewire_unconnected",
+            Self::PipeWireError => "pipewire_error",
+            Self::PipeWirePaused => "pipewire_paused",
+            Self::FormatRejected => "format_rejected",
+            Self::BufferPlaneMissing => "buffer_plane_missing",
+            Self::FrameChunkRejected => "frame_chunk_rejected",
+            Self::PipelineUnknown => "pipeline_unknown",
+            Self::FirstFormat => "first_format",
+            Self::FirstBuffer => "first_buffer",
+            Self::FirstStreaming => "first_streaming",
+            Self::FirstProcessing => "first_processing",
+            Self::FirstDequeue => "first_dequeue",
+            Self::FirstFrame => "first_frame",
+            Self::CaptureWorker => "capture_worker",
+            Self::CaptureStartTimeout => "capture_start_timeout",
+            Self::CaptureSelectTimeout => "capture_select_timeout",
+            Self::CapturePublish => "capture_publish",
+            Self::CapturePublishTimeout => "capture_publish_timeout",
+            Self::CaptureFramePush => "capture_frame_push",
+            Self::CaptureUnpublish => "capture_unpublish",
+            Self::CaptureWorkerShutdown => "capture_worker_shutdown",
+            Self::CapturePreviousWorker => "capture_previous_worker",
+            Self::CaptureThreadSpawn => "capture_thread_spawn",
+            Self::CaptureStartRejected => "capture_start_rejected",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_capture_failure(output: &mut impl std::io::Write, code: CaptureFailureCode) {
+    let _ = writeln!(output, "MORPHEUS_NATIVE_CAPTURE_FAILURE {}", code.as_str());
+}
+
+/// Best-effort fixed support code only; reporting cannot replace a capture error.
+#[cfg(target_os = "linux")]
+pub fn report_capture_failure(code: CaptureFailureCode) {
+    write_capture_failure(&mut std::io::stderr().lock(), code);
+}
+
 /// A local media track whose format is checked before entering libwebrtc.
 pub struct Publication {
     track: Arc<dyn LocalTrackHandle>,
@@ -284,6 +373,24 @@ mod tests {
             rotation: matrix_rtc_transport::VideoRotation::Deg0,
             timestamp_us: 0,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_failure_support_writer_is_closed_and_ignores_broken_pipe() {
+        let mut output = Vec::new();
+        write_capture_failure(&mut output, CaptureFailureCode::FirstBuffer);
+        assert_eq!(output, b"MORPHEUS_NATIVE_CAPTURE_FAILURE first_buffer\n");
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        write_capture_failure(&mut Broken, CaptureFailureCode::CaptureWorkerShutdown);
     }
 
     #[test]

@@ -547,7 +547,7 @@ jobs:
         run: cargo test --locked --no-fail-fast -p morpheus-rtc -p matrix-rtc-core -p matrix-rtc-call -p matrix-rtc-call-sdk -p matrix-rtc-transport -p matrix-rtc-matrix-sdk -p matrix-rtc-livekit --features morpheus-rtc/native-rtc,morpheus-rtc/native-devices --lib
       - name: Test native device and call guards
         id: device-tests
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'devices')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'desktop-video')
         run: cargo test --locked -p morpheus-rtc --features native-devices --lib
       - name: Test Windows capture of an owned synthetic window and display
         id: windows-capture-tests
@@ -927,7 +927,7 @@ jobs:
               selected = {
                   "model-tests": route in ("all", "models"),
                   "desktop-tests": route in ("all", "desktop", "desktop-video"),
-                  "device-tests": route in ("all", "devices"),
+                  "device-tests": route in ("all", "devices", "desktop-video"),
                   "windows-capture-tests": runner == "Windows" and route in ("all", "devices"),
                   "wayland-tests": runner == "Linux" and wayland == "true",
                   "vendor-tests": route in ("all", "vendor"),

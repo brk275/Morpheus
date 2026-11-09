@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -17,6 +18,83 @@ import package_appimage as P
 
 
 class ProgressTests(unittest.TestCase):
+    def test_native_capture_codes_match_static_rust_and_do_not_reflect_private_text(self):
+        import re
+        source = (Path(__file__).resolve().parents[2] /
+                  "crates/morpheus-rtc/src/media.rs").read_text()
+        block = source.split("impl CaptureFailureCode {", 1)[1].split(
+            "fn write_capture_failure(", 1)[0]
+        actual = {code.encode("ascii") for code in re.findall(
+            r'Self::[A-Za-z]+ => "([a-z_]+)"', block)}
+        self.assertEqual(actual, D.CAPTURE_FAILURE_CODES)
+        for code in D.CAPTURE_FAILURE_CODES:
+            with self.subTest(code=code):
+                data = b"private room and source body\n" + D.CAPTURE_FAILURE_PREFIX + code + b"\r\n"
+                result = D._capture_marker_codes(data)
+                self.assertEqual(result, {"status": "known_codes",
+                                          "codes": [code.decode("ascii")]})
+                self.assertNotIn("private", json.dumps(result))
+
+    def test_native_capture_unknown_malformed_and_overlimit_markers_are_closed(self):
+        known = D.CAPTURE_FAILURE_PREFIX + b"first_buffer\n"
+        for data in (D.CAPTURE_FAILURE_PREFIX + b"private account body\n",
+                     b"MORPHEUS_NATIVE_CAPTURE_FAILUREfirst_buffer\n",
+                     known + D.CAPTURE_FAILURE_PREFIX + b"foreign URL\n",
+                     D.CAPTURE_FAILURE_PREFIX + b"first_buffer private suffix\n",
+                     D.CAPTURE_FAILURE_PREFIX + b"first_buffer\r\r\n",
+                     known * 17, b"x" * (8 * 1024 * 1024 + 1), b"\n" * 65537,
+                     bytearray(known)):
+            with self.subTest(kind=type(data).__name__):
+                self.assertEqual(D._capture_marker_codes(data), {"status": "invalid", "codes": []})
+        self.assertEqual(D._capture_marker_codes(b"private foreign text"),
+                         {"status": "known_codes", "codes": []})
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX private capture log identity")
+    def test_native_capture_private_log_requires_scan_and_exact_owned_regular_file(self):
+        with mock.patch.object(D, "Path", side_effect=AssertionError("must not inspect")):
+            self.assertEqual(D.capture_failure_markers("unused", "ordinary", scan_passed=False),
+                             {"status": "withheld", "codes": []})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ordinary").mkdir(mode=0o700)
+            session = root / "ordinary/session"; session.mkdir(mode=0o700)
+            log = session / "app.stderr.log"
+            log.write_bytes(D.CAPTURE_FAILURE_PREFIX + b"portal_select\n"); log.chmod(0o600)
+            self.assertEqual(D.capture_failure_markers(root, "ordinary", scan_passed=True),
+                             {"status": "scanned_private_app_stderr", "codes": ["portal_select"]})
+            log.chmod(0o644)
+            with self.assertRaises(ValueError):
+                D.capture_failure_markers(root, "ordinary", scan_passed=True)
+            log.chmod(0o600)
+            alias = session / "alias.log"; os.link(log, alias)
+            with self.assertRaises(ValueError):
+                D.capture_failure_markers(root, "ordinary", scan_passed=True)
+            alias.unlink()
+            log.rename(alias); log.symlink_to(alias.name)
+            with self.assertRaises(ValueError):
+                D.capture_failure_markers(root, "ordinary", scan_passed=True)
+
+    def test_native_capture_observation_cannot_rescue_or_replace_latched_failure(self):
+        from linux_package_ui import DiagnosticFailure
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); progress = D.Progress(root)
+            progress.wrapper("capture"); progress.command("capture-yellow")
+            progress.capture("ordinary", "reopened_frame")
+            progress.failed(DiagnosticFailure("wait_timeout")); progress.cleanup(True)
+            original = dict(progress.value["failure"])
+            with mock.patch.object(D, "capture_failure_markers", return_value={
+                    "status": "scanned_private_app_stderr", "codes": ["capture_worker"]}):
+                result = D.public_failure(root, scan_passed=True,
+                                          outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["failure"], original)
+            self.assertEqual(progress.value["failure"], original)
+            with mock.patch.object(D, "capture_failure_markers", side_effect=OSError("private error")):
+                self.assertEqual(D.public_failure(root, scan_passed=True,
+                                                 outer_cleanup="passed", outer_reason="namespace_exit"),
+                                 {"diagnostics": "withheld", "passed": False})
+            self.assertEqual(progress.value["failure"], original)
+
     def test_share_control_schema_rejects_unknown_fields_types_and_unrelated_positions(self):
         good = {"observation": "after_timeout", "state": "share", "enabled": False, "checked": True}
         self.assertTrue(D.valid_share_control(good))

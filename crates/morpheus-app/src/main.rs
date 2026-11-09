@@ -2521,6 +2521,12 @@ fn run_application(
                 return;
             };
             if !window.get_live_session() || !window.get_native_call_joined() {
+                #[cfg(target_os = "linux")]
+                if matches!(kind, 1 | 2) {
+                    morpheus_rtc::report_capture_failure(
+                        morpheus_rtc::CaptureFailureCode::CaptureStartRejected,
+                    );
+                }
                 return;
             }
             let id = id.to_string();
@@ -2529,6 +2535,12 @@ fn run_application(
                 .filter_map(|index| model.row_data(index))
                 .find(|source| source.kind == kind && source.id.as_str() == id);
             let Some(selected) = selected else {
+                #[cfg(target_os = "linux")]
+                if matches!(kind, 1 | 2) {
+                    morpheus_rtc::report_capture_failure(
+                        morpheus_rtc::CaptureFailureCode::CaptureStartRejected,
+                    );
+                }
                 window
                     .set_native_capture_error("Capture source changed; refresh the picker".into());
                 call_bar::capture_error_written();
@@ -2542,6 +2554,12 @@ fn run_application(
             };
             let token = calls.video_token();
             if token == 0 {
+                #[cfg(target_os = "linux")]
+                if matches!(kind, 1 | 2) {
+                    morpheus_rtc::report_capture_failure(
+                        morpheus_rtc::CaptureFailureCode::CaptureStartRejected,
+                    );
+                }
                 return;
             }
             let label = safe_capture_label(selected.name.as_str());
@@ -2570,6 +2588,12 @@ fn run_application(
             let weak = weak.clone();
             handle.spawn(async move {
                 let result = calls.start_video_capture(token, source, label).await;
+                #[cfg(target_os = "linux")]
+                if owned_kind == CaptureKind::Screen && result.is_err() {
+                    morpheus_rtc::report_capture_failure(
+                        morpheus_rtc::CaptureFailureCode::CaptureStartRejected,
+                    );
+                }
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     // The click gives up its ownership whatever the outcome.
                     let rollback = call_bar::capture_owner_end(owned_kind, owner, result.is_err());

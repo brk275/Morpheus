@@ -330,6 +330,10 @@ def load_native_validator(function_name="native_check_error"):
 
 class NativeRouteWorkflowTests(unittest.TestCase):
     def test_selected_steps_must_pass_and_unselected_steps_must_be_skipped(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        device = source.split("      - name: Test native device and call guards\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'desktop-video')\n", device)
+        self.assertIn("run: cargo test --locked -p morpheus-rtc --features native-devices --lib\n", device)
         validate = load_native_validator()
         for runner in ("Linux","Windows","macOS"):
             for route in ("all","models","desktop","desktop-video","devices","vendor","sdk","sdk-archive","matrix","wayland"):
@@ -337,7 +341,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
                     continue
                 wayland = "true" if runner=="Linux" and route in ("all","wayland") else "false"
                 selected = {"model-tests":route in ("all","models"), "desktop-tests":route in ("all","desktop","desktop-video"),
-                            "device-tests":route in ("all","devices"), "vendor-tests":route in ("all","vendor"),
+                            "device-tests":route in ("all","devices","desktop-video"), "vendor-tests":route in ("all","vendor"),
                             "rtc-library-tests":route in ("all","vendor"),
                             "video-source-tests":route in ("all","vendor","desktop-video"),
                             "sdk-receipt-tests":route in ("all","sdk"),

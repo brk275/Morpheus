@@ -404,6 +404,107 @@ def peer_failure_marker(root, mode, *, scan_passed):
             "panic_site": sites[0] if len(sites) == 1 else "ambiguous" if sites else "unknown"}
 
 
+CAPTURE_FAILURE_PREFIX = b"MORPHEUS_NATIVE_CAPTURE_FAILURE "
+CAPTURE_FAILURE_CODES = frozenset((
+    b"portal_setup",
+    b"portal_create",
+    b"portal_select",
+    b"portal_start",
+    b"portal_remote",
+    b"portal_selection",
+    b"pipewire_setup",
+    b"portal_session_closed",
+    b"pipewire_unconnected",
+    b"pipewire_error",
+    b"pipewire_paused",
+    b"format_rejected",
+    b"buffer_plane_missing",
+    b"frame_chunk_rejected",
+    b"pipeline_unknown",
+    b"first_format",
+    b"first_buffer",
+    b"first_streaming",
+    b"first_processing",
+    b"first_dequeue",
+    b"first_frame",
+    b"capture_worker",
+    b"capture_start_timeout",
+    b"capture_select_timeout",
+    b"capture_publish",
+    b"capture_publish_timeout",
+    b"capture_frame_push",
+    b"capture_unpublish",
+    b"capture_worker_shutdown",
+    b"capture_previous_worker",
+    b"capture_thread_spawn",
+    b"capture_start_rejected",
+))
+
+
+def _capture_marker_codes(data):
+    """Fixed observations only; never infer which attempt caused a marker."""
+    rejected = {"status": "invalid", "codes": []}
+    if (type(data) is not bytes or len(data) > 8 * 1024 * 1024
+            or data.count(b"\n") > 65536):
+        return rejected
+    observed = []
+    for raw in data.split(b"\n", 65536):
+        line = raw.removesuffix(b"\r")
+        if not line.startswith(b"MORPHEUS_NATIVE_CAPTURE_FAILURE"):
+            continue
+        if (len(line) > 128 or not line.startswith(CAPTURE_FAILURE_PREFIX)
+                or line[len(CAPTURE_FAILURE_PREFIX):] not in CAPTURE_FAILURE_CODES
+                or len(observed) >= 16):
+            return rejected
+        observed.append(line[len(CAPTURE_FAILURE_PREFIX):].decode("ascii"))
+    return {"status": "known_codes", "codes": observed}
+
+
+def capture_failure_markers(root, mode, *, scan_passed):
+    """Read only the stopped, independently scanned owned app stderr."""
+    if scan_passed is not True:
+        return {"status": "withheld", "codes": []}
+    from appimage_client import private_directory
+    case = {"ordinary": "ordinary", "eager_bindings": "bindings"}.get(mode)
+    if case is None:
+        raise ValueError("Invalid private capture mode")
+    directory = Path(root)
+    for part in (None, case, "session"):
+        if part is not None:
+            directory = directory / part
+        try:
+            private_directory(directory)
+        except FileNotFoundError:
+            return {"status": "unavailable", "codes": []}
+    path = directory / "app.stderr.log"
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return {"status": "unavailable", "codes": []}
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+            or before.st_mode & 0o077 or before.st_nlink != 1
+            or not 0 <= before.st_size <= 8 * 1024 * 1024):
+        raise ValueError("Unsafe private capture log")
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink,
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if identity(before) != identity(opened):
+            raise ValueError("Changed private capture log")
+        data = stream.read(8 * 1024 * 1024 + 1)
+        if (identity(opened) != identity(os.fstat(stream.fileno()))
+                or len(data) != before.st_size):
+            raise ValueError("Changed private capture log")
+    if identity(before) != identity(path.lstat()):
+        raise ValueError("Changed private capture log")
+    result = _capture_marker_codes(data)
+    if result["status"] == "known_codes":
+        result["status"] = "scanned_private_app_stderr"
+    return result
+
+
 def public_failure(root, *, scan_passed, outer_cleanup, outer_reason):
     """Only a validated fixed record can leave the private workspace."""
     withheld = {"diagnostics": "withheld", "passed": False}
@@ -429,6 +530,14 @@ def public_failure(root, *, scan_passed, outer_cleanup, outer_reason):
                 and value["inner_cleanup"] == "passed" and outer_cleanup == "passed"):
             result["peer_failure_marker"] = peer_failure_marker(
                 root, value["capture_mode"], scan_passed=scan_passed)
+        failure = value["failure"]
+        if (failure is not None and failure["wrapper_phase"] == "capture"
+                and failure["capture_phase"] == "reopened_frame"
+                and failure["command_stage"] == "capture-yellow"
+                and failure["reason"] == "ui_wait_timeout"
+                and value["inner_cleanup"] == "passed" and outer_cleanup == "passed"):
+            result["native_capture_failure_markers"] = capture_failure_markers(
+                root, failure["capture_mode"], scan_passed=scan_passed)
         return result
     except (OSError, RuntimeError, ValueError, TypeError, KeyError):
         return withheld

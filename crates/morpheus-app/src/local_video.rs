@@ -14,6 +14,8 @@ use std::{
 };
 
 use morpheus_rtc::{CameraCapture, MediaError, Publication, RtcService, ScreenCapture, VideoFrame};
+#[cfg(target_os = "linux")]
+use morpheus_rtc::CaptureFailureCode;
 use tokio::{
     sync::{Notify, mpsc, oneshot, watch},
     time::{self, MissedTickBehavior, timeout},
@@ -199,6 +201,13 @@ impl Drop for CaptureWorkerGuard {
 pub(crate) enum CaptureKind {
     Camera,
     Screen,
+}
+
+#[cfg(target_os = "linux")]
+fn report_screen_failure(kind: CaptureKind, code: CaptureFailureCode) {
+    if kind == CaptureKind::Screen {
+        morpheus_rtc::report_capture_failure(code);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -517,6 +526,8 @@ impl LocalVideoSession {
                 error,
             }) => {
                 if self.slot(kind).generation == generation && self.slot(kind).stop.is_some() {
+                    #[cfg(target_os = "linux")]
+                    report_screen_failure(kind, CaptureFailureCode::CaptureWorker);
                     self.fail(kind, error.to_string()).await;
                 }
             }
@@ -534,6 +545,15 @@ impl LocalVideoSession {
                         .started
                         .is_some_and(|since| since.elapsed() > budget)
                     {
+                        #[cfg(target_os = "linux")]
+                        report_screen_failure(
+                            kind,
+                            if selecting {
+                                CaptureFailureCode::CaptureSelectTimeout
+                            } else {
+                                CaptureFailureCode::CaptureStartTimeout
+                            },
+                        );
                         self.fail(
                             kind,
                             if selecting {
@@ -572,6 +592,8 @@ impl LocalVideoSession {
                 error,
             }) => {
                 if self.slot(kind).generation == generation && self.slot(kind).stop.is_some() {
+                    #[cfg(target_os = "linux")]
+                    report_screen_failure(kind, CaptureFailureCode::CaptureWorker);
                     self.fail(kind, error.to_string()).await;
                 }
             }
@@ -602,6 +624,8 @@ impl LocalVideoSession {
         let slot = self.slot_mut(kind);
         slot.reap_finished_worker()?;
         if slot.worker.is_some() {
+            #[cfg(target_os = "linux")]
+            report_screen_failure(kind, CaptureFailureCode::CapturePreviousWorker);
             let error = MediaError::Device("previous native capture is still stopping".into());
             self.set_phase(kind, CapturePhase::Failed(error.to_string()), label);
             return Err(error);
@@ -629,7 +653,11 @@ impl LocalVideoSession {
                 let _guard = guard;
                 capture_worker(source, generation, capture_stop, call_stop, frames)
             })
-            .map_err(|error| MediaError::Device(error.to_string()))?;
+            .map_err(|error| {
+                #[cfg(target_os = "linux")]
+                report_screen_failure(kind, CaptureFailureCode::CaptureThreadSpawn);
+                MediaError::Device(error.to_string())
+            })?;
         let slot = self.slot_mut(kind);
         slot.generation = generation;
         slot.stop = Some(stop);
@@ -690,6 +718,15 @@ impl LocalVideoSession {
         } else {
             Ok(())
         };
+        #[cfg(target_os = "linux")]
+        {
+            if unpublish.is_err() {
+                report_screen_failure(kind, CaptureFailureCode::CaptureUnpublish);
+            }
+            if worker.is_err() {
+                report_screen_failure(kind, CaptureFailureCode::CaptureWorkerShutdown);
+            }
+        }
         let result = match (unpublish, worker) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -772,10 +809,14 @@ impl LocalVideoSession {
             match published {
                 Ok(Ok(publication)) => self.slot_mut(kind).publication = Some(publication),
                 Ok(Err(error)) => {
+                    #[cfg(target_os = "linux")]
+                    report_screen_failure(kind, CaptureFailureCode::CapturePublish);
                     self.fail(kind, error.to_string()).await;
                     return;
                 }
                 Err(_) => {
+                    #[cfg(target_os = "linux")]
+                    report_screen_failure(kind, CaptureFailureCode::CapturePublishTimeout);
                     self.fail(kind, "timed out publishing video".into()).await;
                     return;
                 }
@@ -812,7 +853,11 @@ impl LocalVideoSession {
                     self.set_phase(kind, CapturePhase::Active, current.source);
                 }
             }
-            Err(error) => self.fail(kind, error.to_string()).await,
+            Err(error) => {
+                #[cfg(target_os = "linux")]
+                report_screen_failure(kind, CaptureFailureCode::CaptureFramePush);
+                self.fail(kind, error.to_string()).await;
+            }
         }
     }
 

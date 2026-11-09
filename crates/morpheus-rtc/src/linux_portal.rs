@@ -36,7 +36,7 @@ use zbus::{
     zvariant::{OwnedFd, OwnedObjectPath, OwnedValue, Value},
 };
 
-use crate::MediaError;
+use crate::{CaptureFailureCode, MediaError, report_capture_failure};
 
 const SERVICE: &str = "org.freedesktop.portal.Desktop";
 const DESKTOP: &str = "/org/freedesktop/portal/desktop";
@@ -52,6 +52,11 @@ fn error(message: &str) -> MediaError {
 }
 fn portal_error(_: impl std::fmt::Debug) -> MediaError {
     error("system screen-sharing portal is unavailable or returned an invalid response")
+}
+
+fn pipewire_error(failure: impl std::fmt::Debug) -> MediaError {
+    report_capture_failure(CaptureFailureCode::PipeWireSetup);
+    portal_error(failure)
 }
 
 #[derive(Clone, Copy)]
@@ -75,6 +80,14 @@ impl RequestPhase {
             Self::CreateSession => "creating the screen-sharing session",
             Self::SelectSources => "selecting the screen-sharing source",
             Self::Start => "starting the screen-sharing stream",
+        }
+    }
+
+    fn failure_code(self) -> CaptureFailureCode {
+        match self {
+            Self::CreateSession => CaptureFailureCode::PortalCreate,
+            Self::SelectSources => CaptureFailureCode::PortalSelect,
+            Self::Start => CaptureFailureCode::PortalStart,
         }
     }
 
@@ -136,6 +149,7 @@ pub(crate) fn sources(kind: u32) -> Result<Vec<(String, String)>, MediaError> {
         },
         &|| false,
         RPC_TIMEOUT,
+        None,
     ))?;
     if available & kind == 0 {
         return Ok(Vec::new());
@@ -157,6 +171,7 @@ async fn wait<T>(
     future: impl Future<Output = Result<T, MediaError>>,
     cancelled: &dyn Fn() -> bool,
     budget: Duration,
+    failure_code: Option<CaptureFailureCode>,
 ) -> Result<T, MediaError> {
     tokio::pin!(future);
     let deadline = tokio::time::sleep(budget);
@@ -167,8 +182,20 @@ async fn wait<T>(
         }
         tokio::select! {
             biased;
-            _ = &mut deadline => return Err(error("screen-sharing request timed out")),
-            result = &mut future => return result,
+            _ = &mut deadline => {
+                if let Some(code) = failure_code {
+                    report_capture_failure(code);
+                }
+                return Err(error("screen-sharing request timed out"));
+            }
+            result = &mut future => {
+                if result.is_err() {
+                    if let Some(code) = failure_code {
+                        report_capture_failure(code);
+                    }
+                }
+                return result;
+            }
             _ = tokio::time::sleep(POLL_INTERVAL) => {},
         }
     }
@@ -215,6 +242,7 @@ async fn request(
         },
         cancelled,
         RPC_TIMEOUT,
+        Some(phase.failure_code()),
     )
     .await
     .map_err(|failure| phase.with_error(failure))?;
@@ -246,6 +274,7 @@ async fn request(
         },
         cancelled,
         SELECT_TIMEOUT,
+        Some(phase.failure_code()),
     )
     .await;
     if result.is_err() {
@@ -266,7 +295,10 @@ impl PortalSession {
         kind: u32,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(Self, u32, Option<u64>, OwnedFd), MediaError> {
-        let runtime = runtime()?;
+        let runtime = runtime().map_err(|failure| {
+            report_capture_failure(CaptureFailureCode::PortalSetup);
+            failure
+        })?;
         let (connection, session, session_token, closed) = runtime.block_on(wait(
             async {
                 let connection = Connection::session().await.map_err(portal_error)?;
@@ -285,6 +317,7 @@ impl PortalSession {
             },
             cancelled,
             RPC_TIMEOUT,
+            Some(CaptureFailureCode::PortalSetup),
         ))?;
         // Own cleanup before CreateSession: even a cancelled request can race
         // session creation. Closing the private connection also revokes it.
@@ -303,6 +336,7 @@ impl PortalSession {
                 },
                 cancelled,
                 RPC_TIMEOUT,
+                Some(CaptureFailureCode::PortalSetup),
             )
             .await?;
             let available = wait(
@@ -314,6 +348,7 @@ impl PortalSession {
                 },
                 cancelled,
                 RPC_TIMEOUT,
+                Some(CaptureFailureCode::PortalSetup),
             )
             .await?;
             if available & kind == 0 {
@@ -361,7 +396,10 @@ impl PortalSession {
                 .remove("streams")
                 .ok_or_else(|| portal_error("no streams"))?;
             let streams: Vec<(u32, Dict)> = Vec::try_from(streams).map_err(portal_error)?;
-            let (node, serial) = selected_stream(streams, kind)?;
+            let (node, serial) = selected_stream(streams, kind).map_err(|failure| {
+                report_capture_failure(CaptureFailureCode::PortalSelection);
+                failure
+            })?;
             let options: HashMap<&str, Value<'_>> = HashMap::new();
             let fd: OwnedFd = wait(
                 async {
@@ -372,6 +410,7 @@ impl PortalSession {
                 },
                 cancelled,
                 RPC_TIMEOUT,
+                Some(CaptureFailureCode::PortalRemote),
             )
             .await?;
             Ok::<_, MediaError>((node, serial, fd))
@@ -440,6 +479,7 @@ fn selected_stream(
 struct FrameState {
     latest: Option<xcap::image::RgbaImage>,
     failed: bool,
+    failure_code: Option<CaptureFailureCode>,
     progress: CaptureProgress,
 }
 
@@ -453,6 +493,22 @@ struct CaptureProgress {
 }
 
 impl CaptureProgress {
+    fn timeout_code(&self) -> CaptureFailureCode {
+        if !self.format_accepted {
+            CaptureFailureCode::FirstFormat
+        } else if !self.buffer_added {
+            CaptureFailureCode::FirstBuffer
+        } else if !self.streaming {
+            CaptureFailureCode::FirstStreaming
+        } else if !self.process_called {
+            CaptureFailureCode::FirstProcessing
+        } else if !self.buffer_dequeued {
+            CaptureFailureCode::FirstDequeue
+        } else {
+            CaptureFailureCode::FirstFrame
+        }
+    }
+
     fn timeout_message(&self) -> &'static str {
         // Fixed local categories only: never expose portal node IDs, source
         // names, negotiated dimensions or backend error bodies.
@@ -564,16 +620,22 @@ pub(crate) struct PortalCapture {
 
 impl PortalCapture {
     pub(crate) fn open(key: &str, cancelled: &dyn Fn() -> bool) -> Result<Self, MediaError> {
-        let (session, node, serial, fd) = PortalSession::open(source_type(key)?, cancelled)?;
+        let (session, node, serial, fd) = PortalSession::open(
+            source_type(key).map_err(|failure| {
+                report_capture_failure(CaptureFailureCode::PortalSelection);
+                failure
+            })?,
+            cancelled,
+        )?;
         if cancelled() {
             return Err(error("screen sharing cancelled"));
         }
         pipewire::init();
-        let main_loop = MainLoopRc::new(None).map_err(portal_error)?;
-        let context = ContextRc::new(&main_loop, None).map_err(portal_error)?;
+        let main_loop = MainLoopRc::new(None).map_err(pipewire_error)?;
+        let context = ContextRc::new(&main_loop, None).map_err(pipewire_error)?;
         let core = context
             .connect_fd_rc(fd.into(), None)
-            .map_err(portal_error)?;
+            .map_err(pipewire_error)?;
         let mut properties = properties::properties! {
             "media.type" => "Video", "media.category" => "Capture", "media.role" => "Screen",
             "node.dont-reconnect" => "true",
@@ -582,7 +644,7 @@ impl PortalCapture {
             properties.insert("target.object", serial.to_string());
         }
         let stream =
-            StreamRc::new(core, "Morpheus screen sharing", properties).map_err(portal_error)?;
+            StreamRc::new(core, "Morpheus screen sharing", properties).map_err(pipewire_error)?;
         let state = Rc::new(RefCell::new(FrameState::default()));
         let format_state = Rc::clone(&state);
         let status_state = Rc::clone(&state);
@@ -599,6 +661,14 @@ impl PortalCapture {
                     || (old == StreamState::Streaming && new == StreamState::Paused)
                 {
                     state.failed = true;
+                    let code = if new == StreamState::Unconnected {
+                        CaptureFailureCode::PipeWireUnconnected
+                    } else if old == StreamState::Streaming && new == StreamState::Paused {
+                        CaptureFailureCode::PipeWirePaused
+                    } else {
+                        CaptureFailureCode::PipeWireError
+                    };
+                    state.failure_code.get_or_insert(code);
                 }
             })
             .param_changed(move |stream, data, id, param| {
@@ -621,6 +691,9 @@ impl PortalCapture {
                 let mut state = format_state.borrow_mut();
                 state.progress.format_accepted = result.is_ok();
                 state.failed |= result.is_err();
+                if result.is_err() {
+                    state.failure_code.get_or_insert(CaptureFailureCode::FormatRejected);
+                }
             })
             .add_buffer(move |_, _, _| {
                 buffer_state.borrow_mut().progress.buffer_added = true;
@@ -633,7 +706,9 @@ impl PortalCapture {
                 frame_state.borrow_mut().progress.buffer_dequeued = true;
                 let datas = buffer.datas_mut();
                 let Some(data_buffer) = datas.first_mut() else {
-                    frame_state.borrow_mut().failed = true;
+                    let mut state = frame_state.borrow_mut();
+                    state.failed = true;
+                    state.failure_code.get_or_insert(CaptureFailureCode::BufferPlaneMissing);
                     return;
                 };
                 let chunk = data_buffer.chunk();
@@ -664,11 +739,14 @@ impl PortalCapture {
                 match result {
                     Ok(Some(image)) => state.latest = Some(image),
                     Ok(None) => {}
-                    Err(_) => state.failed = true,
+                    Err(_) => {
+                        state.failed = true;
+                        state.failure_code.get_or_insert(CaptureFailureCode::FrameChunkRejected);
+                    }
                 }
             })
             .register()
-            .map_err(portal_error)?;
+            .map_err(pipewire_error)?;
         let object = pod::object!(
             SpaTypes::ObjectParamFormat,
             ParamType::EnumFormat,
@@ -705,7 +783,7 @@ impl PortalCapture {
         );
         let serialized =
             PodSerializer::serialize(Cursor::new(Vec::new()), &pod::Value::Object(object))
-                .map_err(portal_error)?
+                .map_err(pipewire_error)?
                 .0
                 .into_inner();
         let mut parameters =
@@ -717,7 +795,7 @@ impl PortalCapture {
                 StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::DONT_RECONNECT,
                 &mut parameters,
             )
-            .map_err(portal_error)?;
+            .map_err(pipewire_error)?;
         Ok(Self {
             _listener: listener,
             stream,
@@ -741,13 +819,24 @@ impl PortalCapture {
             self.main_loop
                 .loop_()
                 .iterate(Timeout::Finite(POLL_INTERVAL));
-            if self.session.ended() || self.state.borrow().failed {
+            if self.session.ended() {
+                report_capture_failure(CaptureFailureCode::PortalSessionClosed);
+                return Err(error("selected screen-sharing source ended"));
+            }
+            if self.state.borrow().failed {
+                let code = self
+                    .state
+                    .borrow()
+                    .failure_code
+                    .unwrap_or(CaptureFailureCode::PipelineUnknown);
+                report_capture_failure(code);
                 return Err(error("selected screen-sharing source ended"));
             }
             if let Some(image) = &self.state.borrow().latest {
                 return Ok(image.clone());
             }
             if Instant::now() >= deadline {
+                report_capture_failure(self.state.borrow().progress.timeout_code());
                 return Err(error(self.state.borrow().progress.timeout_message()));
             }
         }
@@ -1109,6 +1198,7 @@ mod tests {
                 },
                 &|| true,
                 RPC_TIMEOUT,
+                None,
             )
             .await;
             assert!(result.is_err());
