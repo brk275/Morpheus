@@ -1852,7 +1852,8 @@ fn run_application(
         .map_err(|error| startup_error_origin(StartupOrigin::WindowCreate, error))?;
     timeline_model::register_thread_rows(&ui);
     ui.set_login_loading(true);
-    ui.show().map_err(|error| startup_error_origin(StartupOrigin::WindowShow, error))?;
+    ui.show()
+        .map_err(|error| startup_error_origin(StartupOrigin::WindowShow, error))?;
     #[cfg(all(windows, feature = "native-calls"))]
     let wasapi_ui = windows_audio::attach()
         .map_err(|error| startup_error_origin(StartupOrigin::AudioAttach, error))?;
@@ -1914,10 +1915,9 @@ fn run_application(
         .build()
         .map_err(|error| startup_error_origin(StartupOrigin::RuntimeCreate, error))?;
     #[cfg(not(target_os = "macos"))]
-    let runtime_owner =
-        app_shutdown::RuntimeOwner::install(runtime)
-            .map_err(app_shutdown::ShutdownError)
-            .map_err(|error| startup_error_origin(StartupOrigin::RuntimeInstall, error))?;
+    let runtime_owner = app_shutdown::RuntimeOwner::install(runtime)
+        .map_err(app_shutdown::ShutdownError)
+        .map_err(|error| startup_error_origin(StartupOrigin::RuntimeInstall, error))?;
     #[cfg(not(target_os = "macos"))]
     let runtime = runtime_owner
         .borrow_runtime()
@@ -5115,7 +5115,9 @@ fn run_application(
         };
         // All independent cleanup/finalization attempts precede return, while
         // the real event-loop failure keeps its original first precedence.
-        outcome.ui.map_err(|error| startup_error_origin(StartupOrigin::WindowRun, error))?;
+        outcome
+            .ui
+            .map_err(|error| startup_error_origin(StartupOrigin::WindowRun, error))?;
         if let Some(failure) = outcome.failure {
             return Err(startup_error_origin(
                 StartupOrigin::CleanupFailure,
@@ -5136,8 +5138,9 @@ fn run_application(
             None => {
                 return Err(startup_error_origin(
                     StartupOrigin::CleanupMissing,
-                    Box::new(app_shutdown::ShutdownError(app_shutdown::Failure::Ownership))
-                        as Box<dyn std::error::Error>,
+                    Box::new(app_shutdown::ShutdownError(
+                        app_shutdown::Failure::Ownership,
+                    )) as Box<dyn std::error::Error>,
                 ));
             }
         }
