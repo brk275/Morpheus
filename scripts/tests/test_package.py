@@ -640,7 +640,7 @@ class MacUpdatePayloadTests(unittest.TestCase):
 
 class NativeNoticeEvidenceTests(unittest.TestCase):
     @staticmethod
-    def evidence(drop_license=False, registry=False, drop_alsa_provenance=False, formfeed=False, source_overrides=None):
+    def evidence(drop_license=False, registry=False, drop_alsa_provenance=False, formfeed=False, source_overrides=None, accesskit=False):
         source = native_notices.catalogue()
         files = {"Cargo.toml": b'[workspace]\nmembers = ["app", "vendor/cpal", "vendor/slint"]\nexclude = ["vendor/alsa"]\n[patch.crates-io]\nalsa = { path = "vendor/alsa" }\n',
                  "Cargo.lock": b'version = 4\n[[package]]\nname = "fixture"\nversion = "0.1.0"\n[[package]]\nname = "cpal"\nversion = "0.18.2"\n[[package]]\nname = "slint"\nversion = "1.18.1"\n[[package]]\nname = "alsa"\nversion = "0.11.0"\n',
@@ -658,6 +658,19 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                  "vendor/slint/Cargo.toml": b'[package]\nname = "slint"\nversion = "1.18.1"\nlicense = "GPL-3.0-only"\n',
                  "vendor/slint/LICENSE": b"Fixture Slint license\n",
                  "vendor/slint/LICENSES/extra.txt": b"Fixture extra source license\n"}
+        if accesskit:
+            for name, version in (("accesskit_atspi_common", "0.19.1"), ("accesskit_unix", "0.22.1")):
+                root = "vendor/" + name
+                files["Cargo.toml"] += (name + ' = { path = "' + root + '" }\n').encode()
+                files["Cargo.lock"] += ('[[package]]\nname = "' + name + '"\nversion = "' + version + '"\n').encode()
+                files[root + "/Cargo.toml"] = ('[package]\nname = "' + name + '"\nversion = "' + version
+                                              + '"\nlicense = "MIT OR Apache-2.0"\n').encode()
+                for license in ("MIT", "APACHE"):
+                    files[root + "/LICENSE-" + license] = ("Fixture " + name + " " + license + " license\n").encode()
+                if name == "accesskit_atspi_common":
+                    files[root + "/LICENSE.chromium"] = b"Fixture Chromium BSD license\n"
+                files[root + "/MORPHEUS_PROVENANCE.json"] = json.dumps({"upstream_crate": name, "version": version}).encode()
+            files["vendor/unrelated/MORPHEUS_PROVENANCE.json"] = b'{"private_unselected":true}'
         if source_overrides is not None:files.update(source_overrides)
         registry_files = {"Cargo.toml": b'[package]\nname = "fixture-registry"\nversion = "1.0.0"\nlicense = "MIT"\n',
                           "LICENSE": b"Fixture exact registry license\n"}
@@ -713,6 +726,35 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                        "distribution_ready": False, "unresolved_release_requirements": list(source.UNRESOLVED)}
             return bundle, json.dumps(receipt).encode()
         return source, files, manifest, revision, build
+
+    def test_vendored_accesskit_keeps_exact_local_licenses_and_only_selected_json_provenance(self):
+        source, files, manifest, revision, build = self.evidence(accesskit=True)
+        bundle, receipt = build()
+        for platform in ("darwin", "win32"):
+            with self.subTest(platform=platform):
+                contents = native_notices.prepare_bytes(bundle, receipt, revision, platform=platform, version="0.1.0")
+                parsed = native_notices.verify_bytes(contents, revision=revision, platform=platform, version="0.1.0")
+                self.assertEqual(len(parsed["locked_packages"]), 6)
+                for name in ("accesskit_atspi_common", "accesskit_unix"):
+                    root = "vendor/" + name
+                    record = next(item for item in parsed["locked_packages"] if item["name"] == name)
+                    self.assertEqual(record["source"], "committed-workspace")
+                    self.assertEqual(record["declared_license"], "MIT OR Apache-2.0")
+                    self.assertEqual(record["source_identity"], {"tree": manifest["source"]["tree"]})
+                    for license in ("MIT", "APACHE"):
+                        path = root + "/LICENSE-" + license
+                        self.assertIn({"source_path": path, "sha256": source.digest(files[path])}, record["license_texts"])
+                        self.assertIn(files[path].strip(), contents[native_notices.TEXT])
+                    if name == "accesskit_atspi_common":
+                        path = root + "/LICENSE.chromium"
+                        self.assertIn({"source_path": path, "sha256": source.digest(files[path])}, record["license_texts"])
+                        self.assertIn(files[path].strip(), contents[native_notices.TEXT])
+                    path = root + "/MORPHEUS_PROVENANCE.json"
+                    self.assertIn({"source_path": path, "sha256": source.digest(files[path])}, parsed["local_patch_provenance"])
+                self.assertNotIn("vendor/unrelated/MORPHEUS_PROVENANCE.json",
+                                 {item["source_path"] for item in parsed["local_patch_provenance"]})
+                self.assertFalse(parsed["distribution_ready"])
+                self.assertFalse(parsed["license_compliance_verified"])
 
     def test_source_bound_plain_notices_cover_all_packages_patch_and_slint_without_legal_acceptance(self):
         source, files, manifest, revision, build = self.evidence()

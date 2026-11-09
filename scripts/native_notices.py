@@ -294,7 +294,9 @@ def prepare_bytes(bundle, receipt_bytes, revision, *, platform, version, working
     # not invented license text or an assertion of complete legal obligations.
     for name, value in sorted(files.items()):
         path = PurePosixPath(name)
-        if (name in {"vendor/README.md", "vendor/cpal/OWNED_ALSA.md"}
+        if (name in {"vendor/README.md", "vendor/cpal/OWNED_ALSA.md",
+                     "vendor/accesskit_atspi_common/MORPHEUS_PROVENANCE.json",
+                     "vendor/accesskit_unix/MORPHEUS_PROVENANCE.json"}
                 or name.startswith("vendor/") and path.name in
                 {"MORPHEUS_PATCH.md", "OWNED_COREAUDIO.md", "README.md"}):
             # Empty upstream nested READMEs are optional documentation, not
