@@ -97,7 +97,10 @@ mod tests {
             })
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(matches!(publication.retired.try_lock(), Err(TryLockError::WouldBlock)));
+        assert!(matches!(
+            publication.retired.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
         let retiring_publication = publication.clone();
         let retiring_exported = exported.clone();
         let (retiring_tx, retiring_rx) = mpsc::channel();

@@ -2421,7 +2421,11 @@ mod tests {
             ));
         }
         let connection = adopt(&fx);
-        let _own_publication = fx.engine.publish(PublishOptions::microphone()).await.unwrap();
+        let _own_publication = fx
+            .engine
+            .publish(PublishOptions::microphone())
+            .await
+            .unwrap();
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::StreamStarted {
