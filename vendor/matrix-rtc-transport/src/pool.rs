@@ -1818,7 +1818,10 @@ impl MediaPool {
         kind: MediaStreamKind,
         muted: bool,
     ) {
-        if let Some(member_id) = self.identity_on_connection(identity, connection_key).cloned() {
+        if let Some(member_id) = self
+            .identity_on_connection(identity, connection_key)
+            .cloned()
+        {
             let matched = {
                 let mut tracks = self.tracks.lock().expect("track map mutex poisoned");
                 match tracks.get_mut(&(member_id.clone(), kind)) {
@@ -1844,11 +1847,12 @@ impl MediaPool {
             // Preserve a parked receiver's own latest state, never orphan
             // mute events or state belonging to another incarnation/SID.
             if let Some(pending) = self.pending_tracks.get_mut(identity)
-                && let Some((_, pooled)) = pending.iter_mut().rev().find(|(pending_kind, pooled)| {
-                    *pending_kind == kind
-                        && pooled.connection_key == connection_key
-                        && pooled.generation == generation
-                })
+                && let Some((_, pooled)) =
+                    pending.iter_mut().rev().find(|(pending_kind, pooled)| {
+                        *pending_kind == kind
+                            && pooled.connection_key == connection_key
+                            && pooled.generation == generation
+                    })
                 && pooled.publication_id == publication_id
             {
                 pooled.muted = muted;
