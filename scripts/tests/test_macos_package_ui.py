@@ -2125,6 +2125,11 @@ class SwiftSourceTests(unittest.TestCase):
         loop = send_key.split("for transition in transitions {")[1]
         self.assertLess(loop.index("guard frontmostOwned(target.pid) else"), loop.index("event.postToPid(target.pid)"))
         self.assertEqual(send_key.count("postToPid("), 1)
+        self.assertIn("Transition(code: shiftCode, down: true, shifted: true)", send_key)
+        self.assertIn("Transition(code: shiftCode, down: false, shifted: false)", send_key)
+        self.assertIn("if transition.code == shiftCode {\n            event.type = .flagsChanged\n        }", loop)
+        self.assertLess(loop.index("event.type = .flagsChanged"), loop.index("event.postToPid(target.pid)"))
+        self.assertIn("event.flags = transition.shifted ? [.maskShift] : []", loop)
         self.assertNotIn("CGEventTapLocation", self.source)
         self.assertNotIn(".post(tap:", self.source)
         self.assertNotIn("CGEventPost(", self.source)

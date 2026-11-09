@@ -348,7 +348,7 @@ func sendKey(_ command: [String: Any]) {
         recovered = true
     }
     var transitions: [Transition] = []
-    if shift { transitions.append(Transition(code: shiftCode, down: true, shifted: false)) }
+    if shift { transitions.append(Transition(code: shiftCode, down: true, shifted: true)) }
     transitions.append(Transition(code: code, down: true, shifted: shift))
     transitions.append(Transition(code: code, down: false, shifted: shift))
     if shift { transitions.append(Transition(code: shiftCode, down: false, shifted: false)) }
@@ -363,6 +363,11 @@ func sendKey(_ command: [String: Any]) {
             return
         }
         event.flags = transition.shifted ? [.maskShift] : []
+        // Match native modifier event types and the active Shift state.
+        // A Tab event's mask alone does not replace the modifier transition.
+        if transition.code == shiftCode {
+            event.type = .flagsChanged
+        }
         event.postToPid(target.pid)
         posted += 1
     }
