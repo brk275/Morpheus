@@ -94,6 +94,7 @@ struct PooledTrack {
     connection_key: String,
     generation: u64,
     publication_id: String,
+    muted: bool,
     track: Arc<dyn RemoteTrackHandle>,
     /// Participant-level state observed while this exact receiver was present.
     /// A new receiver starts unknown; state never follows only a member ID.
@@ -1163,6 +1164,7 @@ impl MediaPool {
             return;
         }
         pooled.owner = Some(owner);
+        let muted = pooled.muted;
         let replaced = self
             .tracks
             .lock()
@@ -1170,14 +1172,26 @@ impl MediaPool {
             .insert((member_id.to_owned(), kind), pooled)
             .is_some();
         if replaced {
-            // Same stream re-announced (e.g. events replayed on attach); the
-            // handle is refreshed, but it is not a new stream.
+            // Refresh the winning publication's state, including unmuted,
+            // without manufacturing another stream lifecycle event.
+            self.out.push(PoolEvent::StreamMuted {
+                member_id: member_id.to_owned(),
+                kind,
+                muted,
+            });
             return;
         }
         self.out.push(PoolEvent::StreamAdded {
             member_id: member_id.to_owned(),
             kind,
         });
+        if muted {
+            self.out.push(PoolEvent::StreamMuted {
+                member_id: member_id.to_owned(),
+                kind,
+                muted,
+            });
+        }
         // A fresh subscription starts with server-default settings; push the
         // stored constraints at it immediately (no debounce — nothing to
         // coalesce with).
@@ -1620,12 +1634,14 @@ impl MediaPool {
                 identity,
                 publication_id,
                 kind,
+                muted,
                 track,
             } => {
                 let pooled = PooledTrack {
                     connection_key: connection_key.to_owned(),
                     generation,
                     publication_id,
+                    muted,
                     track,
                     encryption_state: None,
                     owner: None,
@@ -1688,11 +1704,39 @@ impl MediaPool {
                     }
                 }
             }
-            ConnectionEvent::TrackMuted { identity, kind } => {
-                self.muted(connection_key, &identity, kind, true)
+            ConnectionEvent::TrackMuted {
+                identity,
+                publication_id,
+                kind,
+            } => {
+                self.muted(
+                    connection_key,
+                    generation,
+                    &identity,
+                    &publication_id,
+                    kind,
+                    true,
+                );
             }
-            ConnectionEvent::TrackUnmuted { identity, kind } => {
-                self.muted(connection_key, &identity, kind, false)
+            ConnectionEvent::TrackUnmuted {
+                identity,
+                publication_id,
+                kind,
+            } => {
+                self.muted(
+                    connection_key,
+                    generation,
+                    &identity,
+                    &publication_id,
+                    kind,
+                    false,
+                );
+            }
+            ConnectionEvent::LocalTrackMuted { identity, kind } => {
+                self.local_muted(connection_key, &identity, kind, true)
+            }
+            ConnectionEvent::LocalTrackUnmuted { identity, kind } => {
+                self.local_muted(connection_key, &identity, kind, false)
             }
             ConnectionEvent::ActiveSpeakers { speakers } => {
                 let speakers = speakers
@@ -1765,8 +1809,66 @@ impl MediaPool {
         }
     }
 
-    fn muted(&mut self, connection_key: &str, identity: &str, kind: MediaStreamKind, muted: bool) {
-        if let Some(member_id) = self.identity_on_connection(identity, connection_key) {
+    fn muted(
+        &mut self,
+        connection_key: &str,
+        generation: u64,
+        identity: &str,
+        publication_id: &str,
+        kind: MediaStreamKind,
+        muted: bool,
+    ) {
+        if let Some(member_id) = self.identity_on_connection(identity, connection_key).cloned() {
+            let matched = {
+                let mut tracks = self.tracks.lock().expect("track map mutex poisoned");
+                match tracks.get_mut(&(member_id.clone(), kind)) {
+                    Some(pooled)
+                        if pooled.connection_key == connection_key
+                            && pooled.generation == generation
+                            && pooled.publication_id == publication_id =>
+                    {
+                        pooled.muted = muted;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if matched {
+                self.out.push(PoolEvent::StreamMuted {
+                    member_id,
+                    kind,
+                    muted,
+                });
+            }
+        } else if !self.identity_map.contains_key(identity) {
+            // Preserve a parked receiver's own latest state, never orphan
+            // mute events or state belonging to another incarnation/SID.
+            if let Some(pending) = self.pending_tracks.get_mut(identity)
+                && let Some((_, pooled)) = pending.iter_mut().rev().find(|(pending_kind, pooled)| {
+                    *pending_kind == kind
+                        && pooled.connection_key == connection_key
+                        && pooled.generation == generation
+                })
+                && pooled.publication_id == publication_id
+            {
+                pooled.muted = muted;
+            }
+        }
+    }
+
+    fn local_muted(
+        &mut self,
+        connection_key: &str,
+        identity: &str,
+        kind: MediaStreamKind,
+        muted: bool,
+    ) {
+        if self.own_connection_key.as_deref() != Some(connection_key) {
+            return;
+        }
+        if let Some(member_id) = self.identity_on_connection(identity, connection_key)
+            && member_id == &self.ctx.member.member_id
+        {
             self.out.push(PoolEvent::StreamMuted {
                 member_id: member_id.clone(),
                 kind,

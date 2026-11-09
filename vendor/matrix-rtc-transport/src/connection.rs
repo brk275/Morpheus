@@ -178,6 +178,8 @@ pub enum ConnectionEvent {
         /// A replacement publication must use a different value.
         publication_id: String,
         kind: MediaStreamKind,
+        /// Current publication state at subscription, including pre-add mute.
+        muted: bool,
         track: Arc<dyn RemoteTrackHandle>,
     },
     TrackRemoved {
@@ -188,9 +190,22 @@ pub enum ConnectionEvent {
     },
     TrackMuted {
         identity: String,
+        /// The exact remote publication supplied by `TrackAdded`.
+        publication_id: String,
         kind: MediaStreamKind,
     },
     TrackUnmuted {
+        identity: String,
+        publication_id: String,
+        kind: MediaStreamKind,
+    },
+    /// Local publication echoes are not subscribed remote receivers. The pool
+    /// accepts these only for its own member on its publishing connection.
+    LocalTrackMuted {
+        identity: String,
+        kind: MediaStreamKind,
+    },
+    LocalTrackUnmuted {
         identity: String,
         kind: MediaStreamKind,
     },
@@ -234,13 +249,23 @@ impl fmt::Debug for ConnectionEvent {
                 .field("identity", identity)
                 .field("kind", kind)
                 .finish(),
-            Self::TrackMuted { identity, kind } => f
+            Self::TrackMuted { identity, kind, .. } => f
                 .debug_struct("TrackMuted")
                 .field("identity", identity)
                 .field("kind", kind)
                 .finish(),
-            Self::TrackUnmuted { identity, kind } => f
+            Self::TrackUnmuted { identity, kind, .. } => f
                 .debug_struct("TrackUnmuted")
+                .field("identity", identity)
+                .field("kind", kind)
+                .finish(),
+            Self::LocalTrackMuted { identity, kind } => f
+                .debug_struct("LocalTrackMuted")
+                .field("identity", identity)
+                .field("kind", kind)
+                .finish(),
+            Self::LocalTrackUnmuted { identity, kind } => f
+                .debug_struct("LocalTrackUnmuted")
                 .field("identity", identity)
                 .field("kind", kind)
                 .finish(),

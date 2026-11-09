@@ -29,3 +29,14 @@ original connection generation to reject an older publication's delayed
 unsubscribe after a same-kind replacement. Same-SID encrypted receiver instance
 admission remains unchanged. This adds no endpoint, permission, dependency or
 logging change and does not claim installed capture or release acceptance.
+
+Remote mute/unmute events now retain that same publication SID instead of
+attributing a delayed update to the latest receiver of its kind. Subscriptions
+also carry the publication's current muted snapshot, including updates before
+subscription or signaling membership. Local publication echoes use explicit
+local-only variants: the pool admits them only for its own membership on its
+publishing connection, without requiring a remote subscribed handle. No key,
+permission, endpoint, dependency or receiver admission policy changes. The
+existing exact stream lifecycle events remain; a replacement snapshot can reset
+the mute state without inventing another stream-start event. Source regressions
+are synthetic; no installed failure cause or runtime acceptance is claimed.

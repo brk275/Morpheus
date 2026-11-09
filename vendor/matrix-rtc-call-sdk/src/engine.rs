@@ -2406,6 +2406,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_mute_state_follows_replacement_without_losing_local_echoes() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![
+                member("own", "@own:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                next_event(&mut fx.events).await,
+                CallEvent::ParticipantJoined { .. }
+            ));
+        }
+        let connection = adopt(&fx);
+        let _own_publication = fx.engine.publish(PublishOptions::microphone()).await.unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted {
+                member_id: "own".into(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        connection
+            .send(ConnectionEvent::LocalTrackMuted {
+                identity: "id-own".into(),
+                kind: MediaStreamKind::Microphone,
+            })
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamMuted {
+                member_id: "own".into(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        wait_until(|| mic_muted(&fx, "own")).await;
+        connection
+            .send(ConnectionEvent::LocalTrackUnmuted {
+                identity: "id-own".into(),
+                kind: MediaStreamKind::Microphone,
+            })
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamUnmuted {
+                member_id: "own".into(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        wait_until(|| !mic_muted(&fx, "own")).await;
+        let add = |publication_id: &str, muted| ConnectionEvent::TrackAdded {
+            identity: "id-bob".into(),
+            publication_id: publication_id.into(),
+            kind: MediaStreamKind::Microphone,
+            muted,
+            track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
+        };
+        connection.send(add("old", true)).unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamMuted {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        connection.send(add("new", false)).unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamUnmuted {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        wait_until(|| !mic_muted(&fx, "bob")).await;
+        connection
+            .send(ConnectionEvent::TrackMuted {
+                identity: "id-bob".into(),
+                publication_id: "old".into(),
+                kind: MediaStreamKind::Microphone,
+            })
+            .unwrap();
+        connection
+            .send(ConnectionEvent::TrackUnmuted {
+                identity: "id-bob".into(),
+                publication_id: "old".into(),
+                kind: MediaStreamKind::Microphone,
+            })
+            .unwrap();
+        // A following event on the same transport channel proves both stale
+        // messages were processed, without a sleep or a zero-test filter.
+        connection
+            .send(ConnectionEvent::ActiveSpeakers { speakers: vec![] })
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ActiveSpeakers { speakers: vec![] }
+        );
+        assert!(!mic_muted(&fx, "bob"));
+        for muted in [true, false] {
+            let event = if muted {
+                ConnectionEvent::TrackMuted {
+                    identity: "id-bob".into(),
+                    publication_id: "new".into(),
+                    kind: MediaStreamKind::Microphone,
+                }
+            } else {
+                ConnectionEvent::TrackUnmuted {
+                    identity: "id-bob".into(),
+                    publication_id: "new".into(),
+                    kind: MediaStreamKind::Microphone,
+                }
+            };
+            connection.send(event).unwrap();
+            let expected = if muted {
+                CallEvent::StreamMuted {
+                    member_id: "bob".into(),
+                    kind: MediaStreamKind::Microphone,
+                }
+            } else {
+                CallEvent::StreamUnmuted {
+                    member_id: "bob".into(),
+                    kind: MediaStreamKind::Microphone,
+                }
+            };
+            assert_eq!(next_event(&mut fx.events).await, expected);
+            wait_until(|| mic_muted(&fx, "bob") == muted).await;
+        }
+    }
+
+    #[tokio::test]
     async fn member_without_supported_transport_is_unreachable() {
         let mut fx = fixture();
         let mut eve = member("eve", "@eve:example.org");
@@ -2435,6 +2573,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 publication_id: "publication".into(),
+                muted: false,
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
@@ -2460,6 +2599,7 @@ mod tests {
         connection
             .send(ConnectionEvent::TrackMuted {
                 identity: "id-bob".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Microphone,
             })
             .unwrap();
@@ -2501,6 +2641,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 publication_id: "publication".into(),
+                muted: false,
                 kind: MediaStreamKind::Camera,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
             })
@@ -2835,6 +2976,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 publication_id: "publication".into(),
+                muted: false,
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::with_stats(
                     MediaStreamKind::Microphone,
@@ -2878,6 +3020,7 @@ mod tests {
                 .send(ConnectionEvent::TrackAdded {
                     identity: format!("id-{member_id}"),
                     publication_id: "publication".into(),
+                    muted: false,
                     kind,
                     track: Arc::new(track),
                 })
@@ -3028,6 +3171,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 publication_id: "publication".into(),
+                muted: false,
                 kind: MediaStreamKind::Microphone,
                 // `FakeTrack::new` leaves the trait default in place.
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
@@ -3056,6 +3200,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 publication_id: "publication".into(),
+                muted: false,
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
@@ -3139,6 +3284,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 publication_id: "publication".into(),
+                muted: false,
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
@@ -3181,6 +3327,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 publication_id: "publication".into(),
+                muted: false,
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
@@ -4084,6 +4231,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 publication_id: "publication".into(),
+                muted: false,
                 kind: MediaStreamKind::Camera,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
             })
@@ -4230,6 +4378,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".into(),
                 publication_id: "publication".into(),
+                muted: false,
                 kind: MediaStreamKind::Camera,
                 track: camera.clone(),
             })
@@ -4835,6 +4984,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-b".to_owned(),
                 publication_id: "publication".into(),
+                muted: false,
                 kind: MediaStreamKind::Microphone,
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
@@ -4848,6 +4998,7 @@ mod tests {
         connection
             .send(ConnectionEvent::TrackMuted {
                 identity: "id-b".to_owned(),
+                publication_id: "publication".into(),
                 kind: MediaStreamKind::Microphone,
             })
             .unwrap();

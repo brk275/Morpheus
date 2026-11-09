@@ -172,3 +172,26 @@ Existing connection replacement and encrypted receiver admission guards remain.
 This correction does not reject a late stale add, prove the cause of an installed
 capture failure, or establish hosted/native/package acceptance. Upstream source,
 licenses, manifests, features and dependency locks remain unchanged.
+
+## Exact remote publication mute state
+
+Remote mute and unmute events carry the same required publication identity as
+add/remove. Active updates match the exact selected connection, generation,
+publication and kind. Parked updates affect only the latest same-kind receiver
+on that connection incarnation and replay with its normal ownership admission.
+An old publication cannot mutate a replacement or supply its mute state.
+
+Each add carries the transport's current muted snapshot. A fresh unmuted stream
+keeps the existing unmuted-default lifecycle; a fresh muted stream reports its
+mute after the stream-start. A re-announced or replacement handle refreshes mute
+state, including false, without a new stream-start. Existing encrypted receiver
+identity, key, constraint and removal behavior is unchanged. Local publication
+echoes have explicit local-only variants bound to our member and publishing
+connection; the SDK's existing local publication state path is preserved.
+
+All in-tree producers and synthetic constructors are updated. Focused existing
+pool/SDK modules cover current and stale publication updates, replacement and
+parked snapshots, stale connection generation, and legitimate/refused local
+echoes. Original licenses, upstream revision, dependency versions/features and
+locks remain unchanged. These source changes have not been executed locally and
+do not establish a cause or cure for an installed capture failure.

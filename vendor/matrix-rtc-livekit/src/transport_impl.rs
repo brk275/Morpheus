@@ -1021,6 +1021,7 @@ async fn translate_room_events(
                     identity: participant.identity().to_string(),
                     publication_id: publication.sid().to_string(),
                     kind,
+                    muted: publication.is_muted(),
                     track: Arc::new(LiveKitRemoteTrack { kind, track }),
                 })
             }
@@ -1102,10 +1103,31 @@ fn remote_mute_event(
 ) -> Option<ConnectionEvent> {
     let identity = participant.identity().to_string();
     let kind = stream_kind(publication.source(), publication.kind());
-    Some(if muted {
-        ConnectionEvent::TrackMuted { identity, kind }
-    } else {
-        ConnectionEvent::TrackUnmuted { identity, kind }
+    Some(match (participant, publication) {
+        (Participant::Local(_), TrackPublication::Local(_)) => {
+            if muted {
+                ConnectionEvent::LocalTrackMuted { identity, kind }
+            } else {
+                ConnectionEvent::LocalTrackUnmuted { identity, kind }
+            }
+        }
+        (Participant::Remote(_), TrackPublication::Remote(_)) => {
+            let publication_id = publication.sid().to_string();
+            if muted {
+                ConnectionEvent::TrackMuted {
+                    identity,
+                    publication_id,
+                    kind,
+                }
+            } else {
+                ConnectionEvent::TrackUnmuted {
+                    identity,
+                    publication_id,
+                    kind,
+                }
+            }
+        }
+        _ => return None,
     })
 }
 

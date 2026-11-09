@@ -242,6 +242,7 @@ fn track_added(identity: &str, kind: MediaStreamKind) -> ConnectionEvent {
     ConnectionEvent::TrackAdded {
         identity: identity.to_owned(),
         publication_id: "publication".into(),
+        muted: false,
         kind,
         track: Arc::new(FakeTrack(kind)),
     }
@@ -257,11 +258,13 @@ async fn an_identity_on_another_publishers_transport_cannot_supply_media_or_stat
         .unwrap();
     own.send(ConnectionEvent::TrackMuted {
         identity: "id-bob".into(),
+        publication_id: "publication".into(),
         kind: MediaStreamKind::Microphone,
     })
     .unwrap();
     own.send(ConnectionEvent::TrackUnmuted {
         identity: "id-bob".into(),
+        publication_id: "publication".into(),
         kind: MediaStreamKind::Microphone,
     })
     .unwrap();
@@ -366,6 +369,7 @@ async fn a_refused_same_connection_epoch_cannot_retain_or_repair_previous_attrib
         .unwrap();
     own.send(ConnectionEvent::TrackMuted {
         identity: "id-bob".into(),
+        publication_id: "publication".into(),
         kind: MediaStreamKind::Microphone,
     })
     .unwrap();
@@ -429,6 +433,7 @@ async fn a_parked_receiver_does_not_reappear_under_a_new_membership_timestamp() 
     own.send(ConnectionEvent::TrackAdded {
         identity: "id-bob".into(),
         publication_id: "publication".into(),
+        muted: false,
         kind: MediaStreamKind::Camera,
         track: old,
     })
@@ -519,12 +524,17 @@ async fn transport_events_are_reported_per_member() {
     let own = fx.adopt();
     fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
 
+    own.send(track_added("id-bob", MediaStreamKind::Microphone))
+        .unwrap();
+    fx.drain().await;
+
     own.send(ConnectionEvent::RemoteJoined {
         identity: "id-stranger".into(),
     })
     .unwrap();
     own.send(ConnectionEvent::TrackMuted {
         identity: "id-bob".into(),
+        publication_id: "publication".into(),
         kind: MediaStreamKind::Microphone,
     })
     .unwrap();
@@ -1109,6 +1119,7 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
         old.send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
             publication_id: "publication".into(),
+            muted: false,
             kind: MediaStreamKind::Microphone,
             track: old_track,
         })
@@ -1137,6 +1148,7 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
         old.send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
             publication_id: "publication".into(),
+            muted: false,
             kind: MediaStreamKind::Microphone,
             track: late_track,
         })
@@ -1156,6 +1168,7 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".into(),
                 publication_id: "publication".into(),
+                muted: false,
                 kind: MediaStreamKind::Microphone,
                 track: fresh.clone(),
             })
@@ -1203,6 +1216,7 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
         peer.send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
             publication_id: "publication".into(),
+            muted: false,
             kind,
             track,
         })
@@ -1259,6 +1273,7 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
     peer.send(ConnectionEvent::TrackAdded {
         identity: "id-bob".into(),
         publication_id: "publication".into(),
+        muted: false,
         kind: MediaStreamKind::Camera,
         track: replacement.clone(),
     })
@@ -1338,6 +1353,7 @@ async fn parked_media_is_not_restored_after_its_track_or_connection_retires() {
         peer.send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
             publication_id: "publication".into(),
+            muted: false,
             kind: MediaStreamKind::Camera,
             track,
         })
@@ -1413,6 +1429,7 @@ async fn retired_generation_events_cannot_refill_parked_media() {
     peer.send(ConnectionEvent::TrackAdded {
         identity: "id-bob".into(),
         publication_id: "publication".into(),
+        muted: false,
         kind: MediaStreamKind::Camera,
         track,
     })
@@ -1440,6 +1457,7 @@ async fn replacing_the_adopted_connection_discards_its_parked_handles() {
     old.send(ConnectionEvent::TrackAdded {
         identity: "id-bob".into(),
         publication_id: "publication".into(),
+        muted: false,
         kind: MediaStreamKind::Camera,
         track,
     })
@@ -1492,6 +1510,7 @@ async fn an_old_publication_removal_cannot_remove_the_replacement_handle() {
             peer.send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".into(),
                 publication_id: publication_id.into(),
+                muted: false,
                 kind: MediaStreamKind::ScreenShare,
                 track,
             })
@@ -1548,6 +1567,7 @@ async fn an_old_connection_removal_cannot_remove_the_replacement_handle() {
         .send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
             publication_id: "publication".into(),
+            muted: false,
             kind: MediaStreamKind::Camera,
             track: replacement.clone(),
         })
@@ -1585,6 +1605,7 @@ async fn an_active_old_incarnation_cannot_be_parked_after_same_key_adoption() {
     old.send(ConnectionEvent::TrackAdded {
         identity: "id-bob".into(),
         publication_id: "publication".into(),
+        muted: false,
         kind: MediaStreamKind::Camera,
         track,
     })
@@ -1609,6 +1630,7 @@ async fn an_active_old_incarnation_cannot_be_parked_after_same_key_adoption() {
         .send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
             publication_id: "publication".into(),
+            muted: false,
             kind: MediaStreamKind::Camera,
             track: current.clone(),
         })
@@ -1638,6 +1660,7 @@ async fn an_active_idle_retired_focus_cannot_be_parked_after_a_lapse() {
         .send(ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
             publication_id: "publication".into(),
+            muted: false,
             kind: MediaStreamKind::Camera,
             track,
         })
@@ -1707,4 +1730,235 @@ async fn member_key_notifications_cannot_cross_a_retired_generation() {
             .is_empty()
     );
     assert!(fx.pool.member_pending_keys.is_empty());
+}
+
+#[tokio::test]
+async fn remote_mute_updates_require_the_winning_publication() {
+    let mut fx = Fixture::new();
+    let peer = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    let add = |publication_id: &str, muted| ConnectionEvent::TrackAdded {
+        identity: "id-bob".into(),
+        publication_id: publication_id.into(),
+        kind: MediaStreamKind::ScreenShare,
+        muted,
+        track: Arc::new(FakeTrack(MediaStreamKind::ScreenShare)),
+    };
+    peer.send(add("old", true)).unwrap();
+    assert_eq!(
+        fx.drain().await,
+        vec![
+            PoolEvent::StreamAdded {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::ScreenShare,
+            },
+            PoolEvent::StreamMuted {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::ScreenShare,
+                muted: true,
+            },
+        ]
+    );
+    peer.send(add("new", false)).unwrap();
+    assert_eq!(
+        fx.drain().await,
+        vec![PoolEvent::StreamMuted {
+            member_id: "bob".into(),
+            kind: MediaStreamKind::ScreenShare,
+            muted: false,
+        }]
+    );
+    for event in [
+        ConnectionEvent::TrackMuted {
+            identity: "id-bob".into(),
+            publication_id: "old".into(),
+            kind: MediaStreamKind::ScreenShare,
+        },
+        ConnectionEvent::TrackUnmuted {
+            identity: "id-bob".into(),
+            publication_id: "old".into(),
+            kind: MediaStreamKind::ScreenShare,
+        },
+    ] {
+        peer.send(event).unwrap();
+    }
+    assert!(fx.drain().await.is_empty());
+    for muted in [true, false] {
+        let event = if muted {
+            ConnectionEvent::TrackMuted {
+                identity: "id-bob".into(),
+                publication_id: "new".into(),
+                kind: MediaStreamKind::ScreenShare,
+            }
+        } else {
+            ConnectionEvent::TrackUnmuted {
+                identity: "id-bob".into(),
+                publication_id: "new".into(),
+                kind: MediaStreamKind::ScreenShare,
+            }
+        };
+        peer.send(event).unwrap();
+        assert_eq!(
+            fx.drain().await,
+            vec![PoolEvent::StreamMuted {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::ScreenShare,
+                muted,
+            }]
+        );
+    }
+    let generation = fx.pool.pool.get(OWN_FOCUS).unwrap().generation;
+    assert!(
+        fx.pool
+            .handle(PoolMessage(Message::Connection {
+                connection_key: OWN_FOCUS.into(),
+                generation: generation - 1,
+                event: ConnectionEvent::TrackMuted {
+                    identity: "id-bob".into(),
+                    publication_id: "new".into(),
+                    kind: MediaStreamKind::ScreenShare,
+                },
+            }))
+            .is_empty()
+    );
+    assert!(!fx.pool.tracks.lock().unwrap()[&("bob".into(), MediaStreamKind::ScreenShare)].muted);
+    fx.pool.close();
+}
+
+#[tokio::test]
+async fn parked_receivers_replay_only_their_own_latest_mute_state() {
+    let mut fx = Fixture::new();
+    let peer = fx.adopt();
+    // Two same-kind subscriptions can precede signaling. Only the latest
+    // receiver's publication can update the state that will win admission.
+    peer.send(ConnectionEvent::TrackAdded {
+        identity: "id-bob".into(),
+        publication_id: "old".into(),
+        kind: MediaStreamKind::Microphone,
+        muted: false,
+        track: Arc::new(FakeTrack(MediaStreamKind::Microphone)),
+    })
+    .unwrap();
+    let current: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Microphone));
+    peer.send(ConnectionEvent::TrackAdded {
+        identity: "id-bob".into(),
+        publication_id: "current".into(),
+        kind: MediaStreamKind::Microphone,
+        muted: true,
+        track: current.clone(),
+    })
+    .unwrap();
+    peer.send(ConnectionEvent::TrackUnmuted {
+        identity: "id-bob".into(),
+        publication_id: "current".into(),
+        kind: MediaStreamKind::Microphone,
+    })
+    .unwrap();
+    peer.send(ConnectionEvent::TrackMuted {
+        identity: "id-bob".into(),
+        publication_id: "old".into(),
+        kind: MediaStreamKind::Microphone,
+    })
+    .unwrap();
+    assert!(fx.drain().await.is_empty());
+    assert_eq!(
+        fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]),
+        vec![
+            PoolEvent::StreamAdded {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Microphone,
+            },
+            PoolEvent::StreamMuted {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Microphone,
+                muted: false,
+            },
+        ]
+    );
+    let tracks = fx.pool.remote_tracks();
+    let original = tracks.get("bob", MediaStreamKind::Microphone).unwrap();
+    assert!(Arc::ptr_eq(&original, &current));
+    fx.pool.apply_snapshot(&[]);
+    peer.send(ConnectionEvent::TrackMuted {
+        identity: "id-bob".into(),
+        publication_id: "current".into(),
+        kind: MediaStreamKind::Microphone,
+    })
+    .unwrap();
+    peer.send(ConnectionEvent::TrackUnmuted {
+        identity: "id-bob".into(),
+        publication_id: "old".into(),
+        kind: MediaStreamKind::Microphone,
+    })
+    .unwrap();
+    assert!(fx.drain().await.is_empty());
+    assert!(tracks.get("bob", MediaStreamKind::Microphone).is_none());
+    assert_eq!(
+        fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]),
+        vec![
+            PoolEvent::StreamAdded {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Microphone,
+            },
+            PoolEvent::StreamMuted {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Microphone,
+                muted: true,
+            },
+        ]
+    );
+    assert!(Arc::ptr_eq(
+        &tracks.get("bob", MediaStreamKind::Microphone).unwrap(),
+        &original,
+    ));
+    fx.pool.close();
+}
+
+#[tokio::test]
+async fn local_mute_echoes_require_our_member_and_publishing_connection() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.pool.apply_snapshot(&[
+        member_on("own", OWN_FOCUS),
+        member_on("bob", OWN_FOCUS),
+        member_on("carol", PEER_FOCUS),
+    ]);
+    fx.drain().await;
+    own.send(ConnectionEvent::LocalTrackMuted {
+        identity: "id-own".into(),
+        kind: MediaStreamKind::Microphone,
+    })
+    .unwrap();
+    own.send(ConnectionEvent::LocalTrackUnmuted {
+        identity: "id-own".into(),
+        kind: MediaStreamKind::Microphone,
+    })
+    .unwrap();
+    own.send(ConnectionEvent::LocalTrackMuted {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Microphone,
+    })
+    .unwrap();
+    fx.sender(PEER_FOCUS)
+        .send(ConnectionEvent::LocalTrackMuted {
+            identity: "id-own".into(),
+            kind: MediaStreamKind::Microphone,
+        })
+        .unwrap();
+    assert_eq!(
+        fx.drain().await,
+        vec![
+            PoolEvent::StreamMuted {
+                member_id: "own".into(),
+                kind: MediaStreamKind::Microphone,
+                muted: true,
+            },
+            PoolEvent::StreamMuted {
+                member_id: "own".into(),
+                kind: MediaStreamKind::Microphone,
+                muted: false,
+            },
+        ]
+    );
+    fx.pool.close();
 }
