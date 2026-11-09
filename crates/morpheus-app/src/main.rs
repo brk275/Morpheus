@@ -1846,6 +1846,13 @@ fn run_application(
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     morpheus_rtc::install_crypto_provider();
+    // This actual UI-thread lease precedes the backend/window and drops after
+    // UI/runtime locals. Slint show() may defer native window creation until
+    // its loop runs; that deferred OLE setup cannot satisfy audio attachment.
+    // The attached native origin retains its own additional checked STA lease.
+    #[cfg(all(windows, feature = "native-calls"))]
+    let _wasapi_ui_apartment = morpheus_rtc::WasapiUiApartment::initialize()
+        .map_err(|error| startup_error_origin(StartupOrigin::AudioAttach, error))?;
     #[cfg(target_os = "macos")]
     let macos_application = macos_termination::Application::install()?;
     let ui = AppWindow::new()

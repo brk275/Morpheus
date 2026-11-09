@@ -670,6 +670,9 @@ jobs:
               ;;
             Windows)
               cpal_tests=(
+                host::wasapi::apartment::tests::ui_apartment_bootstrap_initializes_and_balances_the_actual_thread
+                host::wasapi::apartment::tests::ui_apartment_nested_lease_preserves_the_existing_sta
+                host::wasapi::apartment::tests::ui_apartment_bootstrap_refuses_mta_without_unbalancing_it
                 host::wasapi::owner::tests::native_owner_receipt_waits_for_actual_worker_tls_and_supervisor_join
                 host::wasapi::owner::tests::finite_native_owner_capacity_is_refusal_and_not_a_release_receipt
                 host::wasapi::stream::tests::capture_empty_success_never_admits_data_and_bounds_nonempty_packets

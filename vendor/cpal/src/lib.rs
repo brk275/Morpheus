@@ -187,7 +187,7 @@ extern crate web_sys;
 pub use crate::host::wasapi::{
     begin_wasapi_shutdown, observe_wasapi_retiring, observe_wasapi_shutdown,
     with_wasapi_open_authority, WasapiCloseError, WasapiCloseObservation, WasapiCloseTicket,
-    WasapiUiContext,
+    WasapiUiApartment, WasapiUiContext,
 };
 pub use device_description::{
     DeviceDescription, DeviceDescriptionBuilder, DeviceDirection, DeviceType, InterfaceType,

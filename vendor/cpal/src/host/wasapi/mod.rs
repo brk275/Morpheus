@@ -19,6 +19,7 @@ mod activation;
 mod apartment;
 mod owner;
 pub use activation::WasapiUiContext;
+pub use apartment::WasapiUiApartment;
 pub use owner::with_wasapi_open_authority;
 pub use owner::{
     begin_shutdown as begin_wasapi_shutdown, observe_retiring as observe_wasapi_retiring,

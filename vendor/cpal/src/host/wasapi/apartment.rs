@@ -35,9 +35,10 @@ impl Sta {
         }
         Ok(lease)
     }
-    /// The UI bridge is installed only after the real window initialized its
-    /// apartment. It takes its own lease, without manufacturing UI provenance
-    /// by initializing an arbitrary worker as the permission origin.
+    /// The bridge attaches on the designated UI thread only after that thread
+    /// owns a checked STA (from the app bootstrap or native window setup). It
+    /// takes its own lease without initializing an arbitrary worker as the
+    /// permission origin.
     pub(crate) fn attach_ui() -> Result<Self, WasapiCloseError> {
         if !is_sta() {
             return Err(WasapiCloseError::Apartment);
@@ -50,6 +51,26 @@ impl Drop for Sta {
         unsafe {
             Com::CoUninitialize();
         }
+    }
+}
+
+/// A thread-affine lease for the application's actual UI thread. Initialize it
+/// before constructing the UI backend: Slint may defer native window creation
+/// until its event loop starts. This lease grants no audio/device admission and
+/// does not replace the separate strict `WasapiUiContext::attach` checks.
+///
+/// Each successful initialization, including S_FALSE, owns one balanced COM
+/// lease. An incompatible existing apartment is refused without uninitializing
+/// another owner's apartment. The private Sta also makes this !Send and !Sync.
+pub struct WasapiUiApartment {
+    _lease: Sta,
+}
+
+impl WasapiUiApartment {
+    pub fn initialize() -> Result<Self, WasapiCloseError> {
+        Ok(Self {
+            _lease: Sta::new()?,
+        })
     }
 }
 
@@ -122,5 +143,79 @@ pub(crate) fn retain_apartment() -> ! {
         // Continue servicing existing proxies without accepting new product
         // work. An unsuccessful pump is not permission to release native state.
         let _ = wait(&[], Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_apartment_bootstrap_initializes_and_balances_the_actual_thread() {
+        std::thread::spawn(|| {
+            assert!(!is_sta());
+            // The bootstrap does not weaken strict origin attachment.
+            assert!(matches!(Sta::attach_ui(), Err(WasapiCloseError::Apartment)));
+            let bootstrap = WasapiUiApartment::initialize().unwrap();
+            assert!(is_sta());
+            drop(bootstrap);
+            assert!(!is_sta());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn ui_apartment_nested_lease_preserves_the_existing_sta() {
+        std::thread::spawn(|| {
+            let original = Sta::new().unwrap();
+            assert!(is_sta());
+            // Both subsequent successful S_FALSE calls own their own lease.
+            let bootstrap = WasapiUiApartment::initialize().unwrap();
+            let attached = Sta::attach_ui().unwrap();
+            drop(bootstrap);
+            assert!(is_sta());
+            drop(attached);
+            assert!(is_sta());
+            drop(original);
+            assert!(!is_sta());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn ui_apartment_bootstrap_refuses_mta_without_unbalancing_it() {
+        std::thread::spawn(|| {
+            struct Mta;
+            impl Drop for Mta {
+                fn drop(&mut self) {
+                    unsafe { Com::CoUninitialize() };
+                }
+            }
+            let status = unsafe { Com::CoInitializeEx(None, Com::COINIT_MULTITHREADED) };
+            assert!(status.0 == 0 || status.0 == 1);
+            let mta = Mta;
+            assert!(matches!(
+                WasapiUiApartment::initialize(),
+                Err(WasapiCloseError::Apartment)
+            ));
+            let mut kind = APTTYPE::default();
+            let mut qualifier = APTTYPEQUALIFIER::default();
+            assert!(unsafe { Com::CoGetApartmentType(&mut kind, &mut qualifier) }.is_ok());
+            assert_eq!(kind, Com::APTTYPE_MTA);
+            assert_eq!(qualifier, Com::APTTYPEQUALIFIER_NONE);
+            drop(mta);
+            // Another test thread may keep the process MTA alive. The current
+            // thread must no longer own an explicit initialization either way.
+            let status = unsafe { Com::CoGetApartmentType(&mut kind, &mut qualifier) };
+            assert!(
+                status.is_err()
+                    || (kind == Com::APTTYPE_MTA
+                        && qualifier == Com::APTTYPEQUALIFIER_IMPLICIT_MTA)
+            );
+        })
+        .join()
+        .unwrap();
     }
 }

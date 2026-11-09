@@ -117,6 +117,16 @@ replacement. The returned receipt also requires actual worker/TLS and supervisor
 joins. Notification unregistration permits the documented final COM release; it
 does not claim to join every internal Windows callback thread.
 
+The application now retains an explicit, thread-affine `WasapiUiApartment`
+lease on its actual UI thread before constructing Slint. Slint may defer native
+window creation and OLE initialization until its event loop, so a successful
+`show()` call alone is not an initialized-apartment receipt. The bootstrap uses
+the same checked STA primitive and balances only its own successful COM lease;
+strict native UI attachment and its independent retained lease remain unchanged.
+It grants no media admission or permission and does not initialize worker audio.
+Three synthetic fresh-thread regressions cover balanced initial/nested STA leases
+and refusal of an existing MTA without changing that owner's COM lifetime.
+
 This amendment adds only the normalized manifest's WindowsAndMessaging feature
 on the already locked Windows bindings. Original upstream source, manifests,
 lockfile and Apache license remain preserved. It adds no installed DLL, sidecar
