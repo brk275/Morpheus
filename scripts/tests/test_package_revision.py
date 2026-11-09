@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import package_revision as revision
 from scripts import package_scope
@@ -270,6 +270,24 @@ class RevisionIdentityTests(unittest.TestCase):
             result = revision.verify_versioned_export(root, raw, "0.1.0-updateqa.1")
             self.assertEqual(result["files"], len(originals))
             self.assertEqual(result["allowed_paths"], sorted(revision.UPDATE_VERSION_PATHS))
+            # Exercise the real Mac exporter with the same complete >64 MiB
+            # archive; the two large inventories remain fully authenticated.
+            if os.name != "nt":
+                from scripts import macos_update_acceptance as mac
+                source, mac_root = parent / "reviewed-source", parent / "mac"
+                source.mkdir(); mac_root.mkdir()
+                commands = SimpleNamespace(root=mac_root, run=Mock(side_effect=lambda *args, **kwargs:
+                                            (mac_root / "source.tar").write_bytes(raw)))
+                with patch.object(mac, "verify_checkout", return_value="a" * 40) as checkout, \
+                        patch.object(mac, "app_versions", return_value=("0.1.0-updateqa.1", "0.1.0-updateqa.2")):
+                    exported = mac.export_source(commands, source, "a" * 40)
+                checkout.assert_called_once_with(source, "a" * 40)
+                self.assertEqual(len(exported), 2)
+                self.assertFalse((mac_root / "source.tar").exists())
+                for tree in exported:
+                    self.assertEqual(sum(path.is_file() for path in tree.rglob("*")), len(originals))
+                    for name in sizes:
+                        self.assertEqual((tree / name).read_bytes(), originals[name])
             # A same-sized change in an admitted large inventory still fails
             # the full byte comparison. Its larger cap is not an exclusion.
             with (root / next(iter(sizes))).open("r+b") as changed:
@@ -326,6 +344,26 @@ class RevisionIdentityTests(unittest.TestCase):
                     first.tobuf() + b"one" + b"\0" * 509 + truncated.tobuf() + b"short"):
             with self.subTest(truncated_archive_bytes=len(raw)), self.assertRaises(revision.SourceRevisionError):
                 revision.source_export_members(raw)
+
+
+    def test_mac_update_export_refuses_invalid_members_before_destination_creation(self):
+        if os.name == "nt":
+            self.skipTest("Mac exporter path semantics require POSIX")
+        from scripts import macos_update_acceptance as mac
+        for name, size in (("outside-large.json", 8 * 1024 * 1024 + 1),
+                           ("native/webrtc/linux/expected-linux-overlay.json", 16 * 1024 * 1024 + 1),
+                           ("native/webrtc/linux/selected-linux-build-inputs.json", 32 * 1024 * 1024 + 1),
+                           ("../outside", 0)):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                member = tarfile.TarInfo(name)
+                member.size, member.mode = size, 0o644
+                data = member.tobuf() + b"\0" * 1024
+                commands = SimpleNamespace(root=root, run=Mock(side_effect=lambda *args, **kwargs:
+                                            (root / "source.tar").write_bytes(data)))
+                with patch.object(mac, "verify_checkout"), self.assertRaises(revision.SourceRevisionError):
+                    mac.export_source(commands, root, "a" * 40)
+                self.assertFalse((root / "source-1").exists())
 
 
 class PackageSourceScopeTests(unittest.TestCase):

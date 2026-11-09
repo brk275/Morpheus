@@ -1,6 +1,7 @@
 //! Small Win32 boundary. Never launches a shell or resolves tools through PATH.
 
 use super::super::UpdateError;
+use super::{StartupUnsupportedReason, startup_unsupported};
 use std::{
     ffi::c_void,
     fs::{File, OpenOptions},
@@ -148,7 +149,7 @@ unsafe extern "system" {
 fn wide(value: &std::ffi::OsStr) -> Result<Vec<u16>, UpdateError> {
     let mut units: Vec<_> = value.encode_wide().collect();
     if units.is_empty() || units.len() > 30_000 || units.contains(&0) {
-        return Err(UpdateError::UnsupportedPackage);
+        return Err(startup_unsupported(StartupUnsupportedReason::WideInput));
     }
     units.push(0);
     Ok(units)
@@ -422,7 +423,7 @@ impl Directory {
                 .components()
                 .any(|p| matches!(p, Component::ParentDir | Component::CurDir))
         {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::DirectoryInput));
         }
         let mut ancestors = Vec::new();
         let mut current = PathBuf::new();
@@ -446,7 +447,7 @@ impl Directory {
             ancestors.push(file);
         }
         if ancestors.is_empty() {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::DirectoryHandles));
         }
         let mut units = vec![0_u16; 30_001];
         let count = unsafe {
@@ -458,7 +459,7 @@ impl Directory {
             )
         } as usize;
         if count == 0 || count >= units.len() {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::DirectoryCanonicalRead));
         }
         use std::os::windows::ffi::OsStringExt;
         let canonical = PathBuf::from(std::ffi::OsString::from_wide(&units[..count]));
@@ -469,7 +470,7 @@ impl Directory {
             || !u8::try_from(display[4]).is_ok_and(|b| b.is_ascii_alphabetic())
             || display[5..7] != [58, 92]
         {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::DirectoryCanonicalShape));
         }
         let drive_root = display[4..7]
             .iter()
@@ -499,7 +500,7 @@ pub(super) fn require_fixed_drive(kind: u32) -> Result<(), UpdateError> {
     if kind == 3 {
         Ok(())
     } else {
-        Err(UpdateError::UnsupportedPackage)
+        Err(startup_unsupported(StartupUnsupportedReason::DirectoryDrive))
     }
 }
 
@@ -793,10 +794,10 @@ impl Registry {
             unsafe {
                 RegCloseKey(machine);
             }
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::RegistryMachinePresent));
         }
         if found != 2 {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::RegistryMachineStatus));
         }
         let parts = KEY_PATH.split('\\').collect::<Vec<_>>();
         let mut parents = Vec::<RegistryKey>::new();
@@ -808,7 +809,7 @@ impl Registry {
             // Open the actual key, not a registry symbolic-link target. Keep
             // opened ancestors and resolve children relative to those handles.
             if unsafe { RegOpenKeyExW(base, text(part).as_ptr(), 8, access, &mut handle) } != 0 {
-                return Err(UpdateError::UnsupportedPackage);
+                return Err(startup_unsupported(StartupUnsupportedReason::RegistryComponentOpen));
             }
             let key = RegistryKey(handle);
             let mut kind = 0;
@@ -824,7 +825,7 @@ impl Registry {
                 )
             } != 2
             {
-                return Err(UpdateError::UnsupportedPackage);
+                return Err(startup_unsupported(StartupUnsupportedReason::RegistryLinkValue));
             }
             secure(handle, 4, final_key)?;
             if final_key {
@@ -836,7 +837,7 @@ impl Registry {
             base = handle;
             parents.push(key);
         }
-        Err(UpdateError::UnsupportedPackage)
+        Err(startup_unsupported(StartupUnsupportedReason::RegistryMissingFinal))
     }
 
     fn value(&self, name: &str, kind: u32) -> Result<Vec<u8>, UpdateError> {
@@ -889,21 +890,25 @@ impl Registry {
             || self.number("NoModify")? != 1
             || self.number("NoRepair")? != 1
         {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::RegistrationLiterals));
         }
         let install = self.string("InstallLocation")?;
         let location = install
             .strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
-            .ok_or(UpdateError::UnsupportedPackage)?;
+            .ok_or_else(|| {
+                startup_unsupported(StartupUnsupportedReason::RegistrationInstallQuotes)
+            })?;
         if Directory::open(Path::new(location))?.path != root {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::RegistrationInstallPath));
         }
         let uninstall = self.string("UninstallString")?;
         let uninstall_path = uninstall
             .strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
-            .ok_or(UpdateError::UnsupportedPackage)?;
+            .ok_or_else(|| {
+                startup_unsupported(StartupUnsupportedReason::RegistrationUninstallQuotes)
+            })?;
         let expected = root.join("uninstall.exe");
         let handle = open(Path::new(uninstall_path))?;
         let other = open(&expected)?;
@@ -916,7 +921,9 @@ impl Registry {
             Ok((info.volume, info.index_high, info.index_low))
         };
         if file_id(&handle)? != file_id(&other)? {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(
+                StartupUnsupportedReason::RegistrationUninstallIdentity,
+            ));
         }
         Ok(Registration {
             version: self.string("DisplayVersion")?,

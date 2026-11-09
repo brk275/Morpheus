@@ -70,6 +70,45 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(emitted, {"check": "installed_startup", "status": "failed",
                                   "app_log_public": False, "diagnostic": facts})
 
+    def test_windows_startup_guard_reasons_require_exact_unique_fatal_pair(self):
+        fatal = b"Error: UnsupportedPackage"
+        for reason in package_smoke.WINDOWS_STARTUP_REASONS:
+            with self.subTest(reason=reason), tempfile.TemporaryFile() as log:
+                log.write(b"private path and account body\r\n"
+                          + package_smoke.WINDOWS_STARTUP_REASON_PREFIX + reason + b"\r\n"
+                          + fatal + b"\r\n")
+                with patch.object(package_smoke.sys, "platform", "win32"):
+                    facts = package_smoke.startup_failure_diagnostics(log, 1)
+                self.assertEqual(facts, {"category": "windows_update_unsupported_package",
+                                        "exit_status": 1, "missing_library": None,
+                                        "reason": reason.decode("ascii")})
+                self.assertNotIn("private", repr(facts))
+        known = package_smoke.WINDOWS_STARTUP_REASON_PREFIX + b"ledger_complete"
+        for data in (
+            known, known + b"\nError: NotWritable", known + b"\n" + fatal + b"\nError: foreign",
+            known + b"\n" + known + b"\n" + fatal,
+            known + b"\n" + fatal + b"\n" + fatal,
+            package_smoke.WINDOWS_STARTUP_REASON_PREFIX + b"private foreign path\n" + fatal,
+            known + b" private suffix\n" + fatal,
+            b"MORPHEUS_WINDOWS_STARTUP_REJECT\n" + fatal,
+            known + b"\r\r\n" + fatal,
+        ):
+            with self.subTest(data=data), tempfile.TemporaryFile() as log:
+                log.write(data)
+                with patch.object(package_smoke.sys, "platform", "win32"):
+                    facts = package_smoke.startup_failure_diagnostics(log, 1)
+                self.assertEqual(facts, {"category": "unclassified", "exit_status": 1,
+                                        "missing_library": None})
+        # The public reason set must exactly match compile-time static Rust codes.
+        source = (Path(__file__).resolve().parents[2] /
+                  "crates/morpheus-app/src/updater/windows_transaction/mod.rs").read_text()
+        codes = source.split("impl StartupUnsupportedReason {", 1)[1].split(
+            "fn startup_unsupported(", 1)[0]
+        import re
+        self.assertEqual({value.encode("ascii") for value in re.findall(
+            r'Self::[A-Za-z]+ => "([a-z_]+)"', codes)},
+            package_smoke.WINDOWS_STARTUP_REASONS)
+
     def test_partial_linux_qa_cannot_claim_untested_formats(self):
         self.assertEqual(package_smoke.package_formats("linux-x64"), ["deb", "appimage"])
         self.assertEqual(package_smoke.package_formats("linux-x64", "appimage"), ["appimage"])

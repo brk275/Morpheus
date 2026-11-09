@@ -445,6 +445,34 @@ fn public_install_gate_stays_closed_and_journal_rejects_links_and_unbounded_fiel
 }
 
 #[test]
+fn failed_health_acknowledgement_retains_trial_until_a_durable_commit() {
+    let (_root, mut session, journal) = awaiting_store_health();
+    session.trial = Some(journal.id.clone());
+    let mut other = journal.clone();
+    other.id = "OtherTransaction".into();
+    session.save(&other).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            session.acknowledge_before_store(),
+            Err(UpdateError::RecoveryRequired)
+        );
+        assert_eq!(session.trial.as_deref(), Some(journal.id.as_str()));
+        assert_eq!(
+            session.journal().unwrap().unwrap().phase,
+            Phase::AwaitingHealth
+        );
+        assert_eq!(tree_hash(&session.installed).unwrap(), journal.new_hash);
+    }
+    // Repair the inert fixture's journal, then require the real durable save.
+    session.save(&journal).unwrap();
+    session.acknowledge_before_store().unwrap();
+    assert!(session.trial.is_none());
+    assert_eq!(session.journal().unwrap().unwrap().phase, Phase::Committed);
+    session.acknowledge_before_store().unwrap();
+    assert_eq!(session.journal().unwrap().unwrap().phase, Phase::Committed);
+}
+
+#[test]
 fn health_commit_before_store_is_durable_and_cannot_be_reversed() {
     let (_root, mut session, journal) = awaiting_store_health();
     session.trial = Some(journal.id.clone());
@@ -749,10 +777,13 @@ fn serialized_trial_recovery_restores_old_tree_and_late_health_cannot_open_store
     assert_eq!(tree_hash(&installed).unwrap(), journal.old_hash);
     assert!(late.journal().unwrap().is_none());
     late.trial = Some(journal.id);
-    assert_eq!(
-        late.acknowledge_before_store(),
-        Err(UpdateError::RecoveryRequired)
-    );
+    for _ in 0..2 {
+        assert_eq!(
+            late.acknowledge_before_store(),
+            Err(UpdateError::RecoveryRequired)
+        );
+        assert!(late.trial.is_some());
+    }
     assert!(late.journal().unwrap().is_none());
     assert_eq!(tree_hash(&installed).unwrap(), journal.old_hash);
 }

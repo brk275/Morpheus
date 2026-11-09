@@ -20,6 +20,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import element_process_namespace as containment
+from package_revision import MAX_EXPORT_BYTES, SourceRevisionError, expected_revision, valid_revision
 
 
 PIPEWIRE_PATCH_API_PATH = "/repos/PipeWire/pipewire/commits/800a25a01f99156d7d954f4d7fe1b0a6cf8ae7e3"
@@ -55,11 +56,54 @@ class OwnedRunner:
     def run(self, stage, argv, *, cwd, env, timeout, output_limit,
             binary_output=False, expected_status=(0,), stdin_bytes=None,
             stderr_limit=8 * 1024 * 1024):
+        # Ordinary commands and downloads keep their existing output ceiling.
+        if type(output_limit) is not int or not 0 <= output_limit <= 64 * 1024 * 1024:
+            raise CommandFailure("input")
+        return self._execute(stage, argv, cwd=cwd, env=env, timeout=timeout,
+                             output_limit=output_limit, binary_output=binary_output,
+                             expected_status=expected_status, stdin_bytes=stdin_bytes,
+                             stderr_limit=stderr_limit)
+
+    def source_archive(self, revision, *, cwd, env):
+        """Read only the selected source tree with the canonical export budget.
+
+        The producer authenticates HEAD and cleanliness before this call. The
+        returned bytes still require complete version-only source verification.
+        No caller selects the executable, arguments, timeout or logging mode.
+        """
+        import appimage_client as client
+        if not valid_revision(revision) or type(env) is not dict:
+            raise CommandFailure("input")
+        try:
+            if expected_revision(env) != revision:
+                raise CommandFailure("input")
+            root = Path(cwd)
+            if not root.is_absolute() or root.resolve(strict=True) != root or not root.is_dir():
+                raise CommandFailure("input")
+            details = root.lstat()
+            if details.st_uid != os.getuid() or details.st_mode & 0o022:
+                raise CommandFailure("input")
+            git = client.R.trusted_tool("git")
+        except (client.R.ProbeFailure, SourceRevisionError, OSError, TypeError, ValueError):
+            raise CommandFailure("input") from None
+        if git != "/usr/bin/git":
+            raise CommandFailure("input")
+        argv = [git, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+                "archive", "--format=tar", revision]
+        return self._execute("source-archive", argv, cwd=root, env=env, timeout=60,
+                             output_limit=MAX_EXPORT_BYTES, binary_output=True,
+                             expected_status=(0,), stdin_bytes=None,
+                             stderr_limit=8 * 1024 * 1024)
+
+    def _execute(self, stage, argv, *, cwd, env, timeout, output_limit,
+                 binary_output=False, expected_status=(0,), stdin_bytes=None,
+                 stderr_limit=8 * 1024 * 1024):
         self.assert_containment()
         if (not re.fullmatch(r"[a-z][a-z0-9-]{0,47}", stage)
                 or not argv or not all(isinstance(value, str) and "\0" not in value for value in argv)
                 or not argv[0].startswith("/")
-                or not 0 < timeout <= 3600 or not 0 <= output_limit <= 64 * 1024 * 1024
+                or not 0 < timeout <= 3600 or not 0 <= output_limit <= MAX_EXPORT_BYTES
                 or type(stderr_limit) is not int or not 0 <= stderr_limit <= 8 * 1024 * 1024
                 or (stdin_bytes is not None and
                     (type(stdin_bytes) is not bytes or len(stdin_bytes) > 65536))):

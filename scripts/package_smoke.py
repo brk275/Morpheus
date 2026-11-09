@@ -326,6 +326,44 @@ WINDOWS_STARTUP_ERROR_LINES = {
 }
 
 
+# Compile-time closed codes from Windows transaction startup guards only.
+# A reason is evidence only when paired with exactly one matching fatal line.
+WINDOWS_STARTUP_REASON_PREFIX = b"MORPHEUS_WINDOWS_STARTUP_REJECT "
+WINDOWS_STARTUP_REASONS = frozenset((
+    b"ledger_depth",
+    b"ledger_reparse",
+    b"ledger_name",
+    b"ledger_directory",
+    b"ledger_file",
+    b"ledger_kind",
+    b"ledger_count",
+    b"ledger_complete",
+    b"marker_identity",
+    b"uninstaller_image",
+    b"registration_version",
+    b"current_executable",
+    b"executable_name",
+    b"executable_parent",
+    b"wide_input",
+    b"directory_input",
+    b"directory_handles",
+    b"directory_canonical_read",
+    b"directory_canonical_shape",
+    b"directory_drive",
+    b"registry_machine_present",
+    b"registry_machine_status",
+    b"registry_component_open",
+    b"registry_link_value",
+    b"registry_missing_final",
+    b"registration_literals",
+    b"registration_install_quotes",
+    b"registration_install_path",
+    b"registration_uninstall_quotes",
+    b"registration_uninstall_identity",
+    b"installed_pe",
+))
+
+
 def startup_failure_diagnostics(log, status):
     """Reduce private startup stderr to fixed facts; never return foreign text.
 
@@ -349,8 +387,18 @@ def startup_failure_diagnostics(log, status):
     if type(raw) is not bytes or len(raw) > STARTUP_LOG_BOUND:
         return {**facts, "category": "private_log_exceeded_bound"}
     if windows:
-        lines = (line.removesuffix(b"\r") for line in raw.split(b"\n"))
+        lines = [line.removesuffix(b"\r") for line in raw.split(b"\n")]
         fatal = [line for line in lines if line.startswith(b"Error:")]
+        reasons = [line for line in lines if line.startswith(b"MORPHEUS_WINDOWS_STARTUP_REJECT")]
+        if reasons:
+            if (len(reasons) != 1 or fatal != [b"Error: UnsupportedPackage"]
+                    or not reasons[0].startswith(WINDOWS_STARTUP_REASON_PREFIX)):
+                return facts
+            reason = reasons[0][len(WINDOWS_STARTUP_REASON_PREFIX):]
+            if reason not in WINDOWS_STARTUP_REASONS:
+                return facts
+            return {**facts, "category": "windows_update_unsupported_package",
+                    "reason": reason.decode("ascii")}
         if len(fatal) == 1 and fatal[0] in WINDOWS_STARTUP_ERROR_LINES:
             return {**facts, "category": WINDOWS_STARTUP_ERROR_LINES[fatal[0]]}
         return facts

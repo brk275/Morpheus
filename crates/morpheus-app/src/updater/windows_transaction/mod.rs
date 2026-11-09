@@ -51,6 +51,92 @@ fn embedded_identity() -> Result<Identity, UpdateError> {
     Ok(identity)
 }
 
+// Closed failure localization only. Never attach input or platform error data.
+// Keep the original UnsupportedPackage error and all admission predicates.
+#[derive(Clone, Copy)]
+enum StartupUnsupportedReason {
+    LedgerDepth,
+    LedgerReparse,
+    LedgerName,
+    LedgerDirectory,
+    LedgerFile,
+    LedgerKind,
+    LedgerCount,
+    LedgerComplete,
+    MarkerIdentity,
+    UninstallerImage,
+    RegistrationVersion,
+    CurrentExecutable,
+    ExecutableName,
+    ExecutableParent,
+    WideInput,
+    DirectoryInput,
+    DirectoryHandles,
+    DirectoryCanonicalRead,
+    DirectoryCanonicalShape,
+    DirectoryDrive,
+    RegistryMachinePresent,
+    RegistryMachineStatus,
+    RegistryComponentOpen,
+    RegistryLinkValue,
+    RegistryMissingFinal,
+    RegistrationLiterals,
+    RegistrationInstallQuotes,
+    RegistrationInstallPath,
+    RegistrationUninstallQuotes,
+    RegistrationUninstallIdentity,
+    InstalledPe,
+}
+
+impl StartupUnsupportedReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::LedgerDepth => "ledger_depth",
+            Self::LedgerReparse => "ledger_reparse",
+            Self::LedgerName => "ledger_name",
+            Self::LedgerDirectory => "ledger_directory",
+            Self::LedgerFile => "ledger_file",
+            Self::LedgerKind => "ledger_kind",
+            Self::LedgerCount => "ledger_count",
+            Self::LedgerComplete => "ledger_complete",
+            Self::MarkerIdentity => "marker_identity",
+            Self::UninstallerImage => "uninstaller_image",
+            Self::RegistrationVersion => "registration_version",
+            Self::CurrentExecutable => "current_executable",
+            Self::ExecutableName => "executable_name",
+            Self::ExecutableParent => "executable_parent",
+            Self::WideInput => "wide_input",
+            Self::DirectoryInput => "directory_input",
+            Self::DirectoryHandles => "directory_handles",
+            Self::DirectoryCanonicalRead => "directory_canonical_read",
+            Self::DirectoryCanonicalShape => "directory_canonical_shape",
+            Self::DirectoryDrive => "directory_drive",
+            Self::RegistryMachinePresent => "registry_machine_present",
+            Self::RegistryMachineStatus => "registry_machine_status",
+            Self::RegistryComponentOpen => "registry_component_open",
+            Self::RegistryLinkValue => "registry_link_value",
+            Self::RegistryMissingFinal => "registry_missing_final",
+            Self::RegistrationLiterals => "registration_literals",
+            Self::RegistrationInstallQuotes => "registration_install_quotes",
+            Self::RegistrationInstallPath => "registration_install_path",
+            Self::RegistrationUninstallQuotes => "registration_uninstall_quotes",
+            Self::RegistrationUninstallIdentity => "registration_uninstall_identity",
+            Self::InstalledPe => "installed_pe",
+        }
+    }
+}
+
+fn startup_unsupported(reason: StartupUnsupportedReason) -> UpdateError {
+    use std::io::Write as _;
+    // A closed stderr observation must never replace the original guard error.
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "MORPHEUS_WINDOWS_STARTUP_REJECT {}",
+        reason.code()
+    );
+    UpdateError::UnsupportedPackage
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum Phase {
     Prepared,
@@ -210,7 +296,7 @@ fn enumerate(root: &Path, complete: bool) -> Result<Vec<String>, UpdateError> {
         result: &mut Vec<String>,
     ) -> Result<(), UpdateError> {
         if depth > 2 {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::LedgerDepth));
         }
         let _directory = native::Directory::open(current)?;
         for item in fs::read_dir(current).map_err(|_| UpdateError::RecoveryRequired)? {
@@ -219,31 +305,31 @@ fn enumerate(root: &Path, complete: bool) -> Result<Vec<String>, UpdateError> {
             let meta = fs::symlink_metadata(&path).map_err(|_| UpdateError::RecoveryRequired)?;
             use std::os::windows::fs::MetadataExt;
             if meta.file_attributes() & 0x400 != 0 {
-                return Err(UpdateError::UnsupportedPackage);
+                return Err(startup_unsupported(StartupUnsupportedReason::LedgerReparse));
             }
             let relative = path
                 .strip_prefix(root)
                 .map_err(|_| UpdateError::RecoveryRequired)?;
             let name = relative
                 .to_str()
-                .ok_or(UpdateError::UnsupportedPackage)?
+                .ok_or_else(|| startup_unsupported(StartupUnsupportedReason::LedgerName))?
                 .replace('\\', "/");
             if meta.is_dir() {
                 if !["licenses", "themes"].contains(&name.as_str()) {
-                    return Err(UpdateError::UnsupportedPackage);
+                    return Err(startup_unsupported(StartupUnsupportedReason::LedgerDirectory));
                 }
                 visit(root, &path, depth + 1, result)?;
             } else if meta.is_file() {
                 if !all_paths().any(|expected| expected == name) {
-                    return Err(UpdateError::UnsupportedPackage);
+                    return Err(startup_unsupported(StartupUnsupportedReason::LedgerFile));
                 }
                 native::open(&path)?;
                 result.push(name);
             } else {
-                return Err(UpdateError::UnsupportedPackage);
+                return Err(startup_unsupported(StartupUnsupportedReason::LedgerKind));
             }
             if result.len() > all_paths().count() {
-                return Err(UpdateError::UnsupportedPackage);
+                return Err(startup_unsupported(StartupUnsupportedReason::LedgerCount));
             }
         }
         Ok(())
@@ -254,7 +340,7 @@ fn enumerate(root: &Path, complete: bool) -> Result<Vec<String>, UpdateError> {
     let mut expected = all_paths().map(str::to_owned).collect::<Vec<_>>();
     expected.sort();
     if complete && found != expected {
-        return Err(UpdateError::UnsupportedPackage);
+        return Err(startup_unsupported(StartupUnsupportedReason::LedgerComplete));
     }
     Ok(found)
 }
@@ -283,7 +369,11 @@ fn check_tree(
     }
     check_entry(root, uninstaller)?;
     let executable = native::read(&root.join("morpheus-app.exe"), MAX_UPDATE_BYTES)?;
-    if pe_identity(&executable)? != manifest.identity {
+    let executable_identity = pe_identity(&executable).map_err(|error| match error {
+        UpdateError::UnsupportedPackage => startup_unsupported(StartupUnsupportedReason::InstalledPe),
+        other => other,
+    })?;
+    if executable_identity != manifest.identity {
         return Err(UpdateError::RecoveryRequired);
     }
     Ok(())
@@ -365,11 +455,11 @@ impl WindowsSession {
         let marker = native::read(&self.root.path.join(MARKER), MARKER_LIMIT as u64)?;
         let manifest = Manifest::parse(&marker)?;
         if manifest.identity != self.identity {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::MarkerIdentity));
         }
         let uninstaller = native::read(&self.root.path.join(UNINSTALLER), 16 * 1024 * 1024)?;
         if uninstaller.len() < 64 || &uninstaller[..2] != b"MZ" {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::UninstallerImage));
         }
         let entry = Entry {
             path: UNINSTALLER.into(),
@@ -379,7 +469,7 @@ impl WindowsSession {
         check_tree(&self.root.path, &manifest, &hash(&marker), &entry)?;
         let registration = self.registry.snapshot(&self.root.path)?;
         if registration.version != manifest.identity.version {
-            return Err(UpdateError::UnsupportedPackage);
+            return Err(startup_unsupported(StartupUnsupportedReason::RegistrationVersion));
         }
         Ok((manifest, marker, entry, registration))
     }
@@ -1421,16 +1511,19 @@ fn begin_startup_with_validation(
     if option_env!("MORPHEUS_PACKAGE_FORMAT") != Some("nsis-payload-v2") {
         return Ok((None, false));
     }
-    let executable = std::env::current_exe().map_err(|_| UpdateError::UnsupportedPackage)?;
+    let executable = std::env::current_exe()
+        .map_err(|_| startup_unsupported(StartupUnsupportedReason::CurrentExecutable))?;
     if executable
         .file_name()
         .is_none_or(|n| n != "morpheus-app.exe")
     {
-        return Err(UpdateError::UnsupportedPackage);
+        return Err(startup_unsupported(StartupUnsupportedReason::ExecutableName));
     }
     let identity = embedded_identity()?;
     let mut session = WindowsSession::lock(
-        executable.parent().ok_or(UpdateError::UnsupportedPackage)?,
+        executable
+            .parent()
+            .ok_or_else(|| startup_unsupported(StartupUnsupportedReason::ExecutableParent))?,
         identity,
     )?;
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();

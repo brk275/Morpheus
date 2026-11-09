@@ -128,6 +128,41 @@ fn interrupted_rollback_recognizes_already_restored_old_image() {
 }
 
 #[test]
+fn failed_health_acknowledgement_retains_trial_until_a_durable_commit() {
+    let fixture = Fixture::new();
+    let mut session = fixture.prepared();
+    let mut journal = session.journal().unwrap().unwrap();
+    session.apply(&mut journal).unwrap();
+    session.trial = Some(journal.id.clone());
+    let mut other = journal.clone();
+    other.id = "OtherTransaction".into();
+    session.save(&other).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            session.acknowledge(&fixture.next_metadata),
+            Err(UpdateError::RecoveryRequired)
+        );
+        assert_eq!(session.trial.as_deref(), Some(journal.id.as_str()));
+        assert_eq!(
+            session.journal().unwrap().unwrap().phase,
+            Phase::AwaitingHealth
+        );
+        assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.next);
+        assert_eq!(
+            fs::read(session.state.join("previous.AppImage")).unwrap(),
+            fixture.old
+        );
+    }
+    // Use the real state-layer body called by acknowledge_before_store.
+    session.save(&journal).unwrap();
+    session.acknowledge(&fixture.next_metadata).unwrap();
+    assert!(session.trial.is_none());
+    assert_eq!(session.journal().unwrap().unwrap().phase, Phase::Committed);
+    session.acknowledge(&fixture.next_metadata).unwrap();
+    assert_eq!(session.journal().unwrap().unwrap().phase, Phase::Committed);
+}
+
+#[test]
 fn committed_pre_store_acknowledgement_never_allows_later_binary_rollback() {
     let fixture = Fixture::new();
     let mut session = fixture.prepared();
@@ -237,10 +272,13 @@ fn corrupt_new_image_cannot_acknowledge_and_durable_old_image_is_retained() {
     session.apply(&mut journal).unwrap();
     session.trial = Some(journal.id);
     fs::write(&fixture.installed, b"disk corruption").unwrap();
-    assert_eq!(
-        session.acknowledge(&fixture.next_metadata),
-        Err(UpdateError::RecoveryRequired)
-    );
+    for _ in 0..2 {
+        assert_eq!(
+            session.acknowledge(&fixture.next_metadata),
+            Err(UpdateError::RecoveryRequired)
+        );
+        assert!(session.trial.is_some());
+    }
     assert_eq!(
         fs::read(session.state.join("previous.AppImage")).unwrap(),
         fixture.old

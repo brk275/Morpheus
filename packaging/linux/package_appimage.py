@@ -651,8 +651,7 @@ def update_build(plan_path, scanner):
                            cwd=reference, env=git_env, timeout=20, output_limit=128)
         if clean:
             raise PackageFailure("identity")
-        archive = runner.run("source-archive", [*safe_git, "archive", "--format=tar", plan["revision"]],
-                             cwd=reference, env=git_env, timeout=60, output_limit=64 * 1024 * 1024, binary_output=True)
+        archive = runner.source_archive(plan["revision"], cwd=reference, env=git_env)
         proof = verify_versioned_export(ROOT, archive, plan["version"])
         update = {name: plan[name] for name in ("version", "feed", "public_key")}
         update["source_proof"] = proof
