@@ -12,6 +12,7 @@
     "src/room/mod.rs",
     "src/room/options.rs",
     "src/room/participant/remote_participant.rs",
+    "src/room/publication/remote.rs",
     "src/room/track/remote_audio_track.rs",
     "src/room/track/remote_track.rs",
     "src/room/track/remote_video_track.rs"
@@ -29,6 +30,8 @@
     "src/room/mod.rs.upstream",
     "src/room/options.rs.upstream",
     "src/room/participant/remote_participant.rs.upstream",
+    "src/room/publication/remote.rs.upstream",
+    "src/room/publication/remote_publication_lifetime.rs",
     "src/room/track/remote_audio_track.rs.upstream",
     "src/room/track/remote_track.rs.upstream",
     "src/room/track/remote_video_track.rs.upstream"

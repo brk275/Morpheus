@@ -4,7 +4,7 @@ Same-version livekit0.7.48 path patch. Original registry archive SHA256:
 3db88772d10f8ef1ab43a0aa0634a1d4807d0567b65665274af3e084589dbec6.
 Its recorded source is livekit/rust-sdks commit
 af369aae0fe074762ef0a2051529e7ec63045042, path livekit. The original76
-regular archive members are retained;69 are exact. All seven changed original runtime
+regular archive members are retained;68 are exact. All eight changed original runtime
 files have prominent modification notices and exact .upstream preimages.
 UPSTREAM_FILES.sha256 always records original archive bytes. Cargo.toml and
 Cargo.toml.orig preserve the normalized and original declarations; an extra
@@ -109,3 +109,36 @@ This supersedes the held SID-only/source-task-join proposal, whose quiescence
 assumption missed detached SDK media tasks. Matrix membership authority, key
 trust/history/recipient policy, URLs, capture, original deadlines/23 facts and
 stock peer remain unchanged. This is not a Bob Megolm membership cure claim.
+
+## Remote publication retirement
+
+Each RemoteTrackPublication owns a private lifetime gate shared by its clones.
+Receiver enable, registration and synchronous export complete under that gate.
+Removal first retires the publication, waits out an entered export, disables its
+current receiver and exports unsubscribe before removing the registry entry.
+A detached completion retained before retirement is refused and only its exact
+receiver is disabled. Pending subscription completion no longer re-registers a
+publication or installs callbacks after it was removed. Remote handlers are
+installed before the shared registry exposes a new publication; common mute
+handler setup remains protected by the registry write lock. A detached media
+completion cannot discover a partially configured entry. Temporary unsubscribe
+clears a receiver without retiring the publication, so ordinary resubscribe is
+unchanged. A callback unwind remains failure and closes later admission while
+allowing cleanup. No SID tombstone collection or retained native handle is added.
+
+The gate nests before the existing E2EE receiver admission gate and ManagerInner.
+The existing same-SID Arc token checks and publication-SID pool removal fence are
+unchanged. Actual synchronous callbacks dispatch channel messages or perform the
+existing crypto setup; no await or publication reentry occurs under this gate.
+There is no new task, endpoint, permission, dependency, feature or log text.
+The new publication source has a prominent modification notice and its original
+registry bytes are retained as remote.rs.upstream. The original source inventory,
+licenses and manifests remain unchanged.
+
+The production helper is included by the existing matrix-rtc-livekit library
+unit-test harness, alongside the existing E2EE gate. Source regressions cover
+retirement before a late clone, repeated live admission, entered export versus
+retirement, and failure/poison closure with cleanup. These tests were not run
+locally. This correction does not identify the process that exited in an older
+installed package run or claim interoperability, installed-package or release
+acceptance before affected hosted checks pass.

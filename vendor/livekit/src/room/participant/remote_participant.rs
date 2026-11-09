@@ -187,11 +187,9 @@ impl RemoteParticipant {
                 ..Default::default()
             });
 
-            self.add_publication(TrackPublication::Remote(remote_publication.clone()));
-            track.enable();
-
-            remote_publication.set_track(Some(track)); // This will fire TrackSubscribed on the
-                                                       // publication
+            // The publication was obtained from the registry above. Re-adding
+            // it here could resurrect a publication retired while we waited.
+            remote_publication.set_track(Some(track));
         } else {
             log::error!("could not find published track with sid: {:?}", sid);
 
@@ -209,12 +207,7 @@ impl RemoteParticipant {
 
     pub(crate) fn unpublish_track(&self, sid: &TrackSid) {
         if let Some(publication) = self.get_track_publication(sid) {
-            // Unsubscribe to the track if needed
-            if let Some(track) = publication.track() {
-                track.disable();
-                publication.set_track(None); // This will fire TrackUnsubscribed on the publication
-            }
-
+            // Removal retires this publication before unsubscribing its track.
             self.remove_publication(sid);
 
             if let Some(track_unpublished) = self.remote.events.track_unpublished.lock().as_ref() {
@@ -363,12 +356,6 @@ impl RemoteParticipant {
     }
 
     pub(crate) fn add_publication(&self, publication: TrackPublication) {
-        super::add_publication(
-            &self.inner,
-            &Participant::Remote(self.clone()),
-            publication.clone(),
-        );
-
         let TrackPublication::Remote(publication) = publication else {
             panic!("expected remote publication");
         };
@@ -494,9 +481,23 @@ impl RemoteParticipant {
                 });
             }
         });
+
+        // Publish only after every remote handler is installed. The common
+        // registration holds the registry write lock through mute setup, so
+        // detached subscribers cannot discover a partially configured entry.
+        super::add_publication(
+            &self.inner,
+            &Participant::Remote(self.clone()),
+            TrackPublication::Remote(publication),
+        );
     }
 
     pub(crate) fn remove_publication(&self, sid: &TrackSid) -> Option<TrackPublication> {
+        if let Some(publication) = self.get_track_publication(sid) {
+            // Wait out an entered receiver export, then permanently refuse
+            // late completions before exposing an absent registry entry.
+            publication.retire_track();
+        }
         let publication =
             super::remove_publication(&self.inner, &Participant::Remote(self.clone()), sid);
 

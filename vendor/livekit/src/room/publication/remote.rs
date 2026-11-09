@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Morpheus modification: serialize publication retirement with receiver export.
+// The original source is retained in remote.rs.upstream; see MORPHEUS_PATCH.md.
+
 use std::{fmt::Debug, sync::Arc};
 
 use livekit_protocol::{self as proto, AudioTrackFeature, PacketTrailerFeature};
@@ -19,6 +22,10 @@ use parking_lot::{Mutex, RwLock};
 
 use super::{PermissionStatus, SubscriptionStatus, TrackPublication, TrackPublicationInner};
 use crate::{e2ee::EncryptionType, prelude::*, track::VideoQuality};
+
+#[path = "remote_publication_lifetime.rs"]
+mod remote_publication_lifetime;
+use remote_publication_lifetime::RemotePublicationLifetime;
 
 type SubscribedHandler = Box<dyn Fn(RemoteTrackPublication, RemoteTrack) + Send>;
 type UnsubscribedHandler = Box<dyn Fn(RemoteTrackPublication, RemoteTrack) + Send>;
@@ -50,6 +57,7 @@ struct RemoteInfo {
 }
 
 struct RemoteInner {
+    lifetime: RemotePublicationLifetime,
     info: RwLock<RemoteInfo>,
     events: RemoteEvents,
 }
@@ -78,6 +86,7 @@ impl RemoteTrackPublication {
         Self {
             inner: super::new_inner(info, track.map(Into::into)),
             remote: Arc::new(RemoteInner {
+                lifetime: RemotePublicationLifetime::default(),
                 info: RwLock::new(RemoteInfo { subscribed: auto_subscribe, allowed: true }),
                 events: Default::default(),
             }),
@@ -88,6 +97,30 @@ impl RemoteTrackPublication {
     /// the track is being unsubscribed.
     /// We register the mute events from the track here so we can forward them.
     pub(crate) fn set_track(&self, track: Option<RemoteTrack>) {
+        let Some(track) = track else {
+            self.remote.lifetime.clear_receiver(|| self.set_track_inner(None));
+            return;
+        };
+        if !self.remote.lifetime.admit(|| {
+            track.enable();
+            self.set_track_inner(Some(track.clone()));
+        }) {
+            // Only this late receiver is refused; a replacement publication
+            // and its same-SID E2EE instance ownership remain independent.
+            track.disable();
+        }
+    }
+
+    pub(crate) fn retire_track(&self) {
+        self.remote.lifetime.retire(|| {
+            if let Some(track) = self.track() {
+                track.disable();
+            }
+            self.set_track_inner(None);
+        });
+    }
+
+    fn set_track_inner(&self, track: Option<RemoteTrack>) {
         let old_subscription_state = self.subscription_status();
         let old_permission_state = self.permission_status();
 

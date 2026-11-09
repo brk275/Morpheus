@@ -1487,3 +1487,6 @@ use livekit::e2ee::EncryptionType;
 #[cfg(test)]
 #[path = "../../livekit/src/room/e2ee/remote_track_admission.rs"]
 mod remote_track_admission_tests;
+#[cfg(test)]
+#[path = "../../livekit/src/room/publication/remote_publication_lifetime.rs"]
+mod remote_publication_lifetime_tests;
