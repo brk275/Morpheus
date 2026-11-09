@@ -1166,10 +1166,11 @@ class FocusAndKeyTests(unittest.TestCase):
         self.assertIn({"op": "focus", "id": 1}, bridge.commands)
 
     def test_settings_scale_control_is_reached_by_bounded_tabs_before_its_label_is_queried(self):
-        focused = [focused_reply(name) for name in ["Open settings", "Open settings", "Open settings", "Dark theme",
+        focused = [focused_reply(name) for name in ["Open settings", "Open settings", "Open settings", "Open settings", "Dark theme",
                                                     "Dark theme", "Decrease font scale", "Decrease font scale",
                                                     "Increase font scale", "Increase font scale", "Increase font scale"]]
         instance, bridge, _ = driver([snapshot(node(1, "Open settings", role="AXButton")),
+                                      snapshot(node(1, "Search settings", role="AXTextField")),
                                       snapshot(node(1, "110% · text throughout the app", role="AXStaticText", name_source="value")),
                                       snapshot(node(1, "120% · text throughout the app", role="AXStaticText", name_source="value"))],
                                      focused=focused)
@@ -1180,11 +1181,81 @@ class FocusAndKeyTests(unittest.TestCase):
         last_tab = len(ops) - 1 - ops[::-1].index({"op": "key", "key": "Tab"})
         self.assertFalse(any(command["op"] == "snapshot" for command in ops[first_tab:last_tab + 1]))
 
+    def test_settings_open_waits_for_destination_mount_and_exact_owned_trigger_without_input(self):
+        replies = [focused_reply("Open settings"), focused_reply("Open settings"),
+                   focused_reply("", owned=False, present=False),
+                   focused_reply("Open settings", truncated=True), focused_reply("Open settings"),
+                   focused_reply("Open settings"), focused_reply("Open settings"),
+                   focused_reply("Increase font scale"), focused_reply("Increase font scale"),
+                   focused_reply("Increase font scale")]
+        pending_observations = []
+        def focused(call):
+            if 2 <= call <= 4:
+                pending_observations.append(call)
+                self.assertEqual([command["key"] for command in bridge.commands
+                                  if command["op"] == "key"], ["Return"])
+            return replies[call]
+
+        clock = Clock(0)
+        with patch.object(ui.time, "monotonic", clock), \
+                patch.object(ui.time, "sleep", side_effect=lambda seconds: setattr(clock, "now", clock.now + seconds)):
+            instance, bridge, _ = driver(
+                [snapshot(node(1, "Open settings", role="AXButton")),
+                 snapshot(),
+                 snapshot(node(1, "Search settings", role="AXButton")),
+                 snapshot(node(1, "Search settings", role="AXTextField")),
+                 snapshot(node(1, "110% · text throughout the app", role="AXStaticText", name_source="value")),
+                 snapshot(node(1, "120% · text throughout the app", role="AXStaticText", name_source="value"))],
+                focused=focused)
+            ui.appearance_keyboard(instance)
+        self.assertEqual(pending_observations, [2, 3, 4])
+        first_tab = bridge.commands.index({"op": "key", "key": "Tab"})
+        self.assertEqual(sum(command["op"] == "snapshot" for command in bridge.commands[:first_tab]), 4)
+        self.assertEqual([command for command in bridge.commands if command["op"] == "focus"],
+                         [{"op": "focus", "id": 1}])
+        self.assertEqual([command["key"] for command in bridge.commands if command["op"] == "key"],
+                         ["Return", "Tab", "Space"])
+
+    def test_settings_open_foreign_focus_fails_without_another_key(self):
+        instance, bridge, diagnostics = driver(
+            [snapshot(node(1, "Open settings", role="AXButton")),
+             snapshot(node(1, "Search settings", role="AXTextField"))],
+            focused=[focused_reply("Open settings"), focused_reply("Open settings"),
+                     focused_reply("Open settings", owned=False)])
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            ui.appearance_keyboard(instance)
+        self.assertEqual(error.exception.code, "focus_unowned")
+        self.assertEqual(diagnostics.value["appearance_stage"], "open_settings")
+        self.assertEqual([command["key"] for command in bridge.commands if command["op"] == "key"],
+                         ["Return"])
+
+    def test_settings_open_wait_keeps_existing_wait_and_acceptance_deadlines(self):
+        for acceptance_left, expected in ((180, "wait_timeout"), (0.15, "deadline")):
+            clock = Clock(0)
+            with self.subTest(expected=expected), patch.object(ui, "WAIT_SECONDS", 0.3), \
+                    patch.object(ui.time, "monotonic", clock), \
+                    patch.object(ui.time, "sleep", side_effect=lambda seconds: setattr(clock, "now", clock.now + seconds)):
+                instance, bridge, diagnostics = driver(
+                    [snapshot(node(1, "Open settings", role="AXButton")),
+                     snapshot(node(1, "Search settings", role="AXTextField"))],
+                    focused=lambda call: focused_reply("Open settings") if call < 2
+                        else focused_reply("", owned=False, present=False))
+                diagnostics.deadline = clock.now + acceptance_left
+                with self.assertRaises(ui.DiagnosticFailure) as error:
+                    ui.appearance_keyboard(instance)
+                self.assertEqual(error.exception.code, expected)
+                self.assertLessEqual(clock.now, 0.3 + 1e-9)
+                self.assertEqual(diagnostics.value["appearance_stage"], "open_settings")
+                self.assertEqual([command["key"] for command in bridge.commands if command["op"] == "key"],
+                                 ["Return"])
+
     def test_unreachable_scale_control_fails_within_the_tab_bound(self):
         def focused(call):
-            return focused_reply("Open settings" if call == 0 else f"Control {call}")
+            return focused_reply("Open settings" if call < 3 else f"Control {call}")
 
-        instance, bridge, _ = driver([snapshot(node(1, "Open settings", role="AXButton"))], focused=focused)
+        instance, bridge, _ = driver(
+            [snapshot(node(1, "Open settings", role="AXButton")),
+             snapshot(node(1, "Search settings", role="AXTextField"))], focused=focused)
         with self.assertRaises(ui.DiagnosticFailure) as error:
             ui.appearance_keyboard(instance)
         self.assertEqual(error.exception.code, "scale_unreachable")
@@ -1241,6 +1312,8 @@ class AccountMenuStageTests(unittest.TestCase):
 class AppearanceStageTests(unittest.TestCase):
     def test_failure_stage_survives_lower_level_operations_and_cleanup(self):
         cases = [("focus", "Open settings", "open_settings"),
+                 ("wait", "Search settings", "open_settings"),
+                 ("expect_focus", "Open settings", "open_settings"),
                  ("focused_name", None, "reach_scale"),
                  ("wait", "110% · text throughout the app", "read_seed_scale"),
                  ("key", "Space", "increase_scale"),
@@ -1252,7 +1325,7 @@ class AppearanceStageTests(unittest.TestCase):
                 instance.diagnostics = diagnostics
                 instance.focused_name.return_value = "Increase font scale"
 
-                def fail(*arguments):
+                def fail(*arguments, **keywords):
                     diagnostics.operation("node_name")
                     if argument is None or arguments == (argument,):
                         raise ui.DiagnosticFailure("wait_timeout")

@@ -894,6 +894,10 @@ def appearance_keyboard(ui):
     ui.diagnostics.appearance_stage("open_settings")
     ui.focus("Open settings")
     ui.key("Return")
+    # Wait for the newly mounted page before trusting its still-focused trigger;
+    # the old trigger can remain focused while the Return event is pending.
+    ui.wait("Search settings", role="AXTextField")
+    ui.expect_focus("Open settings")
     # Settings rows below the fold are clipped out of the accessibility tree
     # until revealed, so neither the scale label nor its control can be waited
     # for from here. Reach the control with bounded real Tab presses, checking
