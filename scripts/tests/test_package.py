@@ -282,6 +282,17 @@ class PackageConfigTests(unittest.TestCase):
             self.assertNotIn("before-packaging-command", configured)
             self.assertEqual(configured["nsis"]["installMode"], "currentUser")
             self.assertEqual(configured["windows"], {"allowDowngrades": False})
+            # Single-file string resources are flattened by Cargo Packager.
+            # Every emitted target must instead preserve the native ledger.
+            self.assertEqual(configured["resources"][:4], [
+                {"src": name, "target": name} for name in config["resources"]])
+            targets = [resource["target"] for resource in configured["resources"]]
+            expected = set(prepare_windows_update.FILES) - {"morpheus-app.exe"}
+            self.assertEqual(set(targets), expected | {"morpheus-install.json"})
+            self.assertEqual(len(targets), len(set(targets)))
+            self.assertNotIn("aurora.toml", targets)
+            self.assertNotIn("Symphonia-MPL-2.0.txt", targets)
+            self.assertNotIn("Symphonia-NOTICE.txt", targets)
             data = payload.read_bytes()
             self.assertTrue(data.startswith(prepare_windows_update.MAGIC))
             self.assertNotIn(str(root).encode(), data)

@@ -151,7 +151,9 @@ def prepare(config, root, directory, *, notice_contents):
     result = dict(config)
     result.pop("before-packaging-command", None)  # The exact ordinary build just finished.
     # A target path is explicit; no absolute producer path enters the installed marker.
-    result["resources"] = list(config["resources"])
+    # Cargo Packager treats single-file string resources as basename targets.
+    # Bind every approved resource to the exact path in the native ledger.
+    result["resources"] = [{"src": name, "target": name} for name in config["resources"]]
     for name in notices.NAMES:
         notice_path = directory / name
         with notice_path.open("xb") as stream:

@@ -74,7 +74,13 @@ def check_resources(root, dist=None):
                          ("Symphonia-MPL-2.0.txt", ROOT / "licenses/Symphonia-MPL-2.0.txt"),
                          ("Symphonia-NOTICE.txt", ROOT / "licenses/Symphonia-NOTICE.txt")]:
         expected = source.read_bytes().replace(b"\r\n", b"\n")
-        candidates = [p for p in root.rglob(name) if p.is_file()]
+        # The Windows transaction admits one exact install ledger. A matching
+        # basename elsewhere cannot establish the required native layout.
+        if sys.platform == "win32":
+            required = root / source.relative_to(ROOT)
+            candidates = [required] if required.is_file() else []
+        else:
+            candidates = [p for p in root.rglob(name) if p.is_file()]
         require(any(p.read_bytes().replace(b"\r\n", b"\n") == expected for p in candidates),
                 f"Installed {name} is absent or differs from the source")
     if sys.platform in {"darwin", "win32"}:

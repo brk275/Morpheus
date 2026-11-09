@@ -232,6 +232,37 @@ class PackageSmokeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "Symphonia-NOTICE"):
                     package_smoke.check_resources(installed)
 
+    def test_windows_resources_require_exact_ledger_paths_not_matching_root_basenames(self):
+        from scripts import native_notices
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source"
+            installed = Path(temp) / "installed"
+            paths = ("LICENSE", "themes/aurora.toml", "licenses/Symphonia-MPL-2.0.txt",
+                     "licenses/Symphonia-NOTICE.txt")
+            for name in paths:
+                for root in (source, installed):
+                    path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"Synthetic exact resource\n")
+            (source / "Cargo.lock").write_bytes(b"version = 4\n")
+            with patch.object(package_smoke.sys, "platform", "win32"), \
+                    patch.object(package_smoke, "ROOT", source), \
+                    patch.object(package_smoke, "package_version", return_value="0.1.0"), \
+                    patch.object(package_smoke, "record"), \
+                    patch.dict(os.environ, {"MORPHEUS_PACKAGE_SOURCE_REVISION": "a" * 40,
+                                            "GITHUB_SHA": "a" * 40}), \
+                    patch.object(native_notices, "read_files", return_value={"synthetic": b"notice"}), \
+                    patch.object(native_notices, "verify_bytes") as verify:
+                package_smoke.check_resources(installed, Path(temp) / "dist")
+                verify.assert_called_once()
+                for name in paths[1:]:
+                    required = installed / name
+                    flattened = installed / required.name
+                    required.rename(flattened)
+                    with self.subTest(resource=name), self.assertRaisesRegex(RuntimeError, required.name):
+                        package_smoke.check_resources(installed, Path(temp) / "dist")
+                    flattened.rename(required)
+
     def test_macos_install_uses_canonical_temp_root_without_resolving_bundle_resources(self):
         alias = Path("/synthetic/alias-temp/owned")
         canonical = Path("/synthetic/canonical-temp/owned")
