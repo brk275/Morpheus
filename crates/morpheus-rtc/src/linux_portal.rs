@@ -692,7 +692,9 @@ impl PortalCapture {
                 state.progress.format_accepted = result.is_ok();
                 state.failed |= result.is_err();
                 if result.is_err() {
-                    state.failure_code.get_or_insert(CaptureFailureCode::FormatRejected);
+                    state
+                        .failure_code
+                        .get_or_insert(CaptureFailureCode::FormatRejected);
                 }
             })
             .add_buffer(move |_, _, _| {
@@ -708,7 +710,9 @@ impl PortalCapture {
                 let Some(data_buffer) = datas.first_mut() else {
                     let mut state = frame_state.borrow_mut();
                     state.failed = true;
-                    state.failure_code.get_or_insert(CaptureFailureCode::BufferPlaneMissing);
+                    state
+                        .failure_code
+                        .get_or_insert(CaptureFailureCode::BufferPlaneMissing);
                     return;
                 };
                 let chunk = data_buffer.chunk();
@@ -741,7 +745,9 @@ impl PortalCapture {
                     Ok(None) => {}
                     Err(_) => {
                         state.failed = true;
-                        state.failure_code.get_or_insert(CaptureFailureCode::FrameChunkRejected);
+                        state
+                            .failure_code
+                            .get_or_insert(CaptureFailureCode::FrameChunkRejected);
                     }
                 }
             })

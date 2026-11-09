@@ -65,10 +65,10 @@ pub use matrix_rtc_transport::{
 // subscription constraints (pause or size cap) for a native call stage.
 #[cfg(feature = "native-rtc")]
 pub use matrix_rtc_transport::{Dimensions, MediaConstraints, RemoteTrackHandle, VideoDetail};
-#[cfg(feature = "native-rtc")]
-pub use media::{MediaError, Publication};
 #[cfg(all(target_os = "linux", feature = "native-rtc"))]
 pub use media::{CaptureFailureCode, report_capture_failure};
+#[cfg(feature = "native-rtc")]
+pub use media::{MediaError, Publication};
 #[cfg(feature = "native-rtc")]
 pub use native::{
     CallInfo, CallOptions, InteropMode, MediaFailureSnapshot, ParticipantInfo,

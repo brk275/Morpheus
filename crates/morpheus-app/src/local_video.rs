@@ -13,9 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use morpheus_rtc::{CameraCapture, MediaError, Publication, RtcService, ScreenCapture, VideoFrame};
 #[cfg(target_os = "linux")]
 use morpheus_rtc::CaptureFailureCode;
+use morpheus_rtc::{CameraCapture, MediaError, Publication, RtcService, ScreenCapture, VideoFrame};
 use tokio::{
     sync::{Notify, mpsc, oneshot, watch},
     time::{self, MissedTickBehavior, timeout},
