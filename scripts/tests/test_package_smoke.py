@@ -1,4 +1,5 @@
 import struct
+import json
 import os
 import signal
 import subprocess
@@ -14,6 +15,61 @@ from scripts import package_smoke
 
 
 class PackageSmokeTests(unittest.TestCase):
+    def test_windows_startup_reduces_only_exact_reviewed_error_lines(self):
+        for line, category in package_smoke.WINDOWS_STARTUP_ERROR_LINES.items():
+            with self.subTest(category=category), tempfile.TemporaryFile() as log:
+                log.write(b"private account body and path must not be emitted\r\n" + line + b"\r\n")
+                with patch.object(package_smoke.sys, "platform", "win32"):
+                    facts = package_smoke.startup_failure_diagnostics(log, 1)
+                self.assertEqual(facts, {"category": category, "exit_status": 1, "missing_library": None})
+                self.assertNotIn("private", repr(facts))
+                self.assertNotIn("Error:", repr(facts))
+
+    def test_windows_startup_unknown_ambiguous_or_unbounded_logs_never_claim_a_cause(self):
+        known = b"Error: NotWritable"
+        for data, status, category in (
+            (b"Error: private account and renderer error", 1, "unclassified"),
+            (known + b": private path", 1, "unclassified"),
+            (known + b"\r\r", 1, "unclassified"),
+            (b"prefix " + known, 1, "unclassified"),
+            (known + b"\n" + known, 1, "unclassified"),
+            (known + b"\nError: RecoveryRequired\n", 1, "unclassified"),
+            (known + b"\nError: arbitrary renderer failure\n", 1, "unclassified"),
+            (known, 0, "unclassified"),
+            (known, 127, "unclassified"),
+            (b"x" * (package_smoke.STARTUP_LOG_BOUND + 1), 1, "private_log_exceeded_bound"),
+        ):
+            with self.subTest(status=status, category=category), tempfile.TemporaryFile() as log:
+                log.write(data)
+                with patch.object(package_smoke.sys, "platform", "win32"):
+                    facts = package_smoke.startup_failure_diagnostics(log, status)
+                self.assertEqual(facts["category"], category)
+                self.assertNotIn("private account", repr(facts))
+                self.assertIsNone(facts["missing_library"])
+        unavailable = Mock()
+        unavailable.seek.side_effect = OSError("private log handle")
+        with patch.object(package_smoke.sys, "platform", "win32"):
+            self.assertEqual(package_smoke.startup_failure_diagnostics(unavailable, 1)["category"], "private_log_unavailable")
+
+    def test_windows_startup_failure_stays_failed_emits_fixed_facts_and_stops_owned_process(self):
+        process = Mock()
+        facts = {"category": "windows_update_not_writable", "exit_status": 1, "missing_library": None}
+        with patch.object(package_smoke.sys, "platform", "win32"), \
+                patch.object(package_smoke, "require_nonreaping_wait"), \
+                patch.object(package_smoke.subprocess, "Popen", return_value=process), \
+                patch.object(package_smoke, "process_status", return_value=1), \
+                patch.object(package_smoke, "stop_process") as stop, \
+                patch.object(package_smoke, "startup_failure_diagnostics", return_value=facts) as reduce, \
+                patch.object(package_smoke, "record") as record, patch("builtins.print") as output:
+            with self.assertRaises(RuntimeError):
+                package_smoke.launch_smoke(Path("synthetic-app.exe"), "win32")
+        stop.assert_called_once_with(process)
+        reduce.assert_called_once()
+        record.assert_not_called()
+        emitted = json.loads(output.call_args.args[0])
+        self.assertEqual(emitted, {"check": "installed_startup", "status": "failed",
+                                  "app_log_public": False, "diagnostic": facts})
+
     def test_partial_linux_qa_cannot_claim_untested_formats(self):
         self.assertEqual(package_smoke.package_formats("linux-x64"), ["deb", "appimage"])
         self.assertEqual(package_smoke.package_formats("linux-x64", "appimage"), ["appimage"])

@@ -107,9 +107,9 @@ mod tests {
             WindowBounds::default(),
             Actions(requests.clone()),
         );
-        let interface = EditableTextInterface::new(
-            adapter.platform_node(adapter.root_id().with_same_tree(NodeId(1))),
-        );
+        let root_node = adapter.platform_node(adapter.root_id());
+        let input_id = root_node.child_at_index(0).unwrap().unwrap();
+        let interface = EditableTextInterface::new(adapter.platform_node(input_id));
         let replacement = "Synthetic replacement";
         assert!(interface.set_text_contents(replacement).unwrap());
         assert_eq!(requests.lock().unwrap().len(), 1);

@@ -896,7 +896,9 @@ mod tests {
     fn editable_text_dispatches_unicode_and_password_without_readable_value() {
         for role in [Role::TextInput, Role::PasswordInput] {
             let (adapter, requests, _) = editable_adapter(editable_input(role));
-            let node = adapter.platform_node(adapter.root_id().with_same_tree(LocalNodeId(1)));
+            let root_node = adapter.platform_node(adapter.root_id());
+            let input_id = root_node.child_at_index(0).unwrap().unwrap();
+            let node = adapter.platform_node(input_id);
             assert!(
                 node.interfaces()
                     .unwrap()
@@ -919,7 +921,9 @@ mod tests {
     #[test]
     fn editable_text_rechecks_live_capability_visibility_and_enabled_state() {
         let (mut adapter, requests, interfaces) = editable_adapter(editable_input(Role::TextInput));
-        let node = adapter.platform_node(adapter.root_id().with_same_tree(LocalNodeId(1)));
+        let root_node = adapter.platform_node(adapter.root_id());
+        let input_id = root_node.child_at_index(0).unwrap().unwrap();
+        let node = adapter.platform_node(input_id);
         assert!(
             node.interfaces()
                 .unwrap()
@@ -985,7 +989,9 @@ mod tests {
     #[test]
     fn editable_text_refuses_oversized_and_defunct_requests_without_dispatch() {
         let (mut adapter, requests, _) = editable_adapter(editable_input(Role::TextInput));
-        let node = adapter.platform_node(adapter.root_id().with_same_tree(LocalNodeId(1)));
+        let root_node = adapter.platform_node(adapter.root_id());
+        let input_id = root_node.child_at_index(0).unwrap().unwrap();
+        let node = adapter.platform_node(input_id);
         assert!(matches!(
             node.set_text_contents(&"x".repeat(1024 * 1024 + 1)),
             Err(crate::Error::TooManyCharacters)

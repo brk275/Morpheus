@@ -313,19 +313,33 @@ STARTUP_LIBRARY_NAMES = frozenset((
     "libXrandr.so.2", "libXrender.so.1", "libz.so.1",
 ))
 STARTUP_LOG_BOUND = 65536
+# Exact Rust main error lines from the authenticated typed updater errors,
+# the fail-closed account-store branch and pinned Slint PlatformError display.
+# Never copy an unrecognized error suffix, path or renderer message to output.
+WINDOWS_STARTUP_ERROR_LINES = {
+    b"Error: NotWritable": "windows_update_not_writable",
+    b"Error: UnsupportedPackage": "windows_update_unsupported_package",
+    b"Error: InvalidConfiguration": "windows_update_invalid_configuration",
+    b"Error: RecoveryRequired": "windows_update_recovery_required",
+    b'Error: "Saved-account startup was blocked"': "windows_account_store_blocked",
+    b"Error: No default Slint platform was selected, and no Slint platform was initialized": "windows_slint_platform_unavailable",
+}
 
 
 def startup_failure_diagnostics(log, status):
-    """Reduce private Linux stderr to fixed facts; never return foreign text.
+    """Reduce private startup stderr to fixed facts; never return foreign text.
 
-    Exit 127 alone does not identify a loader defect. Match complete standard
+    Windows exit 1 alone does not identify an updater or window defect. Only
+    exact reviewed full lines are recognized; unknown/ambiguous data stays
+    unclassified. Linux exit 127 alone does not identify a loader defect. Match complete standard
     ELF loader diagnostic lines only, and keep unknown or ambiguous input
     unclassified. No command, file path, symbol, version or arbitrary library
     name can reach public output through this reducer.
     """
     status = status if type(status) is int and -128 <= status <= 255 else None
     facts = {"category": "unclassified", "exit_status": status, "missing_library": None}
-    if status != 127:
+    windows = sys.platform == "win32"
+    if status != (1 if windows else 127):
         return facts
     try:
         log.seek(0)
@@ -334,6 +348,12 @@ def startup_failure_diagnostics(log, status):
         return {**facts, "category": "private_log_unavailable"}
     if type(raw) is not bytes or len(raw) > STARTUP_LOG_BOUND:
         return {**facts, "category": "private_log_exceeded_bound"}
+    if windows:
+        lines = (line.removesuffix(b"\r") for line in raw.split(b"\n"))
+        fatal = [line for line in lines if line.startswith(b"Error:")]
+        if len(fatal) == 1 and fatal[0] in WINDOWS_STARTUP_ERROR_LINES:
+            return {**facts, "category": WINDOWS_STARTUP_ERROR_LINES[fatal[0]]}
+        return facts
     missing = re.findall(
         rb"(?m)^[^\r\n]{1,4096}: error while loading shared libraries: "
         rb"([A-Za-z0-9_.+-]{1,128}): cannot open shared object file: No such file or directory\r?$", raw)
@@ -395,7 +415,7 @@ def launch_smoke(executable, window_check=None, seconds=12, stop=None):
             # Never publish app logs: even startup errors can contain private
             # paths, URLs or account details. Only fixed reduced facts are public.
             failure = {"check": "installed_startup", "status": "failed", "app_log_public": False}
-            if sys.platform.startswith("linux"):
+            if sys.platform.startswith("linux") or sys.platform == "win32":
                 failure["diagnostic"] = startup_failure_diagnostics(log, status)
             print(json.dumps(failure, sort_keys=True), flush=True)
             raise

@@ -149,7 +149,7 @@
       "upstream_url": "https://github.com/AccessKit/accesskit/blob/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-APACHE"
     }
   ],
-  "reviewed_patch_sha256": "d4feb9150c6940be1d6bdbb2a5aa606c84e62883e79f28c37d376dcea395f91a",
+  "reviewed_patch_sha256": "07f559919b0b99732eeed45a5daaaf20dbacc07267d3f3511524138e16d93847",
   "modifications": [
     "src/atspi/bus.rs",
     "src/atspi/interfaces/editable_text.rs",
