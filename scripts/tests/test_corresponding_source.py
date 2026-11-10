@@ -121,7 +121,7 @@ def native_fixture(root):
     pipewire_recipe = ('VERSION = "1.0.5-fixture"\nCOMMIT = "' + "f" * 40 + '"\nUPSTREAM_PATCH_SHA256 = "' + patch_sha + '"\nPATCHED_SOURCE_SHA256 = "' + "1" * 64 + '"\nCONFIGURE = ("--fixture",)\nSOURCES = ("impl-node",)\nARCHIVES = ' + repr(archive_pins) + '\n').encode()
     files["scripts/pipewire_startup_probe.py"] = pipewire_recipe
     files["packaging/linux/appimage_client.py"] = ('LICENSES = ' + repr({name: S.digest(pipewire_files[name]) for name in ("LICENSE", "COPYING")}) + '\n').encode()
-    files["vendor/webrtc-sys-build/src/pins.rs"] = ('"linux-x64-release" => (123, "' + "2" * 64 + '",)\n').encode()
+    files["vendor/webrtc-sys-build/src/pins.rs"] = ('"linux-x64-release" => (456, 123, "' + "2" * 64 + '",)\n').encode()
     client = {"schema": 1, "source_version": "1.0.5-fixture", "upstream_commit": "f" * 40,
               "upstream_patch_sha256": patch_sha, "patched_source_sha256": "1" * 64,
               "source_archives": {key: pin[1] for key, pin in archive_pins.items()},
@@ -313,6 +313,17 @@ class SourceTests(unittest.TestCase):
             self.assertFalse(coverage["sdk"]["complete_matching_source_verified"])
             self.assertFalse(coverage["sdk"]["actual_linked_input_binding"])
             self.assertEqual(coverage["package_artifact_sha256"], receipt["appimage_sha256"])
+            self.assertEqual(coverage["sdk"]["selected_archive_bytes"], 123)
+            self.assertEqual(coverage["sdk"]["selected_archive_sha256"], "2" * 64)
+            # Exercise the exact production pin recipe through the real native
+            # material caller, not a test-only copy of the old tuple format.
+            files["vendor/webrtc-sys-build/src/pins.rs"] = (ROOT / "vendor/webrtc-sys-build/src/pins.rs").read_bytes()
+            _, actual = S.native_material(plan, files, receipt["source_revision"], S.Budget())
+            self.assertEqual(actual["sdk"]["selected_archive_bytes"], 149683670)
+            self.assertEqual(actual["sdk"]["selected_archive_sha256"],
+                             "dce9d9414cd8e2cc9a471c054481851b257ad2a879112ce5be56369b4fefdaed")
+            self.assertEqual(actual["sdk"]["pin_file_sha256"],
+                             S.digest(files["vendor/webrtc-sys-build/src/pins.rs"]))
             self.assertEqual(set(material), {key for key, value in coverage["files"].items() if value["included_in_bundle"]})
             self.assertEqual(budget.inputs, sum(value["bytes"] for value in coverage["files"].values()))
             self.assertNotIn("native/runtime/SOURCE.json", material)
@@ -324,6 +335,30 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(S.native_material({"schema": 1}, {}, "a" * 40, S.Budget()),
                              ({}, {"coverage": "rust-only", "native_sources_complete": False,
                                    "actual_native_build_inputs_verified": False}))
+
+    def test_native_sdk_pin_requires_one_complete_three_field_u64_recipe(self):
+        digest = '"' + "2" * 64 + '"'
+        valid = '"linux-x64-release" => (456, 123, ' + digest + ',)\n'
+        malformed = (
+            '"linux-x64-release" => (123, ' + digest + ',)\n',
+            valid.replace("456, 123", "0, 123"),
+            valid.replace("456, 123", "456, 0"),
+            valid.replace("456, 123", "-456, 123"),
+            valid.replace("456, 123", "18446744073709551616, 123"),
+            valid.replace("456, 123", "456, 18446744073709551616"),
+            valid.replace(digest + ",)", digest + ", 1,)"),
+            valid + valid,
+            valid + '"linux-x64-release" => malformed\n',
+            valid.replace(digest, '"' + "A" * 64 + '"'),
+        )
+        with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP", str(ROOT))) as directory:
+            plan, files, receipt, _, _ = native_fixture(Path(directory))
+            for recipe in malformed:
+                with self.subTest(recipe_index=malformed.index(recipe)):
+                    files["vendor/webrtc-sys-build/src/pins.rs"] = recipe.encode()
+                    with self.assertRaises(S.SourceFailure) as caught:
+                        S.native_material(plan, files, receipt["source_revision"], S.Budget())
+                    self.assertEqual((caught.exception.reason, caught.exception.source_phase), ("manifest", "sdk_pin"))
 
     def test_native_plan_never_admits_complete_or_unknown_source_claims(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP", str(ROOT))) as directory:

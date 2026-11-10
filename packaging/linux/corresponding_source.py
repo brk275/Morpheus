@@ -1076,8 +1076,14 @@ def _native_material(plan, files, revision, budget):
     with source_phase("sdk_pin"):
         sdk_path = "vendor/webrtc-sys-build/src/pins.rs"
         require(sdk_path in files and len(files[sdk_path]) <= 65536, "missing")
-        sdk = re.findall(rb'"linux-x64-release"\s*=>\s*\(\s*([0-9]+),\s*"([0-9a-f]{64})",\s*\)', files[sdk_path])
-        require(len(sdk) == 1, "manifest")
+        # The pinned Rust recipe records (asset_id, bytes, sha256). Admit that
+        # whole shape once; a second malformed selector must not hide beside a
+        # valid tuple. Both numeric fields have the recipe's positive u64 type.
+        require(len(re.findall(rb'"linux-x64-release"\s*=>', files[sdk_path])) == 1, "manifest")
+        sdk = re.findall(
+            rb'"linux-x64-release"\s*=>\s*\(\s*([1-9][0-9]{0,19}),\s*'
+            rb'([1-9][0-9]{0,19}),\s*"([0-9a-f]{64})",\s*\)', files[sdk_path])
+        require(len(sdk) == 1 and all(int(value) <= 2**64 - 1 for value in sdk[0][:2]), "manifest")
     # Raw receipt JSON may contain command text and local build paths. Validate
     # it above but export only its digest/closed bindings, never its raw text.
     # Recipes/patches already in the complete workspace are referenced once.
@@ -1104,7 +1110,7 @@ def _native_material(plan, files, revision, budget):
         "runtime_linked_source_inventory": linked_sources,
         "pipewire_source_and_deployed_inventory_bound": True,
         "sdk": {"pin_file": sdk_path, "pin_file_sha256": digest(files[sdk_path]),
-                "selected_archive_bytes": int(sdk[0][0]), "selected_archive_sha256": sdk[0][1].decode(),
+                "selected_archive_bytes": int(sdk[0][1]), "selected_archive_sha256": sdk[0][2].decode(),
                 "selection_basis": "committed-linux-x64-release-recipe-only",
                 "complete_matching_source_verified": False, "actual_linked_input_binding": False},
         "remaining_native_requirements": ["prebuilt-sdk-complete-matching-source-and-linked-object-provenance",
