@@ -242,7 +242,7 @@ class AccessibleUI:
                 self.pass_incomplete = True
                 continue
 
-    def find(self, label, *, prefix=False):
+    def find(self, label, *, prefix=False, role=None):
         matches = []
         self.diagnostics.value["selector_matches"] = 0
         for node in self.nodes():
@@ -250,6 +250,9 @@ class AccessibleUI:
                 self.diagnostics.operation("node_name")
                 value = node.name or ""
                 matched = value.startswith(label) if prefix else value == label
+                if matched and role is not None:
+                    self.diagnostics.operation("node_role")
+                    matched = node.getRole() == role
                 self.diagnostics.value["traversed_node_matched"] = matched
                 if matched:
                     matches.append(node)
@@ -278,8 +281,8 @@ class AccessibleUI:
             time.sleep(0.1)
         raise DiagnosticFailure("wait_timeout")
 
-    def wait(self, label, *, prefix=False):
-        return self.wait_for(lambda: self.find(label, prefix=prefix))
+    def wait(self, label, *, prefix=False, role=None):
+        return self.wait_for(lambda: self.find(label, prefix=prefix, role=role))
 
     def focused_name(self):
         self.diagnostics.value["focus_kind"] = "unavailable"
@@ -416,7 +419,8 @@ def menu_keyboard(ui, diagnostics=None):
     checkpoint("menu_return_focus")
     ui.expect_focus("Switch to ", prefix=True)
     checkpoint("menu_return_visible")
-    ui.wait("Manage accounts")
+    # Select the action, not its separate same-name static caption.
+    ui.wait("Manage accounts", role=ui.api.ROLE_PUSH_BUTTON)
     checkpoint("menu_escape")
     ui.key("Escape")
     checkpoint("menu_escape_hidden")

@@ -172,6 +172,7 @@ class KeyboardFlowMockTests(unittest.TestCase):
             modal = False
             menu = False
             keys = []
+            api = Mock(ROLE_PUSH_BUTTON=43)
 
             def focus(self, name, **_):
                 self.focus_name = name
@@ -187,7 +188,7 @@ class KeyboardFlowMockTests(unittest.TestCase):
                 present = self.modal if name == "Manage saved Matrix accounts" else self.menu
                 return True if present else None
 
-            def wait(self, name):
+            def wait(self, name, **_):
                 if not self.find(name):
                     raise RuntimeError("missing region")
 
@@ -214,6 +215,18 @@ class KeyboardFlowMockTests(unittest.TestCase):
     def test_menu_is_opened_dismissed_and_reached_by_actual_keys(self):
         driver = self.fake_menu()
         ui.menu_keyboard(driver)
+        self.assertEqual(driver.keys, ["Return", "Escape", "space", "Tab", "Return", "Tab", "shift+Tab", "Escape"])
+
+    def test_menu_presence_selects_button_but_escape_still_requires_all_names_absent(self):
+        driver = self.fake_menu()
+        driver.wait = Mock(wraps=driver.wait)
+        driver.find = Mock(wraps=driver.find)
+        ui.menu_keyboard(driver)
+        self.assertEqual(driver.wait.call_args_list[0], call("Manage accounts", role=43))
+        # The hidden check still queries every owned same-name node, including
+        # the caption, rather than accepting a lingering static label.
+        self.assertEqual(driver.find.call_args_list[:2],
+                         [call("Manage accounts"), call("Manage accounts")])
         self.assertEqual(driver.keys, ["Return", "Escape", "space", "Tab", "Return", "Tab", "shift+Tab", "Escape"])
 
     def test_menu_diagnostics_preserve_the_exact_keyboard_sequence(self):
@@ -414,6 +427,94 @@ class BoundedDiagnosticTests(unittest.TestCase):
         driver.diagnostics.failed(error.exception)
         self.assertEqual(driver.diagnostics.value["failure"], "selector_ambiguous")
         self.assertEqual(driver.diagnostics.value["selector_matches"], 2)
+
+    def test_role_selector_distinguishes_menu_button_from_same_name_caption(self):
+        driver = self.driver()
+        caption, button = Mock(), Mock()
+        caption.name = button.name = "Manage accounts"
+        caption.getRole.return_value, button.getRole.return_value = 29, 43
+        driver.nodes = lambda: iter([caption, button])
+        self.assertIs(driver.find("Manage accounts", role=43), button)
+        self.assertEqual(driver.diagnostics.value["selector_matches"], 1)
+        caption.getRole.assert_called_once_with()
+        button.getRole.assert_called_once_with()
+        # An unqualified query still refuses these same two distinct nodes.
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            driver.find("Manage accounts")
+        self.assertEqual(error.exception.code, "selector_ambiguous")
+
+    def test_role_selector_refuses_two_buttons_even_when_pass_is_incomplete(self):
+        driver = self.driver()
+        nodes = [Mock(), Mock(), Mock()]
+        for node, role in zip(nodes, [43, 29, 43]):
+            node.name = "Manage accounts"
+            node.getRole.return_value = role
+
+        def incomplete():
+            driver.pass_incomplete = True
+            yield from nodes
+
+        driver.nodes = incomplete
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            driver.find("Manage accounts", role=43)
+        self.assertEqual(error.exception.code, "selector_ambiguous")
+        self.assertEqual(driver.diagnostics.value["selector_matches"], 2)
+        self.assertTrue(all(node.getRole.call_count == 1 for node in nodes))
+
+    def test_transient_role_lookup_prevents_partial_match_until_complete_retry(self):
+        driver = self.driver()
+        button, unread = Mock(), Mock()
+        button.name = unread.name = "Manage accounts"
+        button.getRole.return_value = 43
+        unread.getRole.side_effect = [driver.transient_error("PRIVATE_NODE"), 29]
+        driver.key = Mock()
+
+        def nodes():
+            driver.pass_incomplete = False
+            yield button
+            yield unread
+
+        driver.nodes = nodes
+        with self.assertRaises(ui.IncompleteTraversal):
+            driver.find("Manage accounts", role=43)
+        self.assertEqual(driver.diagnostics.value["selector_matches"], 1)
+        self.assertEqual(driver.diagnostics.value["incomplete_passes"], 1)
+        with patch.object(smoke, "process_status", return_value=None):
+            self.assertIs(driver.wait("Manage accounts", role=43), button)
+        driver.key.assert_not_called()
+        self.assertNotIn("PRIVATE", json.dumps(driver.diagnostics.value))
+
+    def test_caption_alone_never_becomes_button_evidence_before_existing_deadline(self):
+        driver = self.driver()
+        caption = Mock()
+        caption.name = "Manage accounts"
+        caption.getRole.return_value = 29
+        driver.nodes = lambda: iter([caption])
+        driver.key = Mock()
+        self.assertIsNone(driver.find("Manage accounts", role=43))
+        with patch.object(smoke, "process_status", return_value=None), \
+                patch.object(ui.time, "monotonic", side_effect=[0.0, 0.0, 100.0]), \
+                patch.object(ui.time, "sleep") as sleep:
+            with self.assertRaises(ui.DiagnosticFailure) as error:
+                driver.wait("Manage accounts", role=43)
+        self.assertEqual(error.exception.code, "wait_timeout")
+        self.assertEqual(driver.diagnostics.value["selector_matches"], 0)
+        sleep.assert_called_once_with(0.1)
+        driver.key.assert_not_called()
+
+    def test_unexpected_role_error_is_closed_and_never_reflects_private_node(self):
+        driver = self.driver()
+        node = Mock()
+        node.name = "Manage accounts"
+        node.getRole.side_effect = TypeError("PRIVATE_NODE_VALUE")
+        driver.nodes = lambda: iter([node])
+        with self.assertRaises(TypeError) as error:
+            driver.find("Manage accounts", role=43)
+        driver.diagnostics.failed(error.exception)
+        self.assertEqual(driver.diagnostics.value["operation"], "node_role")
+        self.assertEqual(driver.diagnostics.value["failure"], "type_error")
+        self.assertEqual(driver.diagnostics.value["selector_matches"], 0)
+        self.assertNotIn("PRIVATE", json.dumps(driver.diagnostics.value))
 
     def test_pid_api_error_is_distinguished_from_missing_owned_tree(self):
         class MissingPid:
