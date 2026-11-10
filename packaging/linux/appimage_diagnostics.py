@@ -540,6 +540,70 @@ def _capture_marker_codes(data):
     return {"status": "known_codes", "codes": observed}
 
 
+def _runtime_wait_observation(data):
+    """Admit one exact complete runtime record, never arbitrary stderr text."""
+    if (type(data) is not bytes or len(data) > 8 * 1024 * 1024
+            or data.count(b"\n") > 65536):
+        return {"status": "invalid"}
+    prefix = b"MORPHEUS_APPIMAGE_WAIT_V1"
+    selected = None
+    lines = data.split(b"\n", 65536)
+    for index, line in enumerate(lines):
+        if not line.startswith(prefix):
+            continue
+        # The producer emits a leading separator and a final LF atomically.
+        # A partial, duplicate, oversized or decorated reserved record is not a fact.
+        if (selected is not None or index == 0 or index == len(lines) - 1 or len(line) >= 96
+                or b"\x00" in line or b"\r" in line):
+            return {"status": "invalid"}
+        selected = line
+    if selected is None:
+        return {"status": "absent"}
+    parts = selected.split(b" ")
+    if (len(parts) != 3 or parts[0] != prefix
+            or parts[2] not in {b"cleanup=passed", b"cleanup=failed", b"cleanup=skipped"}):
+        return {"status": "invalid"}
+    field = parts[1].split(b"=")
+    if len(field) != 2:
+        return {"status": "invalid"}
+    kind, value = field
+    result = {"status": "observed", "cleanup": parts[2][len(b"cleanup="):].decode("ascii")}
+    if kind in {b"exit", b"signal"}:
+        if (not 1 <= len(value) <= 3 or not value.isdigit()
+                or (len(value) > 1 and value.startswith(b"0"))):
+            return {"status": "invalid"}
+        number = int(value)
+        if kind == b"exit" and 0 <= number <= 255:
+            result.update(outcome="exited", exit_code=number)
+        elif kind == b"signal" and 1 <= number <= 64:
+            result.update(outcome="signaled", signal=number)
+        else:
+            return {"status": "invalid"}
+    elif kind == b"wait" and value in {b"failed", b"other"}:
+        result["outcome"] = "wait_failed" if value == b"failed" else "wait_other"
+    else:
+        return {"status": "invalid"}
+    return result
+
+
+def _rust_panic_framing(line):
+    """Recognize the pinned Rust1.99 hook frame without exporting its fields."""
+    if (type(line) is not bytes or len(line) > 8192 or b"\x00" in line
+            or b"\r" in line or b"\n" in line or not line.startswith(b"thread '")):
+        return False
+    name, separator, rest = line[len(b"thread '"):].partition(b"' (")
+    if not separator or len(name) > 256:
+        return False
+    thread_id, separator, location = rest.partition(b") panicked at ")
+    if (not separator or not 1 <= len(thread_id) <= 20 or not thread_id.isdigit()
+            or thread_id.startswith(b"0")):
+        return False
+    fields = location.rsplit(b":", 3)
+    return (len(fields) == 4 and 1 <= len(fields[0]) <= 2048 and fields[3] == b""
+            and all(1 <= len(value) <= 10 and value.isdigit()
+                    and (len(value) == 1 or not value.startswith(b"0")) for value in fields[1:3]))
+
+
 def _app_process_marker_codes(data):
     """Observe fixed stderr labels; neither identify a child signal nor a cause."""
     if (type(data) is not bytes or len(data) > 8 * 1024 * 1024
@@ -560,7 +624,19 @@ def _app_process_marker_codes(data):
             observed.add("runtime_cleanup")
         if line.startswith(b"Failed to run ") and b": " in line[len(b"Failed to run "):]:
             observed.add("runtime_exec")
-    return {"status": "observed_fixed_labels" if observed else "unknown", "codes": sorted(observed)}
+        if _rust_panic_framing(line):
+            observed.add("rust_panic_framing")
+        if line in {b"panic in a function that cannot unwind", b"thread caused non-unwinding panic. aborting."}:
+            observed.add("rust_non_unwinding_panic")
+        if line in {b"RefCell already borrowed", b"RefCell already mutably borrowed"}:
+            observed.add("rust_refcell_borrow_panic")
+    result = {"status": "observed_fixed_labels" if observed else "unknown", "codes": sorted(observed)}
+    wait = _runtime_wait_observation(data)
+    if wait["status"] != "absent":
+        result["runtime_wait"] = wait
+        if not observed and wait["status"] == "observed":
+            result["status"] = "observed_runtime_wait"
+    return result
 
 
 def capture_failure_markers(root, mode, *, scan_passed, include_process=False):

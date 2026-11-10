@@ -23,7 +23,7 @@ import appimage_client as client
 from appimage_process import download_package_input as download
 
 
-MANIFEST_SHA256 = "1ea9da98e5a0976bb039be5edc882503add202769ebded2affb01f274e8e6a81"
+MANIFEST_SHA256 = "15aaa594bedbc78b182fc08acdcd2d1bedaa20afd48df429a9a7a79927d9766c"
 NOTICE_DIR = "usr/share/doc/morpheus-app/appimage-runtime"
 MAX_RUNTIME = 4 * 1024 * 1024
 

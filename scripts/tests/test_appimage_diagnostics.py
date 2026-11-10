@@ -18,6 +18,114 @@ import package_appimage as P
 
 
 class ProgressTests(unittest.TestCase):
+    def test_runtime_wait_records_are_exact_complete_unique_and_closed(self):
+        prefix = b"\nMORPHEUS_APPIMAGE_WAIT_V1 "
+        for cleanup in ("passed", "failed", "skipped"):
+            for code in (0, 1, 126, 127, 255):
+                record = prefix + f"exit={code} cleanup={cleanup}\n".encode()
+                observed = D._app_process_marker_codes(b"private unterminated child text" + record)
+                self.assertEqual(observed, {"status": "observed_runtime_wait", "codes": [],
+                    "runtime_wait": {"status": "observed", "outcome": "exited", "exit_code": code,
+                                     "cleanup": cleanup}})
+                self.assertNotIn("private", json.dumps(observed))
+            for signal in (1, 6, 11, 15, 64):
+                record = prefix + f"signal={signal} cleanup={cleanup}\n".encode()
+                self.assertEqual(D._runtime_wait_observation(record),
+                    {"status": "observed", "outcome": "signaled", "signal": signal, "cleanup": cleanup})
+            for outcome in ("failed", "other"):
+                record = prefix + f"wait={outcome} cleanup={cleanup}\n".encode()
+                self.assertEqual(D._runtime_wait_observation(record),
+                    {"status": "observed", "outcome": "wait_" + outcome, "cleanup": cleanup})
+        good = prefix + b"exit=127 cleanup=passed\n"
+        invalid = (good + good, good[:-1], good[1:], prefix + b"exit=256 cleanup=passed\n",
+            prefix + b"exit=-1 cleanup=passed\n", prefix + b"exit=00 cleanup=passed\n",
+            prefix + b"signal=0 cleanup=passed\n", prefix + b"signal=65 cleanup=passed\n",
+            prefix + b"signal=011 cleanup=passed\n", prefix + b"wait=private cleanup=passed\n",
+            prefix + b"exit=127 cleanup=private\n", prefix + b"exit=127  cleanup=passed\n",
+            prefix + b"exit=127 cleanup=passed private path\n", good.replace(b"\n", b"\r\n"),
+            prefix + b"exit=127 cleanup=passed\x00\n", prefix + b"exit=" + b"1" * 120 + b" cleanup=passed\n",
+            b"\nMORPHEUS_APPIMAGE_WAIT_V1private exit=127 cleanup=passed\n")
+        for record in invalid:
+            with self.subTest(record=record[:96]):
+                self.assertEqual(D._runtime_wait_observation(record), {"status": "invalid"})
+                observed = D._app_process_marker_codes(record)
+                self.assertEqual(observed["runtime_wait"], {"status": "invalid"})
+                self.assertNotIn("private", json.dumps(observed))
+                self.assertNotIn("signal", observed["runtime_wait"])
+                self.assertNotIn("exit_code", observed["runtime_wait"])
+        for absent in (b"private text\n", b"private MORPHEUS_APPIMAGE_WAIT_V1 exit=127 cleanup=passed\n"):
+            self.assertEqual(D._runtime_wait_observation(absent), {"status": "absent"})
+        for invalid_input in (None, "private", b"x" * (8 * 1024 * 1024 + 1), b"\n" * 65537):
+            self.assertEqual(D._runtime_wait_observation(invalid_input), {"status": "invalid"})
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX private capture log identities")
+    def test_runtime_wait_observation_keeps_actual_outer_failure_and_stop_scan_cleanup_gates(self):
+        import appimage_capture as capture
+        observed = {"role": "app", "status": 127, "app_stdout": "clear", "app_stderr": "clear",
+                    "peer_stdout": "clear", "peer_stderr": "clear"}
+        for mode, case, phase, command in (("ordinary", "ordinary", "changed_frame", "capture-green"),
+                ("eager_bindings", "bindings", "changed_after_reopen", "capture-magenta")):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); session = root / case / "session"
+                session.mkdir(mode=0o700, parents=True); (root / case).chmod(0o700)
+                log = session / "app.stderr.log"
+                log.write_bytes(b"private payload without newline\nMORPHEUS_APPIMAGE_WAIT_V1 signal=11 cleanup=passed\n")
+                log.chmod(0o600)
+                progress = D.Progress(root); progress.wrapper("capture"); progress.capture(mode, phase)
+                progress.command(command); error = capture.CaptureFailure("process_exit")
+                error.process_exit = dict(observed); progress.failed(error)
+                original = json.loads(json.dumps(progress.value["failure"]))
+                with mock.patch.object(D, "capture_failure_markers", side_effect=AssertionError("private read forbidden")):
+                    self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                                     {"diagnostics": "withheld", "passed": False})
+                    live = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                    self.assertNotIn("native_capture_failure_markers", live)
+                    progress.cleanup(True)
+                    stopped = D.public_failure(root, scan_passed=True, outer_cleanup="failed", outer_reason="namespace_exit")
+                    self.assertNotIn("native_capture_failure_markers", stopped)
+                result = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                self.assertEqual(result["failure"], original); self.assertFalse(result["passed"])
+                markers = result["native_capture_failure_markers"]
+                self.assertEqual(markers["process_markers"]["runtime_wait"],
+                    {"status": "observed", "outcome": "signaled", "signal": 11, "cleanup": "passed"})
+                self.assertEqual(result["failure"]["process_exit"]["status"], 127)
+                self.assertNotIn("private payload", json.dumps(result)); self.assertEqual(progress.value["failure"], original)
+                log.write_bytes(b"\nMORPHEUS_APPIMAGE_WAIT_V1 signal=11 cleanup=passed\n" * 2)
+                duplicate = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                self.assertEqual(duplicate["native_capture_failure_markers"]["process_markers"]["runtime_wait"],
+                                 {"status": "invalid"})
+                self.assertEqual(duplicate["failure"], original); self.assertFalse(duplicate["passed"])
+                for role in ("peer", "other"):
+                    progress.value["failure"]["process_exit"]["role"] = role; progress.save()
+                    with mock.patch.object(D, "capture_failure_markers", side_effect=AssertionError("other role read")):
+                        unrelated = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                    self.assertNotIn("native_capture_failure_markers", unrelated); self.assertFalse(unrelated["passed"])
+
+    def test_pinned_rust_panic_labels_are_framed_closed_and_noncausal(self):
+        data = (b"\nthread 'private worker' (1234) panicked at /private/source.rs:123:45:\n"
+                b"RefCell already borrowed\n"
+                b"panic in a function that cannot unwind\n"
+                b"thread caused non-unwinding panic. aborting.\n")
+        result = D._app_process_marker_codes(data)
+        self.assertEqual(result, {"status": "observed_fixed_labels", "codes":
+            ["rust_non_unwinding_panic", "rust_panic_framing", "rust_refcell_borrow_panic"]})
+        self.assertNotIn("private", json.dumps(result))
+        for frame in (b"thread '<unnamed>' (1) panicked at /fixture/a.rs:1:1:",
+                      b"thread '' (123) panicked at /fixture/a:b.rs:0:0:"):
+            self.assertTrue(D._rust_panic_framing(frame))
+        unknown = (b"private text panicked at /private/file:1:2:",
+            b"thread 'private' panicked at /private/file:1:2:",
+            b"thread 'private' (0) panicked at /private/file:1:2:",
+            b"thread 'private' (123) panicked at /private/file:01:2:",
+            b"thread 'private' (123) panicked at /private/file:1:2: payload",
+            b"thread 'private' (123) panicked at /private/file:1:2:\x00",
+            b"thread caused non-unwinding panic. aborting. private",
+            b"panic in a function that cannot unwind private", b"RefCell already borrowed private",
+            b"already borrowed: BorrowMutError", b"x" * 8193 + b"panicked at")
+        for line in unknown:
+            with self.subTest(line=line[:96]):
+                self.assertEqual(D._app_process_marker_codes(line + b"\n"), {"status": "unknown", "codes": []})
+
     @unittest.skipIf(sys.platform == "win32", "POSIX private capture log identities")
     def test_process_exit_markers_require_scan_cleanup_and_keep_all_closed_peer_sites(self):
         import appimage_capture as capture

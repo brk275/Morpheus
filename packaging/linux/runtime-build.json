@@ -146,8 +146,8 @@
       "size": 13650
     },
     "type2-runtime-fedfad51-path-bounds.patch": {
-      "sha256": "a0a23399598020146b27cbe049fd3d94d7b04d7bbe90331f408b2113101eefe9",
-      "size": 3679
+      "sha256": "179de6c3367cc2965b77ff885c347f731266b494732055e29a1b1a676971b27a",
+      "size": 10617
     },
     "zlib-1.3.2-CVE-2026-85091.patch": {
       "sha256": "110ff14375733173d8aa54574473424fbd7dfe4b81f1ca34a759c6fe14b15b14",
@@ -156,12 +156,12 @@
   },
   "regressions": {
     "type2-runtime-path-regression.c": {
-      "sha256": "7e2494741ebbb6c3f3ccb44b70bc2951c5689c239dd818023891b8cb0da0b42c",
-      "size": 5338
+      "sha256": "81618a5f2f132c7077e6164c701e17106b83d0c1410d6af413cfcb650a8c04ff",
+      "size": 17979
     }
   },
   "runtime_patched_files": {
-    "src/runtime/runtime.c": "03a5397afcef4885bb631f8f7df47d69289661173185db4b54c5b8ef0b5fbb33"
+    "src/runtime/runtime.c": "ea3a3c03e00c7af9fcb38d52bac557a4e77ec9101904383ede96bc83af8a4123"
   },
   "runtime_revision": "fedfad51acc2860b2916a1eef32ba4a500ff31ef",
   "schema": 1,
@@ -183,7 +183,7 @@
       "patch": "type2-runtime-fedfad51-path-bounds.patch",
       "regression": "type2-runtime-path-regression.c",
       "reviewed_upstream_head": "a1fddcd61ad6307c0840f14324016ee488c49a7c",
-      "scope": "Bounds the portable directory suffix, rejects all three readlink truncations before NUL, and skips unrepresentable optional portable home/config counterparts without probing a truncated path. Original archive remains exact. Actual security fixture and installed package gates remain required.",
+      "scope": "Bounds the portable directory suffix, rejects all three readlink truncations before NUL, and skips unrepresentable optional portable home/config counterparts without probing a truncated path. Original archive remains exact. Actual security fixture and installed package gates remain required. Adds a bounded best-effort post-wait/cleanup observation without changing wait, exit mapping or cleanup behavior; observation is not a failure-cause or cure claim.",
       "upstream_reference": "https://github.com/AppImage/type2-runtime/pull/155",
       "upstream_state_at_review": "open/unmerged"
     },
@@ -213,7 +213,7 @@
     "table.h": "ddcd5e932267337e31dccfc563582beb198a0ca6168b3464710a73d2f73aa947",
     "tests/malformedtest.c": "b35f57dfdd6e1ae560947b247655ee33046bbfabdee6fe2b67763fa461387e92"
   },
-  "version_label": "fedfad51+morpheus-security-4",
+  "version_label": "fedfad51+morpheus-security-4-wait-observation-1",
   "zlib_patched_files": {
     "gzwrite.c": "31d0da140edf382b82b13e2d87a22f59e158d9014ee026459e01cf437d0ab07d"
   }
