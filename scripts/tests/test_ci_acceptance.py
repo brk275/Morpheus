@@ -126,7 +126,9 @@ class AcceptanceTests(unittest.TestCase):
                                 ("windows","devices"), ("macos-arm","vendor"), ("macos-intel","sdk"),
                                 ("all","desktop-video"), ("linux","desktop-video"),
                                 ("windows","desktop-video"), ("macos-arm","desktop-video"),
-                                ("macos-intel","desktop-video")):
+                                ("macos-intel","desktop-video"), ("all","rtc-libraries"),
+                                ("linux","rtc-libraries"), ("windows","rtc-libraries"),
+                                ("macos-arm","rtc-libraries"), ("macos-intel","rtc-libraries")):
             native = [] if route in {"helpers","config"} else platforms[platform]
             value = snapshot(bool(native),config=route=="config",platforms=native,wayland=route=="wayland")
             value["scope"]["outputs"].update(manual="true",manual_platform=platform,check_route=route)
@@ -156,7 +158,7 @@ class AcceptanceTests(unittest.TestCase):
                         changed = json.loads(json.dumps(value)); changed[job]["result"] = bad
                         self.assertIsNotNone(acceptance_error(changed, event))
                 for key, bad in (("manual", "true"), ("manual_platform", "linux"), ("matrix_suite", "oauth-only"),
-                                 ("check_route", "models"), ("check_route", "devices"), ("wayland", "true"), ("config", "true")):
+                                 ("check_route", "models"), ("check_route", "devices"), ("check_route", "rtc-libraries"), ("wayland", "true"), ("config", "true")):
                     changed = json.loads(json.dumps(value)); changed["scope"]["outputs"][key] = bad
                     self.assertIsNotNone(acceptance_error(changed, event))
             for count in range(len(PLATFORMS)):
@@ -171,12 +173,12 @@ class AcceptanceTests(unittest.TestCase):
         source = WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(source.count("github.event_name != 'workflow_dispatch' && needs.scope.outputs.check_route != 'all'"), 2)
 
-    def test_sdk_archive_aggregate_requires_exact_manual_matrix_and_cannot_claim_full_checks(self):
+    def test_rtc_libraries_and_sdk_archive_aggregate_require_exact_manual_matrix_and_cannot_claim_full_checks(self):
         choices = {"all":list(PLATFORMS), "linux":["ubuntu-24.04"], "windows":["windows-2025"],
                    "macos-arm":["macos-15"], "macos-intel":["macos-15-intel"]}
-        for platform, platforms in choices.items():
+        for route, (platform, platforms) in itertools.product(("sdk-archive", "rtc-libraries"), choices.items()):
             value = snapshot(True, platforms=platforms, wayland=False)
-            value["scope"]["outputs"].update(manual="true", manual_platform=platform, check_route="sdk-archive")
+            value["scope"]["outputs"].update(manual="true", manual_platform=platform, check_route=route)
             self.assertIsNone(acceptance_error(value, "workflow_dispatch"))
             for event in ("push", "pull_request"):
                 self.assertIsNotNone(acceptance_error(value, event))
@@ -336,21 +338,28 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertIn("run: cargo test --locked -p morpheus-rtc --features native-devices --lib\n", device)
         validate = load_native_validator()
         for runner in ("Linux","Windows","macOS"):
-            for route in ("all","models","desktop","desktop-video","devices","vendor","sdk","sdk-archive","matrix","wayland"):
+            for route in ("all","models","desktop","desktop-video","devices","vendor","rtc-libraries","sdk","sdk-archive","matrix","wayland"):
                 if route in ("matrix","wayland") and runner!="Linux":
                     continue
                 wayland = "true" if runner=="Linux" and route in ("all","wayland") else "false"
                 selected = {"model-tests":route in ("all","models"), "desktop-tests":route in ("all","desktop","desktop-video"),
                             "device-tests":route in ("all","devices","desktop-video"), "vendor-tests":route in ("all","vendor"),
-                            "rtc-library-tests":route in ("all","vendor"),
+                            "rtc-library-tests":route in ("all","vendor","rtc-libraries"),
                             "video-source-tests":route in ("all","vendor","desktop-video"),
                             "sdk-receipt-tests":route in ("all","sdk"),
                             "sdk-archive-tests":route == "sdk-archive",
                             "windows-capture-tests":runner=="Windows" and route in ("all","devices"),
                             "wayland-tests":wayland=="true", "matrix-tests":runner=="Linux" and route in ("all","matrix")}
                 outcomes={name:{"outcome":"success" if yes else "skipped"} for name,yes in selected.items()}
+                if route == "rtc-libraries":
+                    outcomes["rtc-library-compile"] = {"outcome":"success"}
                 outcomes.update({name:{"outcome":"skipped"} for name in ("preview-capture","preview-upload")})
                 self.assertIsNone(validate(route,runner,wayland,outcomes))
+                if route == "rtc-libraries":
+                    for bad in (None, "failure", "cancelled", "neutral", "skipped"):
+                        self.assertIsNotNone(validate(route, runner, wayland, outcomes | {"rtc-library-compile":{"outcome":bad}}))
+                    missing = outcomes.copy(); del missing["rtc-library-compile"]
+                    self.assertIsNotNone(validate(route, runner, wayland, missing))
                 for name, yes in selected.items():
                     missing = outcomes.copy()
                     del missing[name]
@@ -388,7 +397,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
             outcomes["windows-capture-tests"] = {"outcome": "success" if runner == "Windows" else "skipped"}
             self.assertIsNone(validate("all", runner, project("all", runner, "true"), outcomes))
             self.assertIsNotNone(validate("all", runner, "true", outcomes))
-            for route in ("models", "desktop", "desktop-video", "devices", "vendor", "sdk", "sdk-archive", "matrix", "wayland", "foreign"):
+            for route in ("models", "desktop", "desktop-video", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive", "matrix", "wayland", "foreign"):
                 # Only the legitimate whole-matrix route may project true.
                 # Invalid route/global-Wayland pairs must stay fail-closed.
                 self.assertEqual(project(route, runner, "true"), "true")
@@ -416,7 +425,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertEqual(source.count(start), 1)
         step = source.split(start, 1)[1].split("      - name:", 1)[0]
         self.assertIn("        id: rtc-library-tests\n", step)
-        self.assertIn("        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor')\n", step)
+        self.assertIn("        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'rtc-libraries')\n", step)
         self.assertNotIn("runner.os", step)
         self.assertIn("        timeout-minutes: 20\n", step)
         self.assertIn("        continue-on-error: true\n", step)
@@ -431,7 +440,8 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         compile_start = "      - name: Compile focused call libraries before regression deadline\n"
         self.assertEqual(source.count(compile_start), 1)
         compile_step = source.split(compile_start, 1)[1].split(start, 1)[0]
-        self.assertIn("        if: needs.scope.outputs.check_route == 'vendor'\n", compile_step)
+        self.assertIn("        if: (needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'rtc-libraries')\n", compile_step)
+        self.assertIn("        id: rtc-library-compile\n", compile_step)
         self.assertIn('          SLINT_EMIT_DEBUG_INFO: "1"\n', compile_step)
         self.assertIn("        run: " + command + " --no-run\n", compile_step)
         self.assertNotIn("continue-on-error:", compile_step)
@@ -439,6 +449,12 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertLess(source.index(compile_start), source.index(start))
         self.assertIn("RTC_LIBRARY_OUTCOME: ${{ steps.rtc-library-tests.outcome }}", source)
         self.assertIn('("rtc-library-tests", "RTC_LIBRARY_OUTCOME")', source)
+        self.assertIn("RTC_LIBRARY_COMPILE_OUTCOME: ${{ steps.rtc-library-compile.outcome }}", source)
+        self.assertIn('("rtc-library-compile", "RTC_LIBRARY_COMPILE_OUTCOME")', source)
+        pipewire = source.split("      - name: Prepare the pinned owned native PipeWire client\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("runner.os == 'Linux'", pipewire)
+        self.assertIn("needs.scope.outputs.check_route == 'rtc-libraries'", pipewire)
+        self.assertIn("python3 scripts/build_linux_native.py --variant native", pipewire)
 
     def test_native_compile_budget_covers_cold_mac_graphs_without_changing_windows(self):
         source = WORKFLOW.read_text(encoding="utf-8")
