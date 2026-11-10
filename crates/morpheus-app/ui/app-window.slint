@@ -1192,6 +1192,28 @@ component PendingSendStrip inherits ScrollView {
     in property <float> text-scale: 1;
     in property <length> viewport-cap: 240px;
     out property <length> natural-height: content.preferred-height;
+    // Match every TextAction's wrapped-caption minimum at this actual width.
+    // Metrics-only Text elements add no focus target or accessible action.
+    out property <length> focus-height: max(32px * root.text-scale,
+        max(sent-measure.preferred-height, keep-measure.preferred-height,
+            retry-measure.preferred-height, cancel-measure.preferred-height,
+            restore-measure.preferred-height, copy-measure.preferred-height,
+            discard-measure.preferred-height,
+            root.blocked-notice != "" ? unreadable-measure.preferred-height : 0px)
+            + 16px * root.text-scale);
+    Rectangle {
+        width: 0px; height: 0px; clip: true;
+        property <length> caption-width: max(0px,
+            root.visible-width - 16px - 2 * StyleTokens.control-padding * root.text-scale);
+        sent-measure := Text { width: parent.caption-width; text: "It was sent"; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-role: none; accessible-label: ""; }
+        keep-measure := Text { width: parent.caption-width; text: "Not sent, keep my text"; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-role: none; accessible-label: ""; }
+        retry-measure := Text { width: parent.caption-width; text: "Retry"; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-role: none; accessible-label: ""; }
+        cancel-measure := Text { width: parent.caption-width; text: "Cancel sending"; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-role: none; accessible-label: ""; }
+        restore-measure := Text { width: parent.caption-width; text: "Restore text"; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-role: none; accessible-label: ""; }
+        copy-measure := Text { width: parent.caption-width; text: "Copy text"; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-role: none; accessible-label: ""; }
+        discard-measure := Text { width: parent.caption-width; text: "Discard text"; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-role: none; accessible-label: ""; }
+        unreadable-measure := Text { width: parent.caption-width; text: "Discard unreadable saved status"; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-role: none; accessible-label: ""; }
+    }
     callback cancel(string);
     callback retry(string);
     callback review(string, bool);
@@ -2072,6 +2094,7 @@ component StyleNumberSetting inherits Rectangle {
 component StyleFontSetting inherits Rectangle {
     in property <string> label;
     in-out property <string> family;
+    callback edited();
     in property <color> ink;
     in property <color> surface;
     in property <color> accent;
@@ -2088,6 +2111,7 @@ component StyleFontSetting inherits Rectangle {
             input := ThemedTextInput {
                 x: StyleTokens.input-padding; width: max(0px, parent.width - 2 * StyleTokens.input-padding); height: parent.height;
                 text <=> root.family; single-line: true;
+                edited => { root.edited(); }
                 color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
                 accessible-label: root.label;
             }
@@ -3369,6 +3393,7 @@ component TimelineRecoveryNotice inherits Rectangle {
     in property <color> hover-surface;
     in property <color> outline;
     in property <float> text-scale: 1;
+    in property <length> max-control-width: 0px;
     callback open-recovery();
     vertical-stretch: 0;
     background: root.surface;
@@ -3385,7 +3410,8 @@ component TimelineRecoveryNotice inherits Rectangle {
             vertical-stretch: 0;
             accessible-live-region: polite;
         }
-        TextAction {
+        recovery-action := TextAction {
+            max-control-width: root.max-control-width;
             text: "Security & recovery";
             enabled: root.action-enabled;
             accessible-label: "Open Security and recovery settings for this account";
@@ -3394,6 +3420,11 @@ component TimelineRecoveryNotice inherits Rectangle {
             text-scale: root.text-scale; wrap-caption: true;
             activated => { root.open-recovery(); }
         }
+        states [
+            capped when root.max-control-width > 0px: {
+                recovery-action.max-width: root.max-control-width;
+            }
+        ]
     }
 }
 
@@ -3773,6 +3804,8 @@ export component AppWindow inherits Window {
     in-out property <string> appearance-message-font-input;
     in-out property <string> appearance-mono-font-input;
     in-out property <string> appearance-composer-font-input;
+    // One unsaved form; only real text edits mark it, never config projection.
+    in-out property <bool> appearance-fonts-dirty: false;
     callback choose-style-preset(int);
     // Interface, message, composer and monospaced families.
     callback set-style-fonts(string, string, string, string);
@@ -6643,15 +6676,21 @@ export component AppWindow inherits Window {
         }
 
         // Conversation, settings, and call stage share the main canvas.
-        Rectangle {
+        conversation-canvas := Rectangle {
             x: main-area.x + (root.details-side == 1 ? main-area.panel-width : 0px);
             y: main-area.y;
             width: main-area.width - main-area.panel-width;
             height: main-area.height;
             background: root.window-canvas;
+            // Only this allocation wrapper may shrink below its content. The
+            // timeline keeps its 50 px minimum; chrome and saved sends scroll.
+            property <length> action-viewport-min: max(50px, 32px * root.text-scale);
+            // The unconditional layout measures its conditional child's
+            // explicit preferred floor without reaching across an if scope.
+            property <length> room-minimum: room-allocation-layout.preferred-height;
             VerticalLayout {
                 spacing: 0px;
-                Rectangle {
+                canvas-header := Rectangle {
                     height: max(64px, 40px * root.text-scale + 24px) + StyleTokens.icon-button-growth;
                     background: transparent;
                     // Measured only, never drawn or read out: the page 0 glyph
@@ -6907,9 +6946,30 @@ export component AppWindow inherits Window {
                     }
                 }
                 Rectangle { height: StyleTokens.line-width; background: root.divider; }
+                // Large text and simultaneous notices must not displace the
+                // composer. Every notice and action stays in scroll content.
+                canvas-notices := ScrollView {
+                    out property <length> natural-height: canvas-notice-content.preferred-height;
+                    horizontal-scrollbar-policy: always-off;
+                    // Narrow action rows retain their intrinsic horizontal
+                    // canvas; full focus rectangles reveal either axis.
+                    content-width: max(self.visible-width, canvas-notice-content.min-width);
+                    content-height: self.natural-height;
+                    height: root.page == 0
+                        ? min(self.natural-height, max(conversation-canvas.action-viewport-min,
+                            conversation-canvas.height - canvas-header.height - StyleTokens.line-width - conversation-canvas.room-minimum))
+                        : self.natural-height;
+                    canvas-notice-content := VerticalLayout {
+                        width: canvas-notices.content-width;
+                        height: self.preferred-height;
+                        padding-right: root.page == 0 ? 16px : 0px;
+                        spacing: 0px;
                 // This device's native call on every page but the call page
                 // (call-bar.slint); never on a protected surface.
                 if root.call-bar-visible : CallBarStrip {
+                    // Compact mode depends on this viewport, not the wider
+                    // scroll content whose minimum the call bar contributes.
+                    width: max(0px, canvas-notices.visible-width - (root.page == 0 ? 16px : 0px));
                     text-scale: root.text-scale;
                     palette: root.call-bar-palette;
                     room: root.native-call-room-display;
@@ -7047,6 +7107,8 @@ export component AppWindow inherits Window {
                         overflow: elide;
                     }
                     save-cancel := TextAction {
+                        max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                        max-width: max(0px, canvas-notices.visible-width - 44px);
                         visible: root.downloading-event-id != "";
                         enabled: root.downloading-event-id != "";
                         x: parent.width - self.width - 12px;
@@ -7072,6 +7134,8 @@ export component AppWindow inherits Window {
                             vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
                         }
                         TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Apply";
                             label: "Apply the previewed style profile " + root.style-preview-name;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
@@ -7080,6 +7144,8 @@ export component AppWindow inherits Window {
                             activated => { shortcut-scope.focus(); root.style-preview-apply(); }
                         }
                         TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Cancel";
                             label: "Cancel the preview and restore your look";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
@@ -7104,6 +7170,8 @@ export component AppWindow inherits Window {
                             accessible-live-region: polite;
                         }
                         TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Install and apply";
                             enabled: !root.studio-pack-replaces;
                             label: root.studio-pack-replaces ? "Give the imported pack a different name and import it again; the installed pack is kept" : "Install and apply the " + root.studio-pack-preview-name + " theme pack";
@@ -7112,6 +7180,8 @@ export component AppWindow inherits Window {
                             activated => { shortcut-scope.focus(); root.studio-pack-apply(); }
                         }
                         TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Cancel";
                             label: "Cancel the theme pack preview and restore your look";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
@@ -7141,6 +7211,8 @@ export component AppWindow inherits Window {
                             accessible-live-region: polite;
                         }
                         if root.studio-conflicts == 0 : TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Undo";
                             label: "Undo the last unsaved appearance change";
                             enabled: root.studio-can-undo;
@@ -7149,6 +7221,8 @@ export component AppWindow inherits Window {
                             activated => { root.studio-undo(); }
                         }
                         if root.studio-conflicts == 0 : TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Redo";
                             label: "Redo the appearance change you undid";
                             enabled: root.studio-can-redo;
@@ -7157,6 +7231,8 @@ export component AppWindow inherits Window {
                             activated => { root.studio-redo(); }
                         }
                         if root.studio-conflicts == 0 : TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Discard";
                             label: "Discard the unsaved appearance changes and restore your saved look";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
@@ -7165,6 +7241,8 @@ export component AppWindow inherits Window {
                             activated => { shortcut-scope.focus(); root.studio-discard(); }
                         }
                         if root.studio-conflicts == 0 : TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Apply";
                             label: "Save the appearance changes to the settings file";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
@@ -7172,6 +7250,8 @@ export component AppWindow inherits Window {
                             activated => { shortcut-scope.focus(); root.studio-apply(); }
                         }
                         if root.studio-conflicts > 0 : TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Keep mine";
                             label: "Save this window's values for the settings changed in both places";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
@@ -7179,6 +7259,8 @@ export component AppWindow inherits Window {
                             activated => { shortcut-scope.focus(); root.studio-resolve(1); }
                         }
                         if root.studio-conflicts > 0 : TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Keep the file's";
                             label: "Keep the settings file's values for the settings changed in both places and save the rest";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
@@ -7186,6 +7268,8 @@ export component AppWindow inherits Window {
                             activated => { shortcut-scope.focus(); root.studio-resolve(2); }
                         }
                         if root.studio-conflicts > 0 : TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Back";
                             label: "Go back to editing without saving";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
@@ -7208,6 +7292,8 @@ export component AppWindow inherits Window {
                             accessible-live-region: polite;
                         }
                         TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Dismiss";
                             label: "Dismiss the appearance notice";
                             ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;
@@ -7230,6 +7316,8 @@ export component AppWindow inherits Window {
                             accessible-live-region: polite;
                         }
                         TextAction {
+                            max-control-width: max(0px, canvas-notices.visible-width - 44px);
+                            max-width: max(0px, canvas-notices.visible-width - 44px);
                             text: "Dismiss";
                             label: "Dismiss the style profile notice";
                             ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;
@@ -7240,9 +7328,61 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if root.page == 0 : VerticalLayout {
+                    }
+                }
+                room-allocation := Rectangle {
+                    min-height: 0px;
+                    max-height: root.page == 0 ? conversation-canvas.height : 0px;
+                    vertical-stretch: root.page == 0 ? 1 : 0;
+                    room-allocation-layout := VerticalLayout {
+                        spacing: 0px;
+                if root.page == 0 : room-canvas := Rectangle {
+                    min-height: 0px;
                     vertical-stretch: 1;
-                    spacing: 0px;
+                    preferred-height: self.composer-base-height + attachment-queue.minimum-queue-height + 50px
+                        + self.header-minimum + self.footer-minimum + self.status-minimum;
+                    property <length> composer-base-height: root.composer-box-height
+                        + (root.composer-mode == 0 ? 20px : 51px);
+                    property <length> composer-fixed-height: self.composer-base-height + attachment-queue.needed-height;
+                    property <length> status-minimum: root.composer-status-visible ? composer-status.focus-height + 10px : 0px;
+                    property <length> header-minimum: min(room-headers.natural-height,
+                        max(conversation-canvas.action-viewport-min,
+                            root.live-session && root.active-room-id != "" && root.timeline-recovery-serial > 0
+                                ? recovery-action-measure.preferred-height + 16px * root.text-scale : 0px));
+                    property <length> footer-minimum: min(room-footer.natural-height, 50px);
+                    // TimelineRecoveryNotice is the header's only wrapped
+                    // action: mirror its 10 px layout inset and TextAction
+                    // caption padding at the actual header content width.
+                    Rectangle {
+                        x: 0px; y: 0px; width: 0px; height: 0px; clip: true;
+                        recovery-action-measure := Text {
+                            width: max(0px, room-headers.visible-width - 36px
+                                - 2 * StyleTokens.control-padding * root.text-scale);
+                            text: "Security & recovery";
+                            font-size: 12px * root.text-scale; wrap: word-wrap;
+                            accessible-role: none; accessible-label: "";
+                        }
+                    }
+                    // Assigned viewport heights must not feed the room's
+                    // intrinsic reservation back through layout constraints.
+                    Rectangle {
+                    x: 0px; y: 0px;
+                    width: parent.width;
+                    height: parent.height;
+                    room-headers := ScrollView {
+                        out property <length> natural-height: room-header-content.preferred-height;
+                        y: 0px; width: parent.width;
+                        height: min(self.natural-height, max(room-canvas.header-minimum,
+                            room-canvas.height - room-canvas.composer-fixed-height - 50px
+                                - room-footer.height - room-canvas.status-minimum));
+                        content-width: max(self.visible-width, room-header-content.min-width);
+                        content-height: self.natural-height;
+                        horizontal-scrollbar-policy: always-off;
+                        room-header-content := VerticalLayout {
+                            width: room-headers.content-width;
+                            height: self.preferred-height;
+                            padding-right: 16px;
+                            spacing: 0px;
                     if root.conversation-header-mode == 0 : Rectangle {
                         height: root.message-layout == 0 ? max(110px, 54px * root.text-scale + 56px) : max(48px, 24px * root.text-scale + 24px);
                         background: transparent;
@@ -7265,6 +7405,7 @@ export component AppWindow inherits Window {
                     // (identity-warnings.slint). No row when nobody is warned
                     // about or the room was not checked.
                     if root.live-session && root.active-room-id != "" && IdentityWarnings.summary != "" : IdentityWarningRow {
+                        max-control-width: max(0px, room-headers.visible-width - 64px);
                         ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                         outline: root.divider; text-scale: root.text-scale;
                         // Focus may come back only while nothing replaced
@@ -7285,6 +7426,8 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         TextAction {
+                            max-control-width: max(0px, room-headers.visible-width - 64px);
+                            max-width: max(0px, room-headers.visible-width - 64px);
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                             outline: root.divider; text-scale: root.text-scale;
                             text: root.active-voice-local ? "✓ Mine" : "Mine";
@@ -7293,6 +7436,8 @@ export component AppWindow inherits Window {
                             activated => { root.set-local-voice-space(!root.active-voice-local); }
                         }
                         if root.native-call-enabled : TextAction {
+                            max-control-width: max(0px, room-headers.visible-width - 64px);
+                            max-width: max(0px, room-headers.visible-width - 64px);
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                             outline: root.divider; text-scale: root.text-scale;
                             text: root.active-voice-shared ? "✓ Shared" : "Share";
@@ -7301,6 +7446,8 @@ export component AppWindow inherits Window {
                             activated => { root.set-shared-voice-space(!root.active-voice-shared); }
                         }
                         if root.active-voice-local || root.active-voice-shared : TextAction {
+                            max-control-width: max(0px, room-headers.visible-width - 64px);
+                            max-width: max(0px, room-headers.visible-width - 64px);
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                             outline: root.divider; text-scale: root.text-scale;
                             text: "Join";
@@ -7337,6 +7484,8 @@ export component AppWindow inherits Window {
                                 accessible-live-region: polite;
                             }
                             TextAction {
+                                max-control-width: max(0px, room-headers.visible-width - 64px);
+                                max-width: max(0px, room-headers.visible-width - 64px);
                                 ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;
                                 outline: root.divider; text-scale: root.text-scale;
                                 text: root.focus-newer-loading ? "Loading newer…" : "Load newer";
@@ -7345,6 +7494,8 @@ export component AppWindow inherits Window {
                                 activated => { root.load-newer-focused(); }
                             }
                             TextAction {
+                                max-control-width: max(0px, room-headers.visible-width - 64px);
+                                max-width: max(0px, room-headers.visible-width - 64px);
                                 ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;
                                 outline: root.accent; text-scale: root.text-scale;
                                 text: "Return to live";
@@ -7354,6 +7505,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     if root.live-session && root.page == 0 && root.active-room-id != "" && root.timeline-recovery-serial > 0 : TimelineRecoveryNotice {
+                        max-control-width: max(0px, room-headers.visible-width - 36px);
                         action-enabled: root.viewport-seek-allowed && !root.settings-reveal-protected;
                         ink: root.ink; muted: root.muted; surface: root.elevated;
                         hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
@@ -7365,6 +7517,8 @@ export component AppWindow inherits Window {
                         padding-right: 24px;
                         spacing: 10px;
                         TextAction {
+                            max-control-width: max(0px, room-headers.visible-width - 64px);
+                            max-width: max(0px, room-headers.visible-width - 64px);
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                             outline: root.divider; text-scale: root.text-scale;
                             text: root.history-loading ? "Loading earlier messages…" : root.history-at-start ? "Start of room history" : "Load earlier messages";
@@ -7382,8 +7536,14 @@ export component AppWindow inherits Window {
                             accessible-live-region: polite;
                         }
                     }
+                        }
+                    }
                     timeline-list := ListView {
-                        vertical-stretch: 1;
+                        // Preserve the original conversation viewport minimum.
+                        y: room-headers.height; width: parent.width;
+                        height: max(50px, room-canvas.height - room-headers.height
+                            - room-footer.height - room-composer.height);
+                        accessible-label: "Messages in this room";
                         horizontal-scrollbar-policy: always-off;
                         // Automatic read receipts (room activity): the last row's event while
                         // the live list is scrolled to its bottom; Rust checks everything else.
@@ -7965,6 +8125,21 @@ export component AppWindow inherits Window {
                             timeline-list.approach-seek(false);
                         }
                     }
+                    room-footer := ScrollView {
+                        out property <length> natural-height: room-footer-content.preferred-height;
+                        y: room-headers.height + timeline-list.height;
+                        width: parent.width;
+                        height: min(self.natural-height, max(room-canvas.footer-minimum,
+                            room-canvas.height - room-canvas.composer-fixed-height - 50px
+                                - room-canvas.header-minimum - room-canvas.status-minimum));
+                        content-width: self.visible-width;
+                        content-height: self.natural-height;
+                        horizontal-scrollbar-policy: always-off;
+                        room-footer-content := VerticalLayout {
+                            width: room-footer.visible-width;
+                            height: self.preferred-height;
+                            padding-right: 16px;
+                            spacing: 0px;
                     if root.message-copy-notice != "" : Text {
                         text: root.message-copy-notice; color: root.muted;
                         font-size: 11px * root.text-scale; wrap: word-wrap;
@@ -7982,11 +8157,18 @@ export component AppWindow inherits Window {
                         font-size: 11px * root.text-scale; wrap: word-wrap;
                         accessible-live-region: polite;
                     }
-                    Rectangle {
+                        }
+                    }
+                    room-composer := Rectangle {
                         property <length> status-height: root.composer-status-visible ? composer-status.height + 10px : 0px;
-                        height: root.composer-box-height + (root.composer-mode == 0 ? 20px : 51px) + attachment-queue.needed-height + self.status-height;
+                        y: room-canvas.height - self.height;
+                        width: parent.width;
+                        height: room-canvas.composer-fixed-height + self.status-height;
                         background: transparent;
                         composer-status := PendingSendStrip {
+                            viewport-cap: min(240px, max(self.focus-height,
+                                room-canvas.height - room-headers.height - room-footer.height
+                                    - room-canvas.composer-fixed-height - 50px - 10px));
                             x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + attachment-queue.needed-height;
                             width: parent.width - 44px;
                             items: root.composer-pending-items; blocked-notice: root.composer-blocked-notice;
@@ -8003,6 +8185,9 @@ export component AppWindow inherits Window {
                         }
                         // The queue sits first; the saved-send strip follows it.
                         attachment-queue := AttachmentQueue {
+                            viewport-cap: max(self.minimum-queue-height,
+                                room-canvas.height - room-canvas.composer-base-height - 50px
+                                    - room-canvas.header-minimum - room-canvas.footer-minimum - room-canvas.status-minimum);
                             x: 22px; y: root.composer-mode == 0 ? 2px : 33px;
                             width: parent.width - 44px;
                             items: root.attachment-items;
@@ -8229,6 +8414,9 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                }
+                    }
+                }
                 if root.page == 3 : VerticalLayout {
                     vertical-stretch: 1;
                     padding: 24px;
@@ -9407,6 +9595,7 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "Fonts"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         StyleFontSetting { label: "Interface font family"; family <=> root.appearance-ui-font-input;
+                            edited => { root.appearance-fonts-dirty = true; }
                             property <int> reveal-request: root.reveal-request("appearance.fonts");
                             // Keyboard focus and search share the same bounded reveal.
                             changed has-focus => {
@@ -9423,11 +9612,18 @@ export component AppWindow inherits Window {
                             }
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
                         StyleFontSetting { label: "Message font family · blank follows interface"; family <=> root.appearance-message-font-input;
+                            edited => { root.appearance-fonts-dirty = true; }
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
                         StyleFontSetting { label: "Composer font family · blank follows messages"; family <=> root.appearance-composer-font-input;
+                            edited => { root.appearance-fonts-dirty = true; }
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
                         StyleFontSetting { label: "Monospaced font family · timestamps and security codes"; family <=> root.appearance-mono-font-input;
+                            edited => { root.appearance-fonts-dirty = true; }
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
+                        if root.appearance-fonts-dirty: Text {
+                            text: "Unapplied font changes";
+                            color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
+                        }
                         HorizontalLayout {
                             spacing: 8px;
                             alignment: start;
@@ -11311,7 +11507,7 @@ export component AppWindow inherits Window {
                                     ? "Match Element Call's Matrix 2.0 setting. Encrypted rooms only; Open room call requires room permission."
                                     : root.room-call-mode == 2
                                         ? "Older Element Call room-state calls; room permission may be required."
-                                        : "Standard MatrixRTC. Saved for this account and room; no automatic compatibility fallback.";
+                                        : "Standard encrypted calls. Saved for this account and room; no automatic compatibility fallback.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                         }
                         if !root.call-connected && !root.native-call-request-pending && root.active-room-id != "" && root.room-call-mode != 2 && !root.active-voice-local && !root.active-voice-shared : HorizontalLayout {

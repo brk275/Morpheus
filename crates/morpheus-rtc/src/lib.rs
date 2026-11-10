@@ -54,6 +54,10 @@ pub use audio_device::{
 #[cfg(feature = "native-rtc")]
 pub use matrix_rtc_call_sdk::CallEvent as RtcCallEvent;
 #[cfg(feature = "native-rtc")]
+pub use matrix_rtc_core::{LiveKitCsApiTransport, LiveKitTransport, RtcTransport};
+#[cfg(feature = "native-rtc")]
+pub use matrix_rtc_transport::livekit::LiveKitAuthDialect;
+#[cfg(feature = "native-rtc")]
 pub use matrix_rtc_transport::{
     AudioFrame, I420Buffer, MediaStreamKind, VideoFrame, VideoRotation,
 };
@@ -122,8 +126,19 @@ pub const fn local_device_support() -> LocalDeviceSupport {
 
 /// The advertised transport that the native call stack can use.
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LiveKitDescriptor {
+    LegacyService {
+        service_url: String,
+    },
+    CsApi {
+        url: String,
+        server_name: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransportSupport {
-    LiveKit { service_url: String },
+    LiveKit { transport: LiveKitDescriptor },
     NoLiveKitTransport,
 }
 
@@ -134,8 +149,10 @@ impl TransportSupport {
 
     pub fn livekit_service_url(&self) -> Option<&str> {
         match self {
-            Self::LiveKit { service_url } => Some(service_url),
-            Self::NoLiveKitTransport => None,
+            Self::LiveKit {
+                transport: LiveKitDescriptor::LegacyService { service_url },
+            } => Some(service_url),
+            _ => None,
         }
     }
 }
@@ -153,9 +170,41 @@ pub fn classify_transports(transports: &Value) -> TransportSupport {
     entries
         .iter()
         .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("livekit"))
-        .filter_map(|entry| entry.get("livekit_service_url").and_then(Value::as_str))
-        .find_map(valid_service_url)
-        .map(|service_url| TransportSupport::LiveKit { service_url })
+        .find_map(|entry| {
+            let service = entry.get("livekit_service_url");
+            let locator = entry.get("url");
+            let server_name = match entry.get("server_name") {
+                None => None,
+                Some(value) => {
+                    let server = value.as_str()?;
+                    if server.is_empty()
+                        || server.len() > 1024
+                        || server.chars().any(|c| {
+                            c.is_control()
+                                || c.is_whitespace()
+                                || matches!(c, '/' | '\\' | '?' | '#' | '@')
+                        })
+                    {
+                        return None;
+                    }
+                    Some(server.to_owned())
+                }
+            };
+            let service = match service {
+                Some(value) => Some(valid_service_url(value.as_str()?)?),
+                None => None,
+            };
+            let locator = match locator {
+                Some(value) => Some(valid_sfu_url(value.as_str()?)?),
+                None => None,
+            };
+            // Both standard fields select the legacy publisher flow, matching
+            // current stock Element Call; no endpoint probing or fallback.
+            service
+                .map(|service_url| LiveKitDescriptor::LegacyService { service_url })
+                .or_else(|| locator.map(|url| LiveKitDescriptor::CsApi { url, server_name }))
+        })
+        .map(|transport| TransportSupport::LiveKit { transport })
         .unwrap_or(TransportSupport::NoLiveKitTransport)
 }
 
@@ -163,6 +212,14 @@ pub fn classify_transports(transports: &Value) -> TransportSupport {
 // transport repeats validation for remote membership foci before any OpenID
 // request; discovery alone is not a credential security boundary.
 fn valid_service_url(raw: &str) -> Option<String> {
+    valid_transport_url(raw, false)
+}
+
+fn valid_sfu_url(raw: &str) -> Option<String> {
+    valid_transport_url(raw, true)
+}
+
+fn valid_transport_url(raw: &str, media: bool) -> Option<String> {
     if raw.chars().any(char::is_control) {
         return None;
     }
@@ -183,7 +240,12 @@ fn valid_service_url(raw: &str) -> Option<String> {
         Some(url::Host::Ipv6(address)) => address.is_loopback(),
         _ => false,
     };
-    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+    let (secure, local) = if media {
+        ("wss", "ws")
+    } else {
+        ("https", "http")
+    };
+    if url.scheme() != secure && !(url.scheme() == local && loopback) {
         return None;
     }
     // Keep server path spelling and avoid introducing a trailing slash solely
@@ -197,6 +259,10 @@ fn valid_service_url(raw: &str) -> Option<String> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RtcError {
+    #[error("sign in again before calling")]
+    SignInRequired,
+    #[error("the account session is awaiting refresh; try calling after it reconnects")]
+    AuthExpired,
     #[error("this build has no native MatrixRTC backend")]
     BackendDisabled,
     #[error("the account is not logged in")]
@@ -213,6 +279,8 @@ pub enum RtcError {
     AlreadyJoined,
     #[error("there is no active call in this room")]
     NotJoined,
+    #[error("the call stopped because participant identities could not be uniquely verified")]
+    IdentityRejected,
     #[error("the homeserver advertises no usable LiveKit MatrixRTC transport")]
     NoLiveKitTransport,
     #[error("the homeserver does not advertise sticky events required by this call mode")]
@@ -238,7 +306,23 @@ pub enum RtcError {
     OutgoingPreflight(#[from] OutgoingCallError),
     #[cfg(feature = "native-rtc")]
     #[error("MatrixRTC call failed: {0}")]
-    Call(#[from] matrix_rtc_call_sdk::LiveKitCallError),
+    Call(matrix_rtc_call_sdk::LiveKitCallError),
+}
+
+#[cfg(feature = "native-rtc")]
+impl From<matrix_rtc_call_sdk::LiveKitCallError> for RtcError {
+    fn from(error: matrix_rtc_call_sdk::LiveKitCallError) -> Self {
+        use matrix_rtc_call_sdk::{AttachError, LiveKitCallError};
+        use matrix_rtc_transport::TransportError;
+        match error {
+            LiveKitCallError::Attach(AttachError::IdentityRejected) => Self::IdentityRejected,
+            LiveKitCallError::Attach(AttachError::Transport(TransportError::SignInRequired))
+            | LiveKitCallError::Media(TransportError::SignInRequired) => Self::SignInRequired,
+            LiveKitCallError::Attach(AttachError::Transport(TransportError::AuthExpired))
+            | LiveKitCallError::Media(TransportError::AuthExpired) => Self::AuthExpired,
+            other => Self::Call(other),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +330,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[cfg(feature = "native-rtc")]
+    #[test]
+    fn identity_refusal_is_not_the_retryable_generic_call_error() {
+        let error = matrix_rtc_call_sdk::LiveKitCallError::Attach(
+            matrix_rtc_call_sdk::AttachError::IdentityRejected,
+        );
+        assert!(matches!(RtcError::from(error), RtcError::IdentityRejected));
+    }
 
     #[test]
     fn picks_first_valid_livekit_transport_in_server_order() {
@@ -258,9 +351,45 @@ mod tests {
         assert_eq!(
             classify_transports(&transports),
             TransportSupport::LiveKit {
-                service_url: "https://first.example/rtc".into(),
+                transport: LiveKitDescriptor::LegacyService {
+                    service_url: "https://first.example/rtc".into()
+                },
             }
         );
+    }
+
+    #[test]
+    fn modern_locator_and_mixed_descriptor_are_typed_without_openid_reinterpretation() {
+        assert_eq!(
+            classify_transports(&json!([{"type":"livekit", "url":"wss://sfu.example.org"}])),
+            TransportSupport::LiveKit {
+                transport: LiveKitDescriptor::CsApi {
+                    url: "wss://sfu.example.org".into(),
+                    server_name: None
+                }
+            }
+        );
+        assert_eq!(
+            classify_transports(
+                &json!([{"type":"livekit", "url":"wss://sfu.example.org", "livekit_service_url":"https://auth.example.org"}])
+            ),
+            TransportSupport::LiveKit {
+                transport: LiveKitDescriptor::LegacyService {
+                    service_url: "https://auth.example.org".into()
+                }
+            }
+        );
+        for value in [
+            json!({"type":"livekit", "url":null, "livekit_service_url":"https://auth.example.org"}),
+            json!({"type":"livekit", "url":"ws://remote.example.org"}),
+            json!({"type":"livekit", "url":"wss://user:secret@sfu.example.org"}),
+            json!({"type":"livekit", "url":"wss://sfu.example.org?token=secret"}),
+        ] {
+            assert_eq!(
+                classify_transports(&json!([value])),
+                TransportSupport::NoLiveKitTransport
+            );
+        }
     }
 
     #[test]
@@ -269,6 +398,8 @@ mod tests {
             json!([]),
             json!({"rtc_transports": []}),
             json!([{"type": "org.example.p2p", "url": "https://p2p.example"}]),
+            json!([{"type": "livekit", "url": "https://sfu.example.org"}]),
+            json!([{"type": "livekit", "url": "https://sfu.example.org", "livekit_service_url": "https://auth.example.org"}]),
             json!([{"type": "livekit", "livekit_service_url": "file:///tmp/token"}]),
             json!([{"type": "livekit", "livekit_service_url": "https://"}]),
             json!([{"type": "livekit", "livekit_service_url": "http://rtc.example.org"}]),

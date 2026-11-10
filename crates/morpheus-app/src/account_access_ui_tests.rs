@@ -45,6 +45,19 @@ async fn settle(ui: &AppWindow) {
     i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
 }
 
+// A cold Settings page owns one post-mount focus handoff; a FIFO settle alone
+// need not consume its timer. Observe completion without forcing focus.
+async fn finish_settings_reveal(ui: &AppWindow) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ui.get_settings_reveal_pending() {
+            settle(ui).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the mounted Settings page consumes its one focus request");
+}
+
 /// Check the actual property against an independently queried installed face.
 /// The testing backend keeps the real system-font collection; no rendering or
 /// fixed-width glyph-metric assertion is implied by matching a family identity.
@@ -814,8 +827,80 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
         ui.get_appearance_ui_font_input().as_str(),
         defaults.appearance.font_family
     );
+    assert!(!ui.get_appearance_fonts_dirty());
+    // A real edit marks the atomic font form. Invalid external TOML refuses
+    // both Apply and Reset without erasing that edit or replacing the file.
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Interface font family"));
+    ui.set_appearance_ui_font_input("  ".into());
+    key(ui, Key::End);
+    type_text(ui, "serif  ");
+    ui.set_appearance_message_font_input(" monospace ".into());
+    ui.set_appearance_composer_font_input("".into());
+    ui.set_appearance_mono_font_input(" monospace ".into());
+    assert!(ui.get_appearance_fonts_dirty());
+    let font_draft = ui.get_appearance_ui_font_input();
+    let broken_fonts = "[appearance\nfont_family = \"serif\"\n";
+    std::fs::write(config_path, broken_fonts).unwrap();
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), broken_fonts);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(ui.get_appearance_ui_font_input(), font_draft);
+    tab_to_control(
+        ui,
+        "Use the default interface, message and monospaced fonts",
+    );
+    key(ui, Key::Space);
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), broken_fonts);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(ui.get_appearance_ui_font_input(), font_draft);
+    store.save(&reset).unwrap();
+    apply_config(ui, &reset, None);
+    assert_eq!(ui.get_appearance_ui_font_input(), font_draft);
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(ui.get_appearance_ui_font_input(), "serif");
+    assert_eq!(ui.get_appearance_message_font_input(), "monospace");
+    assert_eq!(ui.get_appearance_composer_font_input(), "");
+    assert_eq!(ui.get_appearance_mono_font_input(), "monospace");
+    assert_eq!(store.load().unwrap().appearance.font_family, "serif");
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    key(ui, Key::End);
+    type_text(ui, " draft");
+    assert!(ui.get_appearance_fonts_dirty());
+    tab_to_control(
+        ui,
+        "Use the default interface, message and monospaced fonts",
+    );
+    key(ui, Key::Space);
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(
+        ui.get_appearance_ui_font_input(),
+        defaults.appearance.font_family
+    );
+    assert_eq!(ui.get_appearance_message_font_input(), "");
+    assert_eq!(ui.get_appearance_composer_font_input(), "");
+    assert_eq!(ui.get_appearance_mono_font_input(), "monospace");
+    let reset_draft = store.load().unwrap();
+    assert_eq!(
+        reset_draft.appearance.font_family,
+        defaults.appearance.font_family
+    );
+    assert_eq!(reset_draft.typography.message_font_family, None);
+    assert_eq!(reset_draft.typography.composer_font_family, None);
+    assert_eq!(reset_draft.typography.monospace_font_family, "monospace");
+    assert_eq!(
+        reset_draft.typography.message_size, 17,
+        "font reset keeps other preferences"
+    );
     store.save(&defaults).unwrap();
     apply_config(ui, &defaults, None);
+    // Restore the original motion control before its unchanged refusal check.
+    tab_to_control(ui, "Reduce motion, off");
     let invalid = "[appearance\nreduce_motion = true\n";
     std::fs::write(config_path, invalid).unwrap();
     key(ui, Key::Space);
@@ -3030,6 +3115,56 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     // Preserve the original local drop order, and identify whether releasing
     // this Arc returns; this is not a receipt for every runtime descendant.
     drop(_entered);
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_release");
+    drop(runtime);
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_released");
+}
+
+// Run this exact ignored case in its own process: Slint's testing backend is
+// process-global. The default account UI case above keeps every transition;
+// a live timeline deadline must not also pay for that separate offline suite.
+#[test]
+#[ignore = "requires disposable Matrix accounts and an isolated fixture vault"]
+fn live_slint_timeline_controller() {
+    run_live_controller_ui(false);
+}
+
+#[test]
+#[ignore = "requires disposable Matrix accounts and an isolated fixture vault"]
+fn live_slint_people_controller() {
+    run_live_controller_ui(true);
+}
+
+fn run_live_controller_ui(people: bool) {
+    assert!(
+        std::env::var_os("MORPHEUS_MATRIX_TEST_ACCOUNTS").is_some(),
+        "live controller acceptance requires a disposable fixture"
+    );
+    i_slint_backend_testing::init_integration_test_with_mock_time();
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    let entered = runtime.enter();
+    let runtime_handle = runtime.handle().clone();
+    slint::spawn_local(async move {
+        if people {
+            eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_entered");
+            crate::people_directory::live_tests::run_if_configured(runtime_handle).await;
+            eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_returned");
+        } else {
+            crate::live::timeline_controller_tests::run_if_configured(runtime_handle).await;
+        }
+        slint::quit_event_loop().unwrap();
+        eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL quit_requested");
+    })
+    .unwrap();
+    slint::run_event_loop_until_quit().unwrap();
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL loop_returned");
+    drop(entered);
     eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_release");
     drop(runtime);
     eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_released");
@@ -5769,6 +5904,39 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     settle(ui).await;
     assert!(!ui.get_style_profile_items().row_data(0).unwrap().current);
     ui.invoke_style_profile_chosen(item.key.clone());
+    // A typed four-field form remains local while a profile changes the look.
+    assert!(
+        !ui.get_appearance_fonts_dirty(),
+        "projection is not a user edit"
+    );
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Interface font family"));
+    ui.set_appearance_ui_font_input("Draft interface".into());
+    key(ui, Key::End);
+    type_text(ui, " typed");
+    ui.set_appearance_message_font_input("Draft messages".into());
+    ui.set_appearance_composer_font_input("Draft composer".into());
+    ui.set_appearance_mono_font_input("Draft monospace".into());
+    assert!(ui.get_appearance_fonts_dirty());
+    let font_drafts = (
+        ui.get_appearance_ui_font_input(),
+        ui.get_appearance_message_font_input(),
+        ui.get_appearance_composer_font_input(),
+        ui.get_appearance_mono_font_input(),
+    );
+    let assert_font_drafts = |ui: &AppWindow| {
+        assert!(ui.get_appearance_fonts_dirty());
+        assert_eq!(
+            (
+                ui.get_appearance_ui_font_input(),
+                ui.get_appearance_message_font_input(),
+                ui.get_appearance_composer_font_input(),
+                ui.get_appearance_mono_font_input(),
+            ),
+            font_drafts
+        );
+    };
     let preview = |ui: &AppWindow| {
         ui.invoke_style_profile_preview();
         assert!(ui.get_style_preview_active());
@@ -5778,10 +5946,13 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     settle(ui).await;
     assert_eq!(ui.get_message_font_size(), 15);
     assert_eq!(store.load().unwrap(), larger, "a preview saves nothing");
+    assert_font_drafts(ui);
     ui.invoke_style_profile_cancel_preview();
     settle(ui).await;
     assert!(!ui.get_style_preview_active());
     assert_eq!(ui.get_message_font_size(), 20);
+    assert_font_drafts(ui);
+    assert_eq!(store.load().unwrap(), larger, "cancel saves no font draft");
 
     // A save that would change the look is refused and ends the preview.
     preview(ui);
@@ -5879,6 +6050,12 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     assert!(!ui.get_style_preview_active());
     assert_eq!(ui.get_message_font_size(), 15);
     assert!(ui.get_style_profile_items().row_data(0).unwrap().current);
+    assert_font_drafts(ui);
+    assert_eq!(
+        applied.appearance.font_family,
+        config.appearance.font_family
+    );
+    assert_ne!(applied.appearance.font_family, font_drafts.0.as_str());
 
     // An invalid settings file is never overwritten by Apply.
     let broken = "schema_version = 1\n[typography]\nmessage_size = 999\n";
@@ -5901,6 +6078,8 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     assert_eq!(store.load().unwrap(), applied);
     assert_eq!(ui.get_style_profile_items().row_count(), 0);
 
+    // End only this synthetic window form before the next unrelated scenario.
+    ui.set_appearance_fonts_dirty(false);
     ui.set_page(0);
     apply_config(ui, &Config::default(), None);
     settle(ui).await;
@@ -10087,6 +10266,100 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
         "the strip must not push the composer out of the lower part of the window: {:?}",
         composer[0]
     );
+    // At the supported minimum, simultaneous global notices get their own
+    // bounded viewport instead of pushing the conversation/composer offscreen.
+    // Every record stays present; ordinary Tab reveals notice/attachment actions.
+    // Three attachment rows share the same finite canvas with eight saved sends;
+    // these are in-memory rows and no action is activated or file accessed.
+    let before_size = ui.window().size();
+    let before_studio_notice = ui.get_studio_notice();
+    let before_profile_notice = ui.get_style_profile_notice();
+    let before_studio_pending = ui.get_studio_pending();
+    let before_studio_conflicts = ui.get_studio_conflicts();
+    let before_attachments = ui.get_attachment_items();
+    let before_ready_count = ui.get_attachment_ready_count();
+    let before_attachment_status = ui.get_attachment_status();
+    let before_recovery_serial = ui.get_timeline_recovery_serial();
+    ui.set_studio_notice("Synthetic appearance result remains available".into());
+    ui.set_style_profile_notice("Synthetic style profile result remains available".into());
+    ui.set_studio_pending(1);
+    ui.set_studio_conflicts(0);
+    ui.set_timeline_recovery_serial(101);
+    ui.set_attachment_items(ModelRc::new(VecModel::from(
+        (1..=3)
+            .map(|id| crate::AttachmentItem {
+                id,
+                name: format!("synthetic bounded file {id}").into(),
+                detail: "1 KiB".into(),
+                status: "Ready".into(),
+                progress: -1.0,
+                can_remove: true,
+                can_move_up: id > 1,
+                can_move_down: id < 3,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_attachment_ready_count(3);
+    ui.set_attachment_status("Three synthetic ready attachments".into());
+    let rail = if ui.get_navigation_mode() == 0 {
+        ui.get_rail_width_px()
+    } else {
+        0
+    };
+    let minimum_width = (rail + ui.get_room_list_width() + ui.get_details_width() + 360).max(940);
+    ui.window()
+        .set_size(slint::PhysicalSize::new(minimum_width as u32, 620));
+    settle(ui).await;
+    assert_eq!(ui.get_composer_pending_items().row_count(), 8);
+    let compact_composer = control_bounds(ui, &composer_label);
+    let conversation = control_bounds(ui, "Messages in this room");
+    assert_eq!((compact_composer.len(), conversation.len()), (1, 1));
+    assert!(inside_window(ui, compact_composer[0]));
+    assert!(inside_window(ui, conversation[0]));
+    assert!(conversation[0].bottom - conversation[0].top >= 49.5);
+    for label in [
+        "Discard the unsaved appearance changes and restore your saved look",
+        "Save the appearance changes to the settings file",
+        "Dismiss the appearance notice",
+        "Dismiss the style profile notice",
+        "Open Security and recovery settings for this account",
+    ] {
+        tab_to_control(ui, label);
+        let action = button_bounds(ui, label);
+        assert_eq!(action.len(), 1);
+        assert!(inside_window(ui, action[0]), "{label}: {:?}", action[0]);
+        assert!(inside_window(ui, control_bounds(ui, &composer_label)[0]));
+    }
+    for label in [
+        "Send 3 ready attachments",
+        "Remove synthetic bounded file 1",
+        "Send synthetic bounded file 1 later",
+        "Send synthetic bounded file 2 earlier",
+        "Send synthetic bounded file 2 later",
+        "Remove synthetic bounded file 2",
+        "Send synthetic bounded file 3 earlier",
+        "Remove synthetic bounded file 3",
+    ] {
+        tab_to_control(ui, label);
+        let action = button_bounds(ui, label);
+        assert_eq!(action.len(), 1);
+        assert!(inside_window(ui, action[0]), "{label}: {:?}", action[0]);
+        assert!(inside_window(ui, control_bounds(ui, &composer_label)[0]));
+    }
+    assert_eq!(ui.get_attachment_items().row_count(), 3);
+    assert_eq!(ui.get_composer_pending_items().row_count(), 8);
+    ui.set_attachment_items(before_attachments);
+    ui.set_attachment_ready_count(before_ready_count);
+    ui.set_attachment_status(before_attachment_status);
+    ui.set_timeline_recovery_serial(before_recovery_serial);
+    ui.set_studio_notice(before_studio_notice);
+    ui.set_style_profile_notice(before_profile_notice);
+    ui.set_studio_pending(before_studio_pending);
+    ui.set_studio_conflicts(before_studio_conflicts);
+    ui.window().set_size(before_size);
+    settle(ui).await;
+
     // Focus walks every control of all eight records down to the composer
     // input; each strip control is scrolled fully into view on both axes
     // when it receives focus, so the deepest record is reachable by keyboard
@@ -14247,6 +14520,195 @@ async fn assert_font_browser(ui: &AppWindow, directory: &std::path::Path) {
     // Following the inherited font removes only that role's own value.
     ui.invoke_font_browser_inherit();
     assert_eq!(store.load().unwrap().typography.message_font_family, None);
+    ui.invoke_font_browser_close();
+    assert!(!ui.get_font_browser_open());
+    settle(ui).await;
+
+    // A browser choice replaces only its role in a dirty form. Applying
+    // that real form must keep the chosen family and the other three edits.
+    crate::appearance::install_callbacks(ui, &store);
+    let font_inputs = |ui: &AppWindow| {
+        [
+            ui.get_appearance_ui_font_input(),
+            ui.get_appearance_message_font_input(),
+            ui.get_appearance_composer_font_input(),
+            ui.get_appearance_mono_font_input(),
+        ]
+    };
+    for (role, family) in [
+        (0, "Literata"),
+        (1, "JetBrains Mono"),
+        (2, "Literata"),
+        (3, "JetBrains Mono"),
+    ] {
+        assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+        settle(ui).await;
+        finish_settings_reveal(ui).await;
+        assert!(focused_control_has_label(ui, "Interface font family"));
+        ui.set_appearance_ui_font_input("Draft interface".into());
+        key(ui, Key::End);
+        type_text(ui, " typed");
+        ui.set_appearance_message_font_input("Draft messages".into());
+        ui.set_appearance_composer_font_input("Draft composer".into());
+        ui.set_appearance_mono_font_input("Draft monospace".into());
+        assert!(ui.get_appearance_fonts_dirty());
+        let mut expected = font_inputs(ui);
+        // Use the production navigation boundary even when leaving and
+        // returning in one event: it retires the mounted Settings handoff.
+        ui.invoke_navigate_page(0);
+        assert!(!ui.get_settings_controls_mounted());
+        // A direct browser save normalizes the selected role only.
+        ui.invoke_font_browser_show(role);
+        ui.invoke_font_browser_use(format!(" {family} ").into());
+        expected[role as usize] = family.into();
+        assert_eq!(font_inputs(ui), expected);
+        assert!(ui.get_appearance_fonts_dirty());
+        let accepted = store.load().unwrap();
+        let accepted_names = [
+            accepted.appearance.font_family.as_str(),
+            accepted
+                .typography
+                .message_font_family
+                .as_deref()
+                .unwrap_or(""),
+            accepted
+                .typography
+                .composer_font_family
+                .as_deref()
+                .unwrap_or(""),
+            accepted.typography.monospace_font_family.as_str(),
+        ];
+        assert_eq!(accepted_names[role as usize], family);
+        ui.invoke_font_browser_close();
+        assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+        settle(ui).await;
+        finish_settings_reveal(ui).await;
+        tab_to_control(ui, "Apply fonts");
+        key(ui, Key::Space);
+        settle(ui).await;
+        assert!(!ui.get_appearance_fonts_dirty());
+        assert_eq!(font_inputs(ui), expected);
+        // Settings stages the form; its Apply commits the exact combined look.
+        ui.invoke_studio_apply();
+        let applied_fonts = store.load().unwrap();
+        assert_eq!(applied_fonts.appearance.font_family, expected[0].as_str());
+        assert_eq!(
+            applied_fonts.typography.message_font_family.as_deref(),
+            Some(expected[1].as_str())
+        );
+        assert_eq!(
+            applied_fonts.typography.composer_font_family.as_deref(),
+            Some(expected[2].as_str())
+        );
+        assert_eq!(
+            applied_fonts.typography.monospace_font_family,
+            expected[3].as_str()
+        );
+    }
+    // A Settings browser choice is staged: synchronize its returned value,
+    // including inheritance, while preserving other drafts and the disk file.
+    ui.set_appearance_fonts_dirty(true);
+    ui.set_appearance_ui_font_input("Staged interface draft".into());
+    ui.set_appearance_message_font_input("Staged message draft".into());
+    ui.set_appearance_composer_font_input("Staged composer draft".into());
+    ui.set_appearance_mono_font_input("Staged monospace draft".into());
+    let mut inherited_inputs = font_inputs(ui);
+    inherited_inputs[1] = "".into();
+    let before_staged = std::fs::read(store.path()).unwrap();
+    ui.invoke_font_browser_show(1);
+    ui.invoke_font_browser_inherit();
+    assert_eq!(font_inputs(ui), inherited_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert!(ui.get_studio_pending() > 0);
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_staged);
+    ui.invoke_font_browser_close();
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    settle(ui).await;
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(font_inputs(ui), inherited_inputs);
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_staged);
+    ui.invoke_studio_apply();
+    let inherited = store.load().unwrap();
+    assert_eq!(
+        inherited.appearance.font_family,
+        inherited_inputs[0].as_str()
+    );
+    assert_eq!(inherited.typography.message_font_family, None);
+    assert_eq!(
+        inherited.typography.composer_font_family.as_deref(),
+        Some(inherited_inputs[2].as_str())
+    );
+    assert_eq!(
+        inherited.typography.monospace_font_family,
+        inherited_inputs[3].as_str()
+    );
+
+    // Use remains enabled for the current family, as does already-inherited
+    // selection. Both are valid choices even when no file write is needed.
+    ui.set_appearance_fonts_dirty(true);
+    ui.set_appearance_ui_font_input("Unapplied interface".into());
+    ui.set_appearance_message_font_input("Unapplied messages".into());
+    ui.set_appearance_composer_font_input("Unapplied composer".into());
+    ui.set_appearance_mono_font_input("Unapplied monospace".into());
+    let mut no_op_inputs = font_inputs(ui);
+    let before_no_op = std::fs::read(store.path()).unwrap();
+    ui.invoke_navigate_page(0);
+    assert!(!ui.get_settings_controls_mounted());
+    ui.invoke_font_browser_show(0);
+    ui.invoke_font_browser_use(inherited.appearance.font_family.as_str().into());
+    no_op_inputs[0] = inherited.appearance.font_family.as_str().into();
+    assert_eq!(font_inputs(ui), no_op_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_no_op);
+    ui.invoke_font_browser_show(1);
+    ui.invoke_font_browser_inherit();
+    no_op_inputs[1] = "".into();
+    assert_eq!(font_inputs(ui), no_op_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_no_op);
+    ui.invoke_font_browser_close();
+    assert!(crate::settings_search::reveal(ui, "appearance.fonts"));
+    settle(ui).await;
+    finish_settings_reveal(ui).await;
+    tab_to_control(ui, "Apply fonts");
+    key(ui, Key::Space);
+    settle(ui).await;
+    assert!(!ui.get_appearance_fonts_dirty());
+    assert_eq!(font_inputs(ui), no_op_inputs);
+    ui.invoke_studio_apply();
+    let no_op_applied = store.load().unwrap();
+    assert_eq!(
+        no_op_applied.appearance.font_family,
+        inherited.appearance.font_family
+    );
+    assert_eq!(no_op_applied.typography.message_font_family, None);
+    assert_eq!(
+        no_op_applied.typography.composer_font_family.as_deref(),
+        Some(no_op_inputs[2].as_str())
+    );
+    assert_eq!(
+        no_op_applied.typography.monospace_font_family,
+        no_op_inputs[3].as_str()
+    );
+
+    // Failed reads never synchronize a choice or overwrite the dirty form/file.
+    ui.set_appearance_fonts_dirty(true);
+    ui.set_appearance_message_font_input("Unapplied messages".into());
+    let refused_inputs = font_inputs(ui);
+    ui.set_page(0);
+    ui.invoke_font_browser_show(1);
+    let broken = "[appearance\nfont_family = \"broken\"\n";
+    std::fs::write(store.path(), broken).unwrap();
+    ui.invoke_font_browser_use("Literata".into());
+    assert_eq!(font_inputs(ui), refused_inputs);
+    assert!(ui.get_appearance_fonts_dirty());
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), broken);
+    ui.invoke_font_browser_close();
+    ui.set_appearance_fonts_dirty(false);
+    store.save(&initial).unwrap();
+    ui.set_config_error("".into());
+    apply_config(ui, &initial, None);
 
     // A family typed by hand that is not installed is kept as typed and
     // shown as not found.
@@ -16358,17 +16820,6 @@ async fn assert_media_viewer_keyboard(ui: &AppWindow) {
 async fn assert_animation_autoplay_setting(ui: &AppWindow) {
     use std::{cell::Cell, rc::Rc};
 
-    async fn finish_reveal(ui: &AppWindow) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while ui.get_settings_reveal_pending() {
-                settle(ui).await;
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the mounted Settings page consumes its one focus request");
-    }
-
     const ROW: &str = "Play animated images automatically when opened";
     let page = ui.get_page();
     let requested = Rc::new(Cell::new(None));
@@ -16383,7 +16834,7 @@ async fn assert_animation_autoplay_setting(ui: &AppWindow) {
     settle(ui).await;
     // A cold Settings page delivers its pending request after mounting. Wait
     // for that handoff, then require the same real control focus as a hot page.
-    finish_reveal(ui).await;
+    finish_settings_reveal(ui).await;
     assert!(focused_control_has_label(
         ui,
         "Allow image previews in encrypted rooms"
@@ -16428,7 +16879,7 @@ async fn assert_animation_autoplay_setting(ui: &AppWindow) {
     ));
     assert!(ui.get_settings_reveal_pending());
     settle(ui).await;
-    finish_reveal(ui).await;
+    finish_settings_reveal(ui).await;
     assert!(focused_control_has_label(ui, ROW));
     assert!(requested.take().is_none());
 
@@ -16438,7 +16889,22 @@ async fn assert_animation_autoplay_setting(ui: &AppWindow) {
     assert!(crate::settings_search::reveal(ui, "media.image_previews"));
     assert!(ui.get_settings_reveal_pending());
     settle(ui).await;
-    finish_reveal(ui).await;
+    finish_settings_reveal(ui).await;
+    assert!(focused_control_has_label(
+        ui,
+        "Allow image previews in encrypted rooms"
+    ));
+    assert!(requested.take().is_none());
+
+    // A stale mounted flag from the old subtree cannot make a cold page
+    // skip its handoff. Only the current page can own live focus trackers.
+    ui.invoke_navigate_page(0);
+    settle(ui).await;
+    ui.set_settings_controls_mounted(true);
+    assert!(crate::settings_search::reveal(ui, "media.image_previews"));
+    assert!(ui.get_settings_reveal_pending());
+    settle(ui).await;
+    finish_settings_reveal(ui).await;
     assert!(focused_control_has_label(
         ui,
         "Allow image previews in encrypted rooms"

@@ -13,7 +13,10 @@ use super::{
     },
     membership_envelope,
 };
-use crate::voice_spaces::{IncomingPolicyRegistration, VoiceSpaces};
+use crate::{
+    calls::CallJoinMode,
+    voice_spaces::{IncomingPolicyRegistration, RoomCallProfile, VoiceSpaces},
+};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use matrix_sdk::{
     Client, Room, RoomState,
@@ -25,6 +28,7 @@ use matrix_sdk::{
     },
 };
 use morpheus_matrix::{AccountManager, AccountSelection, SyncBackend, SyncStatus};
+use morpheus_rtc::InteropMode;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -510,10 +514,32 @@ impl Drop for Scope {
         }
     }
 }
+#[derive(Clone)]
+struct DiscoveryProfile {
+    account: String,
+    captured: RoomCallProfile,
+    mode: InteropMode,
+    admit: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+impl DiscoveryProfile {
+    fn capture(preferences: &Arc<VoiceSpaces>, account: &str, room: &str) -> Option<Self> {
+        let captured = preferences.room_call_profile(account, room)?;
+        Some(Self {
+            account: account.to_owned(),
+            captured,
+            mode: CallJoinMode::from(captured.mode()).options().interop_mode,
+            admit: preferences.room_call_admission(account.to_owned(), room.to_owned(), captured),
+        })
+    }
+    fn is_current(&self) -> bool {
+        (self.admit)()
+    }
+}
 struct Candidate {
     epoch: u64,
     room: OwnedRoomId,
     event: OwnedEventId,
+    profile: DiscoveryProfile,
 }
 
 async fn run(
@@ -588,12 +614,12 @@ async fn run(
                         } else { diagnostic!(gate, ScopeSetupFailed); }
                     }
                 }
-                if let Some(scope) = scope.as_mut() { discover_rooms(scope, &gate, &candidates); }
+                if let Some(scope) = scope.as_mut() { discover_rooms(scope, &preferences, &gate, &candidates); }
                 controller.reap(); start_declines(&mut controller, &gate, &mut checks); publish(&mut controller, &gate);
             },
             candidate = incoming.recv() => {
                 let Some(candidate) = candidate else { break; };
-                if gate.current() != Some(candidate.epoch) { diagnostic!(gate, CandidateStaleEpoch); continue; }
+                if gate.current() != Some(candidate.epoch) || !candidate.profile.is_current() { diagnostic!(gate, CandidateStaleEpoch); continue; }
                 diagnostic!(gate, AdmissionStarted);
                 let ticket = match controller.begin_receive(&candidate.room, &candidate.event) {
                     Ok(ticket) => ticket,
@@ -638,6 +664,16 @@ async fn run(
                         controller.reap(); start_declines(&mut controller, &gate, &mut checks); publish(&mut controller, &gate);
                     }
                     Ok(admitted) => {
+                        let admitted = admitted.and_then(|offer| {
+                            if candidate.profile.is_current()
+                                && offer.profile == candidate.profile.captured
+                                && offer.selection.account_id() == candidate.profile.account.as_str()
+                            {
+                                Ok(offer)
+                            } else {
+                                Err(super::AdmissionFailure::Policy)
+                            }
+                        });
                         let _result = controller.finish_receive(ticket, admitted);
                         #[cfg(test)]
                         gate.diagnostics.result(&_result);
@@ -929,7 +965,12 @@ async fn prepare_scope(
         _handlers,
     })
 }
-fn discover_rooms(scope: &mut Scope, gate: &Arc<Gate>, candidates: &mpsc::Sender<Candidate>) {
+fn discover_rooms(
+    scope: &mut Scope,
+    preferences: &Arc<VoiceSpaces>,
+    gate: &Arc<Gate>,
+    candidates: &mpsc::Sender<Candidate>,
+) {
     let mut joined: Vec<_> = scope
         .client
         .rooms()
@@ -957,11 +998,17 @@ fn discover_rooms(scope: &mut Scope, gate: &Arc<Gate>, candidates: &mpsc::Sender
             continue;
         }
         let id = room.room_id().to_owned();
+        let Some(profile) =
+            DiscoveryProfile::capture(preferences, scope.selection.account_id(), id.as_str())
+        else {
+            continue;
+        };
         let task = tokio::spawn(watch_room(
             room,
             scope.selection.clone(),
             gate.clone(),
             candidates.clone(),
+            profile,
         ));
         scope.rooms.insert(id, task);
     }
@@ -1017,6 +1064,7 @@ async fn watch_room(
     selection: AccountSelection,
     gate: Arc<Gate>,
     candidates: mpsc::Sender<Candidate>,
+    profile: DiscoveryProfile,
 ) {
     let sticky = room.sticky_events();
     let mut receipts = sticky.subscribe_keyless();
@@ -1025,12 +1073,16 @@ async fn watch_room(
     let mut tick = time::interval(CACHE_INTERVAL);
     tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
-        if !selection.is_current() || gate.stopped() || room.state() != RoomState::Joined {
+        if !selection.is_current()
+            || !profile.is_current()
+            || gate.stopped()
+            || room.state() != RoomState::Joined
+        {
             gate.room_changed(room.room_id().as_str());
             gate.interest(room.room_id().as_str(), BTreeSet::new());
             break;
         }
-        reconcile_room(&room, &gate, &candidates, &mut cached);
+        reconcile_room(&room, &gate, &candidates, &mut cached, &profile);
         tokio::select! {
             _ = selection.revoked() => { gate.invalidate(); break; },
             update = receipts.recv() => { if update.is_err() { cached.reject(room.room_id().as_str(), &gate); if matches!(update, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; } } },
@@ -1044,7 +1096,12 @@ fn reconcile_room(
     gate: &Gate,
     candidates: &mpsc::Sender<Candidate>,
     cached: &mut CachedRoom,
+    profile: &DiscoveryProfile,
 ) {
+    if !profile.is_current() {
+        cached.reject(room.room_id().as_str(), gate);
+        return;
+    }
     let retained = room.sticky_events().keyless_live();
     if retained.invalidated || retained.events.len() > RECEIPTS {
         if retained.invalidated {
@@ -1196,6 +1253,7 @@ fn reconcile_room(
             member.event_id.as_str(),
             encryption.sender.as_str(),
             device.as_str(),
+            profile.mode,
         ) else {
             diagnostic!(gate, MemberMalformed);
             cached.reject(room.room_id().as_str(), gate);
@@ -1249,11 +1307,16 @@ fn reconcile_room(
             diagnostic!(gate, GateUnavailable);
             return;
         };
+        if !profile.is_current() {
+            cached.reject(room.room_id().as_str(), gate);
+            return;
+        }
         if candidates
             .try_send(Candidate {
                 epoch,
                 room: room.room_id().to_owned(),
                 event: event.event_id.clone(),
+                profile: profile.clone(),
             })
             .is_err()
         {
@@ -1303,6 +1366,46 @@ mod tests {
     }
     fn members() -> BTreeSet<MemberStamp> {
         BTreeSet::from([member()])
+    }
+
+    #[test]
+    fn queued_discovery_cannot_adopt_a_changed_or_restored_profile() {
+        use morpheus_config::{Config, ConfigStore, RoomCallMode};
+
+        let directory = tempfile::tempdir().unwrap();
+        let preferences = Arc::new(VoiceSpaces::new(ConfigStore::at(
+            directory.path().join("incoming-config.toml"),
+        )));
+        let account = "fixture-account";
+        let room = "!room:example.org";
+        let profile = DiscoveryProfile::capture(&preferences, account, room).unwrap();
+        assert!(profile.is_current());
+        let (send, mut receive) = mpsc::channel(1);
+        assert!(
+            send.try_send(Candidate {
+                epoch: 1,
+                room: room.parse().unwrap(),
+                event: "$offer:example.org".parse().unwrap(),
+                profile,
+            })
+            .is_ok()
+        );
+        let mut changed = Config::default();
+        changed
+            .set_room_call_mode(account, room, RoomCallMode::ElementCallMatrix2)
+            .unwrap();
+        preferences.apply_config(&changed);
+        let queued = receive.try_recv().unwrap();
+        assert!(!queued.profile.is_current());
+        assert_eq!(queued.profile.mode, InteropMode::Sticky2025);
+        assert_eq!(queued.profile.captured.mode(), RoomCallMode::Standard);
+        changed
+            .set_room_call_mode(account, room, RoomCallMode::Standard)
+            .unwrap();
+        preferences.apply_config(&changed);
+        assert!(!queued.profile.is_current());
+        let fresh = DiscoveryProfile::capture(&preferences, account, room);
+        assert!(fresh.unwrap().is_current());
     }
 
     #[test]

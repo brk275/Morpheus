@@ -60,12 +60,132 @@ pub struct SfuToken {
 /// belong to whoever performed the IO and never reach [`parse_sfu_token`].
 #[derive(Debug, thiserror::Error)]
 pub enum TokenServiceError {
+    /// A bounded JWT does not describe the exact requested participant and
+    /// permitted connection purpose. No token or payload enters this error.
+    #[error("LiveKit authorization claims do not match the requested connection")]
+    Authorization,
     /// The service rejected the request (non-2xx response).
     #[error("LiveKit authorisation service returned {status}: {body}")]
     Rejected { status: u16, body: String },
     /// A 2xx response whose body is not the `{jwt, url}` shape.
     #[error("LiveKit authorisation service response did not decode: {0}")]
     Decode(#[from] serde_json::Error),
+}
+
+/// Read only consistency claims, not a signature verdict. The SFU must still
+/// authenticate the signed token; after that handshake the caller compares
+/// the actual participant and room with these exact authorized values.
+#[derive(Clone)]
+pub struct SfuAuthorization {
+    pub room: String,
+    can_publish: bool,
+    publish_sources: Vec<String>,
+}
+
+impl SfuAuthorization {
+    pub fn permits_source(&self, source: &str) -> bool {
+        if self.publish_sources.is_empty() {
+            self.can_publish
+        } else {
+            self.publish_sources.iter().any(|allowed| allowed == source)
+        }
+    }
+}
+
+pub fn authorization_room(
+    jwt: &str,
+    subject: &str,
+    publisher: bool,
+) -> Result<String, TokenServiceError> {
+    Ok(authorization(jwt, subject, publisher)?.room)
+}
+
+pub fn authorization(
+    jwt: &str,
+    subject: &str,
+    publisher: bool,
+) -> Result<SfuAuthorization, TokenServiceError> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let rejected = || TokenServiceError::Authorization;
+    if jwt.len() > 64 * 1024 || subject.is_empty() {
+        return Err(rejected());
+    }
+    let mut parts = jwt.split('.');
+    let header = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(rejected)?;
+    let payload = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(rejected)?;
+    let signature = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(rejected)?;
+    if parts.next().is_some() || header.len() > 4096 || signature.len() > 8192 {
+        return Err(rejected());
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|_| rejected())?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| rejected())?;
+    if value.get("sub").and_then(serde_json::Value::as_str) != Some(subject) {
+        return Err(rejected());
+    }
+    let video = value
+        .get("video")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(rejected)?;
+    let flag = |name: &str, default: bool| -> Result<bool, TokenServiceError> {
+        match video.get(name) {
+            None => Ok(default),
+            Some(value) => value.as_bool().ok_or_else(rejected),
+        }
+    };
+    // LiveKit's VideoGrants defaults: no roomJoin; publishing/subscribing are
+    // permitted when omitted. Subscribers can legitimately have publish grants,
+    // but the native subscriber handle never permits local publication.
+    let can_publish = flag("canPublish", true)?;
+    let publish_sources = match video.get("canPublishSources") {
+        None => Vec::new(),
+        Some(value) => {
+            let values = value
+                .as_array()
+                .filter(|values| values.len() <= 8)
+                .ok_or_else(rejected)?;
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|source| {
+                            !source.is_empty()
+                                && source.len() <= 64
+                                && !source.chars().any(char::is_control)
+                        })
+                        .map(str::to_owned)
+                        .ok_or_else(rejected)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+    if !flag("roomJoin", false)?
+        || !flag("canSubscribe", true)?
+        || (publisher && !can_publish && publish_sources.is_empty())
+    {
+        return Err(rejected());
+    }
+    let room = video
+        .get("room")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(rejected)?;
+    if room.is_empty() || room.len() > 1024 || room.chars().any(char::is_control) {
+        return Err(rejected());
+    }
+    Ok(SfuAuthorization {
+        room: room.to_owned(),
+        can_publish,
+        publish_sources,
+    })
 }
 
 /// Build the MSC4195 `POST /get_token` request: the endpoint URL and the JSON
@@ -156,6 +276,72 @@ pub fn parse_sfu_token(status: u16, body: &str) -> Result<SfuToken, TokenService
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unsigned_consistency_fixture(payload: serde_json::Value) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        format!(
+            "e30.{}.fixture",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        )
+    }
+
+    #[test]
+    fn authorization_preserves_opaque_room_and_legitimate_subscriber_publish_grants() {
+        let jwt = unsigned_consistency_fixture(serde_json::json!({
+            "sub":"exact-participant", "video":{"roomJoin":true,"room":"opaque-provider-room","canPublish":true,"canSubscribe":true}
+        }));
+        assert_eq!(
+            authorization_room(&jwt, "exact-participant", false).unwrap(),
+            "opaque-provider-room"
+        );
+        assert_eq!(
+            authorization_room(&jwt, "exact-participant", true).unwrap(),
+            "opaque-provider-room"
+        );
+        assert!(authorization_room(&jwt, "another-participant", false).is_err());
+        // LiveKit defaults allow publish/subscribe; this does not grant the
+        // caller's native subscriber handle permission to publish a track.
+        let defaults = unsigned_consistency_fixture(serde_json::json!({
+            "sub":"exact-participant", "video":{"roomJoin":true,"room":"opaque-provider-room"}
+        }));
+        assert!(authorization_room(&defaults, "exact-participant", true).is_ok());
+    }
+
+    #[test]
+    fn authorization_rejects_wrong_purpose_malformed_grants_and_unbounded_rooms() {
+        let subscriber = unsigned_consistency_fixture(serde_json::json!({
+            "sub":"exact-participant", "video":{"roomJoin":true,"room":"opaque","canPublish":false,"canSubscribe":true}
+        }));
+        assert!(authorization_room(&subscriber, "exact-participant", false).is_ok());
+        assert!(authorization_room(&subscriber, "exact-participant", true).is_err());
+        for video in [
+            serde_json::json!({"room":"opaque"}),
+            serde_json::json!({"roomJoin":false,"room":"opaque"}),
+            serde_json::json!({"roomJoin":true,"room":"opaque","canSubscribe":false}),
+            serde_json::json!({"roomJoin":true,"room":"opaque","canSubscribe":"true"}),
+            serde_json::json!({"roomJoin":true,"room":""}),
+            serde_json::json!({"roomJoin":true,"room":"x".repeat(1025)}),
+        ] {
+            let jwt = unsigned_consistency_fixture(
+                serde_json::json!({"sub":"exact-participant", "video":video}),
+            );
+            assert!(authorization_room(&jwt, "exact-participant", false).is_err());
+        }
+        assert!(
+            authorization_room(&"x".repeat(64 * 1024 + 1), "exact-participant", false).is_err()
+        );
+    }
+
+    #[test]
+    fn source_limited_publish_grants_override_the_general_publish_flag() {
+        let jwt = unsigned_consistency_fixture(serde_json::json!({
+            "sub":"exact-participant", "video":{"roomJoin":true,"room":"opaque","canPublish":false,"canPublishSources":["microphone"]}
+        }));
+        let grant = authorization(&jwt, "exact-participant", true).unwrap();
+        assert!(grant.permits_source("microphone"));
+        assert!(!grant.permits_source("camera"));
+        assert!(!grant.permits_source("screen_share"));
+    }
 
     fn sample_token() -> OpenIdToken {
         OpenIdToken {

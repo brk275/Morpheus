@@ -39,7 +39,8 @@ use tokio::{sync::broadcast, time};
 
 use crate::{
     call_membership::{MembershipEvidence, MembershipIdentity, matches_membership},
-    voice_spaces::VoiceSpaces,
+    calls::CallJoinMode,
+    voice_spaces::{RoomCallProfile, VoiceSpaces},
 };
 use ledger::{Observation, OfferKey, OfferLedger};
 
@@ -168,6 +169,8 @@ struct Membership {
     device: String,
     logical_id: String,
     mode: InteropMode,
+    slot_id: String,
+    wire_slot_id: String,
 }
 
 impl Membership {
@@ -176,7 +179,7 @@ impl Membership {
             room_id: room,
             sender: &self.user,
             logical_membership_id: &self.logical_id,
-            slot_id: wire_slot(self.mode),
+            slot_id: &self.wire_slot_id,
             application: "m.call",
             device_id: Some(&self.device),
         }
@@ -196,6 +199,7 @@ pub(crate) struct IncomingOffer {
     drain_receipts: Box<dyn FnMut() -> Result<(), AdmissionFailure> + Send>,
     observer: PassiveCallObserver,
     membership: Membership,
+    profile: RoomCallProfile,
     deadline: Instant,
     revoked: bool,
 }
@@ -302,6 +306,13 @@ impl IncomingOffer {
             require_client(&client, &account.user_id, &account.device_id)?;
             let room = client.get_room(room_id).ok_or(AdmissionFailure::Account)?;
             require_scope(manager, preferences, &selection, &room)?;
+            let profile = preferences
+                .room_call_profile(&account.id, room_id.as_str())
+                .ok_or(AdmissionFailure::Policy)?;
+            let mode = CallJoinMode::from(profile.mode()).options().interop_mode;
+            if mode == InteropMode::RoomState {
+                return Err(AdmissionFailure::Membership);
+            }
             // Subscription precedes the first snapshot. Even if a later full
             // snapshot looks useful, lag/generation changes revoke this attempt.
             let mut updates = room.sticky_events().subscribe_keyless();
@@ -344,7 +355,7 @@ impl IncomingOffer {
                     .await
                     .map_err(|_| AdmissionFailure::Trust)?;
                 let referenced =
-                    fetch_membership(&room, &received.ring, &received.encryption).await?;
+                    fetch_membership(&room, &received.ring, &received.encryption, mode).await?;
                 let observer =
                     PassiveCallObserver::open(client.clone(), room_id.as_str(), referenced.mode)
                         .await
@@ -371,6 +382,7 @@ impl IncomingOffer {
                     drain_receipts,
                     observer,
                     membership: referenced,
+                    profile,
                     deadline,
                     revoked: false,
                 };
@@ -392,6 +404,17 @@ impl IncomingOffer {
     pub(crate) fn mode(&self) -> InteropMode {
         self.membership.mode
     }
+    pub(crate) fn slot_id(&self) -> &str {
+        &self.membership.slot_id
+    }
+    fn require_profile(&self, preferences: &VoiceSpaces) -> Result<(), AdmissionFailure> {
+        if preferences.room_call_profile(self.selection.account_id(), self.room.room_id().as_str())
+            != Some(self.profile)
+        {
+            return Err(AdmissionFailure::Policy);
+        }
+        Ok(())
+    }
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -407,6 +430,7 @@ impl IncomingOffer {
         preferences: &VoiceSpaces,
     ) -> Result<Receipt, AdmissionFailure> {
         require_scope(manager, preferences, &self.selection, &self.room)?;
+        self.require_profile(preferences)?;
         require_client(&self.client, &self.own_user, &self.own_device)?;
         if !self.room.encryption_state().is_encrypted() {
             return Err(AdmissionFailure::Trust);
@@ -594,6 +618,7 @@ impl IncomingOffer {
         own_join: Option<&controller::JoinedOwn>,
     ) -> Result<(), AdmissionFailure> {
         require_scope(manager, preferences, &self.selection, &self.room)?;
+        self.require_profile(preferences)?;
         require_client(&self.client, &self.own_user, &self.own_device)?;
         let received = self.current_receipt()?;
         let rtc = RtcService::new(self.client.clone());
@@ -618,7 +643,13 @@ impl IncomingOffer {
             policy::require_event_policy(&self.room, &received.encryption.sender, &received.raw)
                 .await
                 .map_err(|_| AdmissionFailure::Policy)?;
-        let referenced = fetch_membership(&self.room, &received.ring, &received.encryption).await?;
+        let referenced = fetch_membership(
+            &self.room,
+            &received.ring,
+            &received.encryption,
+            self.membership.mode,
+        )
+        .await?;
         if !same_join(&referenced, &self.membership) {
             return Err(AdmissionFailure::Membership);
         }
@@ -628,7 +659,7 @@ impl IncomingOffer {
             .await
             .map_err(|_| AdmissionFailure::Membership)?;
         if observed.mode != referenced.mode
-            || observed.slot_id != "m.call#room"
+            || observed.slot_id != referenced.slot_id
             || observed.room_id != self.room.room_id().as_str()
             || !controller::own_observation_allowed(
                 &observed.participants,
@@ -666,6 +697,7 @@ impl IncomingOffer {
             self.room.room_id().as_str(),
             &participant.membership_event_id,
             &received.encryption,
+            self.membership.mode,
         )?;
         if current.key.sender != encryption.sender
             || current.key.sticky_key != membership.logical_id
@@ -712,7 +744,8 @@ impl IncomingOffer {
         {
             return Err(AdmissionFailure::Membership);
         }
-        require_scope(manager, preferences, &self.selection, &self.room)
+        require_scope(manager, preferences, &self.selection, &self.room)?;
+        self.require_profile(preferences)
     }
 }
 
@@ -794,6 +827,7 @@ async fn fetch_membership(
     room: &Room,
     ring: &RingNotification,
     notification: &EncryptionInfo,
+    mode: InteropMode,
 ) -> Result<Membership, AdmissionFailure> {
     let id =
         EventId::parse(ring.membership_event_id()).map_err(|_| AdmissionFailure::Membership)?;
@@ -814,6 +848,7 @@ async fn fetch_membership(
         room.room_id().as_str(),
         ring.membership_event_id(),
         notification,
+        mode,
     )?;
     policy::require_current_sender(&room.client(), encryption)
         .await
@@ -827,6 +862,7 @@ fn membership<T>(
     room: &str,
     event: &str,
     notification: &EncryptionInfo,
+    mode: InteropMode,
 ) -> Result<Membership, AdmissionFailure> {
     if raw.json().get().len() > MAX_BYTES
         || encryption.verification_state != VerificationState::Verified
@@ -842,7 +878,14 @@ fn membership<T>(
         .as_str();
     let envelope: Value =
         serde_json::from_str(raw.json().get()).map_err(|_| AdmissionFailure::Membership)?;
-    membership_envelope(&envelope, room, event, encryption.sender.as_str(), device)
+    membership_envelope(
+        &envelope,
+        room,
+        event,
+        encryption.sender.as_str(),
+        device,
+        mode,
+    )
 }
 
 fn membership_fields<'a>(
@@ -850,7 +893,7 @@ fn membership_fields<'a>(
     room: &str,
     event: &str,
     user: &str,
-) -> Result<(&'a Value, &'a str, InteropMode), AdmissionFailure> {
+) -> Result<(&'a Value, &'a str, &'a str), AdmissionFailure> {
     if !matches!(
         envelope.get("type").and_then(Value::as_str),
         Some("m.rtc.member" | "org.matrix.msc4143.rtc.member")
@@ -877,12 +920,12 @@ fn membership_fields<'a>(
                 && !id.chars().any(|c| c.is_control() || c.is_whitespace())
         })
         .ok_or(AdmissionFailure::Membership)?;
-    let mode = match content.get("slot_id").and_then(Value::as_str) {
-        Some("m.call#room") => InteropMode::Current,
-        Some("m.call#ROOM") => InteropMode::Sticky2025,
-        _ => return Err(AdmissionFailure::Membership),
-    };
-    Ok((content, logical_id, mode))
+    let slot = content
+        .get("slot_id")
+        .and_then(Value::as_str)
+        .filter(|slot| matches!(*slot, "m.call#room" | "m.call#ROOM"))
+        .ok_or(AdmissionFailure::Membership)?;
+    Ok((content, logical_id, slot))
 }
 
 /// Discovery can ignore a verified departure retained by the sticky cache.
@@ -935,8 +978,12 @@ fn membership_envelope(
     event: &str,
     user: &str,
     device: &str,
+    mode: InteropMode,
 ) -> Result<Membership, AdmissionFailure> {
-    let (content, logical_id, mode) = membership_fields(envelope, room, event, user)?;
+    let (content, logical_id, slot) = membership_fields(envelope, room, event, user)?;
+    if slot != wire_slot(mode) {
+        return Err(AdmissionFailure::Membership);
+    }
     if !matches_membership(
         MembershipEvidence {
             sender: user,
@@ -960,11 +1007,18 @@ fn membership_envelope(
         device: device.to_owned(),
         logical_id: logical_id.to_owned(),
         mode,
+        slot_id: "m.call#room".to_owned(),
+        wire_slot_id: slot.to_owned(),
     })
 }
 
 fn same_join(a: &Membership, b: &Membership) -> bool {
-    a.user == b.user && a.device == b.device && a.logical_id == b.logical_id && a.mode == b.mode
+    a.user == b.user
+        && a.device == b.device
+        && a.logical_id == b.logical_id
+        && a.mode == b.mode
+        && a.slot_id == b.slot_id
+        && a.wire_slot_id == b.wire_slot_id
 }
 
 fn wire_slot(mode: InteropMode) -> &'static str {
@@ -995,12 +1049,17 @@ mod tests {
     }
 
     fn parse(value: &Value) -> Result<Membership, AdmissionFailure> {
+        parse_mode(value, InteropMode::Current)
+    }
+
+    fn parse_mode(value: &Value, mode: InteropMode) -> Result<Membership, AdmissionFailure> {
         membership_envelope(
             value,
             "!room:example.org",
             "$member",
             "@caller:example.org",
             "CALLER",
+            mode,
         )
     }
 
@@ -1133,9 +1192,32 @@ mod tests {
             .remove("membership");
         assert!(parse(&value).is_err());
         value["content"]["slot_id"] = json!("m.call#ROOM");
-        assert_eq!(parse(&value).unwrap().mode, InteropMode::Sticky2025);
+        assert!(parse(&value).is_err());
+        assert_eq!(
+            parse_mode(&value, InteropMode::Sticky2025).unwrap().mode,
+            InteropMode::Sticky2025
+        );
         value["content"]["slot_id"] = json!("m.call#Room");
         assert!(parse(&value).is_err());
+    }
+
+    #[test]
+    fn a_local_profile_and_concrete_slot_are_not_inferred_from_the_event() {
+        let mut value = event();
+        let profile = CallJoinMode::Standard.options().interop_mode;
+        assert_eq!(profile, InteropMode::Sticky2025);
+        assert!(parse_mode(&value, profile).is_err());
+        value["content"]["slot_id"] = json!("m.call#ROOM");
+        let admitted = parse_mode(&value, profile).unwrap();
+        assert_eq!(admitted.mode, profile);
+        assert_eq!(admitted.slot_id, "m.call#room");
+        assert_eq!(admitted.wire_slot_id, "m.call#ROOM");
+        assert!(parse_mode(&value, InteropMode::Current).is_err());
+        let mut other_slot = event();
+        other_slot["content"]["slot_id"] = json!("m.call#standup");
+        assert!(parse_mode(&other_slot, profile).is_err());
+        let literal = parse(&event()).unwrap();
+        assert!(!same_join(&admitted, &literal));
     }
 
     #[test]

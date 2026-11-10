@@ -27,11 +27,13 @@ const FOCUS: &str = "https://sfu.example.org";
 /// Not the default derivation, so a key imported under the raw `member_id`
 /// fallback (the mapper installed too late) shows.
 fn mapper() -> RtcIdentityMapper {
-    Arc::new(|user: &str, device: &str, member: &str| format!("{user}|{device}|{member}"))
+    Arc::new(|user: &str, device: &str, member: &str, _memberships| {
+        Some(format!("{user}|{device}|{member}"))
+    })
 }
 
 fn bob_identity() -> String {
-    mapper()(BOB, "BOBDEV", "bob-1")
+    mapper()(BOB, "BOBDEV", "bob-1", None).expect("fixed test identity")
 }
 
 /// Every key the ring was handed, by identity.
@@ -87,13 +89,13 @@ impl MediaTransport for FakeTransport {
     fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
         match transport {
             RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
-            RtcTransport::Unsupported(_) => None,
+            RtcTransport::LiveKitCsApi(_) | RtcTransport::Unsupported(_) => None,
         }
     }
 
     fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
         let device = member.origin.sender_device_id()?;
-        Some(mapper()(&member.sender, device, &member.member_id))
+        mapper()(&member.sender, device, &member.member_id, None)
     }
 
     async fn connect(
@@ -188,13 +190,14 @@ async fn open(client: &RtcClient<MockBackend>, mock: &MockBackend) -> RtcRoom<Mo
 }
 
 fn bob_key() -> ToDeviceMessageIn {
+    let key = matrix_rtc_core::testing::sequential_test_media_key();
     ToDeviceMessageIn {
         sender: BOB.to_owned(),
         event_type: KEY_MESSAGE_TYPE.to_owned(),
         content: json!({
             "room_id": ROOM,
             "member_id": "bob-1",
-            "media_key": { "index": 0, "key": "AAECAwQFBgcICQoLDA0ODw==" },
+            "media_key": { "index": 0, "key": key },
         }),
         encryption: EventEncryption::encrypted(Some("BOBDEV".to_owned()), Some(true)),
     }
@@ -259,7 +262,8 @@ async fn a_key_held_before_attaching_is_imported_under_the_mapped_identity_and_r
     assert!(attached.own_connection.is_some());
     assert_eq!(
         attached.own_identity,
-        mapper()(&mock.user_id, &mock.device_id, call.member_id())
+        mapper()(&mock.user_id, &mock.device_id, call.member_id(), None)
+            .expect("fixed test identity")
     );
 }
 

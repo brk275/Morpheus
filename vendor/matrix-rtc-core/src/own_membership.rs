@@ -103,6 +103,13 @@ pub fn transport_to_json(transport: &RtcTransport) -> Value {
                 "livekit_service_url": livekit.livekit_service_url
             })
         }
+        RtcTransport::LiveKitCsApi(livekit) => {
+            let mut value = json!({ "type": "livekit", "url": livekit.url });
+            if let Some(server) = &livekit.server_name {
+                value["server_name"] = Value::String(server.clone());
+            }
+            value
+        }
         RtcTransport::Unsupported(unsupported) => {
             let mut obj = json!({
                 "type": unsupported.transport_type

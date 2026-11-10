@@ -1084,16 +1084,23 @@ preferences retain their meaning. A room cannot appear in both lists; invalid
 edits retain the last valid configuration. The UI moves a room between modes
 atomically. Logging out clears both lists for that account.
 
-Element Call Matrix 2.0 uses the pinned RTC library's `Sticky2025` adapter.
+Standard encrypted calls and Element Call Matrix 2.0 use the pinned RTC library's
+`Sticky2025` adapter and the same canonical `m.call#ROOM` wire scope. The saved
+Standard preference remains valid; it now selects the stock-compatible encrypted
+profile before admission. The native API's experimental Current format remains
+an explicit literal/custom API and is not presented as stock Element Call support.
 It requires an encrypted room, advertised sticky-event and MatrixRTC service
 support, working sticky sync, and a verified/recovered device. Use **Open room
 call** when the required slot has not been created; that explicit action needs
 room permission. Legacy uses older room-state membership without that slot.
 These formats do not negotiate or automatically fall back to each other.
 
-The mode chosen when starting is fixed until the call ends. Mode controls are
-disabled while opening, connecting, joined, or cleaning up a call. External
-TOML edits apply to the next call, never an existing one. The voice-space marker
+The admitted profile and concrete call slot remain fixed. Mode controls are
+disabled while opening, connecting, joined, or cleaning up a call. A pending
+incoming offer captures the local account/room choice and its generation; an
+external edit revokes that offer even if the choice is later restored. A changed
+profile also prevents a new outgoing rejoin. An established incoming call is
+authorized for its existing join and is never rejoined automatically. The voice-space marker
 does not select a protocol. Native compilation passed on all four targets at
 `a38fe43`; live UI interaction and production Element Call acceptance for the
 Matrix 2.0 choice remain pending. The controlled peer fixture has a narrower
