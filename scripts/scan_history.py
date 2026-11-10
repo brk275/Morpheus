@@ -16,6 +16,15 @@ import time
 
 MAX_REPORT = 64 * 1024 * 1024
 MAX_FIXTURE = 4 * 1024 * 1024
+# Larger reads admit only these reviewed whole SQLite blobs, never a directory.
+REVIEWED_LARGE_FIXTURES = {
+    "vendor/libsqlite3-sys/sqlite3/sqlite3.c": (
+        9507089, "478a6a723c88f339b98361e341e1bd7457dfa08508f79beec3f5286849c23139",
+    ),
+    "vendor/libsqlite3-sys/sqlcipher/sqlite3.c": (
+        9616200, "7fa12f919a1325f1fa4a58069a4f55a39ecb3a238cbec0f9e62a161cde8576a4",
+    ),
+}
 MAX_FINDINGS = 4096
 MAX_MERGE_PARENTS = 8
 MAX_PROVENANCE_COMMIT = 64 * 1024
@@ -54,11 +63,16 @@ def fixture_object(commit, path):
 def fixture_digest(repository, commit, path, query=git):
     obj = fixture_object(commit, path)
     size = int(query("-C", repository, "cat-file", "-s", obj))
-    if not 0 < size <= MAX_FIXTURE:
+    reviewed = REVIEWED_LARGE_FIXTURES.get(path)
+    if size <= 0 or (size > MAX_FIXTURE and
+                     (reviewed is None or size != reviewed[0])):
         raise ValueError("fixture exceeds size bound")
     if query("-C", repository, "cat-file", "-t", obj).strip() != b"blob":
         raise ValueError("fixture is not a blob")
-    return hashlib.sha256(query("-C", repository, "cat-file", "blob", obj)).hexdigest()
+    digest = hashlib.sha256(query("-C", repository, "cat-file", "blob", obj)).hexdigest()
+    if size > MAX_FIXTURE and digest != reviewed[1]:
+        raise ValueError("unreviewed large fixture digest")
+    return digest
 
 
 def load_manifest(path):

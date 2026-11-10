@@ -8,7 +8,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from scripts.scan_history import MergeProvenance, classify, fixture_digest, git, load_manifest, scan
+from scripts.scan_history import (
+    MAX_FIXTURE, REVIEWED_LARGE_FIXTURES, MergeProvenance, classify,
+    fixture_digest, git, load_manifest, scan,
+)
 
 
 class HistoryScannerTests(unittest.TestCase):
@@ -95,6 +98,68 @@ class HistoryScannerTests(unittest.TestCase):
         (self.repo / "fixture.txt").write_text(self.canary + "changed bytes\n")
         self.commit("New introduction must not inherit an exception")
         self.assertGreater(self.execute("new-introduction")["unexpected_findings"], 0)
+
+    def test_large_fixture_admissions_are_only_exact_reviewed_sqlite_blobs(self):
+        self.assertEqual(MAX_FIXTURE, 4 * 1024 * 1024)
+        self.assertEqual(REVIEWED_LARGE_FIXTURES, {
+            "vendor/libsqlite3-sys/sqlite3/sqlite3.c": (
+                9507089,
+                "478a6a723c88f339b98361e341e1bd7457dfa08508f79beec3f5286849c23139",
+            ),
+            "vendor/libsqlite3-sys/sqlcipher/sqlite3.c": (
+                9616200,
+                "7fa12f919a1325f1fa4a58069a4f55a39ecb3a238cbec0f9e62a161cde8576a4",
+            ),
+        })
+
+    def test_large_fixture_read_requires_exact_path_size_type_and_full_digest(self):
+        # A small synthetic boundary tests the production digest logic without
+        # tracking a second amalgamation or requiring unpublished source blobs.
+        path = "vendor/libsqlite3-sys/sqlite3/sqlite3.c"
+        commit = "1" * 40
+        content = b"Public synthetic SQLite source boundary bytes\n"
+        digest = hashlib.sha256(content).hexdigest()
+        admitted = {path: (len(content), digest)}
+        calls = []
+
+        def query_for(data, size=None, kind=b"blob"):
+            def query(*arguments):
+                calls.append(arguments)
+                operation = arguments[-2]
+                if operation == "-s":
+                    return str(len(data) if size is None else size).encode("ascii")
+                if operation == "-t":
+                    return kind
+                self.assertEqual(operation, "blob")
+                return data
+            return query
+
+        with mock.patch("scripts.scan_history.MAX_FIXTURE", 8), mock.patch.dict(
+            "scripts.scan_history.REVIEWED_LARGE_FIXTURES", admitted, clear=True,
+        ):
+            self.assertEqual(fixture_digest(self.repo, commit, path,
+                                           query_for(content)), digest)
+            self.assertEqual([arguments[-2] for arguments in calls],
+                             ["-s", "-t", "blob"])
+            for other in ("other.c", path.upper(), "prefix/" + path):
+                calls.clear()
+                with self.subTest(path=other), self.assertRaisesRegex(ValueError, "size"):
+                    fixture_digest(self.repo, commit, other, query_for(content))
+                self.assertEqual([arguments[-2] for arguments in calls], ["-s"])
+            for size in (0, len(content) - 1, len(content) + 1, 16 * 1024 * 1024 + 1):
+                calls.clear()
+                with self.subTest(size=size), self.assertRaisesRegex(ValueError, "size"):
+                    fixture_digest(self.repo, commit, path, query_for(content, size=size))
+                self.assertEqual([arguments[-2] for arguments in calls], ["-s"])
+            with self.assertRaisesRegex(ValueError, "not a blob"):
+                fixture_digest(self.repo, commit, path, query_for(content, kind=b"tree"))
+            changed = content[:-1] + b"X"
+            with self.assertRaisesRegex(ValueError, "digest"):
+                fixture_digest(self.repo, commit, path, query_for(changed))
+            small = b"public"
+            self.assertEqual(fixture_digest(self.repo, commit, "ordinary.txt",
+                                           query_for(small)),
+                             hashlib.sha256(small).hexdigest())
 
     def test_digest_reuses_verified_blob_bytes_across_paths_and_commits(self):
         content = b"Reviewed synthetic public fixture bytes\n"
