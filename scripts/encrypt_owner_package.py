@@ -53,13 +53,23 @@ def recipient(value):
     return value
 
 
-def selection(inputs):
+def selected_revision(requested, workflow_revision):
+    def valid(value):
+        return (type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+                and value != "0" * 40)
+    require(valid(workflow_revision))
+    selected = workflow_revision if requested == "" else requested
+    require(valid(selected))
+    return selected
+
+
+def selection(inputs, workflow_revision):
     require(type(inputs) is dict and inputs.get("platform") == "macos-arm64")
-    require(re.fullmatch(r"[0-9a-f]{40}", inputs.get("source_revision", "")))
+    revision = selected_revision(inputs.get("source_revision", ""), workflow_revision)
     for name in ("native_updates", "appimage_updates", "appimage_capture", "source_bundle"):
         value = inputs.get(name)
         require((type(value) is bool and value is False) or (type(value) is str and value == "false"))
-    return recipient(inputs.get("owner_age_recipient"))
+    return recipient(inputs.get("owner_age_recipient")), revision
 
 
 def context(*, worker):
@@ -72,12 +82,12 @@ def context(*, worker):
     event = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_bytes())
     require(event["repository"]["private"] is False
             and event["sender"]["id"] == event["repository"]["owner"]["id"])
-    key = selection(event["inputs"])
+    key, revision = selection(event["inputs"], env.get("GITHUB_SHA", ""))
     if worker:
         require(platform.system() == "Darwin" and platform.machine() == "arm64"
                 and env.get("RUNNER_OS") == "macOS" and env.get("ImageOS") == "macos15")
         require(os.getuid() == os.geteuid() != 0)
-    return key, event["inputs"]["source_revision"]
+    return key, revision
 
 
 def identity(info):

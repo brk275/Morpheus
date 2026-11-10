@@ -716,7 +716,7 @@ jobs:
           import hashlib, os, pathlib, sys
           helper = pathlib.Path(os.environ["OWNER_CONTROLLER"]) / "scripts/encrypt_owner_package.py"
           source = helper.read_bytes()
-          if hashlib.sha256(source).hexdigest() != "023ac5de3dc9cba1c3ce505ea8946a8477302ebb9db71e5df08efdb23b0a31d0":
+          if hashlib.sha256(source).hexdigest() != "73f348d24d7184efc55d38a3c60bd154ce526513ddcea395ed187c12f815dc29":
               raise SystemExit("Owner encryption controller identity mismatch")
           sys.argv = [str(helper), "--dist", os.environ["OWNER_DIST"]]
           exec(compile(source, str(helper), "exec"), {"__name__": "__main__", "__file__": str(helper)})
