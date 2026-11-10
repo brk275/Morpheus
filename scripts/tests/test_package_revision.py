@@ -14,6 +14,20 @@ from scripts import package_revision as revision
 from scripts import package_scope
 
 
+OWNER_CIPHERTEXT_UPLOAD = """\
+      - name: Retain only owner-encrypted accepted ARM DMG
+        if: inputs.owner_age_recipient != '' && matrix.label == 'macos-arm64' && needs.scope.outputs.native_updates == 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: owner-arm-${{ needs.scope.outputs.source_revision }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.owner_encryption.outputs.ciphertext }}
+          retention-days: 1
+          if-no-files-found: error
+          include-hidden-files: false
+          overwrite: false
+"""
+
+
 class RevisionIdentityTests(unittest.TestCase):
     def test_update_export_allows_only_exact_two_version_fields_and_full_file_map(self):
         originals = {"crates/morpheus-app/Cargo.toml": b'[package]\nname = "morpheus-app"\nversion = "0.1.0"\n\n[dependencies]\nother = "0.1.0"\n',
@@ -422,7 +436,8 @@ class PackageSourceScopeTests(unittest.TestCase):
                         workflow.index("Install pinned Rust toolchain"))
         # Actual scanner suppression resistance is covered by HistoryScannerTests.
         self.assertNotIn("pull_request_target", workflow)
-        self.assertNotIn("upload-artifact", workflow)
+        self.assertEqual(workflow.count(OWNER_CIPHERTEXT_UPLOAD), 1)
+        self.assertNotIn("upload-artifact", workflow.replace(OWNER_CIPHERTEXT_UPLOAD, "", 1))
 
 
 @unittest.skipUnless(os.name == "posix" and Path("/bin/bash").is_file(), "Bash fixture requires a POSIX host")
