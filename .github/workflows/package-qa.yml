@@ -8,6 +8,11 @@ on:
         type: string
         required: false
         default: ""
+      owner_age_recipient:
+        description: Optional owner-only age X25519 recipient (ordinary ARM DMG only; ciphertext artifact)
+        type: string
+        required: false
+        default: ""
       platform:
         description: Platforms affected by this package change (all for release candidates)
         type: choice
@@ -85,12 +90,16 @@ jobs:
           APPIMAGE_CAPTURE: ${{ inputs.appimage_capture }}
           SOURCE_BUNDLE: ${{ inputs.source_bundle }}
           NATIVE_UPDATES: ${{ inputs.native_updates }}
+          OWNER_AGE_RECIPIENT: ${{ inputs.owner_age_recipient }}
         shell: bash
         run: |
           set -euo pipefail
           # AppImage stays explicit; never remap default/all/DEB selections.
           if [[ "$PACKAGE_PLATFORM" == linux || "$PACKAGE_PLATFORM" == all ]]; then
             test "$LINUX_FORMATS" = appimage
+          fi
+          if [[ -n "$OWNER_AGE_RECIPIENT" ]]; then
+            python3 -I -B scripts/encrypt_owner_package.py --preflight
           fi
           python3 scripts/package_scope.py
       - name: Check out selected source for independent scanning
@@ -685,8 +694,46 @@ jobs:
             {"owner_id":${{ toJSON(github.event.repository.owner.id) }},"sender_id":${{ toJSON(github.event.sender.id) }},"private":${{ toJSON(github.event.repository.private) }},"inputs":{"source_revision":${{ toJSON(needs.scope.outputs.source_revision) }},"platform":${{ toJSON(inputs.platform) }},"linux_formats":${{ toJSON(inputs.linux_formats) }},"appimage_updates":${{ toJSON(inputs.appimage_updates) }},"appimage_capture":${{ toJSON(inputs.appimage_capture) }},"source_bundle":${{ toJSON(inputs.source_bundle) }},"native_updates":${{ toJSON(inputs.native_updates) }}}}
         shell: bash
         run: python3 -I -B scripts/native_notice_source.py --finish --gitleaks "$MORPHEUS_NATIVE_QA_SCANNER"
-      # Installers deliberately stay on the ephemeral runner. Public artifact
-      # uploads and releases require the separate release acceptance gates.
+      - name: Check out immutable controller for optional owner encryption
+        if: inputs.owner_age_recipient != '' && matrix.label == 'macos-arm64' && needs.scope.outputs.native_updates == 'false'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: owner-package-controller
+          persist-credentials: false
+      - name: Encrypt accepted ARM DMG for its owner
+        id: owner_encryption
+        if: inputs.owner_age_recipient != '' && matrix.label == 'macos-arm64' && needs.scope.outputs.native_updates == 'false'
+        timeout-minutes: 5
+        shell: bash
+        env:
+          OWNER_CONTROLLER: ${{ github.workspace }}/owner-package-controller
+          OWNER_DIST: ${{ github.workspace }}/dist
+        run: |
+          set -euo pipefail
+          test "$(git -C "$OWNER_CONTROLLER" rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -I -B - <<'OWNER_ENCRYPTION'
+          import hashlib, os, pathlib, sys
+          helper = pathlib.Path(os.environ["OWNER_CONTROLLER"]) / "scripts/encrypt_owner_package.py"
+          source = helper.read_bytes()
+          if hashlib.sha256(source).hexdigest() != "023ac5de3dc9cba1c3ce505ea8946a8477302ebb9db71e5df08efdb23b0a31d0":
+              raise SystemExit("Owner encryption controller identity mismatch")
+          sys.argv = [str(helper), "--dist", os.environ["OWNER_DIST"]]
+          exec(compile(source, str(helper), "exec"), {"__name__": "__main__", "__file__": str(helper)})
+          OWNER_ENCRYPTION
+      - name: Retain only owner-encrypted accepted ARM DMG
+        if: inputs.owner_age_recipient != '' && matrix.label == 'macos-arm64' && needs.scope.outputs.native_updates == 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: owner-arm-${{ needs.scope.outputs.source_revision }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.owner_encryption.outputs.ciphertext }}
+          retention-days: 1
+          if-no-files-found: error
+          include-hidden-files: false
+          overwrite: false
+      # Plaintext installers remain on the ephemeral runner. Only an explicit
+      # owner's age-encrypted ordinary ARM DMG may be retained for one day.
+      # Public releases still require the separate release acceptance gates.
 
   source_bundle:
     name: Private corresponding source evidence (Linux)

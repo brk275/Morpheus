@@ -2020,5 +2020,98 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
             security.path(root,directory=True,private=True);root.rmdir()
 
 
+
+
+@unittest.skipIf(sys.platform == "win32", "POSIX owner-encryption filesystem checks")
+class OwnerPackageEncryptionTests(unittest.TestCase):
+    RECIPIENT = "age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m"
+
+    def test_owner_delivery_requires_exact_native_recipient_and_ordinary_arm(self):
+        from scripts import encrypt_owner_package as owner
+        inputs = {"platform": "macos-arm64", "source_revision": "a" * 40,
+                  "native_updates": "false", "appimage_updates": "false",
+                  "appimage_capture": "false", "source_bundle": "false",
+                  "owner_age_recipient": self.RECIPIENT}
+        self.assertEqual(owner.selection(inputs), self.RECIPIENT)
+        for update in ({"platform": "macos-x64"}, {"platform": "all"},
+                       {"source_revision": "main"}, {"native_updates": "true"},
+                       {"appimage_updates": "true"}, {"appimage_capture": "true"},
+                       {"source_bundle": "true"}, {"native_updates": 0}):
+            with self.subTest(update=update), self.assertRaises(owner.Failure):
+                owner.selection(inputs | update)
+        for key in ("", "ssh-ed25519 AAAA", "age1plugin1test", self.RECIPIENT + "\n",
+                    self.RECIPIENT.upper(), self.RECIPIENT[:-1] + "q"):
+            with self.subTest(key=key), self.assertRaises(owner.Failure):
+                owner.recipient(key)
+
+    def test_owner_dmg_copy_rejects_ambiguous_links_and_relative_roots(self):
+        from scripts import encrypt_owner_package as owner
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            dist = root / "dist"; dist.mkdir()
+            package = dist / "Morpheus.dmg"; package.write_bytes(b"synthetic DMG")
+            size, checksum = owner.copy_dmg(dist, root / "copy")
+            self.assertEqual(size, 13)
+            self.assertEqual(checksum, hashlib.sha256(b"synthetic DMG").hexdigest())
+            with self.assertRaises(owner.Failure):
+                owner.copy_dmg(Path("dist"), root / "relative")
+            second = dist / "second.dmg"; second.write_bytes(b"second")
+            with self.assertRaises(owner.Failure):
+                owner.copy_dmg(dist, root / "ambiguous")
+            second.unlink(); package.unlink()
+            package.symlink_to(root / "copy")
+            with self.assertRaises(owner.Failure):
+                owner.copy_dmg(dist, root / "symlink")
+            package.unlink(); os.link(root / "copy", package)
+            with self.assertRaises(owner.Failure):
+                owner.copy_dmg(dist, root / "hardlink")
+
+    def test_owner_encrypt_upload_boundary_and_primary_failure_cleanup(self):
+        from scripts import encrypt_owner_package as owner
+        import subprocess
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve(); root.chmod(0o700)
+            dist = root / "dist"; dist.mkdir()
+            (dist / "Morpheus.dmg").write_bytes(b"synthetic DMG")
+            def encrypt(command, **options):
+                self.assertEqual(command[1:4], ["--encrypt", "--recipient", self.RECIPIENT])
+                self.assertEqual(options["timeout"], 90)
+                self.assertEqual(options["stdin"], subprocess.DEVNULL)
+                self.assertEqual(options["stderr"], subprocess.DEVNULL)
+                self.assertNotIn("GITHUB_TOKEN", options["env"])
+                Path(command[5]).write_bytes(b"synthetic ciphertext")
+            with mock.patch.object(owner, "tool", return_value=root / "age"), \
+                    mock.patch.object(owner.subprocess, "run", side_effect=encrypt):
+                output, receipt = owner.encrypt(dist, root, self.RECIPIENT)
+            self.assertEqual([item.name for item in output.iterdir()], ["Morpheus.dmg.age"])
+            self.assertEqual(receipt["plaintext_sha256"], hashlib.sha256(b"synthetic DMG").hexdigest())
+            self.assertFalse(list(root.glob("owner-encryption-*")))
+            self.assertTrue(owner.cleanup(output))
+            failure = subprocess.CalledProcessError(2, ["age"])
+            with mock.patch.object(owner, "tool", return_value=root / "age"), \
+                    mock.patch.object(owner.subprocess, "run", side_effect=failure):
+                with self.assertRaises(subprocess.CalledProcessError) as raised:
+                    owner.encrypt(dist, root, self.RECIPIENT)
+            self.assertIs(raised.exception, failure)
+            self.assertFalse(list(root.glob("owner-encryption-*")))
+            self.assertFalse(list(root.glob("owner-ciphertext-*")))
+
+    def test_owner_upload_is_exact_ciphertext_after_unchanged_acceptance(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/package-qa.yml").read_text()
+        self.assertLess(workflow.index("Install, inspect, launch and remove unsigned packages"),
+                        workflow.index("Encrypt accepted ARM DMG for its owner"))
+        self.assertLess(workflow.index("Scan and remove owned native notice source inputs"),
+                        workflow.index("Encrypt accepted ARM DMG for its owner"))
+        self.assertIn("path: ${{ steps.owner_encryption.outputs.ciphertext }}", workflow)
+        self.assertIn("retention-days: 1", workflow)
+        self.assertIn("ref: ${{ github.sha }}\n          path: owner-package-controller", workflow)
+        self.assertIn("include-hidden-files: false", workflow)
+        self.assertIn("if-no-files-found: error", workflow)
+        self.assertIn("persist-credentials: false", workflow)
+        helper = Path(__file__).resolve().parents[1] / "encrypt_owner_package.py"
+        checksum = hashlib.sha256(helper.read_bytes()).hexdigest()
+        self.assertIn('if hashlib.sha256(source).hexdigest() != "' + checksum + '":', workflow)
+
+
 if __name__ == "__main__":
     unittest.main()
