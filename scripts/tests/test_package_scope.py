@@ -17,6 +17,20 @@ from scripts.package_scope import package_matrix
 from scripts import package_scope
 
 
+OWNER_CIPHERTEXT_UPLOAD = """\
+      - name: Retain only owner-encrypted accepted ARM DMG
+        if: inputs.owner_age_recipient != '' && matrix.label == 'macos-arm64' && needs.scope.outputs.native_updates == 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: owner-arm-${{ needs.scope.outputs.source_revision }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.owner_encryption.outputs.ciphertext }}
+          retention-days: 1
+          if-no-files-found: error
+          include-hidden-files: false
+          overwrite: false
+"""
+
+
 class PackageScopeTests(unittest.TestCase):
     def test_linux_only_never_requests_mac_or_windows(self):
         for formats in ("both", "appimage", "deb"):
@@ -339,7 +353,9 @@ class NativeUpdateWorkflowTests(unittest.TestCase):
         self.assertIn('--target-dir "$MORPHEUS_MAC_UPDATE_TARGET"', workflow)
         self.assertIn('--gitleaks-sha256 "17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c"', workflow)
         self.assertEqual(workflow.count("--execute-on-free-hosted-runner"), 3)  # Existing AppImage plus explicit Mac and Windows.
-        for value in ("pull_request_target", "workflow_run:", "upload-artifact", "secrets."):
+        self.assertEqual(workflow.count(OWNER_CIPHERTEXT_UPLOAD), 1)
+        self.assertNotIn("upload-artifact", workflow.replace(OWNER_CIPHERTEXT_UPLOAD, "", 1))
+        for value in ("pull_request_target", "workflow_run:", "secrets."):
             self.assertNotIn(value, workflow)
         module = native_scanner_source()
         pin_nodes = [node.value for node in ast.walk(module) if isinstance(node, ast.Assign)
@@ -365,7 +381,9 @@ class NativeNoticeWorkflowTests(unittest.TestCase):
                         workflow.index("Build unsigned QA package"))
         self.assertIn("if: always() && runner.os != 'Linux' && env.MORPHEUS_NATIVE_SOURCE_ROOT != ''",workflow)
         self.assertIn("Prepare pinned native notice and update scanner\n        if: runner.os != 'Linux'",workflow)
-        for forbidden in ("upload-artifact", "pull_request_target", "workflow_run:", "secrets."):
+        self.assertEqual(workflow.count(OWNER_CIPHERTEXT_UPLOAD), 1)
+        self.assertNotIn("upload-artifact", workflow.replace(OWNER_CIPHERTEXT_UPLOAD, "", 1))
+        for forbidden in ("pull_request_target", "workflow_run:", "secrets."):
             self.assertNotIn(forbidden,workflow)
 
 
