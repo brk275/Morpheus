@@ -99,6 +99,16 @@ class HistoryScannerTests(unittest.TestCase):
         self.commit("New introduction must not inherit an exception")
         self.assertGreater(self.execute("new-introduction")["unexpected_findings"], 0)
 
+    def test_package_controller_pins_actual_reviewed_scanner_bytes(self):
+        project = Path(__file__).resolve().parents[2]
+        scanner = (project / "scripts/scan_history.py").read_bytes()
+        workflow = (project / ".github/workflows/package-qa.yml").read_text()
+        # This is a cross-file security contract: a stale digest blocks package
+        # selection before candidate code can run. Keep that check in place.
+        suffix = '  $trusted/scan_history.py" | sha256sum --check --status'
+        lines = [line.strip() for line in workflow.splitlines() if suffix in line]
+        self.assertEqual(lines, ['echo "' + hashlib.sha256(scanner).hexdigest() + suffix])
+
     def test_large_fixture_admissions_are_only_exact_reviewed_sqlite_blobs(self):
         self.assertEqual(MAX_FIXTURE, 4 * 1024 * 1024)
         self.assertEqual(REVIEWED_LARGE_FIXTURES, {
