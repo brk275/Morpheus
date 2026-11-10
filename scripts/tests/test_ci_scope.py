@@ -368,21 +368,22 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual(result["wayland"], "ubuntu-24.04" in platforms)
                 self.assertEqual((result["check_route"], result["matrix_suite"]), ("all", "full"))
 
-    def test_sdk_archive_is_explicit_partial_native_only_on_each_supported_platform(self):
-        for platform, platforms in MANUAL_PLATFORMS.items():
-            inputs = {"platform":platform, "checks":"sdk-archive", "matrix_suite":"full"}
-            selected = event_selection({"inputs":inputs}, "workflow_dispatch")
-            self.assertEqual(selected, {"native":True, "native_matrix":{"os":list(platforms)},
-                "config":False, "wayland":False, "manual":True, "manual_platform":platform,
-                "check_route":"sdk-archive", "matrix_suite":"full"})
-            for suite in MATRIX_SUITES - {"full"}:
-                with self.subTest(platform=platform, suite=suite), self.assertRaises(ValueError):
-                    event_selection({"inputs":inputs | {"matrix_suite":suite}}, "workflow_dispatch")
-        with patch.object(ci_scope, "changed_paths", return_value=(["vendor/webrtc-sys-build/src/lib.rs"], False)):
-            self.assertNotEqual(event_selection({}, "push")["check_route"], "sdk-archive")
+    def test_rtc_libraries_and_sdk_archive_are_explicit_partial_native_only_on_each_supported_platform(self):
+        for route in ("sdk-archive", "rtc-libraries"):
+            for platform, platforms in MANUAL_PLATFORMS.items():
+                inputs = {"platform":platform, "checks":route, "matrix_suite":"full"}
+                selected = event_selection({"inputs":inputs}, "workflow_dispatch")
+                self.assertEqual(selected, {"native":True, "native_matrix":{"os":list(platforms)},
+                    "config":False, "wayland":False, "manual":True, "manual_platform":platform,
+                    "check_route":route, "matrix_suite":"full"})
+                for suite in MATRIX_SUITES - {"full"}:
+                    with self.subTest(platform=platform, suite=suite), self.assertRaises(ValueError):
+                        event_selection({"inputs":inputs | {"matrix_suite":suite}}, "workflow_dispatch")
+            with patch.object(ci_scope, "changed_paths", return_value=(["vendor/webrtc-sys-build/src/lib.rs"], False)):
+                self.assertNotEqual(event_selection({}, "push")["check_route"], route)
 
     def test_manual_routes_are_exact_existing_checks_and_matrix_suites(self):
-        self.assertEqual(MANUAL_CHECKS, {"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "sdk-archive",
+        self.assertEqual(MANUAL_CHECKS, {"all", "models", "desktop", "desktop-video", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive",
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
                                          "timeline-failures", "recovery-only", "media-only", "app-timeline",
@@ -677,9 +678,9 @@ class ScopeTests(unittest.TestCase):
         # comparisons with owned fixture bytes under test-only pins, so a
         # future different workflow can safely fall back all without requiring
         # its execution layout to be admitted by this exemption.
-        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 73746)
+        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 74462)
         self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
-                         "2f090183dd900cfbba63b8560102713c892b420c828bb21e24c3f81317871998")
+                         "1ba679d43f543a586b430cdc0f9bb73d27aac092ea50d73c8fb266fe75c795d8")
         import hashlib
         with patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_BYTES", len(workflow)), \
                 patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_SHA256", hashlib.sha256(workflow).hexdigest()):

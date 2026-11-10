@@ -2446,7 +2446,12 @@ mod tests {
                 kind: MediaStreamKind::Microphone,
             }
         );
-        wait_until(|| mic_muted(&fx, "own")).await;
+        wait_until(|| {
+            fx.engine
+                .local_state()
+                .is_some_and(|state| state.tile.microphone_muted)
+        })
+        .await;
         connection
             .send(ConnectionEvent::LocalTrackUnmuted {
                 identity: "id-own".into(),
@@ -2460,7 +2465,12 @@ mod tests {
                 kind: MediaStreamKind::Microphone,
             }
         );
-        wait_until(|| !mic_muted(&fx, "own")).await;
+        wait_until(|| {
+            fx.engine
+                .local_state()
+                .is_some_and(|state| !state.tile.microphone_muted)
+        })
+        .await;
         let add = |publication_id: &str, muted| ConnectionEvent::TrackAdded {
             identity: "id-bob".into(),
             publication_id: publication_id.into(),

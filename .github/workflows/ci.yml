@@ -17,7 +17,7 @@ on:
         description: Existing check route (focused results are partial evidence)
         type: choice
         default: all
-        options: [all, models, desktop, desktop-video, devices, vendor, sdk, sdk-archive, matrix, wayland, config, helpers]
+        options: [all, models, desktop, desktop-video, devices, vendor, rtc-libraries, sdk, sdk-archive, matrix, wayland, config, helpers]
       matrix_suite:
         description: Existing Matrix suite (non-full requires Linux and matrix)
         type: choice
@@ -309,7 +309,7 @@ jobs:
           test "$(grep -Fxc -- 'test atspi::interfaces::editable_text::tests::editable_text_protocol_accepts_only_supported_whole_replacement ... ok' "$RUNNER_TEMP/morpheus-accesskit-unix-result.txt")" = 1
           test "$(grep -Ec '^test result: ok\. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-accesskit-unix-result.txt")" = 1
       - name: Prepare the pinned owned native PipeWire client
-        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'wayland' || (needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite != 'drafts-only' && needs.scope.outputs.matrix_suite != 'timeline-failures' && needs.scope.outputs.matrix_suite != 'recovery-only' && needs.scope.outputs.matrix_suite != 'media-only' && needs.scope.outputs.matrix_suite != 'oauth-only'))
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'rtc-libraries' || needs.scope.outputs.check_route == 'wayland' || (needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite != 'drafts-only' && needs.scope.outputs.matrix_suite != 'timeline-failures' && needs.scope.outputs.matrix_suite != 'recovery-only' && needs.scope.outputs.matrix_suite != 'media-only' && needs.scope.outputs.matrix_suite != 'oauth-only'))
         timeout-minutes: 20
         shell: bash
         run: |
@@ -533,15 +533,16 @@ jobs:
         continue-on-error: true
         run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
       - name: Compile focused call libraries before regression deadline
-        if: needs.scope.outputs.check_route == 'vendor'
-        # Full native checks already compile the app graph. A focused vendor
-        # route must finish its cold compilation before the bounded test step.
+        id: rtc-library-compile
+        if: (needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'rtc-libraries')
+        # Full native checks already compile the app graph. Focused vendor and
+        # rtc-libraries routes compile before the bounded regression step.
         env:
           SLINT_EMIT_DEBUG_INFO: "1"
         run: cargo test --locked --no-fail-fast -p morpheus-rtc -p matrix-rtc-core -p matrix-rtc-call -p matrix-rtc-call-sdk -p matrix-rtc-transport -p matrix-rtc-matrix-sdk -p matrix-rtc-livekit --features morpheus-rtc/native-rtc,morpheus-rtc/native-devices --lib --no-run
       - name: Test call authentication and media ownership libraries
         id: rtc-library-tests
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'rtc-libraries')
         continue-on-error: true
         timeout-minutes: 20
         env:
@@ -899,6 +900,7 @@ jobs:
           WINDOWS_CAPTURE_OUTCOME: ${{ steps.windows-capture-tests.outcome }}
           WAYLAND_OUTCOME: ${{ steps.wayland-tests.outcome }}
           VENDOR_OUTCOME: ${{ steps.vendor-tests.outcome }}
+          RTC_LIBRARY_COMPILE_OUTCOME: ${{ steps.rtc-library-compile.outcome }}
           RTC_LIBRARY_OUTCOME: ${{ steps.rtc-library-tests.outcome }}
           VIDEO_SOURCE_OUTCOME: ${{ steps.video-source-tests.outcome }}
           SDK_OUTCOME: ${{ steps.sdk-receipt-tests.outcome }}
@@ -920,7 +922,7 @@ jobs:
               return selected
 
           def native_check_error(route, runner, wayland, outcomes):
-              routes = {"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "sdk-archive", "matrix", "wayland"}
+              routes = {"all", "models", "desktop", "desktop-video", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive", "matrix", "wayland"}
               if (not isinstance(route, str) or route not in routes or runner not in ("Linux", "Windows", "macOS")
                       or wayland not in ("true", "false") or not isinstance(outcomes, dict)):
                   return "Native check selection is missing or malformed."
@@ -936,12 +938,16 @@ jobs:
                   "windows-capture-tests": runner == "Windows" and route in ("all", "devices"),
                   "wayland-tests": runner == "Linux" and wayland == "true",
                   "vendor-tests": route in ("all", "vendor"),
-                  "rtc-library-tests": route in ("all", "vendor"),
+                  "rtc-library-tests": route in ("all", "vendor", "rtc-libraries"),
                   "video-source-tests": route in ("all", "vendor", "desktop-video"),
                   "sdk-receipt-tests": route in ("all", "sdk"),
                   "sdk-archive-tests": route == "sdk-archive",
                   "matrix-tests": runner == "Linux" and route in ("all", "matrix"),
               }
+              if route == "rtc-libraries":
+                  compile_result = outcomes.get("rtc-library-compile")
+                  if not isinstance(compile_result, dict) or compile_result.get("outcome") != "success":
+                      return "Focused call library compilation failed or did not run."
               for name, required in selected.items():
                   value = outcomes.get(name)
                   expected = "success" if required else "skipped"
@@ -958,6 +964,7 @@ jobs:
               ("model-tests", "MODEL_OUTCOME"), ("desktop-tests", "DESKTOP_OUTCOME"),
               ("device-tests", "DEVICE_OUTCOME"), ("windows-capture-tests", "WINDOWS_CAPTURE_OUTCOME"),
               ("wayland-tests", "WAYLAND_OUTCOME"), ("vendor-tests", "VENDOR_OUTCOME"),
+              ("rtc-library-compile", "RTC_LIBRARY_COMPILE_OUTCOME"),
               ("rtc-library-tests", "RTC_LIBRARY_OUTCOME"),
               ("video-source-tests", "VIDEO_SOURCE_OUTCOME"),
               ("sdk-receipt-tests", "SDK_OUTCOME"), ("sdk-archive-tests", "SDK_ARCHIVE_OUTCOME"),
@@ -1034,7 +1041,7 @@ jobs:
               choices = {"all": ["macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025"],
                          "linux": ["ubuntu-24.04"], "windows": ["windows-2025"],
                          "macos-arm": ["macos-15"], "macos-intel": ["macos-15-intel"]}
-              routes = {"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk", "sdk-archive", "matrix", "wayland", "config", "helpers"}
+              routes = {"all", "models", "desktop", "desktop-video", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive", "matrix", "wayland", "config", "helpers"}
               suites = {"full", "draft-recovery", "drafts-only", "timeline-reads", "timeline-failures", "recovery-only",
                         "media-only", "app-timeline", "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "rtc-media", "element-interop"}
               if (event_name not in ("push", "pull_request", "workflow_dispatch")
