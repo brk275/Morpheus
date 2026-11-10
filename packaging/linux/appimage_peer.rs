@@ -288,6 +288,13 @@ fn exact_sender(
     (matches == 1 && member.reachable).then(|| (member.member_id.clone(), device.to_owned()))
 }
 
+#[derive(Clone, Copy)]
+enum FrameWait {
+    NoTrack,
+    NoFrame,
+    NoMatch,
+}
+
 async fn frame(
     rtc: &RtcService,
     client: &Client,
@@ -297,7 +304,10 @@ async fn frame(
     device: &str,
     color: Color,
 ) {
-    timeout(Duration::from_secs(45), async {
+    // This latch owns no track or frame; only the existing timeout panic uses it.
+    let mut observation = None;
+    let result = timeout(Duration::from_secs(45), async {
+        observation = Some(FrameWait::NoTrack);
         let track = loop {
             assert!(
                 exact_sender(rtc, client, room, alice, Some((member, device))).is_some(),
@@ -315,6 +325,7 @@ async fn frame(
         let mut frames = track
             .video_frames()
             .expect("Screen track has no video frames");
+        observation = Some(FrameWait::NoFrame);
         while let Some(frame) = frames.next().await {
             assert!(
                 exact_sender(rtc, client, room, alice, Some((member, device))).is_some(),
@@ -323,11 +334,19 @@ async fn frame(
             if color_matches(&frame.buffer, color) {
                 return;
             }
+            observation = Some(FrameWait::NoMatch);
         }
         panic!("Installed screen track ended before matching pixels");
     })
-    .await
-    .expect("Installed screen pixels were not delivered");
+    .await;
+    result.expect(match observation {
+        Some(FrameWait::NoTrack) => "Installed screen track was not observed before deadline",
+        Some(FrameWait::NoFrame) => "Installed screen stream delivered no frame before deadline",
+        Some(FrameWait::NoMatch) => {
+            "Installed screen frames did not match expected source before deadline"
+        }
+        None => "Installed screen pixels were not delivered",
+    });
 }
 
 async fn stopped(

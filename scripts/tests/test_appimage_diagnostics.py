@@ -18,6 +18,80 @@ import package_appimage as P
 
 
 class ProgressTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "POSIX private peer log identities")
+    def test_precise_frame_deadline_sites_keep_scan_cleanup_failure_and_privacy_boundaries(self):
+        import appimage_capture as capture
+        labels = (
+            (b"Installed screen track was not observed before deadline", "screen_track_deadline"),
+            (b"Installed screen stream delivered no frame before deadline", "screen_frame_deadline"),
+            (b"Installed screen frames did not match expected source before deadline", "screen_match_deadline"),
+        )
+        frame = b"thread 'private peer' (1234) panicked at /private/source/packaging/linux/appimage_peer.rs:1:2:\n"
+        observed = {"role": "peer", "status": 101, "app_stdout": "clear", "app_stderr": "clear",
+                    "peer_stdout": "clear", "peer_stderr": "clear"}
+        for mode, case in (("ordinary", "ordinary"), ("eager_bindings", "bindings")):
+            for label, token in labels:
+                with self.subTest(mode=mode, token=token), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory); session = root / case / "session"
+                    session.mkdir(mode=0o700, parents=True); (root / case).chmod(0o700)
+                    peer_log = session / "peer.stderr.log"
+                    peer_log.write_bytes(frame + label + b": Elapsed(())\n" + frame +
+                        b"Installed capture phase deadline exceeded: private payload\n")
+                    peer_log.chmod(0o600)
+                    app_log = session / "app.stderr.log"; app_log.write_bytes(b""); app_log.chmod(0o600)
+                    progress = D.Progress(root); progress.wrapper("capture")
+                    progress.capture(mode, "reopened_frame"); progress.command("capture-yellow")
+                    error = capture.CaptureFailure("process_exit"); error.process_exit = dict(observed)
+                    progress.failed(error); first = json.loads(json.dumps(progress.value["failure"]))
+                    with mock.patch.object(D, "peer_failure_marker", side_effect=AssertionError("premature peer read")):
+                        self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed",
+                            outer_reason="namespace_exit"), {"diagnostics": "withheld", "passed": False})
+                        live = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                        self.assertNotIn("peer_failure_marker", live)
+                        progress.cleanup(True)
+                        failed_cleanup = D.public_failure(root, scan_passed=True, outer_cleanup="failed", outer_reason="namespace_exit")
+                        self.assertNotIn("peer_failure_marker", failed_cleanup)
+                    result = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                    self.assertEqual(result["failure"], first); self.assertFalse(result["passed"])
+                    self.assertEqual(result["peer_failure_marker"], {"status": "scanned_private_peer_stderr",
+                        "panic_site": "ambiguous", "panic_sites": sorted([token, "work_deadline"])})
+                    self.assertEqual(progress.value["failure"], first)
+                    for private in ("private peer", "/private/source", "private payload", "Elapsed"):
+                        self.assertNotIn(private, json.dumps(result))
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX private peer log identities")
+    def test_generic_partial_and_foreign_peer_panics_never_infer_precise_frame_progress(self):
+        frame = b"thread 'peer' panicked at packaging/linux/appimage_peer.rs:1:2:\n"
+        precise = {"screen_track_deadline", "screen_frame_deadline", "screen_match_deadline"}
+        labels = (b"Installed screen track was not observed before deadline",
+                  b"Installed screen stream delivered no frame before deadline",
+                  b"Installed screen frames did not match expected source before deadline")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); session = root / "bindings/session"
+            session.mkdir(mode=0o700, parents=True); (root / "bindings").chmod(0o700)
+            path = session / "peer.stderr.log"
+            def reduce(body):
+                path.write_bytes(body); path.chmod(0o600)
+                return D.peer_failure_marker(root, "eager_bindings", scan_passed=True, include_sites=True)
+            generic = reduce(frame + b"Installed screen pixels were not delivered: private payload\n" +
+                frame + b"Installed capture phase deadline exceeded\n")
+            self.assertEqual(generic, {"status": "scanned_private_peer_stderr", "panic_site": "ambiguous",
+                                      "panic_sites": ["screen_pixel_deadline", "work_deadline"]})
+            wrapper = reduce(frame + b"Installed capture phase deadline exceeded\n")
+            self.assertEqual(wrapper["panic_sites"], ["work_deadline"])
+            self.assertTrue(precise.isdisjoint(generic["panic_sites"]))
+            self.assertTrue(precise.isdisjoint(wrapper["panic_sites"]))
+            for label in labels:
+                for body in (label + b"\n", frame + label[:-1] + b"\n",
+                             frame + b"private prefix " + label + b"\n", frame + label + b" extra payload\n",
+                             frame.replace(b"appimage_peer.rs", b"foreign.rs") + label + b"\n"):
+                    with self.subTest(label=label, body=body[:96]):
+                        result = reduce(body)
+                        self.assertEqual(result["panic_site"], "unknown")
+                        self.assertTrue(precise.isdisjoint(result["panic_sites"]))
+                        for private in ("private prefix", "extra payload", "foreign.rs"):
+                            self.assertNotIn(private, json.dumps(result))
+
     def test_runtime_wait_records_are_exact_complete_unique_and_closed(self):
         prefix = b"\nMORPHEUS_APPIMAGE_WAIT_V1 "
         for cleanup in ("passed", "failed", "skipped"):
