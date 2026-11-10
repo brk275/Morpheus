@@ -570,6 +570,76 @@
       "fingerprint": "3e558a2ff41ecb7d90b2809229e6b63620c99171:vendor/matrix-rtc-call/src/client/tests.rs:generic-api-key:113",
       "blob_sha256": "5e3434e50f0219617bba230f0c3a40cb3b8089e67091593e09cb3abcf38af1ca",
       "provenance": "Public matrix-rust-rtc fixed bytes 0 through 15 media-key fixture in bob_key; authenticated upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 crates/matrix-rtc-call/src/client/tests.rs blob 80f3bd15955cfa6a43d69081c51c8934839b6c47; candidate adds actor regression below the unchanged fixture."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlcipher/sqlite3ext.h:generic-api-key:422",
+      "blob_sha256": "ea81fb7bd05882e0e0b92c4d60f677b205f7f1fbf085f218b12f0b5b3f0b9e48",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlcipher/sqlite3ext.h:generic-api-key:578",
+      "blob_sha256": "ea81fb7bd05882e0e0b92c4d60f677b205f7f1fbf085f218b12f0b5b3f0b9e48",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlcipher/sqlite3ext.h:generic-api-key:670",
+      "blob_sha256": "ea81fb7bd05882e0e0b92c4d60f677b205f7f1fbf085f218b12f0b5b3f0b9e48",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlite3/sqlite3ext.h:generic-api-key:426",
+      "blob_sha256": "ac9645e5c9ff0cf176efdd6e75cb5e98f46295d38e02db5c4d208826a39ab4be",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlite3/sqlite3ext.h:generic-api-key:582",
+      "blob_sha256": "ac9645e5c9ff0cf176efdd6e75cb5e98f46295d38e02db5c4d208826a39ab4be",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlite3/sqlite3ext.h:generic-api-key:674",
+      "blob_sha256": "ac9645e5c9ff0cf176efdd6e75cb5e98f46295d38e02db5c4d208826a39ab4be",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlite3/sqlite3.c:generic-api-key:142753",
+      "blob_sha256": "478a6a723c88f339b98361e341e1bd7457dfa08508f79beec3f5286849c23139",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlite3/sqlite3.c:generic-api-key:142909",
+      "blob_sha256": "478a6a723c88f339b98361e341e1bd7457dfa08508f79beec3f5286849c23139",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlite3/sqlite3.c:generic-api-key:143001",
+      "blob_sha256": "478a6a723c88f339b98361e341e1bd7457dfa08508f79beec3f5286849c23139",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlcipher/sqlite3.c:generic-api-key:146243",
+      "blob_sha256": "7fa12f919a1325f1fa4a58069a4f55a39ecb3a238cbec0f9e62a161cde8576a4",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlcipher/sqlite3.c:generic-api-key:146399",
+      "blob_sha256": "7fa12f919a1325f1fa4a58069a4f55a39ecb3a238cbec0f9e62a161cde8576a4",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlcipher/sqlite3.c:generic-api-key:146491",
+      "blob_sha256": "7fa12f919a1325f1fa4a58069a4f55a39ecb3a238cbec0f9e62a161cde8576a4",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public SQLite API dispatch macro. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlite3/sqlite3.c:generic-api-key:259362",
+      "blob_sha256": "478a6a723c88f339b98361e341e1bd7457dfa08508f79beec3f5286849c23139",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public FTS5 internal averages-row identifier comparison. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
+    },
+    {
+      "fingerprint": "54fc728ddbc45d81336661ee725c79caa63264b0:vendor/libsqlite3-sys/sqlcipher/sqlite3.c:generic-api-key:261689",
+      "blob_sha256": "7fa12f919a1325f1fa4a58069a4f55a39ecb3a238cbec0f9e62a161cde8576a4",
+      "provenance": "Public libsqlite3-sys 0.38.2 source from crates.io archive SHA256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8; public FTS5 internal averages-row identifier comparison. Exact complete blob includes only reviewed official SQLite short-WAL-page zero-fill backport where applicable."
     }
   ]
 }
