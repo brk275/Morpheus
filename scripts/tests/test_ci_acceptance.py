@@ -189,6 +189,30 @@ class AcceptanceTests(unittest.TestCase):
                 changed = json.loads(json.dumps(value)); changed["compile"]["result"] = result
                 self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
 
+    def test_app_guards_aggregate_requires_the_exact_manual_matrix_and_wayland(self):
+        choices = {"all": list(PLATFORMS), "linux": ["ubuntu-24.04"], "windows": ["windows-2025"],
+                   "macos-arm": ["macos-15"], "macos-intel": ["macos-15-intel"]}
+        for platform, platforms in choices.items():
+            wayland = "ubuntu-24.04" in platforms
+            value = snapshot(True, platforms=platforms, wayland=wayland)
+            value["scope"]["outputs"].update(manual="true", manual_platform=platform, check_route="app-guards")
+            self.assertIsNone(acceptance_error(value, "workflow_dispatch"))
+            for event in ("push", "pull_request"):
+                self.assertIsNotNone(acceptance_error(value, event))
+                automatic = json.loads(json.dumps(value))
+                automatic["scope"]["outputs"]["manual"] = "false"
+                self.assertIsNotNone(acceptance_error(automatic, event))
+            for key, bad in (("wayland", str(not wayland).lower()), ("config", "true"),
+                             ("matrix_suite", "native-call"), ("matrix_suite", "rtc-media")):
+                changed = json.loads(json.dumps(value)); changed["scope"]["outputs"][key] = bad
+                self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
+            changed = json.loads(json.dumps(value))
+            changed["scope"]["outputs"]["native_matrix"] = json.dumps({"os": platforms[:-1]})
+            self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
+            for result in ("skipped", "failure", "cancelled", "neutral", None):
+                changed = json.loads(json.dumps(value)); changed["compile"]["result"] = result
+                self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
+
     def test_oauth_only_manual_result_requires_exact_linux_matrix_scope_and_passed_job(self):
         value = snapshot(True, platforms=["ubuntu-24.04"], wayland=False)
         value["scope"]["outputs"].update(manual="true", manual_platform="linux", check_route="matrix", matrix_suite="oauth-only")
@@ -297,7 +321,10 @@ class WaylandWorkflowTests(unittest.TestCase):
         build = source.split("      - name: Build desktop with native call and device adapters\n", 1)[1].split("      - name:", 1)[0]
         # Bind capture to the actual app-producing step, rather than a vendor
         # library test that can leave the binary absent or stale in the cache.
-        self.assertIn("if: " + app_route + "\n", build)
+        build_route = "(needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')"
+        self.assertIn("if: " + build_route + "\n", build)
+        self.assertNotIn("app-guards", capture)
+        self.assertNotIn("app-guards", upload)
         self.assertIn("if: " + route + " && " + app_route + "\n", capture)
         self.assertIn("if: " + route + " && steps.preview-capture.outcome == 'success'\n", upload)
         self.assertIn("--morpheus-capture-preview", capture)
@@ -334,7 +361,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
     def test_selected_steps_must_pass_and_unselected_steps_must_be_skipped(self):
         source = WORKFLOW.read_text(encoding="utf-8")
         device = source.split("      - name: Test native device and call guards\n", 1)[1].split("      - name:", 1)[0]
-        self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'desktop-video')\n", device)
+        self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'desktop-video')\n", device)
         self.assertIn("run: cargo test --locked -p morpheus-rtc --features native-devices --lib\n", device)
         validate = load_native_validator()
         for runner in ("Linux","Windows","macOS"):
@@ -456,6 +483,68 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertIn("needs.scope.outputs.check_route == 'rtc-libraries'", pipewire)
         self.assertIn("python3 scripts/build_linux_native.py --variant native", pipewire)
 
+    def test_app_guards_requires_selected_results_and_refuses_library_or_live_work(self):
+        validate = load_native_validator()
+        project = load_native_validator("native_wayland_selection")
+        for runner in ("Linux", "Windows", "macOS"):
+            wayland = "true" if runner == "Linux" else "false"
+            outcomes = {name: {"outcome": "success"} for name in (
+                "model-tests", "desktop-tests", "device-tests", "video-source-tests")}
+            outcomes.update({name: {"outcome": "skipped"} for name in (
+                "vendor-tests", "rtc-library-compile", "rtc-library-tests", "sdk-receipt-tests",
+                "sdk-archive-tests", "matrix-tests", "preview-capture", "preview-upload")})
+            outcomes["windows-capture-tests"] = {"outcome": "success" if runner == "Windows" else "skipped"}
+            outcomes["wayland-tests"] = {"outcome": "success" if runner == "Linux" else "skipped"}
+            self.assertIsNone(validate("app-guards", runner, wayland, outcomes))
+            self.assertEqual(project("app-guards", runner, "true"), wayland)
+            self.assertIsNone(validate("app-guards", runner, project("app-guards", runner, "true"), outcomes))
+            self.assertEqual(project("app-guards", runner, "false"), "false")
+            self.assertIsNotNone(validate("app-guards", runner, "false" if runner == "Linux" else "true", outcomes))
+            for name, expected in outcomes.items():
+                missing = outcomes.copy(); del missing[name]
+                self.assertIsNotNone(validate("app-guards", runner, wayland, missing))
+                for bad in (None, "failure", "cancelled", "neutral",
+                            "skipped" if expected["outcome"] == "success" else "success"):
+                    with self.subTest(runner=runner, step=name, outcome=bad):
+                        self.assertIsNotNone(validate("app-guards", runner, wayland,
+                                                     outcomes | {name: {"outcome": bad}}))
+            for malformed in (None, "", "TRUE", True, False, [], {}):
+                self.assertIs(project("app-guards", runner, malformed), malformed)
+                self.assertIsNotNone(validate("app-guards", runner,
+                                             project("app-guards", runner, malformed), outcomes))
+
+    def test_app_guards_wires_existing_steps_without_changing_omitted_routes_or_preview(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        selected = (
+            "Test Linux editable text accessibility boundaries",
+            "Prepare the pinned owned native PipeWire client",
+            "Check native interface compilation before desktop dependencies",
+            "Test configuration, Matrix, and RTC protocol models",
+            "Check desktop and Matrix crates", "Build desktop with native call and device adapters",
+            "Verify the actual Linux app uses its owned native client", "Smoke test Linux desktop startup under Xvfb",
+            "Test desktop controller and call guards", "Test native device and call guards",
+            "Test Windows capture of an owned synthetic window and display", "Test synthetic native video source ownership",
+        )
+        omitted = (
+            "Compile focused call libraries before regression deadline", "Test call authentication and media ownership libraries",
+            "Compile focused vendor app prerequisites before regressions", "Test vendored security fixes",
+            "Test pinned SDK sticky receipt and redaction regressions", "Test reviewed SDK archive and response boundaries",
+            "Test real Matrix accounts, recovery, moderation, and encrypted RTC",
+            "Capture actual native preview screens", "Upload native preview PNGs and provenance only",
+        )
+        for name in selected + omitted:
+            marker = "      - name: " + name + "\n"
+            self.assertEqual(source.count(marker), 1)
+            step = source.split(marker, 1)[1].split("      - name:", 1)[0]
+            condition = next(line for line in step.splitlines() if line.startswith("        if: "))
+            with self.subTest(step=name):
+                self.assertEqual("needs.scope.outputs.check_route == 'app-guards'" in condition, name in selected)
+        wayland = source.split("      - name: Test real Wayland portal streaming, source loss, and cancellation\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("if: runner.os == 'Linux' && needs.scope.outputs.wayland != 'false'", wayland)
+        self.assertIn("run: python3 scripts/run_wayland_acceptance.py", wayland)
+        self.assertIn("'Focused CI acceptance (partial)' || 'CI acceptance'", source)
+        self.assertIn("format('Focused {0} ({1}, partial)'", source)
+
     def test_native_compile_budget_covers_cold_mac_graphs_without_changing_windows(self):
         source = WORKFLOW.read_text(encoding="utf-8")
         compile_job = source.split("  compile:\n", 1)[1].split("    strategy:\n", 1)[0]
@@ -469,7 +558,7 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertEqual(source.count(start), 1)
         step = source.split(start, 1)[1].split(end, 1)[0]
         self.assertIn("        id: video-source-tests\n", step)
-        self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'desktop-video')", step)
+        self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'desktop-video')", step)
         cases = (
             "imp::video_source::tests::unused_source_drop_before_first_poll_releases_native_owner",
             "imp::video_source::tests::last_source_clone_drop_while_warmup_pending_releases_native_owner",

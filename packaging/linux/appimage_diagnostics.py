@@ -540,8 +540,33 @@ def _capture_marker_codes(data):
     return {"status": "known_codes", "codes": observed}
 
 
-def capture_failure_markers(root, mode, *, scan_passed):
+def _app_process_marker_codes(data):
+    """Observe fixed stderr labels; neither identify a child signal nor a cause."""
+    if (type(data) is not bytes or len(data) > 8 * 1024 * 1024
+            or data.count(b"\n") > 65536):
+        return {"status": "invalid", "codes": []}
+    observed = set()
+    for raw in data.split(b"\n", 65536):
+        line = raw.removesuffix(b"\r")
+        # Never export the executable/library path, symbol or private payload.
+        # Unknown, localized, malformed or oversized lines stay unclassified.
+        if len(line) > 8192 or b"\x00" in line:
+            continue
+        if b": symbol lookup error: " in line and b": undefined symbol: " in line:
+            observed.add("loader_undefined_symbol")
+        if b": error while loading shared libraries: " in line:
+            observed.add("loader_shared_libraries")
+        if line == b"Failed to clean up cache directory":
+            observed.add("runtime_cleanup")
+        if line.startswith(b"Failed to run ") and b": " in line[len(b"Failed to run "):]:
+            observed.add("runtime_exec")
+    return {"status": "observed_fixed_labels" if observed else "unknown", "codes": sorted(observed)}
+
+
+def capture_failure_markers(root, mode, *, scan_passed, include_process=False):
     """Read only the stopped, independently scanned owned app stderr."""
+    if type(include_process) is not bool:
+        raise ValueError("Invalid private process marker selection")
     if scan_passed is not True:
         return {"status": "withheld", "codes": []}
     from appimage_client import private_directory
@@ -582,6 +607,8 @@ def capture_failure_markers(root, mode, *, scan_passed):
     result = _capture_marker_codes(data)
     if result["status"] == "known_codes":
         result["status"] = "scanned_private_app_stderr"
+    if include_process:
+        result["process_markers"] = _app_process_marker_codes(data)
     return result
 
 
@@ -619,8 +646,19 @@ def public_failure(root, *, scan_passed, outer_cleanup, outer_reason):
             # establish which process failed, causality or package acceptance.
             result["peer_failure_marker"] = peer_failure_marker(
                 root, failure["capture_mode"], scan_passed=scan_passed, include_sites=True)
+        owned_app_exit = (failure is not None and failure["reason"] == "capture_process_exit"
+                          and valid_process_exit(failure.get("process_exit"))
+                          and failure["process_exit"]["role"] == "app")
+        if (failure is not None and failure["wrapper_phase"] == "capture"
+                and failure["reason"] == "capture_process_exit"
+                and (failure["capture_phase"] == "reopened_frame" or owned_app_exit)
+                and value["inner_cleanup"] == "passed" and outer_cleanup == "passed"):
+            # The exact owned app can exit during any closed capture phase.
+            # Keep the original first failure; reduce the same stopped/scanned
+            # bounded stderr, without changing watch order or acceptance.
             result["native_capture_failure_markers"] = capture_failure_markers(
-                root, failure["capture_mode"], scan_passed=scan_passed)
+                root, failure["capture_mode"], scan_passed=scan_passed,
+                include_process=owned_app_exit)
         if (failure is not None and failure["wrapper_phase"] == "capture"
                 and failure["capture_phase"] == "reopened_frame"
                 and failure["command_stage"] == "capture-yellow"

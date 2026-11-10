@@ -55,6 +55,113 @@ class ProgressTests(unittest.TestCase):
                 self.assertNotIn("native_capture_failure_markers", result)
             self.assertEqual(progress.value["failure"], first)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX private capture log identities")
+    def test_owned_app_exit_reduces_stopped_scanned_stderr_in_changed_and_other_capture_phases(self):
+        import appimage_capture as capture
+        observed = {"role": "app", "status": 127, "app_stdout": "clear", "app_stderr": "clear",
+                    "peer_stdout": "clear", "peer_stderr": "clear"}
+        for mode, case, phase, command in (("ordinary", "ordinary", "changed_frame", "capture-green"),
+                ("eager_bindings", "bindings", "changed_after_reopen", "capture-magenta"),
+                ("ordinary", "ordinary", "static_frame", "capture-window"),
+                ("ordinary", "ordinary", "source_loss", "capture-remove-source")):
+            with self.subTest(mode=mode, phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); session = root / case / "session"
+                session.mkdir(mode=0o700, parents=True); (root / case).chmod(0o700)
+                log = session / "app.stderr.log"
+                log.write_bytes(D.CAPTURE_FAILURE_PREFIX + b"capture_frame_push\n" +
+                    b"/private/app: symbol lookup error: /private/library: undefined symbol: private_symbol\n" +
+                    b"Failed to clean up cache directory\nprivate Matrix ID payload\n")
+                log.chmod(0o600)
+                progress = D.Progress(root); progress.wrapper("capture"); progress.capture(mode, phase)
+                progress.command(command); error = capture.CaptureFailure("process_exit")
+                error.process_exit = dict(observed); progress.failed(error); progress.cleanup(True)
+                original = json.loads(json.dumps(progress.value["failure"]))
+                with mock.patch.object(D, "peer_failure_marker", side_effect=AssertionError("unrelated peer read")):
+                    result = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                self.assertEqual(result["failure"], original); self.assertFalse(result["passed"])
+                self.assertEqual(result["native_capture_failure_markers"], {"status": "scanned_private_app_stderr",
+                    "codes": ["capture_frame_push"], "process_markers": {"status": "observed_fixed_labels",
+                    "codes": ["loader_undefined_symbol", "runtime_cleanup"]}})
+                for private in ("/private/", "private_symbol", "private Matrix ID payload"):
+                    self.assertNotIn(private, json.dumps(result))
+                self.assertEqual(progress.value["failure"], original)
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX private capture log identities")
+    def test_new_app_exit_marker_path_refuses_unscanned_unstopped_other_roles_and_unknown_records(self):
+        import appimage_capture as capture
+        observed = {"role": "app", "status": 127, "app_stdout": "clear", "app_stderr": "clear",
+                    "peer_stdout": "clear", "peer_stderr": "clear"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); progress = D.Progress(root); progress.wrapper("capture")
+            progress.capture("ordinary", "changed_frame"); progress.command("capture-green")
+            error = capture.CaptureFailure("process_exit"); error.process_exit = dict(observed)
+            progress.failed(error); original = json.loads(json.dumps(progress.value["failure"]))
+            with mock.patch.object(D, "capture_failure_markers", side_effect=AssertionError("private read forbidden")):
+                self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                                 {"diagnostics": "withheld", "passed": False})
+                live = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                self.assertNotIn("native_capture_failure_markers", live)
+                progress.cleanup(True)
+                stopped = D.public_failure(root, scan_passed=True, outer_cleanup="failed", outer_reason="namespace_exit")
+                self.assertNotIn("native_capture_failure_markers", stopped)
+                for role in ("peer", "other"):
+                    progress.value["failure"]["process_exit"]["role"] = role; progress.save()
+                    result = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                    self.assertNotIn("native_capture_failure_markers", result); self.assertFalse(result["passed"])
+                progress.value["failure"]["process_exit"]["role"] = "private unknown role"
+                progress.path.write_text(json.dumps(progress.value))
+                self.assertEqual(D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit"),
+                                 {"diagnostics": "withheld", "passed": False})
+            self.assertEqual(original["process_exit"], observed)
+
+    def test_process_stderr_labels_are_closed_bounded_and_do_not_infer_a_signal_or_cause(self):
+        labels = D._app_process_marker_codes(
+            b"/private/app: error while loading shared libraries: private.so: private reason\n" +
+            b"Failed to run /private/AppRun: private reason\n" +
+            b"Failed to run /private/AppRun: private reason\n")
+        self.assertEqual(labels, {"status": "observed_fixed_labels", "codes": ["loader_shared_libraries", "runtime_exec"]})
+        self.assertNotIn("private", json.dumps(labels))
+        for data in (b"unknown private stderr\n", b"symbol lookup error without framing\n",
+                     b"/private/app: symbol lookup error: no known undefined-symbol label\n",
+                     b"Failed to run without delimiter\n", b"Failed to clean up cache directory extra\n",
+                     b"\x00Failed to clean up cache directory\n",
+                     b"x" * 8193 + b": error while loading shared libraries: private\n"):
+            self.assertEqual(D._app_process_marker_codes(data), {"status": "unknown", "codes": []})
+        for data in (None, "private text", b"x" * (8 * 1024 * 1024 + 1), b"\n" * 65537):
+            self.assertEqual(D._app_process_marker_codes(data), {"status": "invalid", "codes": []})
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX private capture log identities")
+    def test_process_marker_option_retains_exact_private_file_identity_and_size_guards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); session = root / "ordinary/session"
+            session.mkdir(mode=0o700, parents=True); (root / "ordinary").chmod(0o700)
+            log = session / "app.stderr.log"; log.write_bytes(b"unknown private stderr\n"); log.chmod(0o600)
+            result = D.capture_failure_markers(root, "ordinary", scan_passed=True, include_process=True)
+            self.assertEqual(result, {"status": "scanned_private_app_stderr", "codes": [],
+                                     "process_markers": {"status": "unknown", "codes": []}})
+            with mock.patch.object(Path, "lstat", side_effect=AssertionError("unscanned file read")):
+                self.assertEqual(D.capture_failure_markers(root, "ordinary", scan_passed=False, include_process=True),
+                                 {"status": "withheld", "codes": []})
+            for unsafe in ("permissions", "symlink", "hardlink", "size"):
+                with self.subTest(unsafe=unsafe):
+                    log.unlink(); log.write_bytes(b"private"); log.chmod(0o600)
+                    other = session / "other"
+                    if unsafe == "permissions":
+                        log.chmod(0o644)
+                    elif unsafe == "symlink":
+                        other.write_bytes(b"private"); other.chmod(0o600); log.unlink(); log.symlink_to(other)
+                    elif unsafe == "hardlink":
+                        os.link(log, other)
+                    else:
+                        with log.open("r+b") as stream:
+                            stream.truncate(8 * 1024 * 1024 + 1)
+                    with self.assertRaises(ValueError):
+                        D.capture_failure_markers(root, "ordinary", scan_passed=True, include_process=True)
+                    if other.exists():
+                        other.unlink()
+            with self.assertRaises(ValueError):
+                D.capture_failure_markers(root, "ordinary", scan_passed=False, include_process="private")
+
     def test_owned_capture_exit_is_closed_first_latched_and_independently_scan_gated(self):
         import appimage_capture as capture
         observed = {"role": "app", "status": -13, "app_stdout": "clear", "app_stderr": "truncated",

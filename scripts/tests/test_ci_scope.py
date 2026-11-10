@@ -383,7 +383,7 @@ class ScopeTests(unittest.TestCase):
                 self.assertNotEqual(event_selection({}, "push")["check_route"], route)
 
     def test_manual_routes_are_exact_existing_checks_and_matrix_suites(self):
-        self.assertEqual(MANUAL_CHECKS, {"all", "models", "desktop", "desktop-video", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive",
+        self.assertEqual(MANUAL_CHECKS, {"all", "models", "desktop", "desktop-video", "app-guards", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive",
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
                                          "timeline-failures", "recovery-only", "media-only", "app-timeline",
@@ -399,7 +399,7 @@ class ScopeTests(unittest.TestCase):
             selected = event_selection({"inputs": {"platform": platform, "checks": route}}, "workflow_dispatch")
             self.assertEqual(selected["config"], route == "config")
             self.assertEqual(selected["native"], route not in {"config", "helpers"})
-            self.assertEqual(selected["wayland"], route in {"all", "wayland"})
+            self.assertEqual(selected["wayland"], route in {"all", "wayland", "app-guards"})
         for suite in MATRIX_SUITES:
             selected = event_selection({"inputs": {"platform": "linux", "checks": "matrix", "matrix_suite": suite}},
                                        "workflow_dispatch")
@@ -421,6 +421,26 @@ class ScopeTests(unittest.TestCase):
                     with self.subTest(suite=suite), self.assertRaises(ValueError):
                         event_selection({"inputs": {"platform": platform, "checks": "desktop-video",
                                                     "matrix_suite": suite}}, "workflow_dispatch")
+
+    def test_app_guards_is_manual_with_exact_platform_and_wayland_scope(self):
+        for platform, platforms in MANUAL_PLATFORMS.items():
+            inputs = {"platform": platform, "checks": "app-guards", "matrix_suite": "full"}
+            with self.subTest(platform=platform):
+                self.assertEqual(event_selection({"inputs": inputs}, "workflow_dispatch"), {
+                    "native": True, "native_matrix": {"os": list(platforms)}, "config": False,
+                    "wayland": "ubuntu-24.04" in platforms, "manual": True,
+                    "manual_platform": platform, "check_route": "app-guards", "matrix_suite": "full",
+                })
+            for suite in MATRIX_SUITES - {"full"}:
+                with self.subTest(platform=platform, suite=suite), self.assertRaises(ValueError):
+                    event_selection({"inputs": inputs | {"matrix_suite": suite}}, "workflow_dispatch")
+        for event in ("push", "pull_request"):
+            with patch.object(ci_scope, "changed_paths", return_value=(["Cargo.lock"], False)):
+                selected = event_selection({"inputs": {"platform": "windows", "checks": "app-guards"}}, event)
+                self.assertEqual(selected["check_route"], "all")
+                self.assertEqual(selected["native_matrix"], {"os": list(PLATFORMS)})
+                self.assertTrue(selected["wayland"])
+                self.assertFalse(selected["manual"])
 
     def test_recovery_only_requires_explicit_linux_matrix_and_no_other_platform(self):
         inputs = {"platform": "linux", "checks": "matrix", "matrix_suite": "recovery-only"}
@@ -678,9 +698,9 @@ class ScopeTests(unittest.TestCase):
         # comparisons with owned fixture bytes under test-only pins, so a
         # future different workflow can safely fall back all without requiring
         # its execution layout to be admitted by this exemption.
-        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 74462)
+        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 75789)
         self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
-                         "1ba679d43f543a586b430cdc0f9bb73d27aac092ea50d73c8fb266fe75c795d8")
+                         "a9f6fa957f1c7ae93d61efca0181ab96ba5b06a168f9ff00fb2b7b99d5d1c3b8")
         import hashlib
         with patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_BYTES", len(workflow)), \
                 patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_SHA256", hashlib.sha256(workflow).hexdigest()):

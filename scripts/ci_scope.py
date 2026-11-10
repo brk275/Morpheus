@@ -179,7 +179,7 @@ MANUAL_PLATFORMS = {
     "macos-arm": ("macos-15",),
     "macos-intel": ("macos-15-intel",),
 }
-MANUAL_CHECKS = frozenset({"all", "models", "desktop", "desktop-video", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive",
+MANUAL_CHECKS = frozenset({"all", "models", "desktop", "desktop-video", "app-guards", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive",
                            "matrix", "wayland", "config", "helpers"})
 # Exact existing suites from run_matrix_acceptance.py; no new test composition.
 MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-reads",
@@ -254,8 +254,8 @@ AUTOMATIC_CONTROL_INPUTS = frozenset((
     "scripts/ci_scope.py", "scripts/tests/test_ci_scope.py",
     ".github/workflows/ci.yml", "scripts/tests/test_ci_acceptance.py",
 ))
-REVIEWED_CONTROL_WORKFLOW_SHA256 = "1ba679d43f543a586b430cdc0f9bb73d27aac092ea50d73c8fb266fe75c795d8"
-REVIEWED_CONTROL_WORKFLOW_BYTES = 74462
+REVIEWED_CONTROL_WORKFLOW_SHA256 = "a9f6fa957f1c7ae93d61efca0181ab96ba5b06a168f9ff00fb2b7b99d5d1c3b8"
+REVIEWED_CONTROL_WORKFLOW_BYTES = 75789
 
 
 # The shared archive downloader is exercised by the existing four-platform
@@ -719,7 +719,7 @@ def event_selection(event, event_name):
     return {
         "native": bool(platforms), "native_matrix": {"os": list(platforms)},
         "config": route == "config",
-        "wayland": "ubuntu-24.04" in platforms and route in {"all", "wayland"},
+        "wayland": "ubuntu-24.04" in platforms and route in {"all", "wayland", "app-guards"},
         "manual": True, "manual_platform": platform,
         "check_route": route, "matrix_suite": suite,
     }

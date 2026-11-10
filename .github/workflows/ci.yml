@@ -17,7 +17,7 @@ on:
         description: Existing check route (focused results are partial evidence)
         type: choice
         default: all
-        options: [all, models, desktop, desktop-video, devices, vendor, rtc-libraries, sdk, sdk-archive, matrix, wayland, config, helpers]
+        options: [all, models, desktop, desktop-video, app-guards, devices, vendor, rtc-libraries, sdk, sdk-archive, matrix, wayland, config, helpers]
       matrix_suite:
         description: Existing Matrix suite (non-full requires Linux and matrix)
         type: choice
@@ -291,7 +291,7 @@ jobs:
           done
           test "$(grep -Ec "^test result: ok\. ${#sdk_archive_tests[@]} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in .+$" "$RUNNER_TEMP/morpheus-sdk-archive-result.txt")" = 1
       - name: Test Linux editable text accessibility boundaries
-        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
         timeout-minutes: 15
         shell: bash
         run: |
@@ -309,7 +309,7 @@ jobs:
           test "$(grep -Fxc -- 'test atspi::interfaces::editable_text::tests::editable_text_protocol_accepts_only_supported_whole_replacement ... ok' "$RUNNER_TEMP/morpheus-accesskit-unix-result.txt")" = 1
           test "$(grep -Ec '^test result: ok\. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-accesskit-unix-result.txt")" = 1
       - name: Prepare the pinned owned native PipeWire client
-        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'rtc-libraries' || needs.scope.outputs.check_route == 'wayland' || (needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite != 'drafts-only' && needs.scope.outputs.matrix_suite != 'timeline-failures' && needs.scope.outputs.matrix_suite != 'recovery-only' && needs.scope.outputs.matrix_suite != 'media-only' && needs.scope.outputs.matrix_suite != 'oauth-only'))
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'rtc-libraries' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'wayland' || (needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite != 'drafts-only' && needs.scope.outputs.matrix_suite != 'timeline-failures' && needs.scope.outputs.matrix_suite != 'recovery-only' && needs.scope.outputs.matrix_suite != 'media-only' && needs.scope.outputs.matrix_suite != 'oauth-only'))
         timeout-minutes: 20
         shell: bash
         run: |
@@ -317,10 +317,10 @@ jobs:
           python3 scripts/build_linux_native.py --variant native \
             --prefix "$RUNNER_TEMP/morpheus-native-pipewire-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --github-env
       - name: Check native interface compilation before desktop dependencies
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
         run: cargo check --locked -p morpheus-ui-check
       - name: Test configuration, Matrix, and RTC protocol models
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'models')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'models')
         id: model-tests
         # Still fail the job below, but collect independent desktop/device
         # results on this candidate instead of paying the compilation cost
@@ -328,13 +328,13 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --no-fail-fast -p morpheus-config -p morpheus-matrix -p morpheus-rtc
       - name: Check desktop and Matrix crates
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
         run: cargo check --locked -p morpheus-app -p morpheus-matrix --features morpheus-app/native-calls
       - name: Build desktop with native call and device adapters
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
         run: cargo build --locked -p morpheus-app --features native-calls
       - name: Verify the actual Linux app uses its owned native client
-        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
         timeout-minutes: 2
         shell: /usr/bin/python3 -I -B {0}
         run: |
@@ -510,7 +510,7 @@ jobs:
           compression-level: 0
           include-hidden-files: false
       - name: Smoke test Linux desktop startup under Xvfb
-        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
         shell: bash
         run: |
           set +e
@@ -521,7 +521,7 @@ jobs:
             exit 1
           fi
       - name: Test desktop controller and call guards
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'desktop-video')
         id: desktop-tests
         # ElementHandle queries need compiler-generated element metadata even
         # when Rust debug symbols are disabled for the hosted test build.
@@ -550,11 +550,11 @@ jobs:
         run: cargo test --locked --no-fail-fast -p morpheus-rtc -p matrix-rtc-core -p matrix-rtc-call -p matrix-rtc-call-sdk -p matrix-rtc-transport -p matrix-rtc-matrix-sdk -p matrix-rtc-livekit --features morpheus-rtc/native-rtc,morpheus-rtc/native-devices --lib
       - name: Test native device and call guards
         id: device-tests
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'desktop-video')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'desktop-video')
         run: cargo test --locked -p morpheus-rtc --features native-devices --lib
       - name: Test Windows capture of an owned synthetic window and display
         id: windows-capture-tests
-        if: runner.os == 'Windows' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'devices')
+        if: runner.os == 'Windows' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'devices')
         continue-on-error: true
         timeout-minutes: 15
         env:
@@ -778,7 +778,7 @@ jobs:
           fi
       - name: Test synthetic native video source ownership
         id: video-source-tests
-        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'desktop-video')
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'app-guards' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'desktop-video')
         continue-on-error: true
         shell: bash
         run: |
@@ -917,29 +917,30 @@ jobs:
           def native_wayland_selection(route, runner, selected):
               # Scope selects Linux Wayland once for the whole native matrix.
               # Preserve malformed/missing values for the strict validator.
-              if route == "all" and runner in ("Windows", "macOS") and selected == "true":
+              if route in ("all", "app-guards") and runner in ("Windows", "macOS") and selected == "true":
                   return "false"
               return selected
 
           def native_check_error(route, runner, wayland, outcomes):
-              routes = {"all", "models", "desktop", "desktop-video", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive", "matrix", "wayland"}
+              routes = {"all", "models", "desktop", "desktop-video", "app-guards", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive", "matrix", "wayland"}
               if (not isinstance(route, str) or route not in routes or runner not in ("Linux", "Windows", "macOS")
                       or wayland not in ("true", "false") or not isinstance(outcomes, dict)):
                   return "Native check selection is missing or malformed."
               if ((wayland == "true" and runner != "Linux")
                       or (route in ("matrix", "wayland") and runner != "Linux")
                       or (route == "wayland" and wayland != "true")
-                      or (route not in ("all", "wayland") and wayland != "false")):
+                      or (route == "app-guards" and runner == "Linux" and wayland != "true")
+                      or (route not in ("all", "wayland", "app-guards") and wayland != "false")):
                   return "Native check route disagrees with its platform or Wayland selection."
               selected = {
-                  "model-tests": route in ("all", "models"),
-                  "desktop-tests": route in ("all", "desktop", "desktop-video"),
-                  "device-tests": route in ("all", "devices", "desktop-video"),
-                  "windows-capture-tests": runner == "Windows" and route in ("all", "devices"),
+                  "model-tests": route in ("all", "models", "app-guards"),
+                  "desktop-tests": route in ("all", "desktop", "desktop-video", "app-guards"),
+                  "device-tests": route in ("all", "devices", "desktop-video", "app-guards"),
+                  "windows-capture-tests": runner == "Windows" and route in ("all", "devices", "app-guards"),
                   "wayland-tests": runner == "Linux" and wayland == "true",
                   "vendor-tests": route in ("all", "vendor"),
                   "rtc-library-tests": route in ("all", "vendor", "rtc-libraries"),
-                  "video-source-tests": route in ("all", "vendor", "desktop-video"),
+                  "video-source-tests": route in ("all", "vendor", "desktop-video", "app-guards"),
                   "sdk-receipt-tests": route in ("all", "sdk"),
                   "sdk-archive-tests": route == "sdk-archive",
                   "matrix-tests": runner == "Linux" and route in ("all", "matrix"),
@@ -948,6 +949,10 @@ jobs:
                   compile_result = outcomes.get("rtc-library-compile")
                   if not isinstance(compile_result, dict) or compile_result.get("outcome") != "success":
                       return "Focused call library compilation failed or did not run."
+              elif route == "app-guards":
+                  compile_result = outcomes.get("rtc-library-compile")
+                  if not isinstance(compile_result, dict) or compile_result.get("outcome") != "skipped":
+                      return "App guards ran unselected call library compilation."
               for name, required in selected.items():
                   value = outcomes.get(name)
                   expected = "success" if required else "skipped"
@@ -958,6 +963,8 @@ jobs:
                   value = outcomes.get(name)
                   if not isinstance(value, dict) or value.get("outcome") not in ("success", "skipped"):
                       return "Native preview capture or publication failed."
+                  if route == "app-guards" and value.get("outcome") != "skipped":
+                      return "App guards ran unselected native preview publication."
               return None
 
           outcomes = {name: {"outcome": os.environ.get(variable)} for name, variable in (
@@ -1041,7 +1048,7 @@ jobs:
               choices = {"all": ["macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025"],
                          "linux": ["ubuntu-24.04"], "windows": ["windows-2025"],
                          "macos-arm": ["macos-15"], "macos-intel": ["macos-15-intel"]}
-              routes = {"all", "models", "desktop", "desktop-video", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive", "matrix", "wayland", "config", "helpers"}
+              routes = {"all", "models", "desktop", "desktop-video", "app-guards", "devices", "vendor", "rtc-libraries", "sdk", "sdk-archive", "matrix", "wayland", "config", "helpers"}
               suites = {"full", "draft-recovery", "drafts-only", "timeline-reads", "timeline-failures", "recovery-only",
                         "media-only", "app-timeline", "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "rtc-media", "element-interop"}
               if (event_name not in ("push", "pull_request", "workflow_dispatch")
@@ -1069,7 +1076,7 @@ jobs:
                       return "Incompatible manual check selection."
                   expected_platforms = [] if route in ("helpers", "config") else choices[platform]
                   if (platforms != expected_platforms or (config == "true") != (route == "config")
-                          or (wayland == "true") != ("ubuntu-24.04" in expected_platforms and route in ("all", "wayland"))):
+                          or (wayland == "true") != ("ubuntu-24.04" in expected_platforms and route in ("all", "wayland", "app-guards"))):
                       return "Manual scope disagrees with its exact selected jobs."
               for job, selected in (("config", config), ("compile", native)):
                   expected = "success" if selected == "true" else "skipped"
