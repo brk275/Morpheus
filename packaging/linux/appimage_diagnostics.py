@@ -613,11 +613,16 @@ def _app_process_marker_codes(data):
             or data.count(b"\n") > 65536):
         return {"status": "invalid", "codes": []}
     observed = set()
-    for raw in data.split(b"\n", 65536):
+    # Paired text context only: never emitting-thread or callback provenance.
+    refcell_occurrences = refcell_pairs = 0
+    refcell_context = previous_frame_context = None
+    lines = data.split(b"\n", 65536)
+    for index, raw in enumerate(lines):
         line = raw.removesuffix(b"\r")
         # Never export the executable/library path, symbol or private payload.
         # Unknown, localized, malformed or oversized lines stay unclassified.
         if len(line) > 8192 or b"\x00" in line:
+            previous_frame_context = None
             continue
         if b": symbol lookup error: " in line and b": undefined symbol: " in line:
             observed.add("loader_undefined_symbol")
@@ -627,12 +632,30 @@ def _app_process_marker_codes(data):
             observed.add("runtime_cleanup")
         if line.startswith(b"Failed to run ") and b": " in line[len(b"Failed to run "):]:
             observed.add("runtime_exec")
-        if _rust_panic_framing(line):
+        framed = _rust_panic_framing(line)
+        if framed:
             observed.add("rust_panic_framing")
         if line in {b"panic in a function that cannot unwind", b"thread caused non-unwinding panic. aborting."}:
             observed.add("rust_non_unwinding_panic")
         if line in {b"RefCell already borrowed", b"RefCell already mutably borrowed"}:
             observed.add("rust_refcell_borrow_panic")
+            # Count every occurrence accepted by the old generic comparison,
+            # including CR-trimmed or final fragments, so it cannot look unique.
+            refcell_occurrences = min(refcell_occurrences + 1, 2)
+            if previous_frame_context is not None and index < len(lines) - 1 and raw == line:
+                refcell_pairs = min(refcell_pairs + 1, 2)
+                refcell_context = previous_frame_context if refcell_pairs == 1 else None
+        previous_frame_context = None
+        if (framed and index < len(lines) - 1 and raw == line
+                and line.count(b") panicked at ") == 1):
+            if line.startswith(b"thread 'morpheus-screen' ("):
+                previous_frame_context = "rust_refcell_thread_screen"
+            elif line.startswith(b"thread 'main' ("):
+                previous_frame_context = "rust_refcell_thread_main"
+            else:
+                previous_frame_context = "rust_refcell_thread_unknown"
+    if refcell_occurrences == 1 and refcell_pairs == 1 and refcell_context is not None:
+        observed.add(refcell_context)
     result = {"status": "observed_fixed_labels" if observed else "unknown", "codes": sorted(observed)}
     wait = _runtime_wait_observation(data)
     if wait["status"] != "absent":

@@ -182,7 +182,8 @@ class ProgressTests(unittest.TestCase):
                 b"thread caused non-unwinding panic. aborting.\n")
         result = D._app_process_marker_codes(data)
         self.assertEqual(result, {"status": "observed_fixed_labels", "codes":
-            ["rust_non_unwinding_panic", "rust_panic_framing", "rust_refcell_borrow_panic"]})
+            ["rust_non_unwinding_panic", "rust_panic_framing", "rust_refcell_borrow_panic",
+             "rust_refcell_thread_unknown"]})
         self.assertNotIn("private", json.dumps(result))
         for frame in (b"thread '<unnamed>' (1) panicked at /fixture/a.rs:1:1:",
                       b"thread '' (123) panicked at /fixture/a:b.rs:0:0:"):
@@ -199,6 +200,142 @@ class ProgressTests(unittest.TestCase):
         for line in unknown:
             with self.subTest(line=line[:96]):
                 self.assertEqual(D._app_process_marker_codes(line + b"\n"), {"status": "unknown", "codes": []})
+
+    def test_refcell_thread_context_is_exact_unique_complete_and_private(self):
+        frame = b"\nthread '%s' (1234) panicked at /PRIVATE_SOURCE/a.rs:123:45:\n"
+        for name, context in ((b"morpheus-screen", "screen"), (b"main", "main"),
+                (b"PRIVATE_THREAD", "unknown"), (b"morpheus-screen-PRIVATE", "unknown"),
+                (b"main-PRIVATE", "unknown"), (b"<unnamed>", "unknown"), (b"", "unknown")):
+            for message in (b"RefCell already borrowed\n", b"RefCell already mutably borrowed\n"):
+                with self.subTest(context=context, message=message):
+                    data = frame % name + message + b"\nMORPHEUS_APPIMAGE_WAIT_V1 signal=6 cleanup=passed\n"
+                    result = D._app_process_marker_codes(data)
+                    self.assertEqual(result, {"status": "observed_fixed_labels", "codes":
+                        ["rust_panic_framing", "rust_refcell_borrow_panic", "rust_refcell_thread_" + context],
+                        "runtime_wait": {"status": "observed", "outcome": "signaled", "signal": 6, "cleanup": "passed"}})
+                    for private in ("PRIVATE", "1234", "a.rs", "morpheus-screen", "<unnamed>"):
+                        self.assertNotIn(private, json.dumps(result))
+
+    def test_refcell_thread_context_keeps_pair_before_unrelated_nonunwinding_hook(self):
+        frame = b"\nthread '%s' (1234) panicked at /PRIVATE_SOURCE/a.rs:123:45:\n"
+        for name, context in ((b"morpheus-screen", "screen"), (b"main", "main"), (b"PRIVATE", "unknown")):
+            with self.subTest(context=context):
+                data = (frame % name + b"RefCell already borrowed\n" + frame % b"main" +
+                        b"panic in a function that cannot unwind\nthread caused non-unwinding panic. aborting.\n")
+                result = D._app_process_marker_codes(data)
+                self.assertEqual(result["codes"], ["rust_non_unwinding_panic", "rust_panic_framing",
+                    "rust_refcell_borrow_panic", "rust_refcell_thread_" + context])
+                self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_refcell_thread_context_refuses_duplicate_conflicting_and_second_orphan_occurrences(self):
+        frame = b"\nthread '%s' (1234) panicked at /PRIVATE_SOURCE/a.rs:123:45:\n"
+        screen = frame % b"morpheus-screen" + b"RefCell already borrowed\n"
+        main = frame % b"main" + b"RefCell already mutably borrowed\n"
+        cases = (screen * 2, screen + main, main + screen,
+                 screen + b"RefCell already borrowed\n", b"RefCell already borrowed\n" + screen,
+                 screen + b"RefCell already borrowed", screen + b"RefCell already borrowed\r\n",
+                 screen + b"RefCell already mutably borrowed", screen + b"RefCell already mutably borrowed\r\n")
+        for index, data in enumerate(cases):
+            with self.subTest(index=index):
+                result = D._app_process_marker_codes(data)
+                self.assertEqual(result, {"status": "observed_fixed_labels", "codes":
+                    ["rust_panic_framing", "rust_refcell_borrow_panic"]})
+                self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_refcell_thread_context_refuses_partial_decorated_and_nonadjacent_pairs(self):
+        frame = b"thread 'morpheus-screen' (1234) panicked at /PRIVATE_SOURCE/a.rs:123:45:\n"
+        message = b"RefCell already borrowed\n"
+        cases = (message, frame + message[:-1], frame[:-1] + b"\r\n" + message,
+                 frame + b"RefCell already borrowed\r\n", frame + b"\n" + message,
+                 frame + b"PRIVATE intervening line\n" + message,
+                 frame + b"\x00PRIVATE skipped line\n" + message,
+                 frame + b"x" * 8193 + b"\n" + message,
+                 frame.replace(b"(1234)", b"(0)") + message,
+                 frame.replace(b"a.rs:123", b"a.rs:0123") + message,
+                 frame.replace(b"/PRIVATE_SOURCE/a.rs", b"x" * 8193) + message,
+                 frame + b"RefCell already borrowed PRIVATE\n", frame + b"RefCell already borrowed\x00\n",
+                 message + frame, frame[:-1])
+        for index, data in enumerate(cases):
+            with self.subTest(index=index):
+                result = D._app_process_marker_codes(data)
+                self.assertFalse(any(code.startswith("rust_refcell_thread_") for code in result["codes"]))
+                self.assertNotIn("PRIVATE", json.dumps(result))
+                self.assertNotIn("1234", json.dumps(result))
+
+    def test_refcell_thread_context_refuses_quoted_private_names_and_repeated_hook_delimiters(self):
+        message = b"RefCell already borrowed\n"
+        valid = b"thread 'main' (1) panicked at /fixture/a.rs:123:45:\n" + message
+        for name in (b"main", b"morpheus-screen", b"PRIVATE_WORKER"):
+            # This is the actual default-hook formatting of a name containing
+            # a fake hook prefix, followed by its real thread ID and location.
+            quoted_name = (b"thread '" + name + b"' (1) panicked at /PRIVATE_THREAD' (77) panicked at "
+                           b"/fixture/a.rs:123:45:\n")
+            private_location = (b"thread '" + name + b"' (77) panicked at /PRIVATE_DIR) panicked at "
+                                b"/fixture/a.rs:123:45:\n")
+            for frame in (quoted_name, private_location):
+                with self.subTest(name_kind=name[:4], location_case=frame is private_location):
+                    # The legacy generic parser remains intentionally broad.
+                    self.assertIs(D._rust_panic_framing(frame[:-1]), True)
+                    for data in (frame + message, valid + frame + message, frame + message + valid):
+                        result = D._app_process_marker_codes(data)
+                        self.assertEqual(result, {"status": "observed_fixed_labels", "codes":
+                            ["rust_panic_framing", "rust_refcell_borrow_panic"]})
+                        for private in ("PRIVATE", "77", "a.rs", "morpheus-screen"):
+                            self.assertNotIn(private, json.dumps(result))
+
+    def test_refcell_thread_context_cannot_bypass_existing_input_bounds_or_framing_api(self):
+        pair = b"\nthread 'main' (1234) panicked at /PRIVATE_SOURCE/a.rs:123:45:\nRefCell already borrowed\n"
+        with mock.patch.object(D, "_rust_panic_framing", side_effect=AssertionError("overbound parse")):
+            for data in (pair + b"x" * (8 * 1024 * 1024), pair + b"\n" * 65537, None, "PRIVATE"):
+                self.assertEqual(D._app_process_marker_codes(data), {"status": "invalid", "codes": []})
+        for frame in (b"thread 'main' (1) panicked at /PRIVATE/a.rs:1:1:",
+                      b"thread 'morpheus-screen' (1) panicked at /PRIVATE/a.rs:1:1:",
+                      b"thread '' (1) panicked at /PRIVATE/a.rs:0:0:"):
+            self.assertIs(D._rust_panic_framing(frame), True)
+        self.assertIs(D._rust_panic_framing(pair), False)
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX private capture log identities")
+    def test_refcell_thread_context_retains_real_app_stop_scan_cleanup_and_file_guards(self):
+        import appimage_capture as capture
+        observed = {"role": "app", "status": 127, "app_stdout": "clear", "app_stderr": "clear",
+                    "peer_stdout": "clear", "peer_stderr": "clear"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); session = root / "ordinary/session"
+            session.mkdir(mode=0o700, parents=True); (root / "ordinary").chmod(0o700)
+            log = session / "app.stderr.log"
+            log.write_bytes(b"\nthread 'morpheus-screen' (1234) panicked at /PRIVATE_SOURCE/a.rs:123:45:\n"
+                            b"RefCell already borrowed\n")
+            log.chmod(0o600)
+            progress = D.Progress(root); progress.wrapper("capture"); progress.capture("ordinary", "changed_frame")
+            progress.command("capture-green"); error = capture.CaptureFailure("process_exit")
+            error.process_exit = dict(observed); progress.failed(error)
+            first = json.loads(json.dumps(progress.value["failure"]))
+            progress.command("capture-inventory")
+            with mock.patch.object(D, "_app_process_marker_codes", side_effect=AssertionError("unadmitted context read")):
+                self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                                 {"diagnostics": "withheld", "passed": False})
+                live = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                self.assertNotIn("native_capture_failure_markers", live)
+                progress.cleanup(True)
+                failed_cleanup = D.public_failure(root, scan_passed=True, outer_cleanup="failed", outer_reason="namespace_exit")
+                self.assertNotIn("native_capture_failure_markers", failed_cleanup)
+                for role in ("peer", "other", "unknown"):
+                    progress.value["failure"]["process_exit"]["role"] = role; progress.save()
+                    unrelated = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                    self.assertNotIn("native_capture_failure_markers", unrelated)
+                progress.value["failure"] = first; progress.save()
+                self.assertNotIn("process_markers", D.capture_failure_markers(
+                    root, "ordinary", scan_passed=True, include_process=False))
+            result = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertEqual(result["failure"], first); self.assertFalse(result["passed"])
+            self.assertEqual(result["native_capture_failure_markers"]["process_markers"]["codes"],
+                             ["rust_panic_framing", "rust_refcell_borrow_panic", "rust_refcell_thread_screen"])
+            self.assertEqual(progress.value["failure"], first)
+            self.assertNotIn("PRIVATE", json.dumps(result)); self.assertNotIn("1234", json.dumps(result))
+            log.chmod(0o644)
+            with mock.patch.object(D, "_app_process_marker_codes", side_effect=AssertionError("unsafe context read")):
+                with self.assertRaises(ValueError):
+                    D.capture_failure_markers(root, "ordinary", scan_passed=True, include_process=True)
 
     @unittest.skipIf(sys.platform == "win32", "POSIX private capture log identities")
     def test_process_exit_markers_require_scan_cleanup_and_keep_all_closed_peer_sites(self):
