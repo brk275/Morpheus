@@ -344,6 +344,35 @@ class PreparationTests(unittest.TestCase):
             (alsa / name).write_bytes((ROOT / "vendor/alsa" / name).read_bytes())
         return source
 
+    @staticmethod
+    def sqlite_source(project):
+        source = project / "vendor/libsqlite3-sys"
+        source.mkdir(parents=True)
+        for name in ("LICENSE", "MORPHEUS_PATCH.md", "MORPHEUS_PROVENANCE.json"):
+            (source / name).write_bytes((ROOT / "vendor/libsqlite3-sys" / name).read_bytes())
+        return source
+
+    def test_sqlite_notice_invalid_inputs_refuse_before_staging(self):
+        for mutation in ("license", "missing", "symlink", "empty"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as checkout:
+                root = Path(folder).resolve(); project = Path(checkout).resolve()
+                source = self.sqlite_source(project)
+                if mutation == "license":
+                    (source / "LICENSE").write_bytes(b"changed upstream license")
+                elif mutation == "missing":
+                    (source / "MORPHEUS_PROVENANCE.json").unlink()
+                elif mutation == "symlink":
+                    (source / "MORPHEUS_PATCH.md").unlink()
+                    (source / "MORPHEUS_PATCH.md").symlink_to(source / "LICENSE")
+                else:
+                    (source / "MORPHEUS_PROVENANCE.json").write_bytes(b"")
+                config = {"appimage": {"files": {}}}; notices = {}
+                with mock.patch.object(N.client, "ROOT", project), self.assertRaises(N.InventoryFailure):
+                    N.sqlite_notices(root, config, notices)
+                self.assertEqual(config["appimage"]["files"], {})
+                self.assertEqual(notices, {})
+                self.assertEqual(list(root.iterdir()), [])
+
     def test_cpal_notices_authenticate_license_and_copy_exact_provenance(self):
         with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as checkout:
             root = Path(folder).resolve(); project = Path(checkout).resolve()
@@ -426,6 +455,7 @@ class PreparationTests(unittest.TestCase):
             root = Path(folder).resolve(); project = Path(checkout).resolve()
             (project / "LICENSE").write_bytes(b"Morpheus original code license")
             self.cpal_source(project)
+            sqlite = self.sqlite_source(project)
             stage = root / "stage"; stage.mkdir()
             (stage / "COPYING").write_bytes(b"PipeWire license")
             binary = root / "binary"
@@ -458,10 +488,19 @@ class PreparationTests(unittest.TestCase):
                     "CPAL-0.18.2-LICENSE", "CPAL-0.18.2-PATCH.md",
                     "ALSA-0.11.0-PATCH.md", "ALSA-0.11.0-LICENSE-APACHE",
                     "ALSA-0.11.0-LICENSE-MIT",
+                    "libsqlite3-sys-0.38.2-LICENSE", "libsqlite3-sys-0.38.2-MORPHEUS_PATCH.md",
+                    "libsqlite3-sys-0.38.2-MORPHEUS_PROVENANCE.json",
                 )
             } | {N.client.NOTICE_DIR + "/COPYING"})
             for path, destination in config["appimage"]["files"].items():
                 self.assertEqual(N.digest(Path(path).read_bytes()), prepared["notices"][destination])
+            for name in ("LICENSE", "MORPHEUS_PATCH.md", "MORPHEUS_PROVENANCE.json"):
+                source = (sqlite / name).read_bytes()
+                destination = N.NOTICE_ROOT + "/libsqlite3-sys-0.38.2-" + name
+                self.assertEqual(prepared["notices"][destination], N.digest(source))
+                copied = next(Path(path) for path, target in config["appimage"]["files"].items()
+                              if target == destination)
+                self.assertEqual(copied.read_bytes(), source)
             self.assertNotIn(str(root), str(prepared))
 
     def test_main_client_and_dependency_labels_parse_wide_reports_through_prepare(self):
@@ -469,6 +508,7 @@ class PreparationTests(unittest.TestCase):
             root = Path(folder).resolve(); project = Path(checkout).resolve()
             (project / "LICENSE").write_bytes(b"Morpheus original code license")
             self.cpal_source(project)
+            sqlite = self.sqlite_source(project)
             stage = root / "stage"; stage.mkdir()
             binary = root / "binary"; binary.write_bytes(elf_bytes(b"main"))
             pipewire = stage / N.client.SONAME; pipewire.write_bytes(elf_bytes(b"pipewire"))

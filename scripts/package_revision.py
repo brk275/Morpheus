@@ -65,14 +65,16 @@ UPDATE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-updateqa\.[12]")
 UPDATE_VERSION_PATHS = frozenset({"crates/morpheus-app/Cargo.toml", "Cargo.lock"})
 # A complete reviewed workspace currently exceeds 64 MiB. Keep the same
 # 128 MiB source-content ceiling used by the corresponding-source catalogue.
-# Only these two canonical committed JSON inventories need larger file limits;
-# they remain byte-for-byte authenticated, never source-identity exclusions.
+# Exact committed inventories and the two bundled SQLite amalgamations need
+# larger file limits; all remain authenticated, never source-identity exclusions.
 MAX_EXPORT_BYTES = 128 * 1024 * 1024
 MAX_EXPORT_ENTRIES = 5000
 MAX_EXPORT_FILE_BYTES = 8 * 1024 * 1024
 EXPORT_MANIFEST_LIMITS = {
     "native/webrtc/linux/expected-linux-overlay.json": 16 * 1024 * 1024,
     "native/webrtc/linux/selected-linux-build-inputs.json": 32 * 1024 * 1024,
+    "vendor/libsqlite3-sys/sqlite3/sqlite3.c": 16 * 1024 * 1024,
+    "vendor/libsqlite3-sys/sqlcipher/sqlite3.c": 16 * 1024 * 1024,
 }
 
 
@@ -80,7 +82,7 @@ def source_export_members(archive):
     """Validate every source header and bound the whole export before extraction.
 
     Input must come from the caller's authenticated clean Git revision. Limits
-    apply to all members, including the two named large inventories; no member
+    apply to all members, including the named larger source files; no member
     is omitted from the later complete version-only source comparison.
     """
     if type(archive) is not bytes or not 1 <= len(archive) <= MAX_EXPORT_BYTES:

@@ -296,7 +296,8 @@ def prepare_bytes(bundle, receipt_bytes, revision, *, platform, version, working
         path = PurePosixPath(name)
         if (name in {"vendor/README.md", "vendor/cpal/OWNED_ALSA.md",
                      "vendor/accesskit_atspi_common/MORPHEUS_PROVENANCE.json",
-                     "vendor/accesskit_unix/MORPHEUS_PROVENANCE.json"}
+                     "vendor/accesskit_unix/MORPHEUS_PROVENANCE.json",
+                     "vendor/libsqlite3-sys/MORPHEUS_PROVENANCE.json"}
                 or name.startswith("vendor/") and path.name in
                 {"MORPHEUS_PATCH.md", "OWNED_COREAUDIO.md", "README.md"}):
             # Empty upstream nested READMEs are optional documentation, not

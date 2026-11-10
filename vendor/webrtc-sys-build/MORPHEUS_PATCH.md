@@ -12,11 +12,11 @@ isolation patch still verifies the extracted static library independently.
 
 ## Changes
 
-- Fetch each pinned release asset through its fixed official GitHub asset API
-  identity with an unauthenticated octet-stream request. This avoids a failing
-  browser-download route without changing the SDK bytes or admitting a mirror.
-  The public legacy browser-URL helper remains available to existing callers;
-  the verified downloader uses the asset identity held alongside its size/hash.
+- Fetch each pinned archive through the official GitHub release tag/name URL
+  with unauthenticated octet-stream and User-Agent headers. The expected size
+  and SHA-256 remain the acceptance authority if a release URL changes.
+  Official asset IDs remain provenance references and compact Windows cache
+  identities; the downloader uses the release URL without adding a fallback.
 - Stream downloads over HTTPS with a bounded redirect count and timeout.
   Require the exact reviewed compressed size and SHA-256 before parsing ZIP
   contents. Pins cover the eleven release assets; unsupported profiles fail
@@ -67,7 +67,7 @@ includes this crate's unit tests. No source review or checksum alone establishes
 beta readiness, and version-only ZIP advisory matches must still be assessed
 against actual callers; do not suppress ZIP advisories globally.
 
-## Asset transport correction (source only)
+## Asset transport history
 
 The Apple Silicon build at source `bd5f2fee6dd765ed968d8727cf6d2ebb5311875c`
 failed before archive verification with a rejected HTTP response. A bounded
@@ -78,9 +78,16 @@ The historical build log does not disclose whether its rejection was status or
 content length; the probe establishes the current route failure, not that
 missing historical detail.
 
-All eleven asset IDs are already recorded in the provenance manifest and were
-reconciled against official release metadata before being added to the code pins.
-HTTPS/redirect count, timeout, response status/length, streamed size/digest,
-extraction, cache receipt and cleanup rules are unchanged. No authentication
-header or token is added. The additional existing-module unit regression is
-prepared but unexecuted; no current platform acceptance is claimed for this edit.
+That observation motivated an earlier asset-API transport revision. A later
+Apple Silicon acquisition at source `4959e1238b8fa0101186a0bcf6023dd432f5705e`
+was correctly refused with final status 403 and Content-Length 280. Its response
+body and redirect stage were not retained, so the rejection's network cause
+remains unproved. The current downloader instead uses the official release
+URL already exposed by `download_url()`. Official metadata binds that tag/name
+URL to the same eleven asset IDs, sizes and SHA-256 values.
+
+HTTPS-only redirects, redirect count, timeout, response status/length, streamed
+size/digest, extraction, cache receipts and cleanup rules remain unchanged.
+There is no automatic API fallback, new retry, authentication header or token.
+Transport/source review does not establish future acquisition or platform
+acceptance; actual affected checks retain their own producing-source evidence.

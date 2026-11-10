@@ -246,6 +246,21 @@ def cpal_notices(directory, config, notices):
         add_notice(directory, config, notices, "ALSA-0.11.0-" + name, data)
 
 
+
+def sqlite_notices(directory, config, notices):
+    """Retain this bundled crate's license and exact patch evidence only."""
+    source = client.ROOT / "vendor/libsqlite3-sys"
+    payloads = {name: regular(source / name, MAX_NOTICE) for name in
+                ("LICENSE", "MORPHEUS_PATCH.md", "MORPHEUS_PROVENANCE.json")}
+    if (digest(payloads["LICENSE"]) != "c10c1f27337546471e5f7e4e97fdd398b35b9d4e126115dcd22de8d8e65abf6f"
+            or any(not value for value in payloads.values())):
+        raise InventoryFailure("notice")
+    # Keep actual committed bytes, not synthesized license or source-completeness
+    # claims. add_notice binds each immutable copy in the existing hash inventory.
+    for name, value in payloads.items():
+        add_notice(directory, config, notices, "libsqlite3-sys-0.38.2-" + name, value)
+
+
 def prepare(runner, root, binary, stage, source_metadata, config, environment, *, runtime_metadata):
     root = client.private_directory(root)
     stage = Path(stage)
@@ -290,6 +305,7 @@ def prepare(runner, root, binary, stage, source_metadata, config, environment, *
         pending.extend(record["needed"])
     add_notice(directory, config, notices, "Morpheus-LICENSE", regular(client.ROOT / "LICENSE", MAX_NOTICE))
     cpal_notices(directory, config, notices)
+    sqlite_notices(directory, config, notices)
     # PipeWire provenance/notices are staged by appimage_config; pin every byte.
     for source, destination in config["appimage"]["files"].items():
         if destination.startswith((client.NOTICE_DIR + "/", "usr/share/doc/morpheus-app/appimage-runtime/")):

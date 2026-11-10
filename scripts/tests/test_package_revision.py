@@ -244,6 +244,11 @@ class RevisionIdentityTests(unittest.TestCase):
             self.assertEqual(len(content), size)
             self.assertIn("reviewed_fixture", json.loads(content))
             originals[name] = content
+        for name in ("vendor/libsqlite3-sys/sqlite3/sqlite3.c",
+                     "vendor/libsqlite3-sys/sqlcipher/sqlite3.c"):
+            originals[name] = (Path(__file__).resolve().parents[2] / name).read_bytes()
+            self.assertGreater(len(originals[name]), revision.MAX_EXPORT_FILE_BYTES)
+            self.assertLessEqual(len(originals[name]), 16 * 1024 * 1024)
         # The full real source is also over 64 MiB. Exercise that former outer
         # failure with ordinary individually bounded source members as well.
         for index in range(6):
@@ -288,12 +293,15 @@ class RevisionIdentityTests(unittest.TestCase):
                     self.assertEqual(sum(path.is_file() for path in tree.rglob("*")), len(originals))
                     for name in sizes:
                         self.assertEqual((tree / name).read_bytes(), originals[name])
-            # A same-sized change in an admitted large inventory still fails
-            # the full byte comparison. Its larger cap is not an exclusion.
-            with (root / next(iter(sizes))).open("r+b") as changed:
-                changed.write(b"!")
-            with self.assertRaises(revision.SourceRevisionError):
-                revision.verify_versioned_export(root, raw, "0.1.0-updateqa.1")
+            # Larger caps do not exclude any inventory or SQLite source bytes
+            # from the complete same-size content comparison.
+            for name in (next(iter(sizes)), "vendor/libsqlite3-sys/sqlite3/sqlite3.c",
+                         "vendor/libsqlite3-sys/sqlcipher/sqlite3.c"):
+                with (root / name).open("r+b") as changed:
+                    changed.write(b"!")
+                with self.assertRaises(revision.SourceRevisionError):
+                    revision.verify_versioned_export(root, raw, "0.1.0-updateqa.1")
+                (root / name).write_bytes(originals[name])
 
 
     def test_source_export_manifest_limits_reject_aliases_and_over_bound_members(self):
@@ -302,6 +310,11 @@ class RevisionIdentityTests(unittest.TestCase):
         entries = [
             ("native/webrtc/linux/expected-linux-overlay.json", 16 * 1024 * 1024 + 1),
             ("native/webrtc/linux/selected-linux-build-inputs.json", 32 * 1024 * 1024 + 1),
+            ("vendor/libsqlite3-sys/sqlite3/sqlite3.c", 16 * 1024 * 1024 + 1),
+            ("vendor/libsqlite3-sys/sqlcipher/sqlite3.c", 16 * 1024 * 1024 + 1),
+            ("vendor/libsqlite3-sys/sqlite3/other.c", 8 * 1024 * 1024 + 1),
+            ("vendor/unrelated/sqlite3/sqlite3.c", 8 * 1024 * 1024 + 1),
+            ("vendor/libsqlite3-sys/SQLITE3/sqlite3.c", 8 * 1024 * 1024 + 1),
             ("native/webrtc/linux/unrelated.json", 8 * 1024 * 1024 + 1),
             ("native/webrtc/linux/EXPECTED-LINUX-OVERLAY.json", 8 * 1024 * 1024 + 1),
             ("other/selected-linux-build-inputs.json", 8 * 1024 * 1024 + 1),

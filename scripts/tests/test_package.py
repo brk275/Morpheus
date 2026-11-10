@@ -651,7 +651,7 @@ class MacUpdatePayloadTests(unittest.TestCase):
 
 class NativeNoticeEvidenceTests(unittest.TestCase):
     @staticmethod
-    def evidence(drop_license=False, registry=False, drop_alsa_provenance=False, formfeed=False, source_overrides=None, accesskit=False):
+    def evidence(drop_license=False, registry=False, drop_alsa_provenance=False, formfeed=False, source_overrides=None, accesskit=False, sqlite=False):
         source = native_notices.catalogue()
         files = {"Cargo.toml": b'[workspace]\nmembers = ["app", "vendor/cpal", "vendor/slint"]\nexclude = ["vendor/alsa"]\n[patch.crates-io]\nalsa = { path = "vendor/alsa" }\n',
                  "Cargo.lock": b'version = 4\n[[package]]\nname = "fixture"\nversion = "0.1.0"\n[[package]]\nname = "cpal"\nversion = "0.18.2"\n[[package]]\nname = "slint"\nversion = "1.18.1"\n[[package]]\nname = "alsa"\nversion = "0.11.0"\n',
@@ -682,6 +682,14 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                     files[root + "/LICENSE.chromium"] = b"Fixture Chromium BSD license\n"
                 files[root + "/MORPHEUS_PROVENANCE.json"] = json.dumps({"upstream_crate": name, "version": version}).encode()
             files["vendor/unrelated/MORPHEUS_PROVENANCE.json"] = b'{"private_unselected":true}'
+        if sqlite:
+            root = "vendor/libsqlite3-sys"
+            files["Cargo.toml"] += b'libsqlite3-sys = { path = "vendor/libsqlite3-sys" }\n'
+            files["Cargo.lock"] += b'[[package]]\nname = "libsqlite3-sys"\nversion = "0.38.2"\n'
+            for name in ("Cargo.toml", "build.rs", "LICENSE", "sqlcipher/LICENSE",
+                         "MORPHEUS_PATCH.md", "MORPHEUS_PROVENANCE.json"):
+                files[root + "/" + name] = (Path(__file__).resolve().parents[2] / root / name).read_bytes()
+            files["vendor/unrelated/MORPHEUS_PROVENANCE.json"] = b'{"unselected":true}'
         if source_overrides is not None:files.update(source_overrides)
         registry_files = {"Cargo.toml": b'[package]\nname = "fixture-registry"\nversion = "1.0.0"\nlicense = "MIT"\n',
                           "LICENSE": b"Fixture exact registry license\n"}
@@ -766,6 +774,33 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                                  {item["source_path"] for item in parsed["local_patch_provenance"]})
                 self.assertFalse(parsed["distribution_ready"])
                 self.assertFalse(parsed["license_compliance_verified"])
+
+    def test_vendored_sqlite_keeps_actual_local_license_and_exact_provenance(self):
+        source, files, manifest, revision, build = self.evidence(sqlite=True)
+        bundle, receipt = build()
+        for platform in ("darwin", "win32"):
+            with self.subTest(platform=platform):
+                contents = native_notices.prepare_bytes(bundle, receipt, revision, platform=platform, version="0.1.0")
+                ledger = native_notices.verify_bytes(contents, revision=revision, platform=platform, version="0.1.0")
+                record = next(item for item in ledger["locked_packages"] if item["name"] == "libsqlite3-sys")
+                self.assertEqual(record["source"], "committed-workspace")
+                self.assertEqual(record["declared_license"], "MIT")
+                self.assertEqual(record["source_identity"], {"tree": manifest["source"]["tree"]})
+                for name in ("LICENSE", "sqlcipher/LICENSE"):
+                    path = "vendor/libsqlite3-sys/" + name
+                    self.assertIn({"source_path": path, "sha256": source.digest(files[path])}, record["license_texts"])
+                for name in ("MORPHEUS_PATCH.md", "MORPHEUS_PROVENANCE.json"):
+                    path = "vendor/libsqlite3-sys/" + name
+                    self.assertIn({"source_path": path, "sha256": source.digest(files[path])}, ledger["local_patch_provenance"])
+                self.assertNotIn("vendor/unrelated/MORPHEUS_PROVENANCE.json",
+                                 {item["source_path"] for item in ledger["local_patch_provenance"]})
+                self.assertFalse(ledger["distribution_ready"])
+                self.assertFalse(ledger["license_compliance_verified"])
+        for body in (b"", b"bad\x00provenance"):
+            _, _, _, revision, build = self.evidence(sqlite=True, source_overrides={
+                "vendor/libsqlite3-sys/MORPHEUS_PROVENANCE.json": body})
+            with self.assertRaises(ValueError):
+                native_notices.prepare_bytes(*build(), revision, platform="darwin", version="0.1.0")
 
     def test_source_bound_plain_notices_cover_all_packages_patch_and_slint_without_legal_acceptance(self):
         source, files, manifest, revision, build = self.evidence()
