@@ -33,6 +33,7 @@ CHECKS = frozenset((
     "browser_identity", "browser_presynced", "browser_roster", "browser_video", "browser_audio", "browser_leave",
     "native_presynced_baseline", "native_roster", "native_audio", "native_video", "native_departure",
     "native_group_roster", "native_late_join_media", "native_group_departure", "native_key_rotation",
+    "native_same_device_rejoin",
     "browser_group_roster", "browser_group_audio", "browser_screen", "browser_group_departure",
     "browser_key_rotation", "browser_post_rotation_screen", "browser_post_rotation_audio",
 ))
@@ -47,7 +48,20 @@ STAGES = frozenset((
     "native_test", "log_scan", "complete",
 ))
 FAILURES = frozenset(("fixture_operation", "browser_acceptance", "native_acceptance", "deadline", "evidence", "log_scan"))
-NATIVE_STAGES = ("microphone_cryptor", "late_login", "late_sync", "late_bootstrap", "late_join", "group_roster")
+NATIVE_STAGES = ("microphone_cryptor", "late_login", "late_sync", "late_bootstrap", "late_join", "group_roster", "same_device_rejoin")
+GROUP_ROSTER_PREFIX = "MORPHEUS_ELEMENT_GROUP_ROSTER "
+GROUP_ROSTER_FIELDS = (
+    'alice_available',
+    'alice_count_is_3',
+    'alice_exactly_one_alice',
+    'alice_exactly_one_bob',
+    'alice_exactly_one_carol',
+    'carol_available',
+    'carol_count_is_3',
+    'carol_exactly_one_alice',
+    'carol_exactly_one_bob',
+    'carol_exactly_one_carol',
+)
 NATIVE_STAGE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_STAGE "
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILES = 128
@@ -86,7 +100,41 @@ def native_stages(output: str) -> tuple[str, ...]:
     return tuple(result)
 
 
-def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
+def group_roster_receipt(output: str) -> dict[str, bool] | str | None:
+    """Only ten fixed boolean facts; no raw roster or exception text survives."""
+    found = None
+    cursor = 0
+    marker = "MORPHEUS_ELEMENT_GROUP_ROSTER"
+    while (start := output.find(marker, cursor)) >= 0:
+        cursor = start + len(marker)
+        if start and output[start - 1] != "\n":
+            continue
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        if found is not None or end - start > 512 or not output.startswith(GROUP_ROSTER_PREFIX, start):
+            return "invalid"
+        # The character check above bounds this UTF-8 allocation to 2048 bytes.
+        if len(output[start:end].encode("utf-8")) > 512:
+            return "invalid"
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate roster fact")
+                result[key] = value
+            return result
+        try:
+            value = json.loads(output[start + len(GROUP_ROSTER_PREFIX):end], object_pairs_hook=unique_object)
+        except (ValueError, TypeError, RecursionError):
+            return "invalid"
+        if (type(value) is not dict or set(value) != set(GROUP_ROSTER_FIELDS)
+                or any(type(item) is not bool for item in value.values())):
+            return "invalid"
+        found = value
+    return found
+
+
+def diagnostics(output: str, *, include_native=True) -> dict[str, str | dict[str, bool]]:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
     failures = [value for value in FAILURE_PATTERN.findall(output) if value in FAILURES]
@@ -94,6 +142,8 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
         result["stage"] = stages[-1]
     if failures:
         result["failure"] = failures[-1]
+    if include_native and (roster := group_roster_receipt(output)) is not None:
+        result["group_roster"] = roster
     if include_native and (native := native_stages(output)):
         result["native_stage"] = native[-1]
     return result
@@ -397,6 +447,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     native = None
     peers_complete = False
     children_joined = False
+    scan_complete = False
     cleanup_failure = None
     try:
         runner.mark("tool_install")
@@ -451,6 +502,7 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         if not children_joined or cleanup_failure is not None:
             raise RuntimeError("fixture_operation")
         output, native_output = runner.scan(native)
+        scan_complete = True
         # This is the exact native log snapshot included in the successful
         # scan, inspected only after owned group teardown and actual waits.
         if peers_complete and children_joined and not exact_native_pass(native_output):
@@ -469,6 +521,9 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     for key, value in sorted(facts.items()):
         print(f"MORPHEUS_ELEMENT_CHECK {key}={str(value).lower()}", flush=True)
     if children_joined and cleanup_failure is None:
+        if scan_complete and failure == "native_acceptance":
+            if (roster := group_roster_receipt(native_output)) is not None:
+                print(GROUP_ROSTER_PREFIX + json.dumps(roster, sort_keys=True), flush=True)
         for value in native_stages(native_output):
             print(NATIVE_STAGE_PREFIX + value, flush=True)
     # Cleanup is required but must not erase the last useful failure stage.

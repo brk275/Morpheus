@@ -18,6 +18,40 @@ import run_element_acceptance as target
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_group_roster_failure_receipt_is_fixed_bounded_and_keeps_failure(self):
+        facts = {field: True for field in target.GROUP_ROSTER_FIELDS}
+        raw = target.GROUP_ROSTER_PREFIX + json.dumps(facts) + "\n"
+        self.assertEqual(target.group_roster_receipt(raw), facts)
+        self.assertEqual(target.diagnostics(raw), {"group_roster": facts})
+        partial = facts | {"alice_count_is_3": False, "alice_exactly_one_carol": False}
+        self.assertEqual(target.group_roster_receipt(target.GROUP_ROSTER_PREFIX + json.dumps(partial)), partial)
+        self.assertEqual(target.diagnostics(raw, include_native=False), {})
+        self.assertIsNone(target.group_roster_receipt("private ordinary text"))
+        self.assertIsNone(target.group_roster_receipt("embedded " + raw))
+        invalid = [raw + raw, target.GROUP_ROSTER_PREFIX + "x" * 512,
+                   target.GROUP_ROSTER_PREFIX + "[]\n",
+                   target.GROUP_ROSTER_PREFIX + json.dumps(facts | {"private_owner": True}),
+                   target.GROUP_ROSTER_PREFIX + json.dumps({key: value for key, value in facts.items()
+                                                           if key != target.GROUP_ROSTER_FIELDS[0]}),
+                   target.GROUP_ROSTER_PREFIX + json.dumps(facts)[:-1] + ',"alice_available":false}']
+        for value in (0, 1, "true", None, [], {}):
+            invalid.append(target.GROUP_ROSTER_PREFIX + json.dumps(facts | {"alice_available": value}))
+        for malformed in invalid:
+            with self.subTest(malformed=malformed[:40]):
+                self.assertEqual(target.group_roster_receipt(malformed), "invalid")
+                self.assertEqual(target.diagnostics(malformed), {"group_roster": "invalid"})
+        unicode_oversize = target.GROUP_ROSTER_PREFIX + '{"unknown":"' + "é" * 250 + '"}'
+        self.assertLessEqual(len(unicode_oversize), 512)
+        self.assertGreater(len(unicode_oversize.encode("utf-8")), 512)
+        with mock.patch.object(target.json, "loads") as parse:
+            self.assertEqual(target.group_roster_receipt(unicode_oversize), "invalid")
+            parse.assert_not_called()
+        failed = raw + "MORPHEUS_ELEMENT_FAILURE native_acceptance\n"
+        failed += "".join(f"MORPHEUS_ELEMENT_CHECK {name}=true\n" for name in target.CHECKS)
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(failed, complete=True)
+        self.assertEqual(target.diagnostics(failed), {"failure": "native_acceptance", "group_roster": facts})
+
     def test_requires_every_fixed_assertion_and_preserves_failure(self):
         complete = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in target.CHECKS)
         self.assertEqual(target.evidence(complete, complete=True), dict.fromkeys(target.CHECKS, True))
@@ -40,6 +74,7 @@ class EvidenceTests(unittest.TestCase):
         # late third participant, same sender screen and post-rotation media.
         group = (
             "native_group_roster", "native_late_join_media", "native_group_departure", "native_key_rotation",
+            "native_same_device_rejoin",
             "browser_group_roster", "browser_group_audio", "browser_screen", "browser_group_departure",
             "browser_key_rotation", "browser_post_rotation_screen", "browser_post_rotation_audio",
         )
@@ -91,10 +126,12 @@ class EvidenceTests(unittest.TestCase):
                 fixture.chmod(0o600)
                 (root / "browser-ready").touch()
                 runner = target.Runner(root, "scanner")
+                roster_facts = {field: True for field in target.GROUP_ROSTER_FIELDS}
+                roster_line = target.GROUP_ROSTER_PREFIX + json.dumps(roster_facts) + "\n"
                 native = self.anchored_log(runner, "native.log", (
                     "opaque-fixture-panic\nMORPHEUS_ELEMENT_CHECK native_audio=true\n"
                     + target.NATIVE_STAGE_PREFIX + "microphone_cryptor\n"
-                    + target.NATIVE_STAGE_PREFIX + "late_login\n").encode())
+                    + target.NATIVE_STAGE_PREFIX + "late_login\n" + roster_line).encode())
                 browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
                 native.joined = browser.joined = False
                 native.status = mock.Mock(return_value=1)
@@ -140,6 +177,9 @@ class EvidenceTests(unittest.TestCase):
                 self.assertIsNone(browser.log_anchor)
                 output = visible.getvalue()
                 self.assertNotIn("opaque", output)
+                admitted_roster = scanner_status == 0 and not join_failure and not service_failure
+                self.assertEqual(target.diagnostics(output).get("group_roster"),
+                                 roster_facts if admitted_roster else None)
                 self.assertEqual(target.evidence(output),
                                  {"native_audio": True, "official_image": True} if scanner_status == 0 and not join_failure and not service_failure else {})
                 self.assertEqual(target.diagnostics(output).get("native_stage"),

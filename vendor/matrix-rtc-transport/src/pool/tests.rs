@@ -1281,3 +1281,39 @@ async fn an_active_idle_retired_focus_cannot_be_parked_after_a_lapse() {
     );
     fx.pool.close();
 }
+
+#[tokio::test]
+async fn member_key_notifications_cannot_cross_a_retired_generation() {
+    let mut fx = Fixture::new();
+    let old = Arc::new(AtomicBool::new(true));
+    let current = Arc::new(AtomicBool::new(true));
+    assert!(
+        fx.pool
+            .member_key_imported("id-bob".into(), "old".into(), 1, Arc::clone(&old))
+            .is_empty()
+    );
+    old.store(false, Ordering::Release);
+    assert!(
+        fx.pool
+            .member_key_imported("id-bob".into(), "bob".into(), 2, Arc::clone(&current))
+            .is_empty()
+    );
+    let events = fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    assert!(events.contains(&PoolEvent::KeyImported {
+        member_id: "bob".into(),
+        identity: "id-bob".into(),
+        key_index: 2,
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PoolEvent::KeyImported { key_index: 1, .. }))
+    );
+    assert!(fx.pool.member_pending_keys.is_empty());
+    assert!(
+        fx.pool
+            .member_key_imported("id-bob".into(), "old".into(), 3, old)
+            .is_empty()
+    );
+    assert!(fx.pool.member_pending_keys.is_empty());
+}
